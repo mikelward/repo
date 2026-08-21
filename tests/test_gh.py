@@ -68,6 +68,40 @@ class GhWrapperTest(unittest.TestCase):
             called_args.args[0], ["gh", "api", "repos/o/r; rm -rf /"]
         )
 
+    def test_run_with_input_returns_raw_stdout_bytes_on_success(self):
+        # Bytes throughout, not text=True -- a secret's value is opaque
+        # data, not something to decode/re-encode through a text codec.
+        with patch(
+            "subprocess.run",
+            return_value=FakeCompletedProcess(0, stdout=b"\x00\x01ok"),
+        ) as mock_run:
+            result = gh.run_with_input(["secret", "set", "NAME"], b"the-value")
+        self.assertEqual(result, b"\x00\x01ok")
+        mock_run.assert_called_once_with(
+            ["gh", "secret", "set", "NAME"], input=b"the-value", capture_output=True
+        )
+        self.assertNotIn("text", mock_run.call_args.kwargs)
+
+    def test_run_with_input_raises_gherror_with_decoded_stderr_on_failure(self):
+        with patch(
+            "subprocess.run",
+            return_value=FakeCompletedProcess(1, stderr=b"gh: HTTP 403: Forbidden\n"),
+        ):
+            with self.assertRaises(gh.GhError) as cm:
+                gh.run_with_input(["secret", "set", "NAME"], b"the-value")
+        self.assertEqual(cm.exception.stderr, "gh: HTTP 403: Forbidden\n")
+
+    def test_run_with_input_never_invokes_a_shell(self):
+        with patch(
+            "subprocess.run", return_value=FakeCompletedProcess(0, stdout=b"")
+        ) as mock_run:
+            gh.run_with_input(["secret", "set", "NAME", "--repo", "o/r; rm -rf /"], b"v")
+        self.assertNotIn("shell", mock_run.call_args.kwargs)
+        self.assertEqual(
+            mock_run.call_args.args[0],
+            ["gh", "secret", "set", "NAME", "--repo", "o/r; rm -rf /"],
+        )
+
     def test_require_gh_raises_when_gh_is_missing(self):
         with patch("shutil.which", return_value=None):
             with self.assertRaises(SystemExit) as cm:
