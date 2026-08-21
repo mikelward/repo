@@ -45,3 +45,14 @@ def try_run(args):
     if proc.returncode == 0:
         return True, proc.stdout
     return False, proc.stderr
+
+
+def run_with_input(args, input_bytes):
+    """Run `gh <args>` with `input_bytes` fed to stdin, return stdout.
+    Raises GhError(stderr) on failure. Bytes, not text -- `gh secret set`
+    is the one subcommand here whose payload is an opaque secret value,
+    not something to decode/re-encode through a text codec."""
+    proc = subprocess.run(["gh", *args], input=input_bytes, capture_output=True)
+    if proc.returncode != 0:
+        raise GhError(proc.stderr.decode(errors="replace"))
+    return proc.stdout

@@ -47,6 +47,6 @@ See `AGENTS.md` for testing and contribution conventions.
 
 ## Status
 
-`repo list` is implemented. `repo secrets` and `repo setup` are still stubs
-that exit with "not yet implemented" -- each is a follow-up PR of similar
-size, porting behavior from the shell scripts.
+`repo list` and `repo secrets` are implemented. `repo setup` is still a stub
+that exits with "not yet implemented" -- a follow-up PR of similar size,
+porting behavior from the shell scripts.
