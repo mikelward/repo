@@ -56,9 +56,14 @@ one that has stopped biting.
   no behavior to exercise -- documentation, comments, this file -- add no
   test and don't need `make test` run over them.
 - `unittest`, not a third-party test runner -- consistent with the
-  no-dependencies rule above. Mock `gh` calls at the `subprocess` boundary
-  rather than shelling out to a fake binary on `PATH`; that was necessary in
-  the shell scripts because shell has nothing better, and Python does.
+  no-dependencies rule above. Mock, in Python, rather than shelling out to a
+  fake `gh` binary on `PATH`; that was necessary in the shell scripts
+  because shell has nothing better, and Python does. Two boundaries, two
+  jobs: `tests/test_gh.py` patches `subprocess.run` directly to prove
+  `repo_lib/gh.py` itself does what it claims (argument list, `GhError`,
+  return-code handling); every other subcommand's tests patch
+  `repo_lib.gh.run`/`try_run` instead, so a `list`/`secrets`/`setup` test is
+  about that subcommand's own logic, not the wrapper underneath it.
 - Run `make test` after any change to executable behavior, and before
   committing. Skip it on a docs-only change, and say that's why you skipped
   it.

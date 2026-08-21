@@ -47,5 +47,6 @@ See `AGENTS.md` for testing and contribution conventions.
 
 ## Status
 
-Skeleton only -- each subcommand currently exits with "not yet implemented".
-Behavior ported from the shell scripts lands in a follow-up PR.
+`repo list` is implemented. `repo secrets` and `repo setup` are still stubs
+that exit with "not yet implemented" -- each is a follow-up PR of similar
+size, porting behavior from the shell scripts.
