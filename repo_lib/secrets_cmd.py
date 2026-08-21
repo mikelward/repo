@@ -49,8 +49,12 @@ from repo_lib.common import error, error_lines
 NAME_START_RE = re.compile(r"^[A-Za-z_]")
 NAME_CHARS_RE = re.compile(r"^[A-Za-z0-9_]+$")
 GITHUB_PREFIX_RE = re.compile(r"^github_", re.IGNORECASE)
-ENV_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
-OWNER_REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
+# The lookaheads reject `.` and `..` components: made of allowed
+# characters, but as path segments spliced into `repos/{repo}/...` or
+# `.../environments/{env}/...` they would address a different endpoint
+# than the one that was validated.
+ENV_NAME_RE = re.compile(r"^(?!\.\.?$)[A-Za-z0-9._-]+$")
+OWNER_REPO_RE = re.compile(r"^(?!\.\.?/)[A-Za-z0-9._-]+/(?!\.\.?$)[A-Za-z0-9._-]+$")
 
 
 def add_arguments(parser):
@@ -227,9 +231,10 @@ def run(args):
         raise SystemExit(2)
     env = args.env if env_given else None
     if env and not ENV_NAME_RE.match(env):
-        error(f"'{env}' contains characters this script does not handle in an")
-        error("environment name (kept to letters, digits, '.', '_', '-' -- refusing")
-        error("rather than guessing how to URL-encode anything wider).")
+        error(f"'{env}' is not an environment name this script handles (kept to")
+        error("letters, digits, '.', '_', '-', excluding the reserved '.' and '..'")
+        error("path segments -- refusing rather than guessing how to URL-encode")
+        error("anything wider).")
         raise SystemExit(2)
 
     file_given = args.file is not None

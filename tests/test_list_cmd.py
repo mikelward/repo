@@ -183,6 +183,17 @@ class ListCmdTest(unittest.TestCase):
         self.assertEqual(status, 2)
         self.assertEqual(out, "")
 
+    def test_rejects_a_dot_segment_owner(self):
+        # `.` and `..` pass the character check but are reserved path
+        # segments; spliced into `orgs/{owner}` they would address a
+        # different endpoint than the one that was validated.
+        for owner in (".", ".."):
+            with self.subTest(owner=owner):
+                fake = FakeGh()
+                status, out, _ = run_repo_list(fake, ["--owner", owner])
+                self.assertEqual(status, 2)
+                self.assertEqual(out, "")
+
     def test_rejects_an_explicitly_empty_owner(self):
         # Covers both --owner '' and --owner= -- argparse hands them to us
         # identically as args.owner == "", unlike the shell version, which
