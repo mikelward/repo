@@ -26,7 +26,10 @@ import re
 from repo_lib import gh
 from repo_lib.common import error, error_lines
 
-ACCOUNT_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+# The lookahead rejects `.` and `..`: made of allowed characters, but as a
+# path segment spliced into `orgs/{owner}` they would address a different
+# endpoint than the one that was validated.
+ACCOUNT_NAME_RE = re.compile(r"^(?!\.\.?$)[A-Za-z0-9._-]+$")
 
 
 def add_arguments(parser):
@@ -72,7 +75,7 @@ def run(args):
     owner = args.owner if owner_given else self_login
 
     if not ACCOUNT_NAME_RE.match(owner):
-        error(f"'{owner}' contains characters GitHub does not allow in an account name")
+        error(f"'{owner}' is not a name GitHub allows for an account")
         raise SystemExit(2)
 
     # GitHub account names are case-insensitive (SomeUser and someuser are

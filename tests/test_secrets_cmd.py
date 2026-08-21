@@ -473,6 +473,25 @@ class SecretsCmdTest(unittest.TestCase):
         )
         self.assertEqual(status, 2)
 
+    def test_rejects_a_dot_segment_owner_repo_or_env(self):
+        # `.` and `..` pass the character check but are reserved path
+        # segments; spliced into `repos/{repo}/...` or
+        # `.../environments/{env}/...` they would address a different
+        # endpoint than the one that was validated.
+        cases = [
+            ["--name", "TOKEN", "--force", "../a"],
+            ["--name", "TOKEN", "--force", "./a"],
+            ["--name", "TOKEN", "--force", "o/.."],
+            ["--name", "TOKEN", "--force", "o/."],
+            ["--name", "TOKEN", "--force", "--env", ".", "o/a"],
+            ["--name", "TOKEN", "--force", "--env", "..", "o/a"],
+        ]
+        for argv in cases:
+            with self.subTest(argv=argv):
+                fake = FakeGh()
+                status, out, err = run_repo_secrets(fake, argv, stdin_data=b"s3cr3t")
+                self.assertEqual(status, 2)
+
     def test_gh_not_installed_is_reported(self):
         fake = FakeGh()
         with patch("shutil.which", return_value=None):
