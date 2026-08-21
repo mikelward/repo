@@ -1,0 +1,21 @@
+#!/usr/bin/env python3
+"""Fleet-management CLI: `repo list`, `repo secrets`, `repo setup`.
+
+Run directly from a checkout (this file's own directory is on sys.path,
+so `import repo_lib` resolves without installing anything) -- no build
+step, matching mikelward/scripts's own convention.
+
+Requires the gh CLI, authenticated. Cost and reliability: free -- a
+handful of GitHub REST API calls per invocation, well inside the
+5,000-authenticated-requests-an-hour limit.
+"""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from repo_lib.cli import main
+
+if __name__ == "__main__":
+    sys.exit(main())
