@@ -27,12 +27,15 @@ class CliTest(unittest.TestCase):
             build_parser().parse_args(["setup"])
         self.assertEqual(cm.exception.code, 2)
 
-    def test_each_subcommand_dispatches_to_its_own_module(self):
-        # Skeleton stubs raise SystemExit("... not yet implemented") rather
-        # than silently doing nothing -- proves main() actually calls the
-        # subcommand's run(), not just that argparse accepted the args.
+    def test_stub_subcommands_dispatch_to_their_own_module(self):
+        # `list` now has a real implementation (see test_list_cmd.py) and
+        # is deliberately not covered here, since running it for real would
+        # shell out to the actual gh on PATH rather than exercising a stub.
+        # secrets/setup remain stubs and raise SystemExit("... not yet
+        # implemented") rather than silently doing nothing -- proves
+        # main() actually calls the subcommand's run(), not just that
+        # argparse accepted the args.
         for argv, expected in (
-            (["list"], "repo list: not yet implemented"),
             (["secrets"], "repo secrets: not yet implemented"),
             (["setup", "owner/repo"], "repo setup: not yet implemented"),
         ):
