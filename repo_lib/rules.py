@@ -777,21 +777,34 @@ def apply_ruleset(
     return 0
 
 
-def check_master_branch(repo):
+def check_master_branch(repo, quiet=False):
     """Warns on stderr if `repo` has an actual branch literally named
     'master' -- the backdoor the hardened ~DEFAULT_BRANCH/main/master
     targeting above exists to close, worth flagging independent of any
     ruleset since deleting the branch removes it outright. Advisory, not a
     precondition for the ruleset write: never raises, and a read failure
-    here is reported but does not fail the rest of `repo setup`."""
+    here is reported but does not fail the rest of `repo setup`.
+
+    Returns ("exists" | "absent" | "error", detail) -- detail is gh's raw
+    stderr text for "error", else None. `repo setup` (quiet=False, the
+    default) ignores the return value and relies on this function's own
+    stderr reporting, unchanged. `repo audit` (quiet=True) needs to decide
+    for itself whether an unreadable check should fail the whole audit
+    closed rather than merely warn, so it takes the outcome and detail
+    back and reports the finding in its own [ok]/[GAP] format instead --
+    quiet=True suppresses this function's own printing so the two reports
+    don't duplicate (and word) the same finding differently."""
     ok, result = gh.try_run(["api", f"repos/{repo}/branches/master"])
     if ok:
-        error(f"{repo} has a branch literally named 'master' -- this can bypass a")
-        error("ruleset scoped only to the default branch. Delete it, or confirm the")
-        error("ruleset above also targets refs/heads/master.")
-        return
+        if not quiet:
+            error(f"{repo} has a branch literally named 'master' -- this can bypass a")
+            error("ruleset scoped only to the default branch. Delete it, or confirm the")
+            error("ruleset above also targets refs/heads/master.")
+        return "exists", None
     if "HTTP 404" in result:
-        return
-    error(f"could not check whether {repo} has a branch named 'master':")
-    for line in result.splitlines():
-        error(f"  {line}")
+        return "absent", None
+    if not quiet:
+        error(f"could not check whether {repo} has a branch named 'master':")
+        for line in result.splitlines():
+            error(f"  {line}")
+    return "error", result

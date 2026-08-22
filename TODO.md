@@ -1,5 +1,28 @@
 # TODO
 
+## repo audit
+
+- [x] Port `repo-rules-audit` (mikelward/scripts#216's current, fully-
+      hardened version) as a new read-only `repo audit` subcommand
+      (`repo_lib/audit_cmd.py`). This was the last shell tool without a
+      Python equivalent. Ported: every effective-rule check (pull request
+      required, conversation resolution, per-named-check required status
+      check + strict/up-to-date policy, force-push and deletion
+      protection), the bypass-actor scan over rulesets that plainly cover
+      the audited branch, and -- when the audited branch is directly
+      confirmed to be the repository's real default (not merely "no
+      --branch was given") -- the targeting-completeness check: whether
+      every such ruleset also targets `refs/heads/main` and
+      `refs/heads/master`, with the literal-first-then-glob-fallback
+      ordering and the two separate "unevaluated suppresses the success
+      summary" paths preserved exactly (see `audit_cmd._branch_coverage_
+      verdict`/`_targeting_status`'s own docstrings). `rules.
+      check_master_branch` is reused directly (with a new `quiet=`
+      parameter and a `(status, detail)` return, additive and ignored by
+      `repo setup`'s existing call site) rather than reimplemented, and
+      `rules.DEFAULT_CHECKS` is reused for the same default-check list
+      `repo setup` uses, so the two can't drift.
+
 ## repo setup
 
 - [x] Port `repo-rules`'s ruleset composition from mikelward/scripts, with
