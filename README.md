@@ -47,6 +47,9 @@ See `AGENTS.md` for testing and contribution conventions.
 
 ## Status
 
-`repo list` and `repo secrets` are implemented. `repo setup` is still a stub
-that exits with "not yet implemented" -- a follow-up PR of similar size,
-porting behavior from the shell scripts.
+`repo list` and `repo secrets` are implemented. `repo setup`'s ruleset step
+(composing the required-checks branch ruleset, plus a standalone warning
+when a repository has an actual `master` branch) is implemented; fanning a
+secret out and ensuring GitHub App installation membership -- repo-setup's
+other two steps -- are not yet ported, and `--secret`/`--app` refuse
+outright rather than silently doing nothing. See `TODO.md`.
