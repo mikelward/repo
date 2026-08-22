@@ -9,7 +9,7 @@ one subcommand per concern, composed rather than duplicated.
 import argparse
 import sys
 
-from repo_lib import list_cmd, secrets_cmd, setup_cmd
+from repo_lib import audit_cmd, list_cmd, secrets_cmd, setup_cmd
 
 PROGRAM = "repo"
 
@@ -35,6 +35,12 @@ def build_parser():
     )
     setup_cmd.add_arguments(setup_parser)
     setup_parser.set_defaults(func=setup_cmd.run)
+
+    audit_parser = subparsers.add_parser(
+        "audit", help="report whether a repository's branch rules actually hold"
+    )
+    audit_cmd.add_arguments(audit_parser)
+    audit_parser.set_defaults(func=audit_cmd.run)
 
     return parser
 

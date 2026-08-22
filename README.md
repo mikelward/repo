@@ -1,11 +1,11 @@
 # repo
 
 Fleet-management CLI for GitHub repositories: `repo list`, `repo secrets`,
-`repo setup`. A Python rewrite of the `repo-list`/`repo-secrets`/`repo-setup`
-shell scripts in [mikelward/scripts](https://github.com/mikelward/scripts),
-which stay in place unchanged -- this is a fresh implementation, not a
-migration, and the shell versions remain the source of truth for behavior
-until this catches up.
+`repo setup`, `repo audit`. A Python rewrite of the
+`repo-list`/`repo-secrets`/`repo-setup`/`repo-rules-audit` shell scripts in
+[mikelward/scripts](https://github.com/mikelward/scripts), which stay in
+place unchanged -- this is a fresh implementation, not a migration, and the
+shell versions remain the source of truth for behavior until this catches up.
 
 ## Why Python, not another shell rewrite
 
@@ -41,16 +41,24 @@ repo list [--owner OWNER] [--include-forks] [--include-archived]
 repo secrets --name NAME [--env ENV] --file PATH [--force] OWNER/REPO...
 repo setup [--dry-run] [--force] [--no-rules] [--rule CHECK]...
            [--secret NAME[@ENV]=PATH]... [--app SLUG]... OWNER/REPO
+repo audit [--branch NAME] OWNER/REPO [CHECK...]
 ```
 
 See `AGENTS.md` for testing and contribution conventions.
 
 ## Status
 
-`repo list`, `repo secrets`, and `repo setup` are all implemented.
-`repo setup` composes three steps -- the required-checks branch ruleset
-(plus a standalone warning when a repository has an actual `master`
-branch), fanning a secret out via the same logic `repo secrets` uses, and
-ensuring GitHub App installation membership -- behind one combined plan
-and a single confirmation for the whole repository. See `TODO.md` for
-where the port deliberately diverges from the shell porting source.
+`repo list`, `repo secrets`, `repo setup`, and `repo audit` are all
+implemented -- every shell tool in mikelward/scripts now has a Python
+equivalent here. `repo setup` composes three steps -- the required-checks
+branch ruleset (plus a standalone warning when a repository has an actual
+`master` branch), fanning a secret out via the same logic `repo secrets`
+uses, and ensuring GitHub App installation membership -- behind one
+combined plan and a single confirmation for the whole repository. `repo
+audit` is the read-only counterpart: it reports whether a branch's rules
+(required checks, conversation resolution, up-to-date merges, force-push
+and deletion protection, bypass actors, and -- when auditing the
+repository's real default branch -- whether every covering ruleset also
+targets `refs/heads/main` and `refs/heads/master`) already hold, without
+writing anything. See `TODO.md` for where the port deliberately diverges
+from the shell porting source.

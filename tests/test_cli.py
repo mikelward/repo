@@ -16,7 +16,7 @@ class CliTest(unittest.TestCase):
 
     def test_each_subcommand_parses_with_its_required_arguments(self):
         # list takes none required; secrets needs --name and at least one
-        # repo; setup needs a positional repo.
+        # repo; setup and audit each need a positional repo.
         self.assertEqual(build_parser().parse_args(["list"]).command, "list")
         self.assertEqual(
             build_parser()
@@ -26,6 +26,13 @@ class CliTest(unittest.TestCase):
         )
         self.assertEqual(
             build_parser().parse_args(["setup", "owner/repo"]).command, "setup"
+        )
+        self.assertEqual(
+            build_parser().parse_args(["audit", "owner/repo"]).command, "audit"
+        )
+        self.assertEqual(
+            build_parser().parse_args(["audit", "owner/repo", "lanes", "codex"]).command,
+            "audit",
         )
 
     def test_secrets_requires_name_and_at_least_one_repo(self):
@@ -38,6 +45,19 @@ class CliTest(unittest.TestCase):
     def test_setup_requires_the_owner_repo_positional(self):
         with self.assertRaises(SystemExit) as cm:
             build_parser().parse_args(["setup"])
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_audit_requires_the_owner_repo_positional(self):
+        with self.assertRaises(SystemExit) as cm:
+            build_parser().parse_args(["audit"])
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_audit_dispatches_to_its_own_module(self):
+        # Proves main() actually calls audit_cmd.run(), not just that
+        # argparse accepted the args, via a validation path that fails
+        # before any gh call -- see test_audit_cmd.py for full coverage.
+        with self.assertRaises(SystemExit) as cm:
+            main(["audit", "not-an-owner-repo"])
         self.assertEqual(cm.exception.code, 2)
 
     def test_setup_dispatches_to_its_own_module(self):
