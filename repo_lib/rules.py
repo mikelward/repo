@@ -1,0 +1,731 @@
+"""The ruleset step of `repo setup` -- compose a branch protection ruleset.
+
+Port of mikelward/scripts's repo-rules (see its own header comment for the
+full reasoning; repeated here only where the port changes something).
+`setup_cmd.py` shells the equivalent step of repo-setup out to a separate
+`repo-rules` script; there is no separate `repo rules` subcommand here, so
+this module IS that step, called directly as a library rather than a
+subprocess.
+
+Built in from the start, not ported as a later hardening (see TODO.md):
+a ruleset this module CREATES targets ~DEFAULT_BRANCH together with the
+literal refs/heads/main and refs/heads/master, so a branch literally
+called master -- a leftover from a rename, or one that was simply never
+renamed -- cannot slip past the checks this module requires. An UPDATE
+leaves an existing ruleset's targeting alone, like every other field this
+module does not manage. check_master_branch() is independent of any
+ruleset: it warns whenever the repository has an actual branch named
+"master" at all, since deleting it removes the backdoor outright.
+
+Every internal helper below either returns a plain false-y result or
+raises RulesetError to signal "abort the ruleset step" -- callers decide
+what that means for their own exit status. A helper that fails at one
+specific API call reports it in full (including gh's own stderr) at the
+point of failure; the multi-call check-reporting walk in _collect_reported
+instead lets its caller print one summary message, since which of several
+calls failed is not itself useful to the person reading it.
+
+Cost and reliability: free -- GitHub's REST API, inside the standard
+5,000-authenticated-requests-an-hour limit. A typical run costs a handful
+of calls; a worst case (a check that has never reported, so every head the
+bounded scan offers is walked) costs a few hundred. Not on a hot path --
+`repo setup` is never run from a shell prompt automatically.
+"""
+
+import json
+import re
+import sys
+
+from repo_lib import gh
+from repo_lib.common import error, error_lines
+
+DEFAULT_RULESET_NAME = "merge gates"
+# This fleet's usual three checks -- the lanes docs-vs-code split, Codex's
+# review verdict, zizmor's workflow-injection scan -- used when --rule was
+# never given, matching repo-rules' own default.
+DEFAULT_CHECKS = ["lanes", "codex", "zizmor"]
+# The two rule types this module manages. A ruleset holding any other type
+# is not ours to overwrite -- see _check_ruleset_ownership.
+_MANAGED_RULE_TYPES = {"required_status_checks", "pull_request"}
+# GitHub's ref-name conditions accept fnmatch-style globs; a ref containing
+# one of these is not something this module's literal matching can safely
+# evaluate for a merge-method conflict (see _find_merge_method_conflicts).
+_GLOB_CHARS_RE = re.compile(r"[*?\[]")
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
+# The hardened targeting: a repository's real default branch, resolved by
+# GitHub at merge time, together with the two literal names a rename can
+# leave stranded.
+_HARDENED_INCLUDE = ["~DEFAULT_BRANCH", "refs/heads/main", "refs/heads/master"]
+
+
+class RulesetError(Exception):
+    """Signals "abort the ruleset step"; the reason has already been
+    reported via error()/error_lines() at the point of failure, except
+    where the caller's own wrapper message covers it (see module
+    docstring)."""
+
+
+def _valid_no_control_chars(value, what):
+    if _CONTROL_CHAR_RE.search(value):
+        error(f"{what} contains a control character (tab, newline, or similar).")
+        error("Check names are compared and recorded one per line, so such a")
+        error("name cannot be handled unambiguously. Refusing rather than")
+        error("guessing what was meant.")
+        return False
+    return True
+
+
+def _json_string(value):
+    """A JSON string literal, for splicing into a --jq program's own text
+    (not a full JSON encoder -- matches repo-rules' own json_string, whose
+    caller already rejected control characters upstream)."""
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _read_default_branch(repo):
+    try:
+        branch = gh.run(["api", f"repos/{repo}", "--jq", ".default_branch"]).strip()
+    except gh.GhError as e:
+        error_lines(f"could not read {repo}:", e.stderr)
+        raise RulesetError()
+    if not branch:
+        error(f"could not read {repo}'s default branch")
+        raise RulesetError()
+    return branch
+
+
+def _check_allow_rebase(repo):
+    """A ruleset NARROWS what a repository permits; it cannot enable a
+    method the repository has turned off. Allowing only rebase on a repo
+    with rebase merging disabled would leave the intersection empty and
+    nothing could merge -- refused rather than fixed, since flipping a
+    repository-wide merge setting is not this module's call to make."""
+    try:
+        allow = gh.run(["api", f"repos/{repo}", "--jq", ".allow_rebase_merge"]).strip()
+    except gh.GhError as e:
+        error_lines(
+            f"could not read {repo} to check whether rebase merging is still allowed:",
+            e.stderr,
+        )
+        return False
+    if allow != "true":
+        error(f"{repo} has rebase merging disabled, and this ruleset allows only")
+        error("rebase. A ruleset narrows what the repository permits and cannot")
+        error("enable a method, so together they would leave no way to merge")
+        error("anything. Enable 'Allow rebase merging' in the repository's pull")
+        error("request settings first.")
+        return False
+    return True
+
+
+def _repo_is_empty(repo):
+    """True/False, or None if the read itself failed (an unknown answer,
+    never to be read as "empty")."""
+    try:
+        count = gh.run(["api", f"repos/{repo}/branches?per_page=1", "--jq", "length"]).strip()
+    except gh.GhError:
+        return None
+    return count == "0"
+
+
+def _json_lines(output):
+    names = set()
+    for line in output.splitlines():
+        line = line.strip()
+        if line:
+            names.add(json.loads(line))
+    return names
+
+
+def _collect_reported(repo, wanted):
+    """Every name in `wanted` this repository has reported anywhere,
+    walking the default branch head, then open pull requests, then closed
+    ones -- each stage bounded to one page -- stopping as soon as every
+    wanted name has been seen. Raises RulesetError on any read failure: an
+    incomplete answer must never be read as "this check has never
+    reported", which would either reject a valid name or, with --force,
+    require one on the strength of a safety check that never finished."""
+    reported = set()
+
+    def scan(sha):
+        for endpoint, jq_expr in (
+            (f"repos/{repo}/commits/{sha}/check-runs", ".check_runs[].name | @json"),
+            (f"repos/{repo}/commits/{sha}/status", ".statuses[].context | @json"),
+        ):
+            try:
+                out = gh.run(["api", "--paginate", endpoint, "--jq", jq_expr])
+            except gh.GhError:
+                raise RulesetError()
+            reported.update(_json_lines(out))
+
+    try:
+        head = gh.run(["api", f"repos/{repo}/commits?per_page=1", "--jq", ".[0].sha"]).strip()
+        heads = [head] if head and head != "null" else []
+    except gh.GhError:
+        # A repository with no commits yet answers 409 here -- a KNOWN
+        # zero-report answer, not a failed read: nothing has ever run
+        # because nothing has ever been pushed.
+        if _repo_is_empty(repo) is True:
+            heads = []
+        else:
+            raise RulesetError()
+    for sha in heads:
+        scan(sha)
+    if wanted <= reported:
+        return reported
+
+    for state in ("open", "closed"):
+        try:
+            out = gh.run(
+                [
+                    "api",
+                    f"repos/{repo}/pulls?state={state}&per_page=100&sort=updated&direction=desc",
+                    "--jq",
+                    ".[].head.sha",
+                ]
+            )
+        except gh.GhError:
+            raise RulesetError()
+        for sha in out.splitlines():
+            sha = sha.strip()
+            if not sha:
+                continue
+            scan(sha)
+            if wanted <= reported:
+                return reported
+        if wanted <= reported:
+            return reported
+    return reported
+
+
+def _lookup_existing_ruleset(repo, ruleset_name):
+    """The id of the ruleset named `ruleset_name` on `repo`, or None. A
+    failed lookup must never read as "there is no ruleset": that would
+    create a duplicate that ANDs with a real one this run simply couldn't
+    see -- so it raises RulesetError instead."""
+    try:
+        out = gh.run(
+            [
+                "api",
+                "--paginate",
+                f"repos/{repo}/rulesets?includes_parents=false",
+                "--jq",
+                f".[] | select(.name == {_json_string(ruleset_name)}) | .id",
+            ]
+        )
+    except gh.GhError as e:
+        error_lines(
+            f"could not list {repo}'s rulesets, so cannot tell whether "
+            f"'{ruleset_name}' already exists. Creating one now could duplicate "
+            "it, and two rulesets AND together -- the stale one would keep "
+            "requiring checks this run was meant to replace.",
+            e.stderr,
+        )
+        raise RulesetError()
+    ids = [line.strip() for line in out.splitlines() if line.strip()]
+    return ids[0] if ids else None
+
+
+def _check_ruleset_ownership(repo, ruleset_id, ruleset_name):
+    """A name match is not ownership. If a ruleset carries a rule type this
+    module doesn't manage, or isn't actively enforced, refuses to touch it
+    -- overwriting it would silently delete protections or report a gate
+    that doesn't gate."""
+    try:
+        out = gh.run(
+            ["api", f"repos/{repo}/rulesets/{ruleset_id}", "--jq", ".enforcement, (.rules[].type)"]
+        )
+    except gh.GhError as e:
+        error_lines(
+            f"could not read ruleset '{ruleset_name}' (id {ruleset_id}) to check "
+            "what it contains. Refusing to overwrite rules that cannot be inspected.",
+            e.stderr,
+        )
+        return False
+    lines = out.splitlines()
+    if not lines:
+        error(f"could not read ruleset '{ruleset_name}' (id {ruleset_id}): empty response")
+        return False
+    enforcement, types = lines[0], [t for t in lines[1:] if t]
+    if enforcement != "active":
+        error(f"ruleset '{ruleset_name}' (id {ruleset_id}) on {repo} is '{enforcement}', not")
+        error("'active', so its rules block nothing. Setting a check list on it")
+        error("would report a gate that does not gate. Activate it, or point this")
+        error("run at a different ruleset.")
+        return False
+    unmanaged = [t for t in types if t not in _MANAGED_RULE_TYPES]
+    if unmanaged:
+        error(f"ruleset '{ruleset_name}' (id {ruleset_id}) on {repo} holds rules this")
+        error("module does not manage:")
+        for t in unmanaged:
+            error(f"  {t}")
+        error("Overwriting it would delete them. Rename that ruleset, or point")
+        error("this run at a different one.")
+        return False
+    return True
+
+
+def _compute_scope(repo, existing_id):
+    """The branch conditions the write will target: the existing ruleset's
+    own conditions on update (unchanged), or the hardened three-ref set on
+    create."""
+    if not existing_id:
+        return {"include": list(_HARDENED_INCLUDE), "exclude": []}
+    try:
+        out = gh.run(
+            [
+                "api",
+                f"repos/{repo}/rulesets/{existing_id}",
+                "--jq",
+                "{include: [.conditions.ref_name.include[]?], "
+                "exclude: [.conditions.ref_name.exclude[]?]} | @json",
+            ]
+        ).strip()
+    except gh.GhError as e:
+        error_lines(
+            f"could not read ruleset (id {existing_id}) to see which branches it "
+            "covers. Refusing to guess at what else applies there.",
+            e.stderr,
+        )
+        raise RulesetError()
+    return json.loads(out)
+
+
+def _normalize_refs(refs, default_branch):
+    return [f"refs/heads/{default_branch}" if r == "~DEFAULT_BRANCH" else r for r in refs]
+
+
+def _has_glob(refs):
+    return any(_GLOB_CHARS_RE.search(r) for r in refs)
+
+
+def _find_merge_method_conflicts(repo, scope, existing_id, default_branch):
+    """Rulesets AGGREGATE: a pull request must satisfy every one that
+    applies to the branch, and allowed_merge_methods INTERSECTS across
+    them. Returns (definite, undecidable) -- ruleset names that plainly
+    exclude rebase and overlap `scope`'s branches, and ones whose scope
+    uses a pattern or an exclusion this module's literal matching cannot
+    safely evaluate. Both are reported rather than silently passed over:
+    an unevaluated ruleset might still exclude rebase on this branch, and
+    guessing wrong in either direction is worse than asking a human to
+    check by hand."""
+    try:
+        out = gh.run(
+            ["api", "--paginate", f"repos/{repo}/rulesets?includes_parents=true", "--jq", ".[].id"]
+        )
+    except gh.GhError as e:
+        error_lines(
+            f"could not read {repo}'s other rulesets, so cannot tell whether one of "
+            "them rules out a rebase merge. Refusing to guess: rulesets aggregate, "
+            "and a conflict would leave no way to merge anything.",
+            e.stderr,
+        )
+        raise RulesetError()
+    ids = [line.strip() for line in out.splitlines() if line.strip()]
+
+    ours_include = _normalize_refs(scope.get("include") or [], default_branch)
+    ours_exclude = scope.get("exclude") or []
+
+    definite, undecidable = [], []
+    for rid in ids:
+        if not rid or rid == existing_id:
+            continue
+        try:
+            ruleset = json.loads(gh.run(["api", f"repos/{repo}/rulesets/{rid}"]))
+        except gh.GhError as e:
+            error_lines(f"could not read ruleset (id {rid}) on {repo}:", e.stderr)
+            raise RulesetError()
+        if ruleset.get("enforcement") != "active":
+            continue
+        excludes_rebase = any(
+            rule.get("type") == "pull_request"
+            and (rule.get("parameters") or {}).get("allowed_merge_methods")
+            and "rebase" not in rule["parameters"]["allowed_merge_methods"]
+            for rule in ruleset.get("rules") or []
+        )
+        if not excludes_rebase:
+            continue
+        conditions = (ruleset.get("conditions") or {}).get("ref_name") or {}
+        theirs_include = _normalize_refs(conditions.get("include") or [], default_branch)
+        theirs_exclude = conditions.get("exclude") or []
+        name = ruleset.get("name") or f"id {rid}"
+
+        if _has_glob(ours_include + theirs_include) or ours_exclude or theirs_exclude:
+            undecidable.append(name)
+        elif "~ALL" in ours_include or "~ALL" in theirs_include or (
+            set(ours_include) & set(theirs_include)
+        ):
+            definite.append(name)
+    return definite, undecidable
+
+
+def _validate_merge_method_scope(repo, existing_id, default_branch):
+    scope = _compute_scope(repo, existing_id)
+    definite, undecidable = _find_merge_method_conflicts(repo, scope, existing_id, default_branch)
+    if definite:
+        error(f"another active ruleset on {repo} excludes rebase from its allowed")
+        error("merge methods, and covers the same branches as this one:")
+        for n in definite:
+            error(f"  {n}")
+        error("Rulesets aggregate, so together they would leave no method that")
+        error("satisfies both and nothing could merge. Reconcile them first.")
+        raise RulesetError()
+    if undecidable:
+        error(f"another active ruleset on {repo} excludes rebase from its allowed")
+        error("merge methods, on a scope this module cannot evaluate:")
+        for n in undecidable:
+            error(f"  {n}")
+        error("Its conditions use a pattern (such as 'refs/heads/*') or an")
+        error("exclusion, and this matches branch names literally rather than")
+        error("reimplementing GitHub's ref matching. Check it, then narrow either")
+        error("scope.")
+        raise RulesetError()
+
+
+def _create_body(ruleset_name, checks):
+    return {
+        "name": ruleset_name,
+        "target": "branch",
+        "enforcement": "active",
+        "conditions": {"ref_name": {"include": list(_HARDENED_INCLUDE), "exclude": []}},
+        "rules": [
+            {
+                "type": "required_status_checks",
+                "parameters": {
+                    "strict_required_status_checks_policy": True,
+                    "required_status_checks": [{"context": c} for c in checks],
+                },
+            },
+            {
+                "type": "pull_request",
+                "parameters": {
+                    "required_review_thread_resolution": True,
+                    "allowed_merge_methods": ["rebase"],
+                    "required_approving_review_count": 0,
+                    "dismiss_stale_reviews_on_push": False,
+                    "require_code_owner_review": False,
+                    "require_last_push_approval": False,
+                },
+            },
+        ],
+    }
+
+
+_VOLATILE_FIELDS = (
+    "id",
+    "node_id",
+    "source",
+    "source_type",
+    "created_at",
+    "updated_at",
+    "_links",
+    "current_user_can_bypass",
+)
+
+
+def _build_update_body(repo, existing_id, checks, ruleset_name):
+    """UPDATE does not build a body from scratch: it fetches the existing
+    ruleset and edits only the two managed rules inside it, since a PUT
+    replaces the whole object and this module does not know every field
+    GitHub puts there (conditions, enforcement, bypass_actors, and so on
+    all stay exactly as they were). An entry's integration_id -- which
+    binds a required check to a specific GitHub App -- is preserved by
+    reusing the existing entry for any context that already has one,
+    rather than rebuilding from names alone.
+
+    Returns (changed, target) -- target is the full object to PUT,
+    `changed` is whether it differs from what's there now."""
+    try:
+        raw = gh.run(["api", f"repos/{repo}/rulesets/{existing_id}"])
+    except gh.GhError as e:
+        error_lines(f"could not read ruleset '{ruleset_name}' (id {existing_id}):", e.stderr)
+        raise RulesetError()
+    original = json.loads(raw)
+    for field in _VOLATILE_FIELDS:
+        original.pop(field, None)
+
+    wanted_contexts = [{"context": c} for c in checks]
+    has_status_checks = False
+    has_pull_request = False
+    new_rules = []
+    for rule in original.get("rules") or []:
+        rule = dict(rule)
+        if rule.get("type") == "required_status_checks":
+            has_status_checks = True
+            params = dict(rule.get("parameters") or {})
+            have_by_context = {
+                h.get("context"): h for h in params.get("required_status_checks") or []
+            }
+            params["required_status_checks"] = [
+                have_by_context.get(w["context"], dict(w)) for w in wanted_contexts
+            ]
+            params["strict_required_status_checks_policy"] = True
+            rule["parameters"] = params
+        elif rule.get("type") == "pull_request":
+            has_pull_request = True
+            params = dict(rule.get("parameters") or {})
+            params["required_review_thread_resolution"] = True
+            params["allowed_merge_methods"] = ["rebase"]
+            rule["parameters"] = params
+        new_rules.append(rule)
+
+    if not has_status_checks:
+        new_rules.append(
+            {
+                "type": "required_status_checks",
+                "parameters": {
+                    "strict_required_status_checks_policy": True,
+                    "required_status_checks": wanted_contexts,
+                },
+            }
+        )
+    if not has_pull_request:
+        new_rules.append(
+            {
+                "type": "pull_request",
+                "parameters": {
+                    "required_approving_review_count": 0,
+                    "dismiss_stale_reviews_on_push": False,
+                    "require_code_owner_review": False,
+                    "require_last_push_approval": False,
+                    "required_review_thread_resolution": True,
+                    "allowed_merge_methods": ["rebase"],
+                },
+            }
+        )
+
+    target = dict(original)
+    target["rules"] = new_rules
+    return target != original, target
+
+
+def _describe_plan(repo, existing_id, default_branch, checks, ruleset_name):
+    lines = []
+    if existing_id:
+        lines.append(f"{repo}: would update ruleset '{ruleset_name}' (id {existing_id}); scope unchanged")
+    else:
+        lines.append(f"{repo}: would create ruleset '{ruleset_name}' on {default_branch}, main and master")
+    lines.append("  required checks:")
+    for check in checks:
+        lines.append(f"    {check}")
+    lines.append("  review conversations must be resolved")
+    lines.append("  the branch must be up to date with the base")
+    lines.append("  rebase is the only merge method")
+    return lines
+
+
+def _confirm(repo, ruleset_name, plan_lines):
+    """True if applying was confirmed. Prints the plan and asks only when
+    stdin is a terminal; otherwise refuses rather than blocking on a
+    question nobody can answer or silently applying an unconfirmed
+    change."""
+    if not sys.stdin.isatty():
+        error("stdin is not a terminal and --force was not given, so leaving")
+        error(f"{repo}'s ruleset '{ruleset_name}' unchanged rather than either blocking")
+        error("on a question nobody can answer or silently applying a change nobody")
+        error("confirmed. Pass --force to apply it non-interactively, or run this")
+        error("from a terminal.")
+        return False
+    for line in plan_lines:
+        print(line, file=sys.stderr)
+    print(f"Apply this change to {repo}? [y/N] ", file=sys.stderr, end="")
+    try:
+        answer = input()
+    except EOFError:
+        answer = ""
+    if answer.strip().lower() not in ("y", "yes"):
+        error(f"not confirmed; leaving {repo}'s ruleset '{ruleset_name}' unchanged.")
+        return False
+    return True
+
+
+def apply_ruleset(repo, checks, dry_run, force, ruleset_name=DEFAULT_RULESET_NAME):
+    """Runs the whole repo-rules port against `repo`. Returns 0 on success
+    (including "nothing to change" and a clean --dry-run), 1 if any step
+    failed, 2 for a usage error (an empty or control-character check
+    name)."""
+    checks = list(checks) if checks else list(DEFAULT_CHECKS)
+
+    for check in checks:
+        if not check:
+            error("empty check name")
+            return 2
+        if not _valid_no_control_chars(check, f"check name '{check}'"):
+            return 2
+    if not _valid_no_control_chars(ruleset_name, "the ruleset name"):
+        return 2
+
+    try:
+        default_branch = _read_default_branch(repo)
+    except RulesetError:
+        return 1
+
+    if not _check_allow_rebase(repo):
+        return 1
+
+    try:
+        reported = _collect_reported(repo, set(checks))
+    except RulesetError:
+        error(f"could not read which checks have reported on {repo}")
+        error("Refusing to guess: an incomplete answer here either rejects a valid")
+        error("check or, with --force, requires one on the strength of a safety")
+        error("check that did not finish.")
+        return 1
+    missing = [c for c in checks if c not in reported]
+    if missing:
+        if force:
+            error(f"requiring checks that have never reported on {repo}:")
+            for c in missing:
+                error(f"  {c}")
+            error("(--force given; a merge will block until each one reports)")
+        else:
+            error(f"these checks have never reported on {repo}:")
+            for c in missing:
+                error(f"  {c}")
+            error("A required check that never reports blocks every merge, with no")
+            error("error to say why. Check the spelling, or merge the branch that")
+            error("adds it first. Pass --force to require it anyway.")
+            error("(Looked at the default branch's head, the 100 most recently")
+            error("updated open pull requests and the 100 most recently updated")
+            error("closed ones -- bounded, so a name that last reported on an older")
+            error("head than those lands here too.)")
+            return 1
+
+    try:
+        existing = _lookup_existing_ruleset(repo, ruleset_name)
+    except RulesetError:
+        return 1
+
+    if existing and not _check_ruleset_ownership(repo, existing, ruleset_name):
+        return 1
+
+    try:
+        _validate_merge_method_scope(repo, existing, default_branch)
+    except RulesetError:
+        return 1
+
+    needs_write = True
+    if existing:
+        try:
+            changed, _ = _build_update_body(repo, existing, checks, ruleset_name)
+        except RulesetError:
+            return 1
+        needs_write = changed
+        if not needs_write:
+            print(f"{repo}: ruleset '{ruleset_name}' (id {existing}) already matches; nothing to do")
+            return 0
+
+    plan_lines = _describe_plan(repo, existing, default_branch, checks, ruleset_name)
+
+    if dry_run:
+        for line in plan_lines:
+            print(line)
+        return 0
+
+    if not force and not _confirm(repo, ruleset_name, plan_lines):
+        return 1
+
+    # Every check below is re-run right before writing, not reused from
+    # what the plan/confirmation was built from: the repository or the
+    # ruleset could have changed in whatever time an interactive user
+    # spent deciding. None of these close their window to zero, but
+    # together they shrink it from "however long a human takes to answer a
+    # prompt" down to a handful of API round trips.
+    try:
+        default_branch = _read_default_branch(repo)
+    except RulesetError:
+        return 1
+    if not _check_allow_rebase(repo):
+        return 1
+    if existing:
+        # check_ruleset_ownership re-inspects $existing's own content
+        # (enforcement, rule types) but never re-confirms $existing is
+        # STILL the ruleset named `ruleset_name` -- an admin could rename
+        # it away (to reuse the name elsewhere, or by accident) in
+        # whatever time an interactive user spent on the confirm prompt.
+        # Without this, the PUT below would target `existing` by id
+        # regardless, silently rewriting whatever ruleset that id now
+        # denotes while reporting it as an update to `ruleset_name`. Fails
+        # closed: a lookup that cannot even be re-run is not proof the
+        # name still resolves the same way.
+        try:
+            still_named = _lookup_existing_ruleset(repo, ruleset_name)
+        except RulesetError:
+            return 1
+        if still_named != existing:
+            error(f"ruleset '{ruleset_name}' (id {existing}) on {repo} no longer resolves")
+            error("to that name -- it was renamed, or the name now points at a different")
+            error("ruleset, while this was waiting on confirmation. Refusing to write to a")
+            error("ruleset this run can no longer verify by name. Rerun to re-check.")
+            return 1
+        if not _check_ruleset_ownership(repo, existing, ruleset_name):
+            return 1
+    try:
+        _validate_merge_method_scope(repo, existing, default_branch)
+    except RulesetError:
+        return 1
+
+    if existing:
+        try:
+            _, target_body = _build_update_body(repo, existing, checks, ruleset_name)
+        except RulesetError:
+            error(f"could not re-read ruleset '{ruleset_name}' to write it")
+            return 1
+        try:
+            gh.run_with_input(
+                ["api", "--method", "PUT", f"repos/{repo}/rulesets/{existing}", "--input", "-"],
+                json.dumps(target_body).encode(),
+            )
+        except gh.GhError as e:
+            error_lines(f"could not update ruleset '{ruleset_name}' on {repo}:", e.stderr)
+            return 1
+        print(f"{repo}: updated ruleset '{ruleset_name}' (its scope is unchanged)")
+    else:
+        # The create-path counterpart of the ownership re-check above:
+        # nothing existed under this name a moment ago, but a rerun of
+        # this tool, or another admin, could have created one while this
+        # was waiting on confirmation. Proceeding would POST a duplicate
+        # that ANDs with it.
+        try:
+            just_created = _lookup_existing_ruleset(repo, ruleset_name)
+        except RulesetError:
+            return 1
+        if just_created:
+            error(f"ruleset '{ruleset_name}' now exists on {repo} (id {just_created}) --")
+            error("created while this was waiting on confirmation. Refusing to create")
+            error("a duplicate, which would AND with it. Rerun to update it instead.")
+            return 1
+        try:
+            gh.run_with_input(
+                ["api", "--method", "POST", f"repos/{repo}/rulesets", "--input", "-"],
+                json.dumps(_create_body(ruleset_name, checks)).encode(),
+            )
+        except gh.GhError as e:
+            error_lines(f"could not create ruleset '{ruleset_name}' on {repo}:", e.stderr)
+            return 1
+        print(f"{repo}: created ruleset '{ruleset_name}' on {default_branch}, main and master")
+
+    for check in checks:
+        print(f"  {check}")
+    return 0
+
+
+def check_master_branch(repo):
+    """Warns on stderr if `repo` has an actual branch literally named
+    'master' -- the backdoor the hardened ~DEFAULT_BRANCH/main/master
+    targeting above exists to close, worth flagging independent of any
+    ruleset since deleting the branch removes it outright. Advisory, not a
+    precondition for the ruleset write: never raises, and a read failure
+    here is reported but does not fail the rest of `repo setup`."""
+    ok, result = gh.try_run(["api", f"repos/{repo}/branches/master"])
+    if ok:
+        error(f"{repo} has a branch literally named 'master' -- this can bypass a")
+        error("ruleset scoped only to the default branch. Delete it, or confirm the")
+        error("ruleset above also targets refs/heads/master.")
+        return
+    if "HTTP 404" in result:
+        return
+    error(f"could not check whether {repo} has a branch named 'master':")
+    for line in result.splitlines():
+        error(f"  {line}")

@@ -40,18 +40,17 @@ class CliTest(unittest.TestCase):
             build_parser().parse_args(["setup"])
         self.assertEqual(cm.exception.code, 2)
 
-    def test_stub_subcommands_dispatch_to_their_own_module(self):
-        # `list` and `secrets` now have real implementations (see
-        # test_list_cmd.py / test_secrets_cmd.py) and are deliberately not
-        # covered here, since running either for real would shell out to
-        # the actual gh on PATH rather than exercising a stub. `setup`
-        # remains a stub and raises SystemExit("... not yet implemented")
-        # rather than silently doing nothing -- proves main() actually
-        # calls the subcommand's run(), not just that argparse accepted
-        # the args.
+    def test_setup_dispatches_to_its_own_module(self):
+        # All three subcommands now have real implementations (see
+        # test_list_cmd.py / test_secrets_cmd.py / test_setup_cmd.py) and
+        # are deliberately not exercised end-to-end here, since running
+        # any of them for real would shell out to the actual gh on PATH.
+        # This proves main() actually calls setup_cmd.run(), not just that
+        # argparse accepted the args, via a validation path that fails
+        # before any gh call.
         with self.assertRaises(SystemExit) as cm:
-            main(["setup", "owner/repo"])
-        self.assertEqual(str(cm.exception), "repo setup: not yet implemented")
+            main(["setup", "not-an-owner-repo"])
+        self.assertEqual(cm.exception.code, 2)
 
 
 if __name__ == "__main__":
