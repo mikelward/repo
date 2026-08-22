@@ -78,6 +78,32 @@ def add_arguments(parser):
     parser.add_argument("repos", nargs="+", metavar="OWNER/REPO")
 
 
+def validate_name(name):
+    """Returns an error message if `name` is not a valid GitHub secret name,
+    else None. Pulled out of run() so `repo setup`'s --secret validation can
+    reuse the exact same rule rather than re-deriving it."""
+    if not NAME_START_RE.match(name):
+        return f"'{name}' is not a valid secret name: must start with a letter or underscore"
+    if not NAME_CHARS_RE.match(name):
+        return f"'{name}' is not a valid secret name: only letters, digits, and underscores"
+    if GITHUB_PREFIX_RE.match(name):
+        return f"'{name}' starts with the reserved GITHUB_ prefix; GitHub will refuse it"
+    return None
+
+
+def validate_env(env):
+    """Returns an error message if the already-known-non-empty `env` is not
+    an environment name this tool handles, else None."""
+    if not ENV_NAME_RE.match(env):
+        return (
+            f"'{env}' is not an environment name this script handles (kept to "
+            "letters, digits, '.', '_', '-', excluding the reserved '.' and '..' "
+            "path segments -- refusing rather than guessing how to URL-encode "
+            "anything wider)."
+        )
+    return None
+
+
 def _list_endpoint(repo, env):
     if env:
         return f"repos/{repo}/environments/{env}/secrets"
@@ -213,15 +239,30 @@ def _ensure_environment(repo, env):
     return False
 
 
+def _write_secret(repo, name, env, value):
+    """Writes `value` as secret `name` (optionally environment-scoped to
+    `env`) on `repo`, printing the outcome. Returns True on success. Pulled
+    out of run()'s apply loop so `repo setup`'s --secret step can reuse the
+    exact same write, not a reimplementation of it."""
+    set_args = ["secret", "set", name, "--repo", repo]
+    if env:
+        set_args += ["--env", env]
+    try:
+        gh.run_with_input(set_args, value)
+    except gh.GhError as e:
+        error_lines(f"could not set '{name}' on {repo}{f' (environment {env})' if env else ''}:", e.stderr)
+        return False
+    if env:
+        print(f"{repo}: set '{name}' (environment '{env}')")
+    else:
+        print(f"{repo}: set '{name}'")
+    return True
+
+
 def run(args):
-    if not NAME_START_RE.match(args.name):
-        error(f"'{args.name}' is not a valid secret name: must start with a letter or underscore")
-        raise SystemExit(2)
-    if not NAME_CHARS_RE.match(args.name):
-        error(f"'{args.name}' is not a valid secret name: only letters, digits, and underscores")
-        raise SystemExit(2)
-    if GITHUB_PREFIX_RE.match(args.name):
-        error(f"'{args.name}' starts with the reserved GITHUB_ prefix; GitHub will refuse it")
+    name_err = validate_name(args.name)
+    if name_err:
+        error(name_err)
         raise SystemExit(2)
 
     env_given = args.env is not None
@@ -230,12 +271,11 @@ def run(args):
         error("repository-level secret, or pass a real environment name.")
         raise SystemExit(2)
     env = args.env if env_given else None
-    if env and not ENV_NAME_RE.match(env):
-        error(f"'{env}' is not an environment name this script handles (kept to")
-        error("letters, digits, '.', '_', '-', excluding the reserved '.' and '..'")
-        error("path segments -- refusing rather than guessing how to URL-encode")
-        error("anything wider).")
-        raise SystemExit(2)
+    if env:
+        env_err = validate_env(env)
+        if env_err:
+            error(env_err)
+            raise SystemExit(2)
 
     file_given = args.file is not None
     if file_given and args.file == "":
@@ -337,19 +377,8 @@ def run(args):
             if not _ensure_environment(repo, env):
                 failed.append(repo)
                 continue
-        set_args = ["secret", "set", args.name, "--repo", repo]
-        if env:
-            set_args += ["--env", env]
-        try:
-            gh.run_with_input(set_args, value)
-        except gh.GhError as e:
-            error_lines(f"could not set '{args.name}' on {repo}{f' (environment {env})' if env else ''}:", e.stderr)
+        if not _write_secret(repo, args.name, env, value):
             failed.append(repo)
-        else:
-            if env:
-                print(f"{repo}: set '{args.name}' (environment '{env}')")
-            else:
-                print(f"{repo}: set '{args.name}'")
 
     if failed:
         error(f"failed on: {' '.join(failed)}")
