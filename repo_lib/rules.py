@@ -57,6 +57,18 @@ _CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
 # leave stranded.
 _HARDENED_INCLUDE = ["~DEFAULT_BRANCH", "refs/heads/main", "refs/heads/master"]
 
+# Shared with setup_cmd.py, which greps for it in a preview call's captured
+# stdout to tell "nothing to write" apart from a real plan -- a module-
+# level constant rather than a string duplicated (and driftable) in two
+# files.
+NO_OP_MESSAGE = "already matches; nothing to do"
+
+# Sentinel distinguishing "no earlier fingerprint to compare against" (the
+# default, meaning "compare against my own") from a real fingerprint
+# tuple, which could otherwise collide with a legitimate one -- see
+# apply_ruleset's expected_fingerprint.
+_NO_EXPECTATION = object()
+
 
 class RulesetError(Exception):
     """Signals "abort the ruleset step"; the reason has already been
@@ -500,6 +512,19 @@ def _build_update_body(repo, existing_id, checks, ruleset_name):
     return target != original, target
 
 
+def _plan_write(repo, existing_id, checks, ruleset_name):
+    """Returns (needs_write, target_body): the full API body this step
+    would PUT to `existing_id` (or POST as a new ruleset, when
+    `existing_id` is falsy) to reach `checks`, and whether that differs
+    from what's there now (always True with no `existing_id`, since
+    nothing exists yet to compare against). The pair is apply_ruleset's
+    fingerprint of "what this call has decided to do" -- see its
+    expected_fingerprint doc."""
+    if existing_id:
+        return _build_update_body(repo, existing_id, checks, ruleset_name)
+    return True, _create_body(ruleset_name, checks)
+
+
 def _describe_plan(repo, existing_id, default_branch, checks, ruleset_name):
     lines = []
     if existing_id:
@@ -540,11 +565,62 @@ def _confirm(repo, ruleset_name, plan_lines):
     return True
 
 
-def apply_ruleset(repo, checks, dry_run, force, ruleset_name=DEFAULT_RULESET_NAME):
+def apply_ruleset(
+    repo,
+    checks,
+    dry_run,
+    force,
+    ruleset_name=DEFAULT_RULESET_NAME,
+    expected_fingerprint=_NO_EXPECTATION,
+    report=None,
+    skip_confirm=False,
+):
     """Runs the whole repo-rules port against `repo`. Returns 0 on success
     (including "nothing to change" and a clean --dry-run), 1 if any step
     failed, 2 for a usage error (an empty or control-character check
-    name)."""
+    name).
+
+    A "fingerprint" is `(existing_id, needs_write, target_body)`: which
+    ruleset (or None, meaning create) this call is about to act on,
+    whether it would actually write anything, and the exact API body it
+    would PUT/POST if so. Computed once per pass (see `_plan_write`),
+    exposed via report["fingerprint"], and what expected_fingerprint
+    compares against. All three parts matter -- target_body alone can
+    coincidentally match an earlier no-op's even when a write is newly
+    needed (content removed, then re-added identically), so needs_write
+    has to travel with it rather than being inferred from it.
+
+    expected_fingerprint: when given (not the _NO_EXPECTATION default),
+    the fresh fingerprint computed immediately before the real write must
+    match it exactly, or this refuses rather than writing -- covers an
+    identity swap, a rename, a previewed no-op needing a write after all,
+    or the same ruleset's own managed content changing (a required
+    check's integration binding, say), in any combination, in the window
+    since an earlier call captured it. Left at the default, a call
+    compares against its OWN earlier-in-this-call fingerprint instead, so
+    every real write still protects itself against drift during its own
+    execution with no caller-supplied expectation. See TODO.md's
+    "Decisions needing review" for the history of why this exists and
+    what it replaced.
+
+    Ownership (enforcement, unmanaged rule types) and the other-rulesets
+    merge-method scope conflict are re-verified separately, immediately
+    before the fingerprint recheck, not folded into it: both can fail for
+    reasons a generic mismatch message would explain badly, and scope
+    isn't about this ruleset's own content in the first place.
+
+    report: when given a dict, records structured facts back to the
+    caller rather than leaving them to re-derive from rendered text
+    (which a --rule value matching NO_OP_MESSAGE could otherwise fool):
+    report["needs_write"], report["existing_id"] (also fingerprint[0]),
+    report["fingerprint"].
+
+    skip_confirm: True skips this function's own interactive _confirm()
+    unconditionally, independent of `force`. The two are different
+    things: `force` authorizes overriding the never-reported-check guard
+    above; skip_confirm only says "don't ask a question here" -- for a
+    caller (setup_cmd.py's real apply) whose own confirmation already
+    happened, with nothing left on stdin to answer a second one."""
     checks = list(checks) if checks else list(DEFAULT_CHECKS)
 
     for check in checks:
@@ -597,6 +673,9 @@ def apply_ruleset(repo, checks, dry_run, force, ruleset_name=DEFAULT_RULESET_NAM
     except RulesetError:
         return 1
 
+    if report is not None:
+        report["existing_id"] = existing
+
     if existing and not _check_ruleset_ownership(repo, existing, ruleset_name):
         return 1
 
@@ -605,16 +684,19 @@ def apply_ruleset(repo, checks, dry_run, force, ruleset_name=DEFAULT_RULESET_NAM
     except RulesetError:
         return 1
 
-    needs_write = True
-    if existing:
-        try:
-            changed, _ = _build_update_body(repo, existing, checks, ruleset_name)
-        except RulesetError:
-            return 1
-        needs_write = changed
-        if not needs_write:
-            print(f"{repo}: ruleset '{ruleset_name}' (id {existing}) already matches; nothing to do")
-            return 0
+    try:
+        needs_write, target_body = _plan_write(repo, existing, checks, ruleset_name)
+    except RulesetError:
+        return 1
+
+    fingerprint = (existing, needs_write, target_body)
+    if report is not None:
+        report["needs_write"] = needs_write
+        report["fingerprint"] = fingerprint
+
+    if not needs_write:
+        print(f"{repo}: ruleset '{ruleset_name}' (id {existing}) {NO_OP_MESSAGE}")
+        return 0
 
     plan_lines = _describe_plan(repo, existing, default_branch, checks, ruleset_name)
 
@@ -623,83 +705,67 @@ def apply_ruleset(repo, checks, dry_run, force, ruleset_name=DEFAULT_RULESET_NAM
             print(line)
         return 0
 
-    if not force and not _confirm(repo, ruleset_name, plan_lines):
+    if not (force or skip_confirm) and not _confirm(repo, ruleset_name, plan_lines):
         return 1
 
-    # Every check below is re-run right before writing, not reused from
-    # what the plan/confirmation was built from: the repository or the
-    # ruleset could have changed in whatever time an interactive user
-    # spent deciding. None of these close their window to zero, but
-    # together they shrink it from "however long a human takes to answer a
-    # prompt" down to a handful of API round trips.
+    # Everything below is re-verified fresh, right before writing -- the
+    # repository or the ruleset could have changed in whatever time an
+    # interactive user spent deciding, or (for setup_cmd.py's real apply,
+    # which never actually waits here -- skip_confirm=True) in the
+    # earlier confirmation this call didn't itself show. Ownership and
+    # scope get their own specific rechecks (see apply_ruleset's own doc
+    # for why); everything else -- identity, and the exact content about
+    # to be written -- collapses into the one fingerprint comparison
+    # below, against expected_fingerprint.
     try:
         default_branch = _read_default_branch(repo)
     except RulesetError:
         return 1
     if not _check_allow_rebase(repo):
         return 1
-    if existing:
-        # check_ruleset_ownership re-inspects $existing's own content
-        # (enforcement, rule types) but never re-confirms $existing is
-        # STILL the ruleset named `ruleset_name` -- an admin could rename
-        # it away (to reuse the name elsewhere, or by accident) in
-        # whatever time an interactive user spent on the confirm prompt.
-        # Without this, the PUT below would target `existing` by id
-        # regardless, silently rewriting whatever ruleset that id now
-        # denotes while reporting it as an update to `ruleset_name`. Fails
-        # closed: a lookup that cannot even be re-run is not proof the
-        # name still resolves the same way.
-        try:
-            still_named = _lookup_existing_ruleset(repo, ruleset_name)
-        except RulesetError:
-            return 1
-        if still_named != existing:
-            error(f"ruleset '{ruleset_name}' (id {existing}) on {repo} no longer resolves")
-            error("to that name -- it was renamed, or the name now points at a different")
-            error("ruleset, while this was waiting on confirmation. Refusing to write to a")
-            error("ruleset this run can no longer verify by name. Rerun to re-check.")
-            return 1
-        if not _check_ruleset_ownership(repo, existing, ruleset_name):
-            return 1
     try:
-        _validate_merge_method_scope(repo, existing, default_branch)
+        fresh_existing = _lookup_existing_ruleset(repo, ruleset_name)
+    except RulesetError:
+        return 1
+    if fresh_existing and not _check_ruleset_ownership(repo, fresh_existing, ruleset_name):
+        return 1
+    try:
+        _validate_merge_method_scope(repo, fresh_existing, default_branch)
     except RulesetError:
         return 1
 
-    if existing:
-        try:
-            _, target_body = _build_update_body(repo, existing, checks, ruleset_name)
-        except RulesetError:
-            error(f"could not re-read ruleset '{ruleset_name}' to write it")
-            return 1
+    try:
+        fresh_needs_write, fresh_target_body = _plan_write(repo, fresh_existing, checks, ruleset_name)
+    except RulesetError:
+        error(f"could not re-read ruleset '{ruleset_name}' to write it")
+        return 1
+
+    fresh_fingerprint = (fresh_existing, fresh_needs_write, fresh_target_body)
+    want = fingerprint if expected_fingerprint is _NO_EXPECTATION else expected_fingerprint
+    if fresh_fingerprint != want:
+        error(f"ruleset '{ruleset_name}' on {repo} no longer matches what was previewed and")
+        error("confirmed -- either its identity changed (it was created, deleted, or")
+        error("replaced by something else under the same name) or its own managed")
+        error("content did (a required check re-pointed at a different integration, say),")
+        error("while this was waiting. Refusing to write state nobody actually confirmed.")
+        error("Rerun to re-check.")
+        return 1
+
+    if fresh_existing:
         try:
             gh.run_with_input(
-                ["api", "--method", "PUT", f"repos/{repo}/rulesets/{existing}", "--input", "-"],
-                json.dumps(target_body).encode(),
+                ["api", "--method", "PUT", f"repos/{repo}/rulesets/{fresh_existing}", "--input", "-"],
+                json.dumps(fresh_target_body).encode(),
             )
         except gh.GhError as e:
             error_lines(f"could not update ruleset '{ruleset_name}' on {repo}:", e.stderr)
             return 1
         print(f"{repo}: updated ruleset '{ruleset_name}' (its scope is unchanged)")
     else:
-        # The create-path counterpart of the ownership re-check above:
-        # nothing existed under this name a moment ago, but a rerun of
-        # this tool, or another admin, could have created one while this
-        # was waiting on confirmation. Proceeding would POST a duplicate
-        # that ANDs with it.
-        try:
-            just_created = _lookup_existing_ruleset(repo, ruleset_name)
-        except RulesetError:
-            return 1
-        if just_created:
-            error(f"ruleset '{ruleset_name}' now exists on {repo} (id {just_created}) --")
-            error("created while this was waiting on confirmation. Refusing to create")
-            error("a duplicate, which would AND with it. Rerun to update it instead.")
-            return 1
         try:
             gh.run_with_input(
                 ["api", "--method", "POST", f"repos/{repo}/rulesets", "--input", "-"],
-                json.dumps(_create_body(ruleset_name, checks)).encode(),
+                json.dumps(fresh_target_body).encode(),
             )
         except gh.GhError as e:
             error_lines(f"could not create ruleset '{ruleset_name}' on {repo}:", e.stderr)

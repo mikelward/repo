@@ -47,9 +47,10 @@ See `AGENTS.md` for testing and contribution conventions.
 
 ## Status
 
-`repo list` and `repo secrets` are implemented. `repo setup`'s ruleset step
-(composing the required-checks branch ruleset, plus a standalone warning
-when a repository has an actual `master` branch) is implemented; fanning a
-secret out and ensuring GitHub App installation membership -- repo-setup's
-other two steps -- are not yet ported, and `--secret`/`--app` refuse
-outright rather than silently doing nothing. See `TODO.md`.
+`repo list`, `repo secrets`, and `repo setup` are all implemented.
+`repo setup` composes three steps -- the required-checks branch ruleset
+(plus a standalone warning when a repository has an actual `master`
+branch), fanning a secret out via the same logic `repo secrets` uses, and
+ensuring GitHub App installation membership -- behind one combined plan
+and a single confirmation for the whole repository. See `TODO.md` for
+where the port deliberately diverges from the shell porting source.
