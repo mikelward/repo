@@ -318,7 +318,14 @@ one that has stopped biting.
   share a topic.
 - **Judge every review comment on merit, whoever wrote it.** Verify the
   claim before acting; if it doesn't hold up, reply saying why and
-  decline.
+  decline. A comment citing a rule is a *reading* of that rule, not the
+  rule -- check what the rule actually says. Codex misreads the privacy
+  rules especially, and in one direction: stricter always feels safer,
+  so an over-strict finding quietly costs capability the product needs.
+  Quote the rule and decline rather than narrowing the code to satisfy
+  it; where the rule really does forbid what the product needs, that
+  conflict is the maintainer's call, not one to settle either way
+  yourself.
 - **Never leave a review comment thread silently dismissed.** Answer on
   the thread, then resolve it once the fix is on the head or the point is
   rebutted -- a disagreement is an answer, so say why and resolve;
