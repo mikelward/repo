@@ -921,6 +921,9 @@ class SetupCmdTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("never reported", err)
         self.assertIn("Pass --force to require it anyway", err)
+        # The names themselves, not a repr of the records they arrive in.
+        self.assertIn("'lanes'", err)
+        self.assertNotIn("None", err)
         mock_input.assert_not_called()
         self.assertEqual(fake.posts, [])
 

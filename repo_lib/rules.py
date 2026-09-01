@@ -279,6 +279,14 @@ def _collect_reported(repo, wanted, ref=None):
     return names, app_pairs
 
 
+def quoted(names):
+    """Check names for a message, quoted and comma-separated. A name can
+    contain spaces -- this repository has one called "Classify the diff" --
+    so a space-joined list cannot be split back into names by eye, and the
+    reader cannot tell one missing check from three."""
+    return ", ".join(f"'{n}'" for n in names)
+
+
 def never_reported(repo, entries, ref=None):
     """Which of `entries` this repository has never reported, in the order
     given. A required check nothing posts blocks every merge.
@@ -765,22 +773,11 @@ def apply_ruleset(
         error("check that did not finish.")
         return 1
     if missing:
+        error(f"never reported on {repo}: {describe_missing(missing)}")
         if force:
-            error(f"requiring checks that have never reported on {repo}:")
-            for c in missing:
-                error(f"  {c}")
             error("(--force given; a merge will block until each one reports)")
         else:
-            error(f"these checks have never reported on {repo}:")
-            for c in missing:
-                error(f"  {c}")
-            error("A required check that never reports blocks every merge, with no")
-            error("error to say why. Check the spelling, or merge the branch that")
-            error("adds it first. Pass --force to require it anyway.")
-            error("(Looked at the default branch's head, the 100 most recently")
-            error("updated open pull requests and the 100 most recently updated")
-            error("closed ones -- bounded, so a name that last reported on an older")
-            error("head than those lands here too.)")
+            error("Add the check first. Pass --force to require it anyway.")
             return 1
 
     try:

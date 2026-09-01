@@ -678,6 +678,22 @@ class AuditCmdTest(unittest.TestCase):
         self.assertIn("repoint the ruleset entry", out)
         self.assertNotIn("required but never reported: 'lanes'", out)
 
+    def test_missing_names_containing_spaces_stay_separable(self):
+        # Check names can contain spaces -- this repo has one called
+        # "Classify the diff" -- so a space-joined list leaves the reader
+        # unable to tell one missing check from three.
+        fake = FakeGh()
+        fake.effective_rules = [
+            _pull_request_rule(),
+            _status_checks_rule(["unit tests", "lint checks"]),
+            {"type": "non_fast_forward", "parameters": {}},
+            {"type": "deletion", "parameters": {}},
+        ]
+        fake.check_runs = {fake.default_head_sha: []}
+        code, out, err = _run(fake, [REPO, "unit tests"])
+        self.assertEqual(code, 1, err)
+        self.assertIn("'unit tests', 'lint checks'", out)
+        self.assertNotIn("unit tests lint checks", out)
 
     def test_branch_specific_gate_is_scanned_on_the_audited_branch(self):
         # A check produced only on pushes to `release` never appears on the
