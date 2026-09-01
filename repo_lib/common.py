@@ -13,5 +13,5 @@ def error_lines(prefix, text):
     """Print `prefix`, then every line of `text` indented -- for relaying a
     gh error message without losing its own line breaks."""
     error(prefix)
-    for line in text.splitlines():
+    for line in (text or "").splitlines():
         error(f"  {line}")

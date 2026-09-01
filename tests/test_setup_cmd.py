@@ -198,8 +198,12 @@ class FakeGh:
 
         m = _CHECK_RUNS_RE.match(endpoint)
         if m:
-            names = self.check_runs.get(m.group(2), [])
-            return "".join(json.dumps(n) + "\n" for n in names)
+            # Models --jq '[.name, .app.id]': an entry may be a bare name
+            # (no App binding) or a (name, app id) pair.
+            return "".join(
+                json.dumps(list(n) if isinstance(n, tuple) else [n, None]) + "\n"
+                for n in self.check_runs.get(m.group(2), [])
+            )
 
         m = _STATUS_RE.match(endpoint)
         if m:
@@ -947,7 +951,7 @@ class SetupCmdTest(unittest.TestCase):
         # confirmed plan never showed it as missing. This simulates that
         # exact timing: _collect_reported returns the real (fully-
         # reporting) result on its first call (the preview) and an empty
-        # set on its second (the real apply's own scan) -- distinct from
+        # result on its second (the real apply's own scan) -- distinct from
         # the existing tests above, which are missing from the START.
         fake = FakeGh()
         fake.check_runs = {fake.default_head_sha: ["lanes"]}
@@ -955,11 +959,11 @@ class SetupCmdTest(unittest.TestCase):
         real_collect_reported = rules._collect_reported
         calls = []
 
-        def flaky_collect_reported(repo, wanted):
+        def flaky_collect_reported(repo, wanted, ref=None):
             calls.append(1)
             if len(calls) >= 2:
-                return set()
-            return real_collect_reported(repo, wanted)
+                return set(), set()  # (names, app_pairs): nothing reported
+            return real_collect_reported(repo, wanted, ref=ref)
 
         with patch("repo_lib.rules._collect_reported", side_effect=flaky_collect_reported):
             with patch("builtins.input", return_value="y"):

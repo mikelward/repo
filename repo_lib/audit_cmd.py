@@ -48,9 +48,13 @@ also warns whenever the repository has an actual branch named "master"
 at all.
 
 Cost and reliability: free -- GitHub's REST API, inside the standard
-5,000-authenticated-requests-an-hour limit. A run costs four or five
+5,000-authenticated-requests-an-hour limit. A run costs six or seven
 calls per repository plus one per branch ruleset found on it -- a
-handful, in practice. Every failure mode is loud: not authenticated (the
+handful, in practice. The exception is the never-reported walk: on a
+healthy repository every required check is found on the default head and
+it stops after two calls, but where one has never reported it goes on to
+scan a page of open and then closed pull requests, so the expensive path
+is the one that finds a real gap. Every failure mode is loud: not authenticated (the
 first call fails, exit 1), GitHub down or rate limited (same) -- a failed
 read is never reported as a gap, because "could not tell" and "found a
 gap" are different findings and conflating them would print a false
@@ -291,16 +295,60 @@ def run(args):
 
     if any_rule("required_status_checks"):
         contexts = set()
+        # Every context the branch enforces, with the App it is bound to,
+        # deduplicated but in the order the rules list them.
+        required_entries = []
         for rule in effective_rules:
             if rule.get("type") != "required_status_checks":
                 continue
             for check_entry in (rule.get("parameters") or {}).get("required_status_checks") or []:
-                contexts.add(check_entry.get("context"))
+                context = check_entry.get("context")
+                contexts.add(context)
+                entry = (context, check_entry.get("integration_id") or None)
+                if entry not in required_entries:
+                    required_entries.append(entry)
         for check in checks:
             if check in contexts:
                 ok(f"'{check}' is a required status check")
             else:
                 gap(f"'{check}' is NOT a required status check")
+        # Listed in the ruleset is only half of it. Asked of every context
+        # the branch enforces, not just the named ones: a stale gate nobody
+        # asked about blocks merges exactly as hard, and is likelier to be
+        # the one nothing produces.
+        if required_entries:
+            try:
+                unseen = rules.never_reported(repo, required_entries, ref=branch)
+            except rules.RulesetError as e:
+                error_lines(
+                    f"could not tell which of {repo}'s checks have ever reported:",
+                    e.detail,
+                )
+                raise SystemExit(1)
+            # Two different faults with two different fixes. `repo setup`
+            # reuses an existing entry by context (_build_update_body), so
+            # it carries a stale integration_id straight through -- naming
+            # it as the remedy for a wrong-App gate sends the user to a
+            # command that completes and changes nothing.
+            wrong_app = [i for i in unseen if rules.bound_to_another_app(i)]
+            absent = [i for i in unseen if not rules.bound_to_another_app(i)]
+            if absent:
+                gap(
+                    f"required but never reported: {rules.describe_missing(absent)} -- "
+                    "add the check, or run `repo setup`"
+                )
+            if wrong_app:
+                gap(
+                    "required but never reported by the App it is bound to: "
+                    f"{rules.describe_missing(wrong_app)} -- repoint the ruleset "
+                    "entry; `repo setup` preserves the existing binding"
+                )
+            if not unseen:
+                ok(
+                    "every required check has reported: "
+                    + " ".join(c for c, _ in required_entries)
+                )
+
         if any_rule(
             "required_status_checks",
             lambda r: (r.get("parameters") or {}).get("strict_required_status_checks_policy")
