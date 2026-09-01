@@ -60,5 +60,29 @@ audit` is the read-only counterpart: it reports whether a branch's rules
 and deletion protection, bypass actors, and -- when auditing the
 repository's real default branch -- whether every covering ruleset also
 targets `refs/heads/main` and `refs/heads/master`) already hold, without
-writing anything. See `TODO.md` for where the port deliberately diverges
+writing anything. It also audits where secrets live. The fleet's shared credentials -- the
+weekly dependency batches' `<HUB>_PAT` (or `<HUB>_APP_ID` +
+`<HUB>_APP_PRIVATE_KEY` pair, for mikelward/npm-update, gradle-update and
+rust-update) and mikelward/ci-commit-artifact's `CI_COMMIT_ARTIFACT_TOKEN`
+-- each belong in an environment named after the reusable workflow that
+reads them, because a secret passed to a reusable workflow, or inherited
+by one, reaches every job in it, a batch's untrusted update job included.
+A reusable workflow's callers are whichever workflows call it from a job,
+whatever they are named and on whichever branch (a workflow that differs
+from the default branch's copy is read on its own branch too, since a push
+there runs it). A credential kept as a repository secret, a caller
+that passes its secrets by name (an environment credential never reaches
+it), a consumer whose environment holds none, a workflow that mentions the
+reusable workflow in a shape the audit cannot read as a caller ("cannot
+tell"), and a credential left behind by a workflow nothing here calls --
+for the batches and the commit-back workflow alike -- are each reported as
+`[FIX]` -- a finding `repo setup` closes, named with the command -- and
+every other repository-level secret is listed by name for review. A repository that does not allow auto-merge is a `[FIX]` too: the weekly
+batches arm it on their pull requests. `[FIX]` findings do not fail the audit
+yet (see `TODO.md`): the layout is being rolled out through `repo setup`.
+
+Set one where it belongs with
+`repo secrets --name GRADLE_UPDATE_PAT --env gradle-update --file token.txt OWNER/REPO...`
+(or `repo setup --secret GRADLE_UPDATE_PAT@gradle-update=token.txt OWNER/REPO`); `repo setup` is being taught to make the whole move itself.
+See `TODO.md` for where the port deliberately diverges
 from the shell porting source.

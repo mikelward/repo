@@ -47,6 +47,26 @@
       flow, alongside the ruleset step. See "Decisions needing review"
       below for where this diverges from the porting source and why.
 
+## repo audit and repo setup: the fleet credentials
+
+- [x] Audit where the fleet credentials live (`repo_lib/credentials.py`,
+      shared with `repo setup`): a `[FIX]` for a repository-level copy, a
+      batch consumer with no credential, a stale copy for a batch the
+      repository does not run, and a repository-level
+      `CI_COMMIT_ARTIFACT_TOKEN`; every other repository secret listed
+      under `[CHECK]`.
+- [ ] **Promote `[FIX]` to `[GAP]` after the next setup pass.** `[FIX]`
+      findings are reported but do not fail `repo audit` (maintainer,
+      2026-09-01: "keep it lax enough to accept the current standard ...
+      and keep a Todo to tighten it after the next setup pass"). Once
+      every repository has been through `repo setup --credential ...`,
+      route them through `gap()` instead of `fix()` in
+      `audit_cmd.audit_secrets` and flip the `assertEqual(code, 0, ...)`
+      assertions in `SecretsAuditTest` -- they are written to have to
+      change. Until then the hubs and every converted caller read a
+      repository-level credential through `inherit`, so nothing is
+      broken by the lax reading, only less isolated than it will be.
+
 ## Decisions needing review
 
 - **An invalid `--secret` NAME (or the value file being empty) is now a

@@ -1,3 +1,5 @@
+import base64
+import hashlib
 import json
 import re
 import urllib.parse
@@ -20,6 +22,13 @@ _COMMITS_HEAD_RE = re.compile(r"^repos/([^/]+/[^/]+)/commits\?per_page=1(?:&sha=
 _CHECK_RUNS_RE = re.compile(r"^repos/([^/]+/[^/]+)/commits/([^/]+)/check-runs$")
 _STATUS_RE = re.compile(r"^repos/([^/]+/[^/]+)/commits/([^/]+)/status$")
 _PULLS_RE = re.compile(r"^repos/([^/]+/[^/]+)/pulls\?state=(open|closed)&.*$")
+_REPO_SECRETS_RE = re.compile(r"^repos/([^/]+/[^/]+)/actions/secrets$")
+_ENVIRONMENTS_RE = re.compile(r"^repos/([^/]+/[^/]+)/environments$")
+_ENV_SECRETS_RE = re.compile(r"^repos/([^/]+/[^/]+)/environments/([^/]+)/secrets$")
+_WORKFLOW_FILE_RE = re.compile(r"^repos/([^/]+/[^/]+)/contents/\.github/workflows/([^/?]+)(?:\?ref=(.+))?$")
+_WORKFLOWS_DIR_RE = re.compile(r"^repos/([^/]+/[^/]+)/contents/\.github/workflows(?:\?ref=(.+))?$")
+_ROOT_CONTENTS_RE = re.compile(r"^repos/([^/]+/[^/]+)/contents(?:\?ref=(.+))?$")
+_BRANCHES_RE = re.compile(r"^repos/([^/]+/[^/]+)/branches\?per_page=100$")
 
 
 def _parse_api_args(rest):
@@ -86,6 +95,8 @@ class FakeGh:
         self.calls = []
         self.default_branch = "main"
         self.default_branch_fails = False
+        # Other branches: name -> {workflow name: text}; see the setup fake.
+        self.branch_workflows = {}
         self.effective_rules = list(DEFAULT_EFFECTIVE_RULES)
         self.effective_rules_fails = None  # gh stderr text, or None
         # None means "one page" (self.effective_rules as a whole). Set to a
@@ -111,6 +122,21 @@ class FakeGh:
         self.statuses = {}
         self.open_prs = []
         self.closed_prs = []
+        # The secrets audit. Names only, as the API itself answers.
+        self.repo_secrets = []
+        self.repo_secrets_fails = None  # gh stderr text, or None
+        self.environments = {}  # name -> list of environment secret names
+        self.environments_fails = None
+        self.env_secrets_fails = set()  # environment names whose read fails
+        # None models a repository with no .github/workflows at all (404);
+        # a list is the file names the directory holds.
+        self.workflow_files = None
+        self.workflows_error = None  # non-404 stderr text, or None
+        # A caller file's text, by name; a hub caller not listed here reads
+        # as the fleet's own shape, an inheriting job-level `uses:`.
+        self.workflow_texts = {}
+        self.workflow_text_fails = set()  # file names whose read fails
+        self.root_contents_error = None  # stderr text for the root listing, or None to succeed
 
     def run(self, args):
         self.calls.append(list(args))
@@ -184,7 +210,54 @@ class FakeGh:
                 raise gh.GhError(f"gh: HTTP 500: simulated failure reading ruleset {rid}\n")
             return json.dumps(self.ruleset_objects[rid])
 
+        if _BRANCHES_RE.match(endpoint):
+            return "".join(n + "\n" for n in [self.default_branch, *self.branch_workflows])
+
+        m = _WORKFLOW_FILE_RE.match(endpoint)
+        if m and jq == ".content":
+            name, ref = m.group(2), (urllib.parse.unquote(m.group(3)) if m.group(3) else None)
+            if name in self.workflow_text_fails:
+                raise gh.GhError("gh: HTTP 500: boom\n")
+            return base64.encodebytes(self._text(name, ref).encode()).decode()
+
+        m = _REPO_SECRETS_RE.match(endpoint)
+        if m and jq == ".secrets[].name":
+            if self.repo_secrets_fails is not None:
+                raise gh.GhError(self.repo_secrets_fails)
+            return "".join(name + "\n" for name in self.repo_secrets)
+
+        m = _ENVIRONMENTS_RE.match(endpoint)
+        if m and jq == ".environments[].name":
+            if self.environments_fails is not None:
+                raise gh.GhError(self.environments_fails)
+            return "".join(name + "\n" for name in self.environments)
+
+        m = _ENV_SECRETS_RE.match(endpoint)
+        if m and jq == ".secrets[].name":
+            env = urllib.parse.unquote(m.group(2))
+            if env in self.env_secrets_fails:
+                raise gh.GhError("gh: HTTP 500: boom\n")
+            assert env in self.environments, f"secrets read for an environment that does not exist: {env}"
+            return "".join(name + "\n" for name in self.environments[env])
+
         raise AssertionError(f"unexpected endpoint: {endpoint} (method={method} jq={jq})")
+
+    def _text(self, name, ref):
+        """A workflow's text on `ref` (None: the default branch); a file
+        not given a text reads as an inheriting caller of the hub it is
+        named after."""
+        if ref and name in self.branch_workflows.get(ref, {}):
+            return self.branch_workflows[ref][name]
+        if name in self.workflow_texts:
+            return self.workflow_texts[name]
+        hub = name.rsplit(".", 1)[0]
+        return (
+            f"jobs:\n  update:\n    uses: mikelward/{hub}/.github/workflows/{hub}.yml@main\n"
+            "    secrets: inherit\n"
+        )
+
+    def _blob(self, name, ref):
+        return hashlib.sha1(self._text(name, ref).encode()).hexdigest()
 
     def try_run(self, args):
         self.calls.append(list(args))
@@ -201,6 +274,19 @@ class FakeGh:
             if self.master_exists:
                 return True, "master\n"
             return False, "gh: HTTP 404: Not Found\n"
+        m = _WORKFLOWS_DIR_RE.match(endpoint)
+        if m:
+            ref = urllib.parse.unquote(m.group(2)) if m.group(2) else None
+            if self.workflows_error:
+                return False, self.workflows_error
+            if self.workflow_files is None:
+                return False, "gh: HTTP 404: Not Found\n"
+            files = [*self.workflow_files, *(self.branch_workflows.get(ref, {}) if ref else {})]
+            return True, "".join(f"{n} {self._blob(n, ref)}\n" for n in dict.fromkeys(files))
+        if _ROOT_CONTENTS_RE.match(endpoint):
+            if self.root_contents_error:
+                return False, self.root_contents_error
+            return True, "3\n"
         raise AssertionError(f"unexpected try_run endpoint: {endpoint}")
 
 
@@ -919,6 +1005,471 @@ class AuditCmdTest(unittest.TestCase):
         code, out, err = _run(fake, [REPO, "lanes"])
         self.assertEqual(code, 0, err)
         self.assertIn("[ok]", out)
+
+
+class SecretsAuditTest(unittest.TestCase):
+    """Where the fleet credentials live, and what else sits repository-wide.
+
+    A placement finding is [FIX], not [GAP]: `repo setup` closes it, and
+    it does not count toward the exit status until the fleet has been
+    through setup (TODO.md). So the exit code is asserted 0 wherever a
+    [FIX] is the only finding, on purpose -- flipping that is the
+    promotion, and it should have to change these tests."""
+
+    def _hub_repo(self, hub="gradle-update"):
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml", f"{hub}.yml"]
+        return fake
+
+    def test_a_repository_with_no_secrets_and_no_workflows_is_clean(self):
+        code, out, err = _run(FakeGh(), [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[ok] no repository-level secrets", out)
+        self.assertNotIn("[CHECK] repository secrets", out)
+        self.assertNotIn("[FIX]", out)
+
+    def test_a_batch_credential_kept_as_a_repository_secret_is_a_fix_naming_the_move(self):
+        fake = self._hub_repo()
+        fake.repo_secrets = ["GRADLE_UPDATE_PAT"]
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[FIX] gradle-update: GRADLE_UPDATE_PAT is a repository secret", out)
+        self.assertIn(
+            f"`repo setup --credential GRADLE_UPDATE_PAT=PATH {REPO}` moves it into the 'gradle-update' environment",
+            out,
+        )
+        # Not double-reported as "no credential in the environment": the
+        # move is the one fix, and the repository copy is what still
+        # reaches the update job even once the environment holds one.
+        self.assertNotIn("holds no batch credential", out)
+        self.assertNotIn("[GAP]", out)
+
+    def test_a_repository_copy_is_still_a_fix_once_the_environment_holds_one(self):
+        fake = self._hub_repo()
+        fake.repo_secrets = ["GRADLE_UPDATE_PAT"]
+        fake.environments = {"gradle-update": ["GRADLE_UPDATE_PAT"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[FIX] gradle-update: GRADLE_UPDATE_PAT is a repository secret", out)
+        self.assertNotIn("[ok] gradle-update:", out)
+
+    def test_a_caller_naming_its_secrets_is_a_fix_even_with_the_credential_scoped(self):
+        # `repo setup` calls this NOT FIXED: an environment credential never
+        # reaches a caller that names its secrets. The audit reads the
+        # caller the same way, so it cannot print [ok] over it.
+        fake = self._hub_repo()
+        fake.workflow_texts = {
+            "gradle-update.yml": "jobs:\n  update:\n    uses: mikelward/gradle-update/.github/workflows/gradle-update.yml@main\n    secrets:\n      token: ${{ secrets.GRADLE_UPDATE_PAT }}\n"
+        }
+        fake.environments = {"gradle-update": ["GRADLE_UPDATE_PAT"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "[FIX] gradle-update: gradle-update.yml passes its secrets by name, so a credential in the "
+            "'gradle-update' environment never reaches the batch -- convert the caller to `secrets: inherit`",
+            out,
+        )
+        self.assertNotIn("[ok] gradle-update:", out)
+        # A `gradle-update.yml` that calls nothing is no caller at all: the
+        # batch does not run here, so its scoped credential is the stale
+        # one -- the same reading `repo setup` deletes it on.
+        fake.workflow_texts = {"gradle-update.yml": "name: x\non: push\njobs: {}\n"}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "[FIX] batch credential(s) for a batch this repository does not run, in the "
+            "'gradle-update' environment: GRADLE_UPDATE_PAT",
+            out,
+        )
+        self.assertNotIn("[ok] gradle-update:", out)
+
+    def test_a_failed_caller_read_exits_1(self):
+        fake = self._hub_repo()
+        fake.workflow_text_fails = {"gradle-update.yml"}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("could not read owner/repo's .github/workflows/gradle-update.yml:", err)
+
+    def test_a_caller_with_the_yaml_extension_is_the_batch_too(self):
+        # GitHub runs `.yaml` workflows as readily as `.yml`; a batch missed
+        # for its extension would have its real credential reported stale.
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml", "gradle-update.yaml"]
+        fake.environments = {"gradle-update": ["GRADLE_UPDATE_PAT"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[ok] gradle-update: the batch credential lives in the 'gradle-update' environment", out)
+        self.assertNotIn("does not run", out)
+
+    def test_every_caller_file_of_a_batch_is_read(self):
+        # `<hub>.yml` and `<hub>.yaml` can coexist, and GitHub runs both; the
+        # one that names its secrets is the finding however the other
+        # reads, and the [ok] is withheld.
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml", "gradle-update.yml", "gradle-update.yaml"]
+        fake.workflow_texts = {
+            "gradle-update.yaml": (
+                "jobs:\n  update:\n"
+                "    uses: mikelward/gradle-update/.github/workflows/gradle-update.yml@main\n"
+                "    secrets:\n      token: ${{ secrets.GRADLE_UPDATE_PAT }}\n"
+            )
+        }
+        fake.environments = {"gradle-update": ["GRADLE_UPDATE_PAT"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[FIX] gradle-update: gradle-update.yaml passes its secrets by name", out)
+        self.assertNotIn("[ok] gradle-update:", out)
+
+    def test_a_caller_under_another_name_is_read_too(self):
+        # GitHub runs a workflow whatever it is named, so a second caller
+        # naming its secrets is the finding even though `<hub>.yml` inherits.
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml", "gradle-update.yml", "weekly.yml"]
+        fake.workflow_texts = {
+            "weekly.yml": (
+                "jobs:\n  update:\n"
+                "    uses: mikelward/gradle-update/.github/workflows/gradle-update.yml@main\n"
+                "    secrets:\n      token: ${{ secrets.GRADLE_UPDATE_PAT }}\n"
+            )
+        }
+        fake.environments = {"gradle-update": ["GRADLE_UPDATE_PAT"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[FIX] gradle-update: weekly.yml passes its secrets by name", out)
+        self.assertNotIn("[ok] gradle-update:", out)
+
+    def test_a_mention_no_caller_resolves_is_cannot_tell(self):
+        # Neither "runs" nor "does not run": the credential is not stale,
+        # and the finding names the file to rewrite.
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml", "batch.yml"]
+        fake.workflow_texts = {
+            "batch.yml": "jobs: {update: {uses: mikelward/gradle-update/.github/workflows/gradle-update.yml@main}}\n"
+        }
+        fake.environments = {"gradle-update": ["GRADLE_UPDATE_PAT"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "[FIX] gradle-update: batch.yml mentions mikelward/gradle-update/ in a shape this cannot read as a caller",
+            out,
+        )
+        self.assertNotIn("does not run", out)
+
+    SYNC = (
+        "jobs:\n  sync:\n"
+        "    uses: mikelward/ci-commit-artifact/.github/workflows/commit-artifact.yml@main\n"
+        "    secrets: inherit\n"
+    )
+
+    def test_a_hub_with_an_unread_mention_beside_a_caller_is_cannot_tell(self):
+        # `repo setup` refuses every move for such a hub, so neither an [ok]
+        # nor a move recommendation may contradict it.
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml", "gradle-update.yml", "batch.yml"]
+        fake.workflow_texts = {
+            "batch.yml": "jobs: {update: {uses: mikelward/gradle-update/.github/workflows/gradle-update.yml@main}}\n"
+        }
+        fake.repo_secrets = ["GRADLE_UPDATE_PAT"]
+        fake.environments = {"gradle-update": ["GRADLE_UPDATE_PAT"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[FIX] gradle-update: batch.yml mentions mikelward/gradle-update/", out)
+        self.assertNotIn("[ok] gradle-update:", out)
+        self.assertNotIn("moves it into the 'gradle-update' environment", out)
+        self.assertNotIn("does not run", out)
+
+    def test_the_commit_back_token_is_audited_like_a_batch(self):
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        fake.workflow_texts = {"ci.yml": self.SYNC}
+        fake.environments = {"ci-commit-artifact": ["CI_COMMIT_ARTIFACT_TOKEN"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[ok] ci-commit-artifact: the token lives in the 'ci-commit-artifact' environment", out)
+        # Behind a caller naming its secrets the environment copy is idle.
+        fake.workflow_texts = {
+            "ci.yml": self.SYNC.replace(
+                "secrets: inherit", "secrets:\n      push-token: ${{ secrets.CI_COMMIT_ARTIFACT_TOKEN }}"
+            )
+        }
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[FIX] ci-commit-artifact: ci.yml passes its secrets by name", out)
+        self.assertNotIn("[ok] ci-commit-artifact:", out)
+        # Nowhere at all: the commit-back pushes as GITHUB_TOKEN.
+        fake.workflow_texts = {"ci.yml": self.SYNC}
+        fake.environments = {}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "[FIX] ci-commit-artifact: environment 'ci-commit-artifact' holds no CI_COMMIT_ARTIFACT_TOKEN", out
+        )
+        # Nothing calls the workflow: the token is stale wherever it sits.
+        fake.workflow_texts = {"ci.yml": "jobs: {}\n"}
+        fake.environments = {"ci-commit-artifact": ["CI_COMMIT_ARTIFACT_TOKEN"]}
+        fake.repo_secrets = ["CI_COMMIT_ARTIFACT_TOKEN"]
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "[FIX] CI_COMMIT_ARTIFACT_TOKEN as a repository secret and in the 'ci-commit-artifact' "
+            "environment, but no workflow here calls mikelward/ci-commit-artifact",
+            out,
+        )
+        self.assertNotIn("moves it into", out)
+
+    def test_a_caller_on_another_branch_is_read_too(self):
+        # A push to `feature` runs its workflows from `feature`; its caller
+        # naming its secrets is the finding, and the hub is not stale.
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        fake.workflow_texts = {"ci.yml": "jobs: {}\n"}
+        fake.branch_workflows = {
+            "feature": {
+                "weekly.yml": (
+                    "jobs:\n  update:\n"
+                    "    uses: mikelward/gradle-update/.github/workflows/gradle-update.yml@main\n"
+                    "    secrets:\n      token: ${{ secrets.GRADLE_UPDATE_PAT }}\n"
+                )
+            }
+        }
+        fake.environments = {"gradle-update": ["GRADLE_UPDATE_PAT"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[FIX] gradle-update: weekly.yml on feature passes its secrets by name", out)
+        self.assertNotIn("does not run", out)
+
+    def test_a_credential_in_the_environment_alone_is_ok(self):
+        fake = self._hub_repo()
+        fake.environments = {"gradle-update": ["GRADLE_UPDATE_PAT"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[ok] gradle-update: the batch credential lives in the 'gradle-update' environment", out)
+        self.assertNotIn("[FIX]", out)
+
+    def test_the_app_pair_in_the_environment_counts_as_the_credential(self):
+        fake = self._hub_repo("rust-update")
+        fake.environments = {"rust-update": ["RUST_UPDATE_APP_ID", "RUST_UPDATE_APP_PRIVATE_KEY"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[ok] rust-update: the batch credential lives in the 'rust-update' environment", out)
+        self.assertNotIn("[FIX]", out)
+
+    def test_half_an_app_pair_in_the_environment_is_no_credential(self):
+        fake = self._hub_repo("rust-update")
+        fake.environments = {"rust-update": ["RUST_UPDATE_APP_ID"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[FIX] rust-update: environment 'rust-update' holds no batch credential", out)
+
+    def test_an_environment_listed_in_another_case_is_the_hub_environment(self):
+        # GitHub environment names are case-insensitive, so `Gradle-Update`
+        # is the hub's environment: read under the name GitHub lists, and
+        # its credential counts.
+        fake = self._hub_repo()
+        fake.environments = {"Gradle-Update": ["GRADLE_UPDATE_PAT"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[ok] gradle-update: the batch credential lives in the 'gradle-update' environment", out)
+        self.assertTrue(any("/environments/Gradle-Update/secrets" in " ".join(c) for c in fake.calls))
+
+    def test_half_an_app_pair_at_repository_level_is_both_a_move_and_a_missing_credential(self):
+        # The lone half has to move like any repository copy, but moving it
+        # still leaves the batch with nothing that opens a pull request --
+        # unlike a whole credential at repository level, which the move
+        # alone fixes -- so both findings are reported.
+        fake = self._hub_repo("rust-update")
+        fake.repo_secrets = ["RUST_UPDATE_APP_ID"]
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[FIX] rust-update: RUST_UPDATE_APP_ID is a repository secret", out)
+        self.assertIn(
+            "[FIX] rust-update: environment 'rust-update' holds no batch credential (RUST_UPDATE_PAT, or RUST_UPDATE_APP_ID and RUST_UPDATE_APP_PRIVATE_KEY), and RUST_UPDATE_APP_ID is only half of the App pair -- the batch opens its pull requests as GITHUB_TOKEN; "
+            f"`repo setup --credential RUST_UPDATE_PAT=PATH {REPO}` sets one",
+            out,
+        )
+
+    def test_an_app_pair_split_across_the_scopes_is_still_a_credential(self):
+        # One half at repository level, the other in the environment: the
+        # called workflow receives both (the first through `inherit`, the
+        # second from its environment), so the batch has a credential. The
+        # repository half still has to move; the missing-credential finding
+        # would be false.
+        fake = self._hub_repo("rust-update")
+        fake.repo_secrets = ["RUST_UPDATE_APP_ID"]
+        fake.environments = {"rust-update": ["RUST_UPDATE_APP_PRIVATE_KEY"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[FIX] rust-update: RUST_UPDATE_APP_ID is a repository secret", out)
+        self.assertNotIn("holds no batch credential", out)
+
+    def test_the_move_names_every_repository_copy(self):
+        fake = self._hub_repo("rust-update")
+        fake.repo_secrets = ["RUST_UPDATE_APP_ID", "RUST_UPDATE_APP_PRIVATE_KEY"]
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "[FIX] rust-update: RUST_UPDATE_APP_ID, RUST_UPDATE_APP_PRIVATE_KEY is a repository secret",
+            out,
+        )
+        self.assertIn(
+            f"`repo setup --credential RUST_UPDATE_APP_ID=PATH --credential RUST_UPDATE_APP_PRIVATE_KEY=PATH {REPO}` moves it",
+            out,
+        )
+        self.assertNotIn("holds no batch credential", out)
+
+    def test_secret_names_are_matched_in_any_case(self):
+        # GitHub secret names are case-insensitive, so a credential listed
+        # in another spelling is still the batch credential: at repository
+        # level it is still the copy that has to move, and in the
+        # environment it still counts.
+        fake = self._hub_repo()
+        fake.repo_secrets = ["gradle_update_pat"]
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[FIX] gradle-update: GRADLE_UPDATE_PAT is a repository secret", out)
+        self.assertNotIn("[CHECK] repository secrets", out)
+        fake = self._hub_repo("rust-update")
+        fake.environments = {"rust-update": ["rust_update_app_id", "Rust_Update_App_Private_Key"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[ok] rust-update: the batch credential lives in the 'rust-update' environment", out)
+
+    def test_a_consumer_with_no_credential_anywhere_is_a_fix(self):
+        fake = self._hub_repo("npm-update")
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "[FIX] npm-update: environment 'npm-update' holds no batch credential (NPM_UPDATE_PAT, or NPM_UPDATE_APP_ID and NPM_UPDATE_APP_PRIVATE_KEY) -- the batch opens its pull requests as GITHUB_TOKEN; "
+            f"`repo setup --credential NPM_UPDATE_PAT=PATH {REPO}` sets one",
+            out,
+        )
+        # Nothing was read from an environment that does not exist.
+        self.assertFalse(any("/environments/npm-update/secrets" in " ".join(c) for c in fake.calls))
+
+    def test_a_credential_for_a_batch_the_repository_does_not_run_is_stale(self):
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        fake.repo_secrets = ["NPM_UPDATE_PAT"]
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "[FIX] batch credential(s) for a batch this repository does not run: NPM_UPDATE_PAT -- "
+            f"`repo setup {REPO}` deletes them",
+            out,
+        )
+
+    def test_a_credential_left_in_the_environment_of_a_batch_no_longer_run_is_stale(self):
+        # The caller was removed but the credential stayed in the hub's
+        # environment -- the place the audit steers it to. Nothing uses it,
+        # so it is the same finding as a stale repository secret.
+        fake = self._hub_repo()  # runs gradle-update only
+        fake.environments = {
+            "gradle-update": ["GRADLE_UPDATE_PAT"],
+            "rust-update": ["RUST_UPDATE_PAT", "OTHER"],
+        }
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "[FIX] batch credential(s) for a batch this repository does not run, in the 'rust-update' environment: RUST_UPDATE_PAT -- "
+            f"`repo setup {REPO}` deletes them",
+            out,
+        )
+        # The environment of a batch that IS run, and an unrelated secret
+        # in the stale one, are not reported as stale.
+        stale = [line for line in out.splitlines() if "does not run" in line]
+        self.assertEqual(len(stale), 1, out)
+        self.assertNotIn("gradle-update", stale[0])
+        self.assertNotIn("OTHER", stale[0])
+        self.assertIn("[ok] gradle-update: the batch credential lives in the 'gradle-update' environment", out)
+
+    def test_the_commit_back_token_at_repository_level_is_a_fix(self):
+        fake = self._hub_repo()
+        fake.environments = {"gradle-update": ["GRADLE_UPDATE_PAT"]}
+        fake.repo_secrets = ["CI_COMMIT_ARTIFACT_TOKEN"]
+        fake.workflow_files = ["ci.yml"]
+        fake.workflow_texts = {"ci.yml": self.SYNC}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "[FIX] CI_COMMIT_ARTIFACT_TOKEN is a repository secret, which reaches every job of every workflow -- "
+            f"`repo setup --credential CI_COMMIT_ARTIFACT_TOKEN=PATH {REPO}` moves it into the 'ci-commit-artifact' environment",
+            out,
+        )
+        # A fleet credential, so not also listed for review by hand.
+        self.assertNotIn("[CHECK] repository secrets", out)
+        self.assertIn("[ok] no repository-level secrets beyond the fleet credentials reported above", out)
+
+    def test_other_repository_secrets_are_listed_for_review_not_flagged(self):
+        fake = self._hub_repo()
+        fake.environments = {"gradle-update": ["GRADLE_UPDATE_PAT"]}
+        fake.repo_secrets = ["RELEASE_KEYSTORE_BASE64", "VERCEL_TOKEN"]
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[CHECK] repository secrets", out)
+        self.assertIn("    RELEASE_KEYSTORE_BASE64\n    VERCEL_TOKEN\n", out)
+        self.assertNotIn("[ok] no repository-level secrets", out)
+        self.assertNotIn("[FIX]", out)
+
+    def test_a_repository_holding_only_fleet_credentials_says_so(self):
+        fake = self._hub_repo()
+        fake.repo_secrets = ["GRADLE_UPDATE_PAT"]
+        code, out, err = _run(fake, [REPO])
+        self.assertIn("[ok] no repository-level secrets beyond the fleet credentials reported above", out)
+
+    def test_a_failed_secrets_read_exits_1_and_reports_no_finding(self):
+        fake = FakeGh()
+        fake.repo_secrets_fails = "gh: HTTP 403: Resource not accessible\n"
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("could not list owner/repo's repository secrets:", err)
+        tail = out.split("[ok] no branch literally named 'master'")[-1]
+        self.assertNotIn("[GAP]", tail)
+        self.assertNotIn("[FIX]", tail)
+
+    def test_a_failed_environments_read_exits_1(self):
+        fake = FakeGh()
+        fake.environments_fails = "gh: HTTP 500: boom\n"
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("could not list owner/repo's environments:", err)
+
+    def test_a_failed_environment_secrets_read_exits_1(self):
+        fake = self._hub_repo()
+        fake.environments = {"gradle-update": []}
+        fake.env_secrets_fails = {"gradle-update"}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("could not list owner/repo's 'gradle-update' environment secrets:", err)
+
+    def test_a_hidden_workflows_directory_fails_closed(self):
+        # A fine-grained token without Contents access gets the same 404 an
+        # absent directory does. Taken as "no batch", the audit would skip
+        # every credential check and tell the operator to delete the real
+        # credentials as stale; the root listing failing too is the tell.
+        fake = FakeGh()
+        fake.repo_secrets = ["GRADLE_UPDATE_PAT"]
+        fake.root_contents_error = "gh: HTTP 404: Not Found\n"
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("could not tell whether owner/repo has workflows", err)
+        self.assertNotIn("does not run", out)
+
+    def test_an_empty_repository_runs_no_batch(self):
+        # No commits, so no workflows: GitHub's own message for the root
+        # listing says so, and that is a plain answer rather than a hidden
+        # directory.
+        fake = FakeGh()
+        fake.root_contents_error = "gh: This repository is empty. (HTTP 404)\n"
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[ok] no repository-level secrets", out)
+
+    def test_a_non_404_workflows_listing_failure_exits_1(self):
+        fake = FakeGh()
+        fake.workflows_error = "gh: HTTP 500: boom\n"
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("could not list owner/repo's workflows:", err)
 
 
 if __name__ == "__main__":

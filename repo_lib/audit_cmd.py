@@ -47,10 +47,30 @@ review to get right in the shell source). Independent of any ruleset, it
 also warns whenever the repository has an actual branch named "master"
 at all.
 
+It also audits where secrets live (new here; the shell source never did).
+The fleet's shared credentials -- the weekly dependency batches'
+`<HUB>_PAT` (or `<HUB>_APP_ID` + `<HUB>_APP_PRIVATE_KEY` pair) and the
+screenshot commit-back token -- each belong in an environment named after
+the reusable workflow that reads them, because a secret passed to a
+reusable workflow reaches the runner of every job in it, a batch's
+untrusted update job included (repo_lib.credentials has the full
+reasoning). A credential kept as a REPOSITORY secret, a consumer (one
+carrying the hub's caller workflow) whose environment holds no credential
+at all, and a batch credential left behind by a batch this repository no
+longer runs are each reported as [FIX] -- a finding `repo setup` closes,
+named with the command -- rather than [GAP]: the environment layout is
+being rolled out through `repo setup`, and until every repository has
+been through it these are not counted toward the exit status (TODO.md
+records promoting them). Every other repository-level secret is listed
+under [CHECK]: with the callers passing `secrets: inherit`, those reach
+the update job as well, and each should be scoped to an environment its
+one consuming job declares -- or confirmed, by hand, as genuinely
+repository-wide. Names only, never values: GitHub does not return them.
+
 Cost and reliability: free -- GitHub's REST API, inside the standard
 5,000-authenticated-requests-an-hour limit. A run costs six or seven
-calls per repository plus one per branch ruleset found on it -- a
-handful, in practice. The exception is the never-reported walk: on a
+calls per repository plus one per branch ruleset found on it, plus three
+to six for the secrets audit and one per batch caller read -- a handful, in practice. The exception is the never-reported walk: on a
 healthy repository every required check is found on the default head and
 it stops after two calls, but where one has never reported it goes on to
 scan a page of open and then closed pull requests, so the expensive path
@@ -68,7 +88,7 @@ import json
 import re
 import urllib.parse
 
-from repo_lib import gh, rules
+from repo_lib import credentials, gh, rules
 from repo_lib.common import error, error_lines
 
 # Same shape as setup_cmd.py's/secrets_cmd.py's own OWNER_REPO_RE -- kept
@@ -191,6 +211,207 @@ def _targeting_status(include, exclude):
     return "missing", missing
 
 
+# The weekly dependency batches, keyed by the caller workflow file a consumer
+# carries. Each hub's publish job reads its credential from an environment
+# of the same name (see that repository's docs/PAT.md).
+def audit_secrets(repo, ok, fix):
+    """Reports where the fleet credentials live, and names every other
+    repository-level secret. See the module docstring for the reasoning.
+
+    A failed read exits 1 rather than reporting a finding: "could not
+    tell" and "found a gap" are different findings (same rule as the rest
+    of this module). The reads, and the one 404 they tolerate, are
+    repo_lib.credentials' -- the same ones `repo setup` fixes from."""
+    try:
+        repo_secrets = credentials.repository_secrets(repo)
+        environments = credentials.environments(repo)
+    except credentials.ReadError as e:
+        error_lines(e.message, e.detail)
+        raise SystemExit(1)
+
+    def environment_secrets(hub):
+        try:
+            return credentials.environment_secrets(repo, environments, hub)
+        except credentials.ReadError as e:
+            error_lines(e.message, e.detail)
+            raise SystemExit(1)
+
+    def move_command(names):
+        flags = " ".join(f"--credential {name}=PATH" for name in names)
+        return f"`repo setup {flags} {repo}`"
+
+    # Every workflow is read, on every branch: a batch's caller is
+    # whichever file calls it from a job -- the fleet names it `<hub>.yml`,
+    # but GitHub runs any name, from any branch a push lands on -- and a
+    # file that mentions the batch in a shape the reader cannot resolve is
+    # "cannot tell", never "does not run". Read as `repo setup` reads it,
+    # so the two agree.
+    try:
+        texts = credentials.workflow_texts(repo)
+    except credentials.ReadError as e:
+        error_lines(e.message, e.detail)
+        raise SystemExit(1)
+    found = {hub: credentials.callers(texts, credentials.hub_workflow(hub)) for hub in credentials.BATCH_HUBS}
+    unread = {hub: credentials.unread_mentions(texts, credentials.hub_workflow(hub)) for hub in credentials.BATCH_HUBS}
+    # A hub with an unread mention is "cannot tell" even beside a readable
+    # caller: `repo setup` refuses every move for it, so an [ok] or a move
+    # here would contradict the command the audit points at.
+    unknown = [hub for hub in credentials.BATCH_HUBS if unread[hub]]
+    hubs = [hub for hub in credentials.BATCH_HUBS if found[hub] and hub not in unknown]
+    for hub in unknown:
+        fix(
+            f"{hub}: {', '.join(unread[hub])} mentions {credentials.hub_workflow(hub)} in a shape "
+            f"this cannot read as a caller -- whether the batch runs there cannot be told; write "
+            f"the caller as a job-level `uses:` (`repo setup` moves or deletes nothing of its "
+            f"until then)"
+        )
+    for hub in hubs:
+        pat, app_id, app_key = credentials.batch_credentials(hub)
+        environment, env_secrets = environment_secrets(hub)
+        in_environment = credentials.usable(env_secrets, hub)
+        as_repository = [name for name in (pat, app_id, app_key) if name in repo_secrets]
+        # The callers' shape decides whether an environment credential can
+        # reach the batch at all: only `secrets: inherit` carries one into
+        # a called workflow, and one caller naming its secrets is the
+        # finding however the others read. Read as `repo setup` reads
+        # them, so the two agree -- an [ok] here for a credential setup
+        # calls NOT FIXED would be a false all-clear.
+        inherits = True
+        for caller, verdict in sorted(found[hub].items()):
+            if not verdict:
+                inherits = False
+                fix(
+                    f"{hub}: {caller} passes its secrets by name, so a credential in the '{hub}' "
+                    f"environment never reaches the batch -- convert the caller to `secrets: inherit`"
+                )
+        if as_repository:
+            # Reported even when the environment already holds a copy: the
+            # repository one is what still reaches the update job.
+            fix(
+                f"{hub}: {', '.join(as_repository)} is a repository secret, which reaches "
+                f"every job of every workflow, the batch's untrusted update job included -- "
+                f"{move_command(as_repository)} moves it into the '{hub}' environment"
+            )
+        if in_environment:
+            if not as_repository and inherits is True:
+                ok(f"{hub}: the batch credential lives in the '{hub}' environment")
+        elif not credentials.usable(set(repo_secrets) | set(env_secrets), hub):
+            # No usable credential anywhere. A whole credential at repository
+            # level still opens the batch's pull requests (through `inherit`),
+            # and so does an App pair split across the two scopes -- the
+            # called workflow sees both halves -- so there the move above is
+            # the one fix; half an App pair with no partner opens nothing, so
+            # it gets this finding as well as the move.
+            half = (
+                f", and {', '.join(as_repository)} is only half of the App pair"
+                if as_repository
+                else ""
+            )
+            fix(
+                f"{hub}: environment '{hub}' holds no batch credential ({pat}, or {app_id} "
+                f"and {app_key}){half} -- the batch opens its pull requests as GITHUB_TOKEN; "
+                f"{move_command([pat])} sets one"
+            )
+
+    expected = {name for hub in (*hubs, *unknown) for name in credentials.batch_credentials(hub)}
+    every_batch_name = {
+        name for hub in credentials.BATCH_HUBS for name in credentials.batch_credentials(hub)
+    }
+    stale = sorted(name for name in repo_secrets if name in every_batch_name and name not in expected)
+    if stale:
+        fix(
+            f"batch credential(s) for a batch this repository does not run: "
+            f"{', '.join(stale)} -- `repo setup {repo}` deletes them"
+        )
+    # A batch whose caller was removed can leave its credential behind in
+    # the hub's environment -- the place this audit steers it to -- where
+    # the loop above never looks. An active credential nothing uses is the
+    # same finding wherever it sits.
+    for hub in credentials.BATCH_HUBS:
+        if hub in hubs or hub in unknown:
+            continue
+        environment, env_secrets = environment_secrets(hub)
+        left_behind = sorted(
+            name for name in env_secrets if name in credentials.batch_credentials(hub)
+        )
+        if left_behind:
+            fix(
+                f"batch credential(s) for a batch this repository does not run, in the "
+                f"'{environment}' environment: {', '.join(left_behind)} -- "
+                f"`repo setup {repo}` deletes them"
+            )
+
+    # The commit-back workflow, audited the way its batch siblings are: by
+    # what calls it, with `repo setup`'s reading, so the two agree on a
+    # missing token, a token behind a caller naming its secrets, and a
+    # token nothing uses.
+    token = credentials.COMMIT_ARTIFACT_TOKEN
+    label = credentials.COMMIT_ARTIFACT_ENV
+    prefix = credentials.COMMIT_ARTIFACT_WORKFLOW
+    callers = credentials.callers(texts, prefix)
+    unread = credentials.unread_mentions(texts, prefix)
+    environment, env_secrets = environment_secrets(label)
+    if unread:
+        fix(
+            f"{label}: {', '.join(unread)} mentions {prefix} in a shape this cannot read as a "
+            f"caller -- whether the token is used there cannot be told; write the caller as a "
+            f"job-level `uses:` (`repo setup` moves or deletes nothing of its until then)"
+        )
+    elif not callers:
+        where = []
+        if token in repo_secrets:
+            where.append("as a repository secret")
+        if token in env_secrets:
+            where.append(f"in the '{environment}' environment")
+        if where:
+            fix(
+                f"{token} {' and '.join(where)}, but no workflow here calls "
+                f"{prefix.rstrip('/')} -- `repo setup {repo}` deletes it"
+            )
+    else:
+        inherits = True
+        for caller, verdict in sorted(callers.items()):
+            if not verdict:
+                inherits = False
+                fix(
+                    f"{label}: {caller} passes its secrets by name, so a token in the '{label}' "
+                    f"environment never reaches the commit-back workflow -- convert the caller to "
+                    f"`secrets: inherit`"
+                )
+        if token in repo_secrets:
+            # Reported even when the environment already holds a copy: the
+            # repository one is what reaches every job of every workflow.
+            fix(
+                f"{token} is a repository secret, which reaches every job of every workflow -- "
+                f"{move_command([token])} moves it into the '{label}' environment"
+            )
+        if token in env_secrets:
+            if token not in repo_secrets and inherits:
+                ok(f"{label}: the token lives in the '{label}' environment")
+        elif token not in repo_secrets:
+            fix(
+                f"{label}: environment '{label}' holds no {token} -- the commit-back workflow "
+                f"pushes as GITHUB_TOKEN, and a push it authors starts no workflow run, so a "
+                f"pull request with drift wedges on checks that never arrive; "
+                f"{move_command([token])} sets one"
+            )
+
+    other = sorted(name for name in repo_secrets if name not in credentials.FLEET_CREDENTIALS)
+    if other:
+        print(
+            "  [CHECK] repository secrets -- these reach every job of every workflow, "
+            "and every job of a reusable workflow called with `secrets: inherit` (the "
+            "dependency batches are); scope each to an environment its one consuming "
+            "job declares, or confirm it must be repository-wide:"
+        )
+        for name in other:
+            print(f"    {name}")
+    elif repo_secrets:
+        ok("no repository-level secrets beyond the fleet credentials reported above")
+    else:
+        ok("no repository-level secrets")
+
+
 def run(args):
     if not OWNER_REPO_RE.match(args.repo):
         error(f"'{args.repo}' is not OWNER/REPO")
@@ -230,6 +451,15 @@ def run(args):
     def gap(message):
         print(f"  [GAP] {message}")
         gap_found[0] = True
+
+    def fix(message):
+        # A finding `repo setup` closes, reported but not yet counted: the
+        # environment layout for the fleet credentials is being rolled out
+        # through `repo setup`, and failing every repository until it has
+        # been run would make the exit status say nothing else. TODO.md
+        # records promoting these to [GAP] once the fleet has been through
+        # it.
+        print(f"  [FIX] {message}")
 
     print(f"{repo} (@{branch})")
 
@@ -548,6 +778,8 @@ def run(args):
     else:
         error_lines(f"could not check whether {repo} has a branch named 'master':", detail)
         raise SystemExit(1)
+
+    audit_secrets(repo, ok, fix)
 
     if gap_found[0]:
         raise SystemExit(1)
