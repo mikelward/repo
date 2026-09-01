@@ -85,8 +85,8 @@ from contextlib import redirect_stdout
 from dataclasses import dataclass
 from typing import Optional
 
-from repo_lib import apps, gh, rules, secrets_cmd
-from repo_lib.common import error
+from repo_lib import apps, credentials, gh, rules, secrets_cmd
+from repo_lib.common import error, error_lines
 
 # The lookaheads reject `.` and `..` components: made of allowed
 # characters, but as path segments spliced into `repos/{repo}/...` they
@@ -101,6 +101,17 @@ def add_arguments(parser):
     parser.add_argument("--rule", action="append", default=[], help="a required check (repeatable)")
     parser.add_argument(
         "--secret", action="append", default=[], metavar="NAME[@ENV]=PATH", help="repeatable"
+    )
+    parser.add_argument(
+        "--credential",
+        action="append",
+        default=[],
+        metavar="NAME=PATH",
+        help=(
+            "a fleet credential's value (one of "
+            + ", ".join(credentials.FLEET_CREDENTIALS)
+            + "), set in the environment it belongs in when this repository uses it (repeatable)"
+        ),
     )
     parser.add_argument("--app", action="append", default=[], help="a GitHub App slug (repeatable)")
     parser.add_argument("repo", metavar="OWNER/REPO")
@@ -187,6 +198,367 @@ def _validate_secret_specs(raw_specs):
     return specs
 
 
+@dataclass
+class CredentialSpec:
+    name: str
+    path: str
+    raw: str
+    value: bytes = b""
+
+
+def _validate_credential_specs(raw_specs):
+    """NAME=PATH -> CredentialSpec, every one validated up front as a usage
+    error: the name must be a fleet credential (there is no other kind
+    setup knows where to put), spelled in any case since GitHub matches
+    secret names case-insensitively; two specs for one name would silently
+    have the second win; and the file is read here, once, as both the
+    readability check and the snapshot -- see _validate_secret_specs."""
+    specs = []
+    seen = set()
+    for raw in raw_specs:
+        if "=" not in raw:
+            error(f"'--credential {raw}' is not NAME=PATH (missing '=')")
+            raise SystemExit(2)
+        name, path = raw.split("=", 1)
+        name = name.upper()
+        if not name:
+            error(f"'--credential {raw}' has an empty NAME")
+            raise SystemExit(2)
+        if not path:
+            error(f"'--credential {raw}' has an empty PATH")
+            raise SystemExit(2)
+        if name not in credentials.FLEET_CREDENTIALS:
+            error(f"'{name}' (from --credential {raw}) is not a fleet credential; those are:")
+            for known in credentials.FLEET_CREDENTIALS:
+                error(f"  {known} (environment '{credentials.home_environment(known)}')")
+            error("For any other secret, --secret NAME[@ENV]=PATH sets it where you say.")
+            raise SystemExit(2)
+        if name in seen:
+            error(f"'--credential {raw}' repeats an earlier --credential's NAME ({name})")
+            error("-- the second would silently win; drop one of them.")
+            raise SystemExit(2)
+        seen.add(name)
+        spec = CredentialSpec(name=name, path=path, raw=raw)
+        try:
+            with open(spec.path, "rb") as f:
+                spec.value = f.read()
+        except OSError:
+            error(f"cannot read '{spec.path}' (from --credential {raw})")
+            raise SystemExit(2)
+        if not spec.value:
+            error(f"the value at '{spec.path}' (from --credential {raw}) is empty")
+            raise SystemExit(2)
+        specs.append(spec)
+    return specs
+
+
+@dataclass
+class CredentialMove:
+    """One reusable workflow's credential brought into line: the
+    environment writes, then -- only once every write has landed -- the
+    deletions of the copies that write makes redundant. A delete never
+    runs ahead of the write it depends on, or after one that failed: the
+    repository copy is what keeps the workflow working until the
+    environment holds the credential. `recheck` re-reads the caller
+    immediately before the deletes and answers None when the plan still
+    holds, else why it no longer does -- the confirmation prompt can sit
+    for an arbitrary time, and a caller that went back to naming its
+    secrets in that window would be left with nothing (Codex,
+    mikelward/repo#13)."""
+
+    label: str
+    writes: list  # (name, environment, value, environment already exists)
+    deletes: list  # (name, environment or None for the repository level)
+    recheck: object = None  # () -> None | str
+
+
+@dataclass
+class CredentialsPlan:
+    lines: list  # what the combined plan shows, one per action or fact
+    moves: list  # CredentialMove, in order
+    unfixed: list  # what this run cannot fix, each reason a failure at the end
+    failed: bool = False  # a read failed; `lines` carries the error
+
+
+def _plan_credentials(repo, specs):
+    """Where each fleet credential is on `repo`, against where it belongs
+    (repo_lib.credentials has the reasoning), and what closes the gap:
+
+    - a credential supplied by --credential is set in its environment when
+      the repository uses the workflow that reads it -- a batch, by the
+      caller file `<hub>.yml`; the commit-back workflow, by a job calling
+      it -- and is otherwise left unset, with a line saying so;
+    - a repository-level copy is deleted once the environment holds a
+      usable credential (the PAT, or both halves of a batch's App pair),
+      whether it already did or this run's write puts it there;
+    - a copy for a workflow the repository does not use is deleted, at the
+      repository level and in the environment alike;
+    - neither a write nor a delete happens while the caller still passes
+      its secrets by name: an environment secret reaches a called
+      workflow only through `secrets: inherit`, so moving the credential
+      out from under such a caller hands the workflow nothing -- and a
+      credential the environment already holds is idle under such a
+      caller, which is the same finding. That, and a credential this run
+      was not given a value for, are reported as not fixed, and fail the
+      run -- the point of this step is that a clean exit means the
+      repository is in shape;
+    - every delete is re-validated immediately before it runs (the caller
+      re-read, the workflows re-listed), since the confirmation prompt can
+      sit for an arbitrary time; a plan that no longer holds keeps the
+      copy and fails the step;
+    - "unused" is decided from the text, not from what the reader could
+      parse: a credential is deleted as unused only when no workflow
+      mentions its reader at all. A mention with no readable job-level
+      caller (flow style, a shape the fleet does not write) is reported as
+      not fixed and nothing is deleted -- the same fail-closed direction as
+      the rest of this step.
+
+    GitHub never returns a secret's value, which is why a move needs the
+    value handed in: setup can delete a copy it can see, but cannot copy
+    it."""
+    plan = CredentialsPlan(lines=[], moves=[], unfixed=[])
+    given = {spec.name: spec for spec in specs}
+    try:
+        repo_secrets = credentials.repository_secrets(repo)
+        environments = credentials.environments(repo)
+        texts = credentials.workflow_texts(repo)
+        held = {
+            env: credentials.environment_secrets(repo, environments, env)
+            for env in (*credentials.BATCH_HUBS, credentials.COMMIT_ARTIFACT_ENV)
+        }
+    except credentials.ReadError as e:
+        plan.failed = True
+        plan.lines.append(e.message)
+        plan.lines += [f"  {line}" for line in (e.detail or "").splitlines()]
+        return plan
+
+    def reread():
+        """The workflows' texts as they are now, on every branch, for a
+        recheck."""
+        return credentials.workflow_texts(repo)
+
+    def guarded(check):
+        """Wraps a recheck so a failed read reads as "no longer holds"
+        rather than an exception out of the apply loop: a delete this
+        step cannot re-validate does not happen."""
+
+        def run():
+            try:
+                return check()
+            except credentials.ReadError as e:
+                return f"{e.message.rstrip(':')} (the plan could not be re-validated)"
+
+        return run
+
+    def unused(label, names, listed, env_secrets, why, recheck):
+        move = CredentialMove(label=label, writes=[], deletes=[], recheck=guarded(recheck))
+        for name in names:
+            if name in repo_secrets:
+                move.deletes.append((name, None))
+                plan.lines.append(f"{label}: delete repository secret {name} -- {why}")
+            if name in env_secrets:
+                move.deletes.append((name, listed))
+                plan.lines.append(f"{label}: delete {name} from environment '{listed}' -- {why}")
+            if name in given:
+                plan.lines.append(f"{label}: {name} not set -- {why}")
+        if move.deletes:
+            plan.moves.append(move)
+
+    def move(label, names, listed, env_secrets, env, caller_desc, inherits, usable, suggest, recheck):
+        at_repo = [name for name in names if name in repo_secrets]
+        in_env = [name for name in names if name in env_secrets]
+        supplied = [name for name in names if name in given]
+        held_after = set(in_env) | set(supplied)
+        # A caller that names its secrets is a problem whenever there is
+        # something the environment holds or would hold: a value to set, a
+        # repository copy to delete, or a credential already sitting there
+        # that such a caller can never read.
+        if inherits is not True and (supplied or at_repo or usable(set(in_env))):
+            how = (
+                f"{caller_desc} passes its secrets by name"
+                if inherits is False
+                else f"{caller_desc} does not call the workflow"
+            )
+            left = ", ".join(dict.fromkeys(supplied + at_repo))
+            plan.unfixed.append(
+                f"{label}: {how}, so a credential in the '{env}' environment would never reach "
+                f"it -- convert the caller to `secrets: inherit` first"
+                + (f"; {left} left as is" if left else "")
+            )
+            return
+        def recheck_all():
+            reason = recheck()
+            if reason is not None:
+                return reason
+            # The destination is re-read too: a delete justified by a
+            # credential already in the environment has to find it still
+            # there, since the confirmation prompt can have sat while an
+            # administrator removed it (Codex, mikelward/repo#13). A value
+            # supplied on the command line is about to be written, so it
+            # counts; the environment's own copy is what has to be re-seen.
+            if step.deletes and not usable(set(supplied)):
+                _listed, env_now = credentials.environment_secrets(repo, credentials.environments(repo), env)
+                if not usable(set(env_now) | set(supplied)):
+                    return f"the '{env}' environment no longer holds the credential"
+            return None
+
+        step = CredentialMove(label=label, writes=[], deletes=[], recheck=guarded(recheck_all))
+        for name in supplied:
+            state = "OVERWRITES an existing value" if name in in_env else "new"
+            step.writes.append((name, env, given[name].value, listed is not None))
+            plan.lines.append(f"{label}: set {name} in environment '{env}' ({state})")
+        if usable(held_after):
+            for name in at_repo:
+                step.deletes.append((name, None))
+                plan.lines.append(
+                    f"{label}: delete repository secret {name} -- the '{env}' environment holds "
+                    f"the credential{' once set' if supplied else ''}"
+                )
+            if not supplied and not at_repo:
+                plan.lines.append(f"{label}: the credential lives in the '{env}' environment")
+        else:
+            flags = " ".join(f"--credential {name}=PATH" for name in suggest(held_after))
+            stays = f"; {', '.join(at_repo)} stays a repository secret until then" if at_repo else ""
+            plan.unfixed.append(
+                f"{label}: environment '{env}' holds no credential -- pass {flags} to set one{stays}"
+            )
+        if step.writes or step.deletes:
+            plan.moves.append(step)
+
+    def settle(label, names, prefix, listed, env_secrets, env, usable, suggest):
+        """Plans one reusable workflow's credentials from every workflow that
+        calls it from a job, whatever the file is named -- the fleet names a
+        batch's caller `<hub>.yml`, but GitHub runs any name, and a second
+        caller under another name would be stranded by a delete the named
+        one justifies (Codex, mikelward/repo#13). A workflow that mentions
+        it in a shape the reader cannot resolve is "cannot tell", and holds
+        everything back."""
+        found = credentials.callers(texts, prefix)
+        unread = credentials.unread_mentions(texts, prefix)
+        if unread:
+            plan.unfixed.append(
+                f"{label}: {', '.join(unread)} mentions {prefix} in a shape this cannot read as a "
+                f"caller -- whether it is used there cannot be told, so nothing is deleted; write "
+                f"the caller as a job-level `uses:`, or delete the credential by hand"
+            )
+            return
+
+        def now():
+            """(reason, callers) as the workflows read now, for a recheck."""
+            texts_now = reread()
+            callers_now = credentials.callers(texts_now, prefix)
+            if credentials.unread_mentions(texts_now, prefix):
+                return f"a workflow now mentions {prefix} in a shape this cannot read as a caller", callers_now
+            return None, callers_now
+
+        if not found:
+
+            def still_unused():
+                reason, callers_now = now()
+                if reason is None and callers_now:
+                    reason = f"{', '.join(sorted(callers_now))} appeared since the plan was built"
+                return reason
+
+            unused(
+                label,
+                names,
+                listed,
+                env_secrets,
+                f"no workflow here calls {prefix.rstrip('/')}, so nothing uses it",
+                still_unused,
+            )
+            return
+
+        def still_inherits():
+            reason, callers_now = now()
+            if reason is not None:
+                return reason
+            if set(callers_now) != set(found):
+                return (
+                    f"the callers changed since the plan was built "
+                    f"({', '.join(sorted(callers_now)) or 'none'} now)"
+                )
+            naming = sorted(name for name, inherits in callers_now.items() if not inherits)
+            if naming:
+                return f"{', '.join(naming)} no longer passes `secrets: inherit`"
+            return None
+
+        failing = sorted(name for name, inherits in found.items() if not inherits)
+        move(
+            label,
+            names,
+            listed,
+            env_secrets,
+            env,
+            ", ".join(failing or sorted(found)),
+            not failing,
+            usable,
+            suggest,
+            still_inherits,
+        )
+
+    for hub in credentials.BATCH_HUBS:
+        pat, app_id, app_key = names = credentials.batch_credentials(hub)
+        listed, env_secrets = held[hub]
+
+        def suggest(held_after, pat=pat, app_id=app_id, app_key=app_key):
+            # The other half of a pair the environment already holds half
+            # of; otherwise the PAT, the simpler credential.
+            if app_id in held_after and app_key not in held_after:
+                return [app_key]
+            if app_key in held_after and app_id not in held_after:
+                return [app_id]
+            return [pat]
+
+        settle(
+            hub,
+            names,
+            credentials.hub_workflow(hub),
+            listed,
+            env_secrets,
+            listed or hub,
+            lambda held_after, hub=hub: credentials.usable(held_after, hub),
+            suggest,
+        )
+
+    token = credentials.COMMIT_ARTIFACT_TOKEN
+    label = credentials.COMMIT_ARTIFACT_ENV
+    listed, env_secrets = held[label]
+    settle(
+        label,
+        (token,),
+        credentials.COMMIT_ARTIFACT_WORKFLOW,
+        listed,
+        env_secrets,
+        listed or label,
+        lambda held_after: token in held_after,
+        lambda held_after: [token],
+    )
+    return plan
+
+
+def _reject_fleet_credentials_under_secret(secret_specs):
+    """A fleet credential has one place, and --credential is the flag that
+    puts it there; a --secret naming one is refused whatever scope it
+    names. At repository level, or in any environment but its own, it
+    would write exactly the copy the fleet-credentials step exists to
+    remove, and since that step plans from what it read before any write,
+    the copy would survive the run with a clean exit. In its own
+    environment it is a write that plan does not know about either: the
+    step still reports the credential missing and keeps the repository
+    copy, so the run does the right write and exits 1 for it (Codex,
+    mikelward/repo#13, both). A usage error, before any gh call."""
+    for spec in secret_specs:
+        home = credentials.home_environment(spec.name)
+        if home is None:
+            continue
+        name = spec.name.upper()
+        error(f"'--secret {spec.raw}' names the fleet credential {name}, which `repo setup` places")
+        error(f"itself: in the '{home}' environment and nowhere else, deleting the repository copy.")
+        error(f"Use --credential {name}=PATH instead.")
+        raise SystemExit(2)
+
+
 def _validate_app_slugs(slugs):
     for slug in slugs:
         if not slug:
@@ -211,6 +583,8 @@ def run(args):
         raise SystemExit(2)
 
     secret_specs = _validate_secret_specs(args.secret)
+    credential_specs = _validate_credential_specs(args.credential)
+    _reject_fleet_credentials_under_secret(secret_specs)
     _validate_app_slugs(args.app)
 
     gh.require_gh()
@@ -223,7 +597,25 @@ def run(args):
     # flagging on its own, and read-only, so it always runs exactly once.
     rules.check_master_branch(repo)
 
-    if args.no_rules and not secret_specs and not args.app:
+    # Always on, like the master-branch check: the fleet credentials have
+    # one right place each, so there is nothing to request -- this step
+    # reads where they are and plans the difference. It reads before the
+    # early return below so that a run requesting nothing else still
+    # closes a gap it found; a repository already in shape costs the reads
+    # and nothing more.
+    credentials_plan = _plan_credentials(repo, credential_specs)
+    credentials_idle = not (credentials_plan.moves or credentials_plan.unfixed or credentials_plan.failed)
+
+    if (
+        args.no_rules
+        and not secret_specs
+        and not args.app
+        # A supplied credential is never dropped silently: with nothing to
+        # move it still shows the "not set" line saying why (Codex,
+        # mikelward/repo#13).
+        and not credential_specs
+        and credentials_idle
+    ):
         # Nothing requested actually mutates anything -- no ruleset step,
         # no secrets, no apps -- so there's nothing to build a plan for or
         # confirm. Codex review: reaching the confirmation gate below for
@@ -295,12 +687,26 @@ def run(args):
         if app_plans:
             lines.append("  App installation membership:")
             lines += [f"    {line}" for line in apps.describe_plan(repo, app_plans)]
+        lines.append("  fleet credentials:")
+        lines += [f"    {line}" for line in credentials_plan.lines]
+        lines += [f"    NOT FIXED: {reason}" for reason in credentials_plan.unfixed]
+        if not credentials_plan.lines and not credentials_plan.unfixed:
+            lines.append("    nothing to do")
         return lines
 
     if args.dry_run:
         for line in describe_combined_plan():
             print(line)
-        if ruleset_preview_failed or secrets_preview_failed or app_plan_has_error:
+        # A NOT FIXED line exits 1 here too: the real run would, and the
+        # dry run's exit status is a preview of that as much as of the
+        # plan's text.
+        if (
+            ruleset_preview_failed
+            or secrets_preview_failed
+            or app_plan_has_error
+            or credentials_plan.failed
+            or credentials_plan.unfixed
+        ):
             raise SystemExit(1)
         return 0
 
@@ -337,7 +743,12 @@ def run(args):
     # without ever attempting a write, confirmed or not.
     ruleset_needs_mutation = (not args.no_rules) and ruleset_report.get("needs_write", True)
     apps_need_mutation = any(p.verdict == "ADD" for p in app_plans)
-    needs_confirmation = ruleset_needs_mutation or bool(secret_previews) or apps_need_mutation
+    needs_confirmation = (
+        ruleset_needs_mutation
+        or bool(secret_previews)
+        or apps_need_mutation
+        or bool(credentials_plan.moves)
+    )
 
     # Printed unconditionally -- including under --force, and even when
     # nothing actually needs confirming -- so a forced, unattended run
@@ -451,6 +862,61 @@ def run(args):
     for plan in app_plans:
         if not apps.apply_step(repo, repo_owner, plan):
             failed.append(f"app:{plan.slug}")
+
+    for move in credentials_plan.moves:
+        # The caller is re-read right before the move -- same reason
+        # --secret rechecks before its write: the confirmation prompt above
+        # can have sat for any length of time. Before the writes as well as
+        # the deletes: a caller that went back to naming its secrets makes
+        # the environment copy idle, not only the delete unsafe, and a move
+        # with nothing to delete used to skip the recheck altogether and
+        # report that idle write as success (Codex, mikelward/repo#13).
+        reason = move.recheck()
+        if reason is not None:
+            for name, _env, _value, _env_exists in move.writes:
+                error(f"{name} not set: {reason}")
+            for name, env in move.deletes:
+                error(f"{name} kept: {reason}")
+            failed.append(f"credential:{move.label}")
+            continue
+        # No absent-then-created recheck for these writes, unlike --secret's:
+        # a --credential value is "what this name must hold", so a copy
+        # someone else set in the meantime is overwritten on purpose, and
+        # the plan already said OVERWRITES where one was there to begin
+        # with. _ensure_environment does its own recheck.
+        written = True
+        for name, env, value, env_exists in move.writes:
+            if not env_exists and not secrets_cmd._ensure_environment(repo, env):
+                written = False
+                failed.append(f"credential:{name}")
+                continue
+            if not secrets_cmd._write_secret(repo, name, env, value):
+                written = False
+                failed.append(f"credential:{name}")
+        if not written:
+            for name, env in move.deletes:
+                error(f"{name} kept: the write it waited on failed")
+            continue
+        for name, env in move.deletes:
+            try:
+                credentials.delete_secret(repo, name, env)
+            except gh.GhError as e:
+                error_lines(
+                    f"could not delete '{name}' from {repo}{f' (environment {env})' if env else ''}:",
+                    e.stderr,
+                )
+                failed.append(f"credential:{name}")
+                continue
+            print(f"{repo}: deleted '{name}'" + (f" (environment '{env}')" if env else ""))
+
+    for reason in credentials_plan.unfixed:
+        error(f"not fixed: {reason}")
+        failed.append(f"credential:{reason.split(':', 1)[0]}")
+    if credentials_plan.failed:
+        # The read failure is already in the plan above. Like an App-plan
+        # error, it fails this step alone: a ruleset or secret write must
+        # not be held back by a listing this step could not get.
+        failed.append("credentials")
 
     if failed:
         error("failed on: " + " ".join(failed))

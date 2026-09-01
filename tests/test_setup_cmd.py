@@ -1,3 +1,6 @@
+import base64
+import urllib.parse
+import hashlib
 import json
 import os
 import re
@@ -25,6 +28,13 @@ _MASTER_BRANCH_RE = re.compile(r"^repos/([^/]+/[^/]+)/branches/master$")
 _ACTIONS_SECRETS_RE = re.compile(r"^repos/([^/]+/[^/]+)/actions/secrets$")
 _ENV_SECRETS_RE = re.compile(r"^repos/([^/]+/[^/]+)/environments/([^/]+)/secrets$")
 _ENV_ONE_RE = re.compile(r"^repos/([^/]+/[^/]+)/environments/([^/]+)$")
+_ENVIRONMENTS_RE = re.compile(r"^repos/([^/]+/[^/]+)/environments$")
+_REPO_SECRET_ONE_RE = re.compile(r"^repos/([^/]+/[^/]+)/actions/secrets/([^/]+)$")
+_ENV_SECRET_ONE_RE = re.compile(r"^repos/([^/]+/[^/]+)/environments/([^/]+)/secrets/([^/]+)$")
+_WORKFLOWS_DIR_RE = re.compile(r"^repos/([^/]+/[^/]+)/contents/\.github/workflows(?:\?ref=(.+))?$")
+_WORKFLOW_FILE_RE = re.compile(r"^repos/([^/]+/[^/]+)/contents/\.github/workflows/([^/?]+)(?:\?ref=(.+))?$")
+_ROOT_CONTENTS_RE = re.compile(r"^repos/([^/]+/[^/]+)/contents(?:\?ref=(.+))?$")
+_BRANCHES_RE = re.compile(r"^repos/([^/]+/[^/]+)/branches\?per_page=100$")
 _USER_INSTALLATIONS_RE = re.compile(r"^user/installations$")
 _INSTALL_REPOS_RE = re.compile(r"^user/installations/([^/]+)/repositories$")
 _INSTALL_REPO_ONE_RE = re.compile(r"^user/installations/([^/]+)/repositories/([^/]+)$")
@@ -149,6 +159,27 @@ class FakeGh:
         self.set_fails = set()  # secret names whose `secret set` fails
         self.written_secrets = []  # (name, repo, env, value)
 
+        # -- fleet-credentials step state --
+        # None models a repository with no .github/workflows at all (404);
+        # a list is the file names the directory holds, each read back
+        # from workflow_texts (absent => empty file).
+        self.workflow_files = None
+        self.workflow_texts = {}
+        # From the second listing / second read of a file on: the state a
+        # recheck sees, modeling a change made while the plan waited on
+        # confirmation. None => unchanged; "error" (listing only) => the
+        # second listing fails.
+        self.workflow_files_after_recheck = None
+        # Other branches: name -> {workflow name: text}. A branch lists the
+        # default branch's workflows plus these; a text equal to the
+        # default's has the same blob sha and is not re-read.
+        self.branch_workflows = {}
+        self.workflow_texts_after_recheck = {}
+        self._workflow_reads = {}
+        self.root_contents_error = None  # stderr for the root listing, or None to succeed
+        self.deleted_secrets = []  # (name, env or None)
+        self.delete_fails = set()  # secret names whose DELETE fails
+
         # -- App-installation step state --
         self.installations = []  # (slug, id, selection, account)
         self.install_members = {}  # install_id -> set(full_name)
@@ -160,9 +191,16 @@ class FakeGh:
         key = env
         self._list_calls[key] = self._list_calls.get(key, 0) + 1
         count = self._list_calls[key]
-        if count >= 2 and key in self.fail_secret_recheck:
+        # The fleet-credentials step lists the repository secrets once, up
+        # front, before any --secret plan is built -- so at the repository
+        # level the --secret step's own plan read is the second call and its
+        # write-time recheck the third. Environment lists are unaffected:
+        # that step reads only the fleet environments (the three hubs and
+        # ci-commit-artifact), which no --secret test here targets.
+        recheck = 3 if env is None else 2
+        if count >= recheck and key in self.fail_secret_recheck:
             raise gh.GhError("gh: simulated failure on revalidation\n")
-        if count >= 2:
+        if count >= recheck:
             if env is None and self.secret_names_after_recheck is not None:
                 return self.secret_names_after_recheck
             if env is not None and env in self.env_secret_names_after_recheck:
@@ -268,6 +306,67 @@ class FakeGh:
                 raise gh.GhError(f"gh: HTTP 404: Not Found (.../{endpoint})\n")
             return "".join(n + "\n" for n in sorted(self._secret_names_for(None)))
 
+        m = _REPO_SECRET_ONE_RE.match(endpoint)
+        if m and method == "DELETE":
+            name = m.group(2)
+            if name in self.delete_fails:
+                raise gh.GhError("gh: HTTP 500: Internal Server Error\n")
+            self.secret_names = {n for n in self.secret_names if n.upper() != name.upper()}
+            self.deleted_secrets.append((name, None))
+            return ""
+
+        m = _ENV_SECRET_ONE_RE.match(endpoint)
+        if m and method == "DELETE":
+            env, name = m.group(2), m.group(3)
+            if name in self.delete_fails:
+                raise gh.GhError("gh: HTTP 500: Internal Server Error\n")
+            self.env_secret_names[env] = {
+                n for n in self.env_secret_names.get(env, set()) if n.upper() != name.upper()
+            }
+            self.deleted_secrets.append((name, env))
+            return ""
+
+        if _ENVIRONMENTS_RE.match(endpoint) and jq == ".environments[].name":
+            if self.repo_missing:
+                raise gh.GhError(f"gh: HTTP 404: Not Found (.../{endpoint})\n")
+            return "".join(n + "\n" for n in self.env_secret_names)
+
+        if _BRANCHES_RE.match(endpoint):
+            return "".join(n + "\n" for n in [self.default_branch, *self.branch_workflows])
+
+        m = _WORKFLOWS_DIR_RE.match(endpoint)
+        if m:
+            ref = urllib.parse.unquote(m.group(2)) if m.group(2) else None
+            if ref:
+                files = [*(self.workflow_files or []), *self.branch_workflows[ref]]
+                return "".join(f"{n} {self._blob(n, ref)}\n" for n in dict.fromkeys(files))
+            self._workflow_reads["/"] = self._workflow_reads.get("/", 0) + 1
+            files = self.workflow_files
+            if self._workflow_reads["/"] >= 2 and self.workflow_files_after_recheck is not None:
+                if self.workflow_files_after_recheck == "error":
+                    raise gh.GhError("gh: HTTP 500: boom\n")
+                files = self.workflow_files_after_recheck
+            if files is None:
+                raise gh.GhError(f"gh: HTTP 404: Not Found (.../{endpoint})\n")
+            return "".join(f"{n} {self._blob(n, None)}\n" for n in files)
+
+        m = _WORKFLOW_FILE_RE.match(endpoint)
+        if m and jq == ".content":
+            name, ref = m.group(2), (urllib.parse.unquote(m.group(3)) if m.group(3) else None)
+            if ref:
+                return base64.encodebytes(self._text(name, ref).encode()).decode()
+            self._workflow_reads[name] = self._workflow_reads.get(name, 0) + 1
+            if self._workflow_reads[name] >= 2 and name in self.workflow_texts_after_recheck:
+                text = self.workflow_texts_after_recheck[name]
+            else:
+                text = self.workflow_texts.get(name, "")
+            return base64.encodebytes(text.encode()).decode()
+
+        if _ROOT_CONTENTS_RE.match(endpoint):
+            if self.root_contents_error is not None:
+                raise gh.GhError(self.root_contents_error)
+            return "3\n"
+
         m = _ENV_SECRETS_RE.match(endpoint)
         if m:
             env = m.group(2)
@@ -317,6 +416,15 @@ class FakeGh:
             return ""
 
         raise AssertionError(f"unexpected endpoint: {endpoint} (method={method} jq={jq})")
+
+    def _text(self, name, ref):
+        """A workflow's text on `ref` (None: the default branch)."""
+        if ref and name in self.branch_workflows.get(ref, {}):
+            return self.branch_workflows[ref][name]
+        return self.workflow_texts.get(name, "")
+
+    def _blob(self, name, ref):
+        return hashlib.sha1(self._text(name, ref).encode()).hexdigest()
 
     def try_run(self, args):
         try:
@@ -1752,6 +1860,753 @@ class CombinedPlanTest(unittest.TestCase):
             code, _, err = _run(fake, ["--force", "--secret", f"TOKEN={path}", "--app", "codex", REPO])
         self.assertEqual(code, 0, err)
         self.assertIn("branch literally named 'master'", err)
+
+
+class CredentialsStepTest(unittest.TestCase):
+    """The fleet-credentials step: always on, it sets a supplied credential
+    in the environment it belongs in, deletes the copies that leaves
+    redundant and the ones nothing uses, and refuses to act under a caller
+    that still names its secrets. The combined plan goes to stderr (as the
+    rest of setup's does); a dry run prints it to stdout."""
+
+    INHERITING = (
+        "jobs:\n"
+        "  update:\n"
+        "    uses: mikelward/gradle-update/.github/workflows/gradle-update.yml@main\n"
+        "    permissions:\n"
+        "      contents: write\n"
+        "    # the reason\n"
+        "    secrets: inherit\n"
+        "    with:\n"
+        "      extra-repositories: ''\n"
+    )
+    NAMING = INHERITING.replace(
+        "    secrets: inherit\n", "    secrets:\n      token: ${{ secrets.GRADLE_UPDATE_PAT }}\n"
+    )
+    RUST_INHERITING = INHERITING.replace("gradle-update", "rust-update")
+    SYNC_INHERITING = (
+        "jobs:\n"
+        "  build:\n"
+        "    steps:\n"
+        "      - uses: mikelward/lanes@main\n"
+        "  sync:\n"
+        "    needs: build\n"
+        "    uses: mikelward/ci-commit-artifact/.github/workflows/commit-artifact.yml@main\n"
+        "    with:\n"
+        "      artifact-name: rendered\n"
+        "    secrets: inherit\n"
+    )
+    SYNC_NAMING = SYNC_INHERITING.replace(
+        "    secrets: inherit\n", "    secrets:\n      push-token: ${{ secrets.CI_COMMIT_ARTIFACT_TOKEN }}\n"
+    )
+
+    def _consumer(self, text=INHERITING, hub="gradle-update"):
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml", f"{hub}.yml"]
+        fake.workflow_texts = {f"{hub}.yml": text}
+        return fake
+
+    def _order(self, fake):
+        """Indexes of the environment creation, the first secret write and
+        the first delete in the fake's call log (None where absent)."""
+
+        def first(predicate):
+            return next((i for i, c in enumerate(fake.calls) if predicate(c)), None)
+
+        return (
+            first(lambda c: c[1:3] == ["--method", "PUT"] and "/environments/" in c[3]),
+            first(lambda c: c[:2] == ["secret", "set"]),
+            first(lambda c: c[1:3] == ["--method", "DELETE"]),
+        )
+
+    def test_a_repository_in_shape_needs_nothing(self):
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        # Nothing to plan, so the no-rules early return still applies:
+        # no plan printed, no confirmation asked of a non-terminal.
+        code, out, err = _run(fake, ["--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(err, "")
+        # Alongside another step, the section says so.
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+        code, out, err = _run(fake, ["--dry-run", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("  fleet credentials:\n    nothing to do\n", out)
+        self.assertEqual(fake.written_secrets, [])
+        self.assertEqual(fake.deleted_secrets, [])
+
+    def test_a_supplied_credential_moves_into_the_hub_environment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _secret_file(tmp, "pat.txt", b"ghp_example")
+            fake = self._consumer()
+            fake.secret_names = {"GRADLE_UPDATE_PAT"}
+            code, out, err = _run(
+                fake, ["--force", "--no-rules", "--credential", f"GRADLE_UPDATE_PAT={path}", REPO]
+            )
+        self.assertEqual(code, 0, err)
+        self.assertIn("gradle-update: set GRADLE_UPDATE_PAT in environment 'gradle-update' (new)", err)
+        self.assertIn(
+            "gradle-update: delete repository secret GRADLE_UPDATE_PAT -- the 'gradle-update' "
+            "environment holds the credential once set",
+            err,
+        )
+        self.assertEqual(
+            fake.written_secrets, [("GRADLE_UPDATE_PAT", REPO, "gradle-update", b"ghp_example")]
+        )
+        self.assertEqual(fake.deleted_secrets, [("GRADLE_UPDATE_PAT", None)])
+        # The environment is created before the write, and the repository
+        # copy deleted only after it: the copy is what keeps the batch
+        # working until the environment holds the credential.
+        env_put, write, delete = self._order(fake)
+        self.assertIsNotNone(env_put)
+        self.assertLess(env_put, write)
+        self.assertLess(write, delete)
+        self.assertIn(f"{REPO}: deleted 'GRADLE_UPDATE_PAT'", out)
+
+    def test_a_repository_copy_is_deleted_once_the_environment_already_holds_one(self):
+        fake = self._consumer()
+        fake.secret_names = {"GRADLE_UPDATE_PAT"}
+        fake.env_secret_names = {"gradle-update": {"GRADLE_UPDATE_PAT"}}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "gradle-update: delete repository secret GRADLE_UPDATE_PAT -- the 'gradle-update' "
+            "environment holds the credential\n",
+            err,
+        )
+        self.assertEqual(fake.written_secrets, [])
+        self.assertEqual(fake.deleted_secrets, [("GRADLE_UPDATE_PAT", None)])
+
+    def test_a_caller_with_the_yaml_extension_is_read_as_the_batch(self):
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml", "gradle-update.yaml"]
+        fake.workflow_texts = {"gradle-update.yaml": self.INHERITING}
+        fake.secret_names = {"GRADLE_UPDATE_PAT"}
+        fake.env_secret_names = {"gradle-update": {"GRADLE_UPDATE_PAT"}}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.deleted_secrets, [("GRADLE_UPDATE_PAT", None)])
+        self.assertNotIn("nothing uses it", err)
+
+    def test_every_caller_file_of_a_batch_must_inherit(self):
+        # `<hub>.yml` and `<hub>.yaml` can both exist, and GitHub runs both;
+        # the one that names its secrets would be stranded by the delete the
+        # other justifies.
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml", "gradle-update.yml", "gradle-update.yaml"]
+        fake.workflow_texts = {"gradle-update.yml": self.INHERITING, "gradle-update.yaml": self.NAMING}
+        fake.secret_names = {"GRADLE_UPDATE_PAT"}
+        fake.env_secret_names = {"gradle-update": {"GRADLE_UPDATE_PAT"}}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("gradle-update: gradle-update.yaml passes its secrets by name", out + err)
+        self.assertEqual(fake.deleted_secrets, [])
+
+    def test_a_second_caller_added_while_the_plan_waited_keeps_the_repository_copy(self):
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml", "gradle-update.yml"]
+        fake.workflow_texts = {"gradle-update.yml": self.INHERITING, "gradle-update.yaml": self.NAMING}
+        fake.workflow_files_after_recheck = ["ci.yml", "gradle-update.yml", "gradle-update.yaml"]
+        fake.secret_names = {"GRADLE_UPDATE_PAT"}
+        fake.env_secret_names = {"gradle-update": {"GRADLE_UPDATE_PAT"}}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "GRADLE_UPDATE_PAT kept: the callers changed since the plan was built "
+            "(gradle-update.yaml, gradle-update.yml now)",
+            err,
+        )
+        self.assertEqual(fake.deleted_secrets, [])
+
+    def test_a_caller_naming_the_repository_in_another_case_is_the_caller(self):
+        # Owner and repository names are case-insensitive on GitHub, so
+        # this is the commit-back workflow's caller and its token is in
+        # use: the repository copy moves, the environment copy stays.
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        assert "mikelward/ci-commit-artifact" in self.SYNC_INHERITING
+        fake.workflow_texts = {
+            "ci.yml": self.SYNC_INHERITING.replace("mikelward/ci-commit-artifact", "MikelWard/CI-Commit-Artifact")
+        }
+        fake.secret_names = {"CI_COMMIT_ARTIFACT_TOKEN"}
+        fake.env_secret_names = {"ci-commit-artifact": {"CI_COMMIT_ARTIFACT_TOKEN"}}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.deleted_secrets, [("CI_COMMIT_ARTIFACT_TOKEN", None)])
+
+    def test_a_caller_under_another_name_holds_the_move_back(self):
+        # GitHub runs a workflow whatever it is named; a second caller that
+        # names its secrets would be stranded by the delete the named
+        # caller justifies.
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml", "gradle-update.yml", "weekly.yml"]
+        fake.workflow_texts = {"gradle-update.yml": self.INHERITING, "weekly.yml": self.NAMING}
+        fake.secret_names = {"GRADLE_UPDATE_PAT"}
+        fake.env_secret_names = {"gradle-update": {"GRADLE_UPDATE_PAT"}}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("gradle-update: weekly.yml passes its secrets by name", out + err)
+        self.assertEqual(fake.deleted_secrets, [])
+
+    def test_a_credential_removed_from_the_environment_while_the_plan_waited_keeps_the_copy(self):
+        # The plan deletes the repository copy because the environment
+        # already holds the credential; by apply time it does not.
+        fake = self._consumer()
+        fake.secret_names = {"GRADLE_UPDATE_PAT"}
+        fake.env_secret_names = {"gradle-update": {"GRADLE_UPDATE_PAT"}}
+        fake.env_secret_names_after_recheck = {"gradle-update": set()}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "GRADLE_UPDATE_PAT kept: the 'gradle-update' environment no longer holds the credential", err
+        )
+        self.assertEqual(fake.deleted_secrets, [])
+
+    def test_a_supplied_credential_nothing_uses_is_still_reported(self):
+        # Nothing to move and no ruleset step used to take the silent early
+        # return, leaving no trace of the value the user handed in.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _secret_file(tmp, "pat.txt")
+            fake = FakeGh()
+            fake.workflow_files = ["ci.yml"]
+            code, out, err = _run(
+                fake, ["--no-rules", "--credential", f"NPM_UPDATE_PAT={path}", REPO], isatty=False
+            )
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "npm-update: NPM_UPDATE_PAT not set -- no workflow here calls mikelward/npm-update, "
+            "so nothing uses it",
+            out + err,
+        )
+        self.assertEqual(fake.written_secrets, [])
+
+    def test_a_second_caller_the_reader_cannot_resolve_in_a_read_file_holds_the_move_back(self):
+        fake = self._consumer(
+            self.INHERITING
+            + "  weekly: {uses: mikelward/gradle-update/.github/workflows/gradle-update.yml@main, "
+            "secrets: {token: x}}\n"
+        )
+        fake.secret_names = {"GRADLE_UPDATE_PAT"}
+        fake.env_secret_names = {"gradle-update": {"GRADLE_UPDATE_PAT"}}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "NOT FIXED: gradle-update: gradle-update.yml mentions mikelward/gradle-update/ in a shape "
+            "this cannot read as a caller",
+            err,
+        )
+        self.assertEqual(fake.deleted_secrets, [])
+
+    def test_a_caller_on_another_branch_is_read_too(self):
+        # A push to `feature` runs its workflows from `feature`, so a caller
+        # that exists only there still needs the credential: not unused,
+        # and held to the same `inherit` test as one on the default branch.
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        fake.workflow_texts = {"ci.yml": "jobs: {}\n"}
+        fake.branch_workflows = {"feature": {"ci.yml": "jobs: {}\n", "weekly.yml": self.NAMING}}
+        fake.secret_names = {"GRADLE_UPDATE_PAT"}
+        fake.env_secret_names = {"gradle-update": {"GRADLE_UPDATE_PAT"}}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("gradle-update: weekly.yml on feature passes its secrets by name", out + err)
+        self.assertEqual(fake.deleted_secrets, [])
+        # The unchanged ci.yml is not re-read on the branch: same blob.
+        self.assertFalse(any("ci.yml?ref=feature" in " ".join(c) for c in fake.calls))
+        # A branch name with URL metacharacters reaches the API encoded;
+        # sent raw, `feature/x#1` would read as `feature/x`.
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        fake.branch_workflows = {"feature/x": {}, "feature/x#1": {"weekly.yml": self.NAMING}}
+        fake.secret_names = {"GRADLE_UPDATE_PAT"}
+        fake.env_secret_names = {"gradle-update": {"GRADLE_UPDATE_PAT"}}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("gradle-update: weekly.yml on feature/x#1 passes its secrets by name", out + err)
+        self.assertTrue(any("?ref=feature%2Fx%231" in " ".join(c) for c in fake.calls))
+        self.assertEqual(fake.deleted_secrets, [])
+        # Inheriting there, the caller lets the move go ahead.
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        fake.branch_workflows = {"feature": {"weekly.yml": self.INHERITING}}
+        fake.secret_names = {"GRADLE_UPDATE_PAT"}
+        fake.env_secret_names = {"gradle-update": {"GRADLE_UPDATE_PAT"}}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.deleted_secrets, [("GRADLE_UPDATE_PAT", None)])
+        self.assertNotIn("nothing uses it", out + err)
+
+    def test_a_credential_already_in_place_is_left_alone(self):
+        fake = self._consumer()
+        fake.env_secret_names = {"gradle-update": {"GRADLE_UPDATE_PAT"}}
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+        code, out, err = _run(fake, ["--dry-run", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("gradle-update: the credential lives in the 'gradle-update' environment", out)
+        self.assertNotIn("NOT FIXED", out)
+
+    def test_without_a_value_the_move_is_reported_as_not_fixed(self):
+        fake = self._consumer()
+        fake.secret_names = {"GRADLE_UPDATE_PAT"}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "NOT FIXED: gradle-update: environment 'gradle-update' holds no credential -- pass "
+            "--credential GRADLE_UPDATE_PAT=PATH to set one; GRADLE_UPDATE_PAT stays a "
+            "repository secret until then",
+            err,
+        )
+        self.assertIn("not fixed: gradle-update:", err)
+        self.assertIn("failed on: credential:gradle-update", err)
+        self.assertEqual(fake.deleted_secrets, [])
+
+    def test_a_caller_naming_its_secrets_blocks_the_move(self):
+        # An environment secret reaches a called workflow only through
+        # `secrets: inherit`; a caller still passing it by name would be
+        # handed nothing once the repository copy is gone.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _secret_file(tmp, "pat.txt")
+            fake = self._consumer(self.NAMING)
+            fake.secret_names = {"GRADLE_UPDATE_PAT"}
+            code, out, err = _run(
+                fake, ["--force", "--no-rules", "--credential", f"GRADLE_UPDATE_PAT={path}", REPO]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "NOT FIXED: gradle-update: gradle-update.yml passes its secrets by name, so a "
+            "credential in the 'gradle-update' environment would never reach it -- convert the "
+            "caller to `secrets: inherit` first; GRADLE_UPDATE_PAT left as is",
+            err,
+        )
+        self.assertEqual(fake.written_secrets, [])
+        self.assertEqual(fake.deleted_secrets, [])
+
+    def test_a_caller_naming_its_secrets_keeps_the_repository_copy(self):
+        # Even with the environment already holding one: the copy is the
+        # one the caller actually passes.
+        fake = self._consumer(self.NAMING)
+        fake.secret_names = {"GRADLE_UPDATE_PAT"}
+        fake.env_secret_names = {"gradle-update": {"GRADLE_UPDATE_PAT"}}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("passes its secrets by name", err)
+        self.assertEqual(fake.deleted_secrets, [])
+
+    def test_a_caller_naming_its_secrets_leaves_a_scoped_credential_idle(self):
+        # Nothing to write or delete, but the credential the environment
+        # holds can never reach a caller that names its secrets -- the
+        # batch runs as GITHUB_TOKEN, quietly. Not "in shape".
+        fake = self._consumer(self.NAMING)
+        fake.env_secret_names = {"gradle-update": {"GRADLE_UPDATE_PAT"}}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "NOT FIXED: gradle-update: gradle-update.yml passes its secrets by name, so a "
+            "credential in the 'gradle-update' environment would never reach it -- convert the "
+            "caller to `secrets: inherit` first\n",
+            err,
+        )
+        self.assertNotIn("left as is", err)
+        self.assertNotIn("lives in the", err)
+
+    def test_a_caller_changed_while_the_plan_waited_keeps_the_repository_copy(self):
+        # The plan saw an inheriting caller; by apply time it names its
+        # secrets again. The write would be idle and the delete would
+        # strand the batch, so the move is re-checked before either.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _secret_file(tmp, "pat.txt")
+            fake = self._consumer()
+            fake.workflow_texts_after_recheck = {"gradle-update.yml": self.NAMING}
+            fake.secret_names = {"GRADLE_UPDATE_PAT"}
+            code, out, err = _run(
+                fake, ["--force", "--no-rules", "--credential", f"GRADLE_UPDATE_PAT={path}", REPO]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "GRADLE_UPDATE_PAT kept: gradle-update.yml no longer passes `secrets: inherit`", err
+        )
+        self.assertIn(
+            "GRADLE_UPDATE_PAT not set: gradle-update.yml no longer passes `secrets: inherit`", err
+        )
+        self.assertIn("failed on: credential:gradle-update", err)
+        self.assertEqual(fake.written_secrets, [])
+        self.assertEqual(fake.deleted_secrets, [])
+        self.assertIn("GRADLE_UPDATE_PAT", fake.secret_names)
+
+    def test_a_move_with_nothing_to_delete_is_re_validated_too(self):
+        # A new credential with no repository copy is writes only; the
+        # caller going back to naming its secrets makes that write idle,
+        # which is not a success.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _secret_file(tmp, "pat.txt")
+            fake = self._consumer()
+            fake.workflow_texts_after_recheck = {"gradle-update.yml": self.NAMING}
+            code, out, err = _run(
+                fake, ["--force", "--no-rules", "--credential", f"GRADLE_UPDATE_PAT={path}", REPO]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "GRADLE_UPDATE_PAT not set: gradle-update.yml no longer passes `secrets: inherit`", err
+        )
+        self.assertIn("failed on: credential:gradle-update", err)
+        self.assertEqual(fake.written_secrets, [])
+        self.assertEqual(fake.deleted_secrets, [])
+
+    def test_a_caller_added_while_the_plan_waited_keeps_a_stale_copy(self):
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        fake.workflow_files_after_recheck = ["ci.yml", "npm-update.yml"]
+        fake.workflow_texts = {"npm-update.yml": self.INHERITING.replace("gradle-update", "npm-update")}
+        fake.secret_names = {"NPM_UPDATE_PAT"}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("NPM_UPDATE_PAT kept: npm-update.yml appeared since the plan was built", err)
+        self.assertEqual(fake.deleted_secrets, [])
+
+    def test_a_delete_that_cannot_be_re_validated_does_not_happen(self):
+        fake = self._consumer()
+        fake.workflow_files_after_recheck = "error"
+        fake.secret_names = {"GRADLE_UPDATE_PAT"}
+        fake.env_secret_names = {"gradle-update": {"GRADLE_UPDATE_PAT"}}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            f"GRADLE_UPDATE_PAT kept: could not list {REPO}'s workflows (the plan could not be re-validated)",
+            err,
+        )
+        self.assertEqual(fake.deleted_secrets, [])
+
+    def test_the_commit_back_token_delete_is_re_validated_too(self):
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        fake.workflow_texts = {"ci.yml": self.SYNC_INHERITING}
+        fake.workflow_texts_after_recheck = {"ci.yml": self.SYNC_NAMING}
+        fake.secret_names = {"CI_COMMIT_ARTIFACT_TOKEN"}
+        fake.env_secret_names = {"ci-commit-artifact": {"CI_COMMIT_ARTIFACT_TOKEN"}}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("CI_COMMIT_ARTIFACT_TOKEN kept: ci.yml no longer passes `secrets: inherit`", err)
+        self.assertEqual(fake.deleted_secrets, [])
+
+    def test_a_caller_file_that_calls_nothing_is_no_caller(self):
+        # What a workflow calls decides, not what it is named: a
+        # `gradle-update.yml` with no job calling the batch means the batch
+        # does not run here, so the value is left unset and the repository
+        # copy goes as unused.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _secret_file(tmp, "pat.txt")
+            fake = self._consumer("name: gradle update\non: push\njobs: {}\n")
+            fake.secret_names = {"GRADLE_UPDATE_PAT"}
+            code, out, err = _run(
+                fake, ["--force", "--no-rules", "--credential", f"GRADLE_UPDATE_PAT={path}", REPO]
+            )
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "gradle-update: GRADLE_UPDATE_PAT not set -- no workflow here calls mikelward/gradle-update, "
+            "so nothing uses it",
+            err,
+        )
+        self.assertEqual(fake.written_secrets, [])
+        self.assertEqual(fake.deleted_secrets, [("GRADLE_UPDATE_PAT", None)])
+
+    def test_stale_credentials_are_deleted_wherever_they_sit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _secret_file(tmp, "pat.txt")
+            fake = FakeGh()
+            fake.workflow_files = ["ci.yml"]
+            fake.secret_names = {"NPM_UPDATE_PAT", "OTHER"}
+            fake.env_secret_names = {"rust-update": {"RUST_UPDATE_PAT", "KEEP"}, "lanes": {"LANES_TOKEN"}}
+            code, out, err = _run(
+                fake, ["--force", "--no-rules", "--credential", f"NPM_UPDATE_PAT={path}", REPO]
+            )
+        self.assertEqual(code, 0, err)
+        self.assertEqual(
+            fake.deleted_secrets, [("NPM_UPDATE_PAT", None), ("RUST_UPDATE_PAT", "rust-update")]
+        )
+        self.assertEqual(fake.written_secrets, [])
+        self.assertIn(
+            "npm-update: delete repository secret NPM_UPDATE_PAT -- no workflow here calls "
+            "mikelward/npm-update, so nothing uses it",
+            err,
+        )
+        self.assertIn(
+            "rust-update: delete RUST_UPDATE_PAT from environment 'rust-update' -- no workflow "
+            "here calls mikelward/rust-update, so nothing uses it",
+            err,
+        )
+        # The supplied value is not set on a repository that runs no such
+        # batch -- that is the whole difference from --secret.
+        self.assertIn("npm-update: NPM_UPDATE_PAT not set -- no workflow here calls mikelward/npm-update", err)
+        self.assertIn("OTHER", fake.secret_names)
+        self.assertIn("KEEP", fake.env_secret_names["rust-update"])
+        self.assertEqual(fake.env_secret_names["lanes"], {"LANES_TOKEN"})
+
+    def test_the_commit_back_token_moves_like_a_batch_credential(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _secret_file(tmp, "token.txt", b"github_pat_example")
+            fake = FakeGh()
+            fake.workflow_files = ["ci.yml"]
+            fake.workflow_texts = {"ci.yml": self.SYNC_INHERITING}
+            fake.secret_names = {"CI_COMMIT_ARTIFACT_TOKEN"}
+            code, out, err = _run(
+                fake,
+                ["--force", "--no-rules", "--credential", f"CI_COMMIT_ARTIFACT_TOKEN={path}", REPO],
+            )
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "ci-commit-artifact: set CI_COMMIT_ARTIFACT_TOKEN in environment 'ci-commit-artifact' (new)",
+            err,
+        )
+        self.assertEqual(
+            fake.written_secrets,
+            [("CI_COMMIT_ARTIFACT_TOKEN", REPO, "ci-commit-artifact", b"github_pat_example")],
+        )
+        self.assertEqual(fake.deleted_secrets, [("CI_COMMIT_ARTIFACT_TOKEN", None)])
+
+    def test_the_commit_back_token_stays_while_any_caller_names_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _secret_file(tmp, "token.txt")
+            fake = FakeGh()
+            fake.workflow_files = ["ci.yml", "nightly.yml"]
+            fake.workflow_texts = {"ci.yml": self.SYNC_INHERITING, "nightly.yml": self.SYNC_NAMING}
+            fake.secret_names = {"CI_COMMIT_ARTIFACT_TOKEN"}
+            code, out, err = _run(
+                fake,
+                ["--force", "--no-rules", "--credential", f"CI_COMMIT_ARTIFACT_TOKEN={path}", REPO],
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("NOT FIXED: ci-commit-artifact: nightly.yml passes its secrets by name", err)
+        self.assertEqual(fake.written_secrets, [])
+        self.assertEqual(fake.deleted_secrets, [])
+
+    def test_a_mention_the_reader_cannot_parse_blocks_the_stale_delete(self):
+        # Flow style (or any shape the fleet does not write) is not a
+        # caller the reader can see, but it IS a mention -- and "unused"
+        # must mean absent from the text, not unparsed. Nothing deleted.
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml", "batch.yml"]
+        fake.workflow_texts = {
+            "ci.yml": "jobs: {sync: {uses: mikelward/ci-commit-artifact/.github/workflows/commit-artifact.yml@main, secrets: inherit}}\n",
+            "batch.yml": "jobs: {update: {uses: mikelward/npm-update/.github/workflows/npm-update.yml@main, secrets: inherit}}\n",
+        }
+        fake.secret_names = {"CI_COMMIT_ARTIFACT_TOKEN", "NPM_UPDATE_PAT"}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "NOT FIXED: ci-commit-artifact: ci.yml mentions mikelward/ci-commit-artifact/ in a shape "
+            "this cannot read as a caller -- whether it is used there cannot be told, so nothing is deleted",
+            err,
+        )
+        self.assertIn(
+            "NOT FIXED: npm-update: batch.yml mentions mikelward/npm-update/ in a shape this cannot "
+            "read as a caller",
+            err,
+        )
+        self.assertEqual(fake.deleted_secrets, [])
+        self.assertEqual(fake.secret_names, {"CI_COMMIT_ARTIFACT_TOKEN", "NPM_UPDATE_PAT"})
+
+    def test_a_mention_appearing_while_the_plan_waited_keeps_a_stale_copy(self):
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        fake.workflow_texts = {"ci.yml": "jobs:\n  build:\n    steps:\n      - run: true\n"}
+        fake.workflow_texts_after_recheck = {
+            "ci.yml": "jobs: {sync: {uses: mikelward/ci-commit-artifact/.github/workflows/commit-artifact.yml@main}}\n"
+        }
+        fake.secret_names = {"CI_COMMIT_ARTIFACT_TOKEN"}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "CI_COMMIT_ARTIFACT_TOKEN kept: a workflow now mentions mikelward/ci-commit-artifact/", err
+        )
+        self.assertEqual(fake.deleted_secrets, [])
+
+    def test_an_unused_commit_back_token_is_stale(self):
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        fake.workflow_texts = {"ci.yml": "jobs:\n  build:\n    steps:\n      - uses: mikelward/lanes@main\n"}
+        fake.secret_names = {"CI_COMMIT_ARTIFACT_TOKEN"}
+        fake.env_secret_names = {"ci-commit-artifact": {"CI_COMMIT_ARTIFACT_TOKEN"}}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "ci-commit-artifact: delete repository secret CI_COMMIT_ARTIFACT_TOKEN -- no workflow "
+            "here calls mikelward/ci-commit-artifact, so nothing uses it",
+            err,
+        )
+        self.assertEqual(
+            fake.deleted_secrets,
+            [("CI_COMMIT_ARTIFACT_TOKEN", None), ("CI_COMMIT_ARTIFACT_TOKEN", "ci-commit-artifact")],
+        )
+
+    def test_half_an_app_pair_in_the_environment_asks_for_the_other_half(self):
+        fake = self._consumer(self.RUST_INHERITING, hub="rust-update")
+        fake.secret_names = {"RUST_UPDATE_APP_PRIVATE_KEY"}
+        fake.env_secret_names = {"rust-update": {"RUST_UPDATE_APP_ID"}}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "pass --credential RUST_UPDATE_APP_PRIVATE_KEY=PATH to set one; "
+            "RUST_UPDATE_APP_PRIVATE_KEY stays a repository secret until then",
+            err,
+        )
+        self.assertEqual(fake.deleted_secrets, [])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _secret_file(tmp, "key.pem", b"-----BEGIN EXAMPLE-----")
+            fake = self._consumer(self.RUST_INHERITING, hub="rust-update")
+            fake.secret_names = {"RUST_UPDATE_APP_PRIVATE_KEY"}
+            fake.env_secret_names = {"rust-update": {"RUST_UPDATE_APP_ID"}}
+            code, out, err = _run(
+                fake,
+                ["--force", "--no-rules", "--credential", f"RUST_UPDATE_APP_PRIVATE_KEY={path}", REPO],
+            )
+        self.assertEqual(code, 0, err)
+        self.assertEqual(
+            fake.written_secrets,
+            [("RUST_UPDATE_APP_PRIVATE_KEY", REPO, "rust-update", b"-----BEGIN EXAMPLE-----")],
+        )
+        self.assertEqual(fake.deleted_secrets, [("RUST_UPDATE_APP_PRIVATE_KEY", None)])
+        # The environment already existed, so it was not re-PUT (which
+        # would reset its protection settings).
+        env_put, write, delete = self._order(fake)
+        self.assertIsNone(env_put)
+
+    def test_an_environment_listed_in_another_case_is_written_under_that_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _secret_file(tmp, "pat.txt")
+            fake = self._consumer()
+            fake.secret_names = {"gradle_update_pat"}
+            fake.env_secret_names = {"Gradle-Update": set()}
+            code, out, err = _run(
+                fake, ["--force", "--no-rules", "--credential", f"gradle_update_pat={path}", REPO]
+            )
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.written_secrets, [("GRADLE_UPDATE_PAT", REPO, "Gradle-Update", b"sekrit")])
+        self.assertEqual(fake.deleted_secrets, [("GRADLE_UPDATE_PAT", None)])
+        self.assertEqual(fake.secret_names, set())
+
+    def test_a_failed_write_keeps_the_repository_copy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _secret_file(tmp, "pat.txt")
+            fake = self._consumer()
+            fake.secret_names = {"GRADLE_UPDATE_PAT"}
+            fake.set_fails = {"GRADLE_UPDATE_PAT"}
+            code, out, err = _run(
+                fake, ["--force", "--no-rules", "--credential", f"GRADLE_UPDATE_PAT={path}", REPO]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("GRADLE_UPDATE_PAT kept: the write it waited on failed", err)
+        self.assertIn("failed on: credential:GRADLE_UPDATE_PAT", err)
+        self.assertEqual(fake.deleted_secrets, [])
+
+    def test_a_failed_delete_fails_the_run(self):
+        fake = self._consumer()
+        fake.secret_names = {"GRADLE_UPDATE_PAT"}
+        fake.env_secret_names = {"gradle-update": {"GRADLE_UPDATE_PAT"}}
+        fake.delete_fails = {"GRADLE_UPDATE_PAT"}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(f"could not delete 'GRADLE_UPDATE_PAT' from {REPO}:", err)
+        self.assertIn("failed on: credential:GRADLE_UPDATE_PAT", err)
+
+    def test_a_failed_read_fails_this_step_alone(self):
+        # A hidden workflows directory (a token without Contents access
+        # reads as 404, and so does the root listing) is not an answer, so
+        # nothing is deleted as stale -- but a --secret asked for in the
+        # same run still goes through, as every other step does past a
+        # failed one.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _secret_file(tmp, "value.txt")
+            fake = FakeGh()
+            fake.secret_names = {"NPM_UPDATE_PAT"}
+            fake.root_contents_error = "gh: HTTP 404: Not Found\n"
+            code, out, err = _run(fake, ["--force", "--no-rules", "--secret", f"TOKEN@lanes={path}", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(f"could not tell whether {REPO} has workflows", err)
+        self.assertIn("failed on: credentials", err)
+        self.assertEqual(fake.deleted_secrets, [])
+        self.assertEqual(fake.written_secrets, [("TOKEN", REPO, "lanes", b"sekrit")])
+
+    def test_a_dry_run_shows_the_plan_and_changes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _secret_file(tmp, "pat.txt")
+            fake = self._consumer()
+            fake.secret_names = {"GRADLE_UPDATE_PAT"}
+            code, out, err = _run(
+                fake,
+                ["--dry-run", "--no-rules", "--credential", f"GRADLE_UPDATE_PAT={path}", REPO],
+            )
+            self.assertEqual(code, 0, err)
+            self.assertIn("gradle-update: set GRADLE_UPDATE_PAT in environment 'gradle-update' (new)", out)
+            self.assertEqual(fake.written_secrets, [])
+            self.assertEqual(fake.deleted_secrets, [])
+            # A NOT FIXED line is an exit 1 in a dry run too, as the real
+            # run's would be.
+            fake = self._consumer()
+            fake.secret_names = {"GRADLE_UPDATE_PAT"}
+            code, out, err = _run(fake, ["--dry-run", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("NOT FIXED: gradle-update:", out)
+
+    def test_a_delete_needs_confirmation(self):
+        fake = self._consumer()
+        fake.secret_names = {"GRADLE_UPDATE_PAT"}
+        fake.env_secret_names = {"gradle-update": {"GRADLE_UPDATE_PAT"}}
+        code, out, err = _run(fake, ["--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("stdin is not a terminal", err)
+        self.assertEqual(fake.deleted_secrets, [])
+
+    def test_a_fleet_credential_under_secret_is_refused(self):
+        # --secret NPM_UPDATE_PAT=PATH writes the repository copy this step
+        # removes, and the plan was built before that write, so the copy
+        # would survive a clean exit; in its own environment it is a write
+        # the plan does not know about either, so the step would still
+        # report the credential missing and keep the repository copy.
+        # Refused up front whatever scope it names, with the flag that does
+        # the whole move.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _secret_file(tmp, "pat.txt")
+            for spec in [
+                f"NPM_UPDATE_PAT={path}",
+                f"npm_update_pat={path}",
+                f"NPM_UPDATE_PAT@production={path}",
+                f"NPM_UPDATE_PAT@npm-update={path}",
+            ]:
+                for extra in ([], ["--credential", f"NPM_UPDATE_PAT={path}"]):
+                    fake = FakeGh()
+                    code, out, err = _run(fake, ["--force", "--no-rules", "--secret", spec, *extra, REPO])
+                    self.assertEqual(code, 2, (spec, extra, err))
+                    self.assertIn("names the fleet credential NPM_UPDATE_PAT", err)
+                    self.assertIn("Use --credential NPM_UPDATE_PAT=PATH instead", err)
+                    self.assertEqual(fake.calls, [])
+
+    def test_credential_specs_are_validated_up_front(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _secret_file(tmp, "pat.txt")
+            empty = _secret_file(tmp, "empty.txt", b"")
+            cases = [
+                ([f"RANDOM_TOKEN={path}"], "is not a fleet credential"),
+                ([f"GRADLE_UPDATE_PAT{path}"], "missing '='"),
+                ([f"={path}"], "empty NAME"),
+                (["GRADLE_UPDATE_PAT="], "empty PATH"),
+                ([f"GRADLE_UPDATE_PAT={path}", f"gradle_update_pat={path}"], "repeats an earlier"),
+                ([f"GRADLE_UPDATE_PAT={tmp}/missing.txt"], "cannot read"),
+                ([f"GRADLE_UPDATE_PAT={empty}"], "is empty"),
+            ]
+            for raws, message in cases:
+                fake = FakeGh()
+                argv = ["--force", "--no-rules"]
+                for raw in raws:
+                    argv += ["--credential", raw]
+                code, out, err = _run(fake, argv + [REPO])
+                self.assertEqual(code, 2, (raws, err))
+                self.assertIn(message, err)
+                self.assertEqual(fake.calls, [], raws)
+        # The rejection names what the flag is for.
+        fake = FakeGh()
+        code, out, err = _run(fake, ["--force", "--no-rules", "--credential", "RANDOM_TOKEN=x", REPO])
+        self.assertIn("CI_COMMIT_ARTIFACT_TOKEN (environment 'ci-commit-artifact')", err)
+        self.assertIn("--secret NAME[@ENV]=PATH sets it where you say", err)
 
 
 if __name__ == "__main__":

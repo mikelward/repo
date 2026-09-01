@@ -40,7 +40,8 @@ Run `./repo` directly from a checkout; nothing to install.
 repo list [--owner OWNER] [--include-forks] [--include-archived]
 repo secrets --name NAME [--env ENV] --file PATH [--force] OWNER/REPO...
 repo setup [--dry-run] [--force] [--no-rules] [--rule CHECK]...
-           [--secret NAME[@ENV]=PATH]... [--app SLUG]... OWNER/REPO
+           [--secret NAME[@ENV]=PATH]... [--credential NAME=PATH]...
+           [--app SLUG]... OWNER/REPO
 repo audit [--branch NAME] OWNER/REPO [CHECK...]
 ```
 
@@ -81,8 +82,22 @@ every other repository-level secret is listed by name for review. A repository t
 batches arm it on their pull requests. `[FIX]` findings do not fail the audit
 yet (see `TODO.md`): the layout is being rolled out through `repo setup`.
 
-Set one where it belongs with
-`repo secrets --name GRADLE_UPDATE_PAT --env gradle-update --file token.txt OWNER/REPO...`
-(or `repo setup --secret GRADLE_UPDATE_PAT@gradle-update=token.txt OWNER/REPO`); `repo setup` is being taught to make the whole move itself.
+`repo setup` makes the move. Its fleet-credentials step is always on: for
+each batch the repository runs (by whichever workflows call it from a job,
+whatever they are named, on any branch) and for the
+commit-back workflow (by a job calling it), a value passed as
+`--credential NAME=PATH` is set in the environment the name belongs in, the
+repository-level copy is deleted once the environment holds a usable
+credential, and a copy for a workflow the repository does not use is deleted
+wherever it sits. A value for a workflow the repository does not use is left
+unset, which is the difference from `--secret` (which refuses a fleet
+credential's name outright, whatever scope it names: `--credential` is the
+one flag that places it). It refuses -- and says so, as
+`NOT FIXED`, exiting 1 -- while the caller still passes its secrets by name
+(an environment secret reaches a called workflow only through
+`secrets: inherit`, so the move would hand the workflow nothing) or when the
+environment holds nothing and no value was given (GitHub never returns a
+secret's value, so a move needs it handed in). Across a fleet:
+`repo list | xargs -n1 repo setup --force --credential NPM_UPDATE_PAT=pat.txt --credential GRADLE_UPDATE_PAT=pat.txt --credential RUST_UPDATE_PAT=pat.txt --credential CI_COMMIT_ARTIFACT_TOKEN=token.txt`.
 See `TODO.md` for where the port deliberately diverges
 from the shell porting source.
