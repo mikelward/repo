@@ -794,13 +794,35 @@ def check_master_branch(repo, quiet=False):
     back and reports the finding in its own [ok]/[GAP] format instead --
     quiet=True suppresses this function's own printing so the two reports
     don't duplicate (and word) the same finding differently."""
-    ok, result = gh.try_run(["api", f"repos/{repo}/branches/master"])
+    # Ask for the branch's own name back, and require it to be literally
+    # "master" -- a 200 is not enough. GitHub 301-redirects a renamed
+    # branch's old name to its new one, and `gh api` follows redirects, so
+    # on a repository renamed master -> main this endpoint answers 200 with
+    # main's record. Reading only the exit status turns every such rename
+    # into a standing false "master exists" -- the exact backdoor finding
+    # that is supposed to mean something, reported on repositories that
+    # closed it by renaming. The name in the response settles it whatever
+    # the redirect did: only a real master branch answers to that name.
+    ok, result = gh.try_run(["api", f"repos/{repo}/branches/master", "--jq", ".name"])
     if ok:
+        name = result.strip()
+        if name == "master":
+            if not quiet:
+                error(f"{repo} has a branch literally named 'master' -- this can bypass a")
+                error("ruleset scoped only to the default branch. Delete it, or confirm the")
+                error("ruleset above also targets refs/heads/master.")
+            return "exists", None
+        if name:
+            # A different name means the request was redirected off a
+            # renamed master, so there is no master branch to report.
+            return "absent", None
+        # 200 with no name is neither -- "could not tell" is its own
+        # finding here, never quietly folded into a clean result.
+        detail = f"gh: repos/{repo}/branches/master returned no branch name\n"
         if not quiet:
-            error(f"{repo} has a branch literally named 'master' -- this can bypass a")
-            error("ruleset scoped only to the default branch. Delete it, or confirm the")
-            error("ruleset above also targets refs/heads/master.")
-        return "exists", None
+            error(f"could not check whether {repo} has a branch named 'master':")
+            error(f"  {detail.strip()}")
+        return "error", detail
     if "HTTP 404" in result:
         return "absent", None
     if not quiet:

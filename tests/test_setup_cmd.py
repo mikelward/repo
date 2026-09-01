@@ -124,6 +124,7 @@ class FakeGh:
         self.ruleset_content_change_threshold = 1
         self.master_exists = False
         self.master_error = None
+        self.master_redirect_name = None  # branch a renamed master redirects to
         self.puts = []
         self.posts = []
         self.fail_default_branch = False
@@ -248,8 +249,13 @@ class FakeGh:
         if _MASTER_BRANCH_RE.match(endpoint):
             if self.master_error:
                 raise gh.GhError(self.master_error)
+            if self.master_redirect_name:
+                # GitHub 301s a renamed branch's old name to the new one and
+                # gh follows it, so the call succeeds -- reporting the name
+                # it landed on, not the one asked for.
+                return f"{self.master_redirect_name}\n"
             if self.master_exists:
-                return "{}\n"
+                return "master\n"
             raise gh.GhError("gh: HTTP 404: Not Found\n")
 
         m = _ACTIONS_SECRETS_RE.match(endpoint)
@@ -862,6 +868,16 @@ class SetupCmdTest(unittest.TestCase):
         # mentions master as part of the ruleset's own hardened targeting
         # ("...on main, main and master") -- it's specifically the
         # branch-exists warning that must be absent.
+        self.assertNotIn("branch literally named 'master'", err)
+
+    def test_renamed_master_does_not_warn(self):
+        # gh follows GitHub's 301 off a renamed master, so the lookup
+        # succeeds with main's record -- not a master branch to warn about.
+        fake = FakeGh()
+        fake.check_runs = {fake.default_head_sha: ["lanes"]}
+        fake.master_redirect_name = "main"
+        code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
         self.assertNotIn("branch literally named 'master'", err)
 
     def test_master_branch_check_failure_is_reported_but_not_fatal(self):
