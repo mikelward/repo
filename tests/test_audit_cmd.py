@@ -97,6 +97,8 @@ class FakeGh:
         self.default_branch_fails = False
         # Other branches: name -> {workflow name: text}; see the setup fake.
         self.branch_workflows = {}
+        self.allow_auto_merge = "true"
+        self.auto_merge_fails = None  # gh stderr text, or None
         self.effective_rules = list(DEFAULT_EFFECTIVE_RULES)
         self.effective_rules_fails = None  # gh stderr text, or None
         # None means "one page" (self.effective_rules as a whole). Set to a
@@ -148,6 +150,10 @@ class FakeGh:
             if self.default_branch_fails:
                 raise gh.GhError("gh: HTTP 404: Not Found\n")
             return self.default_branch + "\n"
+        if m and jq == ".allow_auto_merge":
+            if self.auto_merge_fails is not None:
+                raise gh.GhError(self.auto_merge_fails)
+            return self.allow_auto_merge + "\n"
 
         m = _RULES_RE.match(endpoint)
         if m:
@@ -1005,6 +1011,32 @@ class AuditCmdTest(unittest.TestCase):
         code, out, err = _run(fake, [REPO, "lanes"])
         self.assertEqual(code, 0, err)
         self.assertIn("[ok]", out)
+
+
+class AutoMergeAuditTest(unittest.TestCase):
+    def test_auto_merge_allowed_is_ok(self):
+        code, out, err = _run(FakeGh(), [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[ok] auto-merge is allowed on the repository", out)
+
+    def test_auto_merge_off_is_a_fix_naming_setup(self):
+        fake = FakeGh()
+        fake.allow_auto_merge = "false"
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "[FIX] auto-merge is not allowed on the repository -- the weekly batch cannot arm it "
+            f"on its pull requests; `repo setup {REPO}` enables it",
+            out,
+        )
+
+    def test_a_failed_auto_merge_read_exits_1(self):
+        fake = FakeGh()
+        fake.auto_merge_fails = "gh: HTTP 500: boom\n"
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(f"could not read whether {REPO} allows auto-merge:", err)
+        self.assertNotIn("auto-merge is", out)
 
 
 class SecretsAuditTest(unittest.TestCase):

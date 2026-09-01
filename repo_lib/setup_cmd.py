@@ -79,6 +79,7 @@ silently change what gets written.
 """
 
 import io
+import json
 import re
 import sys
 from contextlib import redirect_stdout
@@ -537,6 +538,23 @@ def _plan_credentials(repo, specs):
     return plan
 
 
+def _plan_auto_merge(repo):
+    """Whether the repository allows auto-merge: ("allowed" | "enable" |
+    "error", the plan lines). The weekly batches arm auto-merge on the pull
+    requests they open, so a repository with the setting off leaves them
+    parked. Always on, like the fleet-credentials step: there is nothing to
+    request, only a setting with one right value."""
+    try:
+        value = gh.run(["api", f"repos/{repo}", "--jq", ".allow_auto_merge"]).strip()
+    except gh.GhError as e:
+        lines = [f"could not read whether {repo} allows auto-merge:"]
+        lines += [f"  {line}" for line in (e.stderr or "").splitlines()]
+        return "error", lines
+    if value == "true":
+        return "allowed", ["already allowed"]
+    return "enable", ["enable auto-merge on the repository (the weekly batches arm it on their pull requests)"]
+
+
 def _reject_fleet_credentials_under_secret(secret_specs):
     """A fleet credential has one place, and --credential is the flag that
     puts it there; a --secret naming one is refused whatever scope it
@@ -605,6 +623,7 @@ def run(args):
     # and nothing more.
     credentials_plan = _plan_credentials(repo, credential_specs)
     credentials_idle = not (credentials_plan.moves or credentials_plan.unfixed or credentials_plan.failed)
+    auto_merge_state, auto_merge_lines = _plan_auto_merge(repo)
 
     if (
         args.no_rules
@@ -615,6 +634,7 @@ def run(args):
         # mikelward/repo#13).
         and not credential_specs
         and credentials_idle
+        and auto_merge_state == "allowed"
     ):
         # Nothing requested actually mutates anything -- no ruleset step,
         # no secrets, no apps -- so there's nothing to build a plan for or
@@ -692,6 +712,8 @@ def run(args):
         lines += [f"    NOT FIXED: {reason}" for reason in credentials_plan.unfixed]
         if not credentials_plan.lines and not credentials_plan.unfixed:
             lines.append("    nothing to do")
+        lines.append("  auto-merge:")
+        lines += [f"    {line}" for line in auto_merge_lines]
         return lines
 
     if args.dry_run:
@@ -706,6 +728,7 @@ def run(args):
             or app_plan_has_error
             or credentials_plan.failed
             or credentials_plan.unfixed
+            or auto_merge_state == "error"
         ):
             raise SystemExit(1)
         return 0
@@ -748,6 +771,7 @@ def run(args):
         or bool(secret_previews)
         or apps_need_mutation
         or bool(credentials_plan.moves)
+        or auto_merge_state == "enable"
     )
 
     # Printed unconditionally -- including under --force, and even when
@@ -917,6 +941,22 @@ def run(args):
         # error, it fails this step alone: a ruleset or secret write must
         # not be held back by a listing this step could not get.
         failed.append("credentials")
+
+    if auto_merge_state == "enable":
+        try:
+            gh.run_with_input(
+                ["api", "--method", "PATCH", f"repos/{repo}", "--input", "-"],
+                json.dumps({"allow_auto_merge": True}).encode(),
+            )
+        except gh.GhError as e:
+            error_lines(f"could not enable auto-merge on {repo}:", e.stderr)
+            failed.append("auto-merge")
+        else:
+            print(f"{repo}: enabled auto-merge")
+    elif auto_merge_state == "error":
+        # Already in the plan above; a step failure of its own, same as a
+        # failed credentials read.
+        failed.append("auto-merge")
 
     if failed:
         error("failed on: " + " ".join(failed))

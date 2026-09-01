@@ -60,15 +60,19 @@
       repository uses the workflow, deletes the repository copy once the
       environment holds a usable credential, deletes stale copies, and
       refuses under a caller that still names its secrets.
+- [x] Enable auto-merge on the repository from `repo setup`, and report it
+      off as a `[FIX]` in `repo audit` (maintainer, 2026-09-01: it was off on
+      readmo and "probably is for a few repos"; the weekly batches arm it on
+      their pull requests).
 - [ ] **Promote `[FIX]` to `[GAP]` after the next setup pass.** `[FIX]`
       findings are reported but do not fail `repo audit` (maintainer,
       2026-09-01: "keep it lax enough to accept the current standard ...
       and keep a Todo to tighten it after the next setup pass"). Once
       every repository has been through `repo setup --credential ...`,
       route them through `gap()` instead of `fix()` in
-      `audit_cmd.audit_secrets` and flip the `assertEqual(code, 0, ...)`
-      assertions in `SecretsAuditTest` -- they are written to have to
-      change. Until then the hubs and every converted caller read a
+      `audit_cmd.audit_secrets` and `audit_auto_merge`, and flip the
+      `assertEqual(code, 0, ...)` assertions in `SecretsAuditTest` and
+      `AutoMergeAuditTest` -- they are written to have to change. Until then the hubs and every converted caller read a
       repository-level credential through `inherit`, so nothing is
       broken by the lax reading, only less isolated than it will be.
 

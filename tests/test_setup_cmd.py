@@ -87,6 +87,10 @@ class FakeGh:
         # -- ruleset step state (unchanged) --
         self.default_branch = "main"
         self.allow_rebase = "true"
+        self.allow_auto_merge = "true"
+        self.fail_allow_auto_merge = False
+        self.patches = []
+        self.patch_fails = False
         self.branch_count = "1"
         self.default_head_sha = "abc123"
         self.default_head_fails = False
@@ -217,6 +221,10 @@ class FakeGh:
             if self.fail_default_branch:
                 raise gh.GhError("gh: HTTP 404: Not Found\n")
             return self.default_branch + "\n"
+        if m and jq == ".allow_auto_merge":
+            if self.fail_allow_auto_merge or self.repo_missing:
+                raise gh.GhError("gh: HTTP 404: Not Found\n")
+            return self.allow_auto_merge + "\n"
         if m and jq == ".allow_rebase_merge":
             if self.fail_allow_rebase:
                 raise gh.GhError("gh: HTTP 500: Internal Server Error\n")
@@ -449,6 +457,11 @@ class FakeGh:
             self.puts.append((args, body))
         elif method == "POST":
             self.posts.append((args, body))
+        elif method == "PATCH":
+            if self.patch_fails:
+                raise gh.GhError("gh: HTTP 403: Must have admin rights to Repository.\n")
+            self.patches.append((args, body))
+            self.allow_auto_merge = "true" if body.get("allow_auto_merge") else self.allow_auto_merge
         else:
             raise AssertionError(f"unexpected method: {method}")
         return b""
@@ -2607,6 +2620,76 @@ class CredentialsStepTest(unittest.TestCase):
         code, out, err = _run(fake, ["--force", "--no-rules", "--credential", "RANDOM_TOKEN=x", REPO])
         self.assertIn("CI_COMMIT_ARTIFACT_TOKEN (environment 'ci-commit-artifact')", err)
         self.assertIn("--secret NAME[@ENV]=PATH sets it where you say", err)
+
+
+class AutoMergeStepTest(unittest.TestCase):
+    """Always on, like the fleet-credentials step: the setting has one right
+    value, and the weekly batches depend on it."""
+
+    def test_an_allowed_repository_needs_nothing(self):
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        code, out, err = _run(fake, ["--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(err, "")
+        self.assertEqual(fake.patches, [])
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+        code, out, err = _run(fake, ["--dry-run", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("  auto-merge:\n    already allowed\n", out)
+
+    def test_auto_merge_is_enabled_after_confirmation(self):
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        fake.allow_auto_merge = "false"
+        # A repository setting change, so it is a mutation the gate asks about.
+        code, out, err = _run(fake, ["--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("stdin is not a terminal", err)
+        self.assertEqual(fake.patches, [])
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "enable auto-merge on the repository (the weekly batches arm it on their pull requests)",
+            err,
+        )
+        self.assertEqual(len(fake.patches), 1)
+        args, body = fake.patches[0]
+        self.assertEqual(args[:4], ["api", "--method", "PATCH", f"repos/{REPO}"])
+        self.assertEqual(body, {"allow_auto_merge": True})
+        self.assertIn(f"{REPO}: enabled auto-merge", out)
+
+    def test_a_dry_run_reports_without_enabling(self):
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        fake.allow_auto_merge = "false"
+        code, out, err = _run(fake, ["--dry-run", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("  auto-merge:\n    enable auto-merge on the repository", out)
+        self.assertEqual(fake.patches, [])
+
+    def test_a_failed_enable_fails_the_step(self):
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        fake.allow_auto_merge = "false"
+        fake.patch_fails = True
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(f"could not enable auto-merge on {REPO}:", err)
+        self.assertIn("failed on: auto-merge", err)
+
+    def test_a_failed_read_fails_this_step_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _secret_file(tmp, "value.txt")
+            fake = FakeGh()
+            fake.workflow_files = ["ci.yml"]
+            fake.fail_allow_auto_merge = True
+            code, out, err = _run(fake, ["--force", "--no-rules", "--secret", f"TOKEN@lanes={path}", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(f"could not read whether {REPO} allows auto-merge:", err)
+        self.assertIn("failed on: auto-merge", err)
+        self.assertEqual(fake.patches, [])
+        self.assertEqual(fake.written_secrets, [("TOKEN", REPO, "lanes", b"sekrit")])
 
 
 if __name__ == "__main__":
