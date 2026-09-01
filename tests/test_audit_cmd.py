@@ -1,5 +1,6 @@
 import json
 import re
+import urllib.parse
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
@@ -15,6 +16,10 @@ _RULES_RE = re.compile(r"^repos/([^/]+/[^/]+)/rules/branches/(.+)$")
 _RULESETS_ALL_RE = re.compile(r"^repos/([^/]+/[^/]+)/rulesets\?includes_parents=true$")
 _RULESET_ONE_RE = re.compile(r"^repos/([^/]+/[^/]+)/rulesets/([^/]+)$")
 _MASTER_BRANCH_RE = re.compile(r"^repos/([^/]+/[^/]+)/branches/master$")
+_COMMITS_HEAD_RE = re.compile(r"^repos/([^/]+/[^/]+)/commits\?per_page=1(?:&sha=(.+))?$")
+_CHECK_RUNS_RE = re.compile(r"^repos/([^/]+/[^/]+)/commits/([^/]+)/check-runs$")
+_STATUS_RE = re.compile(r"^repos/([^/]+/[^/]+)/commits/([^/]+)/status$")
+_PULLS_RE = re.compile(r"^repos/([^/]+/[^/]+)/pulls\?state=(open|closed)&.*$")
 
 
 def _parse_api_args(rest):
@@ -52,7 +57,14 @@ def _status_checks_rule(contexts, strict=True):
         "type": "required_status_checks",
         "parameters": {
             "strict_required_status_checks_policy": strict,
-            "required_status_checks": [{"context": c} for c in contexts],
+            # A context may be a bare name, or (name, integration_id) to
+            # model a gate bound to one GitHub App.
+            "required_status_checks": [
+                {"context": c[0], "integration_id": c[1]}
+                if isinstance(c, tuple)
+                else {"context": c}
+                for c in contexts
+            ],
         },
     }
 
@@ -87,6 +99,18 @@ class FakeGh:
         self.master_exists = False
         self.master_error = None  # non-404 stderr text, or None
         self.master_redirect_name = None  # branch a renamed master redirects to
+        # A healthy repo: every default check has reported on the head, so
+        # the never-reported walk short-circuits after one commit.
+        self.default_head_sha = "abc123"
+        self.default_head_fails = False
+        # ref -> head sha, for branch-specific gates. Any ref not listed
+        # answers with default_head_sha.
+        self.branch_heads = {}
+        self.check_runs = {"abc123": ["lanes", "codex", "zizmor"]}
+        self.check_runs_fails = None  # gh stderr text, or None
+        self.statuses = {}
+        self.open_prs = []
+        self.closed_prs = []
 
     def run(self, args):
         self.calls.append(list(args))
@@ -118,6 +142,35 @@ class FakeGh:
             # document; more than one page is not, and a bare json.loads
             # over it raises JSONDecodeError.
             return "".join(json.dumps(page) for page in pages)
+
+        m = _COMMITS_HEAD_RE.match(endpoint)
+        if m:
+            if self.default_head_fails:
+                raise gh.GhError("gh: HTTP 409: Git Repository is empty.\n")
+            ref = urllib.parse.unquote(m.group(2)) if m.group(2) else None
+            return self.branch_heads.get(ref, self.default_head_sha) + "\n"
+
+        m = _CHECK_RUNS_RE.match(endpoint)
+        if m:
+            if self.check_runs_fails is not None:
+                raise gh.GhError(self.check_runs_fails)
+            # Models --jq '[.name, .app.id]': an entry may be a bare name
+            # (no App binding) or a (name, app id) pair.
+            return "".join(
+                json.dumps(list(n) if isinstance(n, tuple) else [n, None]) + "\n"
+                for n in self.check_runs.get(m.group(2), [])
+            )
+
+        m = _STATUS_RE.match(endpoint)
+        if m:
+            return "".join(
+                json.dumps(c) + "\n" for c in self.statuses.get(m.group(2), [])
+            )
+
+        m = _PULLS_RE.match(endpoint)
+        if m:
+            shas = self.open_prs if m.group(2) == "open" else self.closed_prs
+            return "".join(sha + "\n" for sha in shas)
 
         if _RULESETS_ALL_RE.match(endpoint):
             if self.rulesets_list_fails is not None:
@@ -550,6 +603,141 @@ class AuditCmdTest(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertNotIn("every ruleset covering", out)
         self.assertNotIn("does not target", out)
+
+    # ---- required check nothing produces ---------------------------------
+
+    def test_required_check_that_never_reported_is_a_gap(self):
+        # The ruleset lists it, so the rule-level check reads clean -- but
+        # nothing posts it, so every pull request waits forever.
+        fake = FakeGh()
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 1, err)
+        self.assertIn("[ok] 'zizmor' is a required status check", out)
+        self.assertIn("required but never reported: 'zizmor'", out)
+
+    def test_all_required_checks_reporting_is_ok(self):
+        fake = FakeGh()
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[ok] every required check has reported", out)
+
+    def test_check_reporting_read_failure_fails_closed(self):
+        # "could not tell" is not "never reported" -- it must not print as
+        # a gap, and it must not print as an ok either.
+        fake = FakeGh()
+        fake.check_runs_fails = "gh: HTTP 500: simulated failure\n"
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("could not tell which of", err)
+        # The underlying gh error survives: which call failed, on which
+        # commit, and what GitHub actually said -- without it a rate limit
+        # and a permissions problem read identically.
+        self.assertIn("reading check runs for abc123", err)
+        self.assertIn("HTTP 500: simulated failure", err)
+        self.assertNotIn("required but never reported", out)
+        self.assertNotIn("every required check has reported", out)
+
+    def test_enforced_context_outside_the_named_checks_is_still_scanned(self):
+        # A stale gate nobody asked about blocks merges just as hard. The
+        # scan is built from what the ruleset enforces, not from the
+        # names on the command line.
+        fake = FakeGh()
+        fake.effective_rules = [
+            _pull_request_rule(),
+            _status_checks_rule(["lanes", "codex", "zizmor", "obsolete-ci"]),
+            {"type": "non_fast_forward", "parameters": {}},
+            {"type": "deletion", "parameters": {}},
+        ]
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 1, err)
+        self.assertIn("required but never reported: 'obsolete-ci'", out)
+
+    def test_same_name_from_another_app_does_not_satisfy_a_bound_gate(self):
+        # The gate is bound to App 42; the only 'lanes' run ever seen came
+        # from App 7. GitHub will not accept it, so neither does the audit.
+        fake = FakeGh()
+        fake.effective_rules = [
+            _pull_request_rule(),
+            _status_checks_rule([("lanes", 42), "codex", "zizmor"]),
+            {"type": "non_fast_forward", "parameters": {}},
+            {"type": "deletion", "parameters": {}},
+        ]
+        fake.check_runs = {fake.default_head_sha: [("lanes", 7), "codex", "zizmor"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 1, err)
+        # The name DOES report, just never from App 42 -- saying it "never
+        # reported" reads as false to someone watching lanes run, and
+        # `repo setup` would not fix it: _build_update_body reuses the
+        # existing entry by context, stale binding included.
+        self.assertIn(
+            "required but never reported by the App it is bound to: "
+            "'lanes' (needs App 42)",
+            out,
+        )
+        self.assertIn("repoint the ruleset entry", out)
+        self.assertNotIn("required but never reported: 'lanes'", out)
+
+
+    def test_branch_specific_gate_is_scanned_on_the_audited_branch(self):
+        # A check produced only on pushes to `release` never appears on the
+        # default branch's head. Scanning that head while auditing
+        # `release` reports a working gate as never reported.
+        fake = FakeGh()
+        fake.ruleset_objects["1"] = _covering_ruleset(include=["refs/heads/release"])
+        fake.effective_rules = [
+            _pull_request_rule(),
+            _status_checks_rule(["release-build"]),
+            {"type": "non_fast_forward", "parameters": {}},
+            {"type": "deletion", "parameters": {}},
+        ]
+        fake.branch_heads = {"release": "rel999"}
+        fake.check_runs = {
+            fake.default_head_sha: [],  # never reported on main
+            "rel999": ["release-build"],  # but reports on release
+        }
+        code, out, err = _run(fake, ["--branch", "release", REPO, "release-build"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[ok] every required check has reported", out)
+        self.assertNotIn("required but never reported", out)
+
+
+    def test_a_gate_nothing_produces_and_one_bound_wrong_report_separately(self):
+        # Two faults, two fixes: one name nothing posts at all, one that
+        # posts from the wrong App. They must not share a remedy line.
+        fake = FakeGh()
+        fake.effective_rules = [
+            _pull_request_rule(),
+            _status_checks_rule([("lanes", 42), "missing-gate"]),
+            {"type": "non_fast_forward", "parameters": {}},
+            {"type": "deletion", "parameters": {}},
+        ]
+        fake.check_runs = {fake.default_head_sha: [("lanes", 7)]}
+        code, out, err = _run(fake, [REPO, "lanes"])
+        self.assertEqual(code, 1, err)
+        self.assertIn(
+            "required but never reported: 'missing-gate' -- add the check, "
+            "or run `repo setup`",
+            out,
+        )
+        self.assertIn(
+            "required but never reported by the App it is bound to: "
+            "'lanes' (needs App 42)",
+            out,
+        )
+
+    def test_bound_gate_satisfied_by_its_own_app_is_ok(self):
+        fake = FakeGh()
+        fake.effective_rules = [
+            _pull_request_rule(),
+            _status_checks_rule([("lanes", 42), "codex", "zizmor"]),
+            {"type": "non_fast_forward", "parameters": {}},
+            {"type": "deletion", "parameters": {}},
+        ]
+        fake.check_runs = {fake.default_head_sha: [("lanes", 42), "codex", "zizmor"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[ok] every required check has reported", out)
 
     # ---- master branch check --------------------------------------------
 

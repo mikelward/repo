@@ -35,6 +35,7 @@ bounded scan offers is walked) costs a few hundred. Not on a hot path --
 import json
 import re
 import sys
+import urllib.parse
 
 from repo_lib import gh
 from repo_lib.common import error, error_lines
@@ -74,7 +75,17 @@ class RulesetError(Exception):
     """Signals "abort the ruleset step"; the reason has already been
     reported via error()/error_lines() at the point of failure, except
     where the caller's own wrapper message covers it (see module
-    docstring)."""
+    docstring).
+
+    `.detail` carries the failed call and gh's own stderr for the raisers
+    that report nothing themselves -- without it the wrapper can only say
+    "could not tell", leaving no way to distinguish a rate limit from a
+    permissions problem, or to see which call failed. None where the
+    raiser already reported."""
+
+    def __init__(self, detail=None):
+        super().__init__(detail or "")
+        self.detail = detail
 
 
 def _valid_no_control_chars(value, what):
@@ -150,42 +161,99 @@ def _json_lines(output):
     return names
 
 
-def _collect_reported(repo, wanted):
-    """Every name in `wanted` this repository has reported anywhere,
-    walking the default branch head, then open pull requests, then closed
-    ones -- each stage bounded to one page -- stopping as soon as every
-    wanted name has been seen. Raises RulesetError on any read failure: an
-    incomplete answer must never be read as "this check has never
-    reported", which would either reject a valid name or, with --force,
-    require one on the strength of a safety check that never finished."""
-    reported = set()
+def _entry_satisfied(entry, names, app_pairs):
+    """Whether a required-status-check entry has ever been reported by
+    something GitHub would actually accept for it.
+
+    An entry carrying an integration_id is bound to one GitHub App, so a
+    same-named check run from a different producer -- or a legacy commit
+    status, which has no App at all -- does not satisfy it. Matching on
+    the name alone there prints an all-clear while merges stay blocked,
+    which is the failure this whole check exists to catch."""
+    context, integration_id = entry
+    if integration_id is None:
+        return context in names
+    return (context, integration_id) in app_pairs
+
+
+def _collect_reported(repo, wanted, ref=None):
+    """What this repository has ever reported, as (names, app_pairs):
+    every context name seen anywhere, and every (name, App id) pair seen
+    on a check run. Walks the default branch head, then open pull
+    requests, then closed ones -- each stage bounded to one page --
+    stopping as soon as every entry in `wanted` is satisfied.
+
+    `wanted` is a set of (context, integration_id-or-None) entries. `ref`
+    is the branch whose head to scan first -- the branch whose gates are
+    actually in question. None means the repository's default branch. A
+    check produced only on pushes to `release` never appears on the
+    default branch's head, so scanning that head while auditing `release`
+    reports a working gate as never reported.
+
+    Raises RulesetError on any read failure: an incomplete answer must
+    never be read as "this check has never reported", which would either
+    reject a valid name or, with --force, require one on the strength of a
+    safety check that never finished."""
+    names = set()
+    app_pairs = set()
 
     def scan(sha):
-        for endpoint, jq_expr in (
-            (f"repos/{repo}/commits/{sha}/check-runs", ".check_runs[].name | @json"),
-            (f"repos/{repo}/commits/{sha}/status", ".statuses[].context | @json"),
-        ):
-            try:
-                out = gh.run(["api", "--paginate", endpoint, "--jq", jq_expr])
-            except gh.GhError:
-                raise RulesetError()
-            reported.update(_json_lines(out))
+        try:
+            out = gh.run(
+                [
+                    "api",
+                    "--paginate",
+                    f"repos/{repo}/commits/{sha}/check-runs",
+                    "--jq",
+                    ".check_runs[] | [.name, .app.id] | @json",
+                ]
+            )
+        except gh.GhError as e:
+            raise RulesetError(f"reading check runs for {sha}:\n{e.stderr}")
+        for line in out.splitlines():
+            if not line.strip():
+                continue
+            name, app_id = json.loads(line)
+            names.add(name)
+            if app_id is not None:
+                app_pairs.add((name, app_id))
+        try:
+            out = gh.run(
+                [
+                    "api",
+                    "--paginate",
+                    f"repos/{repo}/commits/{sha}/status",
+                    "--jq",
+                    ".statuses[].context | @json",
+                ]
+            )
+        except gh.GhError as e:
+            raise RulesetError(f"reading commit statuses for {sha}:\n{e.stderr}")
+        names.update(_json_lines(out))
 
+    def satisfied():
+        return all(_entry_satisfied(e, names, app_pairs) for e in wanted)
+
+    endpoint = f"repos/{repo}/commits?per_page=1"
+    if ref is not None:
+        endpoint += f"&sha={urllib.parse.quote(ref, safe='')}"
     try:
-        head = gh.run(["api", f"repos/{repo}/commits?per_page=1", "--jq", ".[0].sha"]).strip()
+        head = gh.run(["api", endpoint, "--jq", ".[0].sha"]).strip()
         heads = [head] if head and head != "null" else []
-    except gh.GhError:
+    except gh.GhError as e:
         # A repository with no commits yet answers 409 here -- a KNOWN
         # zero-report answer, not a failed read: nothing has ever run
         # because nothing has ever been pushed.
         if _repo_is_empty(repo) is True:
             heads = []
         else:
-            raise RulesetError()
+            raise RulesetError(
+                f"reading the head of {ref or 'the default branch'}:\n{e.stderr}"
+            )
     for sha in heads:
         scan(sha)
-    if wanted <= reported:
-        return reported
+    if satisfied():
+        return names, app_pairs
 
     for state in ("open", "closed"):
         try:
@@ -197,18 +265,64 @@ def _collect_reported(repo, wanted):
                     ".[].head.sha",
                 ]
             )
-        except gh.GhError:
-            raise RulesetError()
+        except gh.GhError as e:
+            raise RulesetError(f"listing {state} pull requests:\n{e.stderr}")
         for sha in out.splitlines():
             sha = sha.strip()
             if not sha:
                 continue
             scan(sha)
-            if wanted <= reported:
-                return reported
-        if wanted <= reported:
-            return reported
-    return reported
+            if satisfied():
+                return names, app_pairs
+        if satisfied():
+            return names, app_pairs
+    return names, app_pairs
+
+
+def never_reported(repo, entries, ref=None):
+    """Which of `entries` this repository has never reported, in the order
+    given. A required check nothing posts blocks every merge.
+
+    Each entry is (context, integration_id-or-None); pass None where the
+    gate is not bound to a particular GitHub App. `ref` is the branch
+    whose gates are in question, whose head is scanned first.
+
+    Returns (context, integration_id, name_reported) triples.
+    `name_reported` says the name itself has reported from some producer,
+    which only matters for a bound gate: there the check is failing on the
+    App, not the name, and a bare "never reported" reads as plainly false
+    to a user who can see that check running.
+
+    Raises RulesetError on a failed read: "never reported" and "could not
+    tell" are different findings, and only the first is a gap."""
+    entries = list(entries)
+    names, app_pairs = _collect_reported(repo, set(entries), ref=ref)
+    return [
+        (context, integration_id, context in names)
+        for context, integration_id in entries
+        if not _entry_satisfied((context, integration_id), names, app_pairs)
+    ]
+
+
+def bound_to_another_app(item):
+    """True when a missing check's name does report, just never from the
+    App its gate is bound to -- a different problem with a different fix
+    from a check nothing produces at all."""
+    _, integration_id, name_reported = item
+    return integration_id is not None and name_reported
+
+
+def describe_missing(items):
+    """Missing checks for a message. Quoted like `quoted`, and for a gate
+    whose name reports from the wrong producer, naming the App it is bound
+    to -- otherwise the reader is told a check they can watch running has
+    never reported."""
+    return ", ".join(
+        f"'{context}' (needs App {integration_id})"
+        if bound_to_another_app((context, integration_id, name_reported))
+        else f"'{context}'"
+        for context, integration_id, name_reported in items
+    )
 
 
 def _lookup_existing_ruleset(repo, ruleset_name):
@@ -641,14 +755,15 @@ def apply_ruleset(
         return 1
 
     try:
-        reported = _collect_reported(repo, set(checks))
-    except RulesetError:
-        error(f"could not read which checks have reported on {repo}")
+        # Names off the command line carry no App binding, so every entry
+        # is unbound: any producer of that context counts.
+        missing = never_reported(repo, [(c, None) for c in checks])
+    except RulesetError as e:
+        error_lines(f"could not read which checks have reported on {repo}:", e.detail)
         error("Refusing to guess: an incomplete answer here either rejects a valid")
         error("check or, with --force, requires one on the strength of a safety")
         error("check that did not finish.")
         return 1
-    missing = [c for c in checks if c not in reported]
     if missing:
         if force:
             error(f"requiring checks that have never reported on {repo}:")
