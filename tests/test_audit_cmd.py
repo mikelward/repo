@@ -86,6 +86,7 @@ class FakeGh:
         self.rulesets_list_fails = None  # gh stderr text, or None
         self.master_exists = False
         self.master_error = None  # non-404 stderr text, or None
+        self.master_redirect_name = None  # branch a renamed master redirects to
 
     def run(self, args):
         self.calls.append(list(args))
@@ -139,8 +140,13 @@ class FakeGh:
         if _MASTER_BRANCH_RE.match(endpoint):
             if self.master_error:
                 return False, self.master_error
+            if self.master_redirect_name:
+                # GitHub 301s a renamed branch's old name to the new one and
+                # gh follows it, so the call succeeds -- reporting the name
+                # it landed on, not the one asked for.
+                return True, f"{self.master_redirect_name}\n"
             if self.master_exists:
-                return True, "{}\n"
+                return True, "master\n"
             return False, "gh: HTTP 404: Not Found\n"
         raise AssertionError(f"unexpected try_run endpoint: {endpoint}")
 
@@ -560,6 +566,31 @@ class AuditCmdTest(unittest.TestCase):
         code, out, err = _run(fake, [REPO])
         self.assertEqual(code, 0, err)
         self.assertIn("[ok] no branch literally named 'master'", out)
+
+    def test_renamed_master_is_not_reported_as_an_existing_branch(self):
+        # A repository renamed master -> main keeps a 301 from the old name,
+        # and gh follows it, so the endpoint answers 200 with main's record.
+        # Reading only the exit status turns every such rename into a
+        # standing false gap -- on exactly the repositories that closed the
+        # backdoor by renaming.
+        fake = FakeGh()
+        fake.master_redirect_name = "main"
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[ok] no branch literally named 'master'", out)
+        self.assertNotIn("[GAP] a branch literally named 'master' exists", out)
+
+    def test_master_branch_lookup_without_a_name_fails_closed(self):
+        # 200 but nothing to identify the branch by is "could not tell",
+        # which is neither a gap nor an ok.
+        fake = FakeGh()
+        fake.master_redirect_name = None
+        fake.master_exists = True
+        with patch.object(fake, "try_run", lambda args: (True, "\n")):
+            code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("could not check whether", err)
+        self.assertNotIn("branch literally named 'master'", out)
 
     def test_master_branch_read_failure_fails_closed(self):
         fake = FakeGh()
