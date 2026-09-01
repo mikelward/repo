@@ -80,9 +80,11 @@ for the batches and the commit-back workflow alike -- are each reported as
 `[FIX]` -- a finding `repo setup` closes, named with the command -- and
 every other repository-level secret is listed by name for review. A repository that does not allow auto-merge is a `[FIX]` too: the weekly
 batches arm it on their pull requests. `[FIX]` findings do not fail the audit
+batches arm it on their pull requests. `[FIX]` findings do not fail the audit
 yet (see `TODO.md`): the layout is being rolled out through `repo setup`.
 
-`repo setup` makes the move. Its fleet-credentials step is always on: for
+`repo setup` makes the move, and enables auto-merge on the repository where it
+is off. Its fleet-credentials step is always on: for
 each batch the repository runs (by whichever workflows call it from a job,
 whatever they are named, on any branch) and for the
 commit-back workflow (by a job calling it), a value passed as

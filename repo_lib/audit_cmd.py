@@ -214,6 +214,26 @@ def _targeting_status(include, exclude):
 # The weekly dependency batches, keyed by the caller workflow file a consumer
 # carries. Each hub's publish job reads its credential from an environment
 # of the same name (see that repository's docs/PAT.md).
+def audit_auto_merge(repo, ok, fix):
+    """Whether the repository allows auto-merge. The weekly batches arm
+    auto-merge on the pull requests they open, and a repository with the
+    setting off leaves them parked -- quietly, since a batch's pull request
+    is the one nobody is watching for. A setup pass enables it, so this is
+    a [FIX] like the credential findings."""
+    try:
+        value = gh.run(["api", f"repos/{repo}", "--jq", ".allow_auto_merge"]).strip()
+    except gh.GhError as e:
+        error_lines(f"could not read whether {repo} allows auto-merge:", e.stderr)
+        raise SystemExit(1)
+    if value == "true":
+        ok("auto-merge is allowed on the repository")
+    else:
+        fix(
+            "auto-merge is not allowed on the repository -- the weekly batch cannot arm it on "
+            f"its pull requests; `repo setup {repo}` enables it"
+        )
+
+
 def audit_secrets(repo, ok, fix):
     """Reports where the fleet credentials live, and names every other
     repository-level secret. See the module docstring for the reasoning.
@@ -779,6 +799,7 @@ def run(args):
         error_lines(f"could not check whether {repo} has a branch named 'master':", detail)
         raise SystemExit(1)
 
+    audit_auto_merge(repo, ok, fix)
     audit_secrets(repo, ok, fix)
 
     if gap_found[0]:
