@@ -346,7 +346,7 @@ def run(args):
             if not unseen:
                 ok(
                     "every required check has reported: "
-                    + " ".join(c for c, _ in required_entries)
+                    + rules.quoted(c for c, _ in required_entries)
                 )
 
         if any_rule(
