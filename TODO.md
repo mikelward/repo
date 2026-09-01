@@ -55,6 +55,11 @@
       repository does not run, and a repository-level
       `CI_COMMIT_ARTIFACT_TOKEN`; every other repository secret listed
       under `[CHECK]`.
+- [x] `repo setup --credential NAME=PATH`: the fleet-credentials step,
+      always on -- sets a supplied value in its environment where the
+      repository uses the workflow, deletes the repository copy once the
+      environment holds a usable credential, deletes stale copies, and
+      refuses under a caller that still names its secrets.
 - [ ] **Promote `[FIX]` to `[GAP]` after the next setup pass.** `[FIX]`
       findings are reported but do not fail `repo audit` (maintainer,
       2026-09-01: "keep it lax enough to accept the current standard ...
@@ -68,6 +73,24 @@
       broken by the lax reading, only less isolated than it will be.
 
 ## Decisions needing review
+
+- **`repo setup` fails (exit 1) on a fleet credential it cannot move,
+  rather than reporting it and exiting 0.** "Fixes everything" was the
+  ask, so a clean exit has to mean the repository is in shape: a
+  `NOT FIXED` line (no value given, or a caller still naming its secrets)
+  is counted in the failure summary, and a dry run exits 1 on one too.
+  The alternative -- advisory only, exit 0 -- would let a fleet-wide
+  `xargs` run finish green with credentials left where they were.
+  Reversible by dropping the two `failed.append` calls for `unfixed` in
+  `setup_cmd.run` (the plan lines stay).
+- **A failed read in the fleet-credentials step fails that step alone.**
+  Like an App-plan error, not like a ruleset or `--secret` preview
+  failure: the other steps still apply. A read this step cannot make
+  (a token without Contents access hides the workflows directory) says
+  nothing about whether the ruleset needs writing, and holding the
+  ruleset write hostage to it would make `repo setup` refuse whole
+  repositories over a listing. Reversible by adding
+  `credentials_plan.failed` to the preview gate.
 
 - **An invalid `--secret` NAME (or the value file being empty) is now a
   usage error caught up front, before any gh call runs — not discovered
