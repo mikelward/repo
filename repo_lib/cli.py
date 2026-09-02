@@ -9,7 +9,7 @@ one subcommand per concern, composed rather than duplicated.
 import argparse
 import sys
 
-from repo_lib import audit_cmd, list_cmd, secrets_cmd, setup_cmd
+from repo_lib import audit_cmd, create_cmd, list_cmd, secrets_cmd, setup_cmd
 
 PROGRAM = "repo"
 
@@ -17,6 +17,12 @@ PROGRAM = "repo"
 def build_parser():
     parser = argparse.ArgumentParser(prog=PROGRAM)
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    create_parser = subparsers.add_parser(
+        "create", help="create an empty GitHub repository"
+    )
+    create_cmd.add_arguments(create_parser)
+    create_parser.set_defaults(func=create_cmd.run)
 
     list_parser = subparsers.add_parser(
         "list", help="enumerate a fleet without missing one"

@@ -15,9 +15,14 @@ class CliTest(unittest.TestCase):
         self.assertEqual(cm.exception.code, 2)
 
     def test_each_subcommand_parses_with_its_required_arguments(self):
-        # list takes none required; secrets needs --name and at least one
-        # repo; setup and audit each need a positional repo.
+        # list takes none required; create needs a visibility flag and a
+        # positional repo; secrets needs --name and at least one repo;
+        # setup and audit each need a positional repo.
         self.assertEqual(build_parser().parse_args(["list"]).command, "list")
+        self.assertEqual(
+            build_parser().parse_args(["create", "--private", "owner/repo"]).command,
+            "create",
+        )
         self.assertEqual(
             build_parser()
             .parse_args(["secrets", "--name", "TOKEN", "owner/repo"])
@@ -42,6 +47,11 @@ class CliTest(unittest.TestCase):
                     build_parser().parse_args(argv)
                 self.assertEqual(cm.exception.code, 2)
 
+    def test_create_requires_a_visibility_flag(self):
+        with self.assertRaises(SystemExit) as cm:
+            build_parser().parse_args(["create", "owner/repo"])
+        self.assertEqual(cm.exception.code, 2)
+
     def test_setup_requires_the_owner_repo_positional(self):
         with self.assertRaises(SystemExit) as cm:
             build_parser().parse_args(["setup"])
@@ -58,6 +68,14 @@ class CliTest(unittest.TestCase):
         # before any gh call -- see test_audit_cmd.py for full coverage.
         with self.assertRaises(SystemExit) as cm:
             main(["audit", "not-an-owner-repo"])
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_create_dispatches_to_its_own_module(self):
+        # Same reasoning as test_audit_dispatches_to_its_own_module: proves
+        # main() calls create_cmd.run() via a validation path that fails
+        # before any gh call -- see test_create_cmd.py for full coverage.
+        with self.assertRaises(SystemExit) as cm:
+            main(["create", "--private", "not-an-owner-repo"])
         self.assertEqual(cm.exception.code, 2)
 
     def test_setup_dispatches_to_its_own_module(self):
