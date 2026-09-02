@@ -1,11 +1,13 @@
 # repo
 
-Fleet-management CLI for GitHub repositories: `repo list`, `repo secrets`,
-`repo setup`, `repo audit`. A Python rewrite of the
-`repo-list`/`repo-secrets`/`repo-setup`/`repo-rules-audit` shell scripts in
-[mikelward/scripts](https://github.com/mikelward/scripts), which stay in
-place unchanged -- this is a fresh implementation, not a migration, and the
-shell versions remain the source of truth for behavior until this catches up.
+Fleet-management CLI for GitHub repositories: `repo list`, `repo create`,
+`repo secrets`, `repo setup`, `repo audit`. Four of the five are a Python
+rewrite of the `repo-list`/`repo-secrets`/`repo-setup`/`repo-rules-audit`
+shell scripts in [mikelward/scripts](https://github.com/mikelward/scripts),
+which stay in place unchanged -- this is a fresh implementation, not a
+migration, and the shell versions remain the source of truth for behavior
+until this catches up. `repo create` has no shell-script counterpart; it's
+new here.
 
 ## Why Python, not another shell rewrite
 
@@ -38,6 +40,7 @@ Run `./repo` directly from a checkout; nothing to install.
 
 ```
 repo list [--owner OWNER] [--include-forks] [--include-archived]
+repo create (--private|--public) OWNER/REPO
 repo secrets --name NAME [--env ENV] --file PATH [--force] OWNER/REPO...
 repo setup [--dry-run] [--force] [--no-rules] [--rule CHECK]...
            [--secret NAME[@ENV]=PATH]... [--credential NAME=PATH]...
