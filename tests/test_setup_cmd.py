@@ -3136,6 +3136,35 @@ class BootstrapStepTest(unittest.TestCase):
         )
         self.assertLess(bootstrap_call, ruleset_call)
 
+    def test_a_never_reported_repository_still_gets_bootstrapped_and_only_skips_the_ruleset(self):
+        # The exact case this exists for: a fresh (or never-fully-
+        # scaffolded) repository, `repo setup OWNER/REPO` with no flags at
+        # all. Its required checks have never reported -- there's been no
+        # CI to report them -- so the ruleset step can't safely proceed.
+        # Before this, that made the WHOLE run refuse to change anything,
+        # bootstrap included, even though bootstrap's own plan was fine on
+        # its own. Now it applies everything it safely can (bootstrap) and
+        # skips only the ruleset step, saying what unblocks it.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = {"TODO.md"}  # real gaps to fill
+        # fake.check_runs defaults to {} -- nothing has ever reported.
+        with patch("builtins.input", return_value="y"):
+            code, out, err = _run(fake, [REPO], isatty=True)
+        self.assertEqual(code, 1)
+        self.assertIn("failed on:", err)
+        self.assertIn("ruleset", err)
+        self.assertIn("skipping the ruleset step", err)
+        self.assertIn("never reported", err)
+        self.assertIn("--force", err)
+        # Bootstrap's writes actually landed...
+        self.assertIn(f"{REPO}: added", out)
+        blob_posts = [body for _args, body in fake.posts if "encoding" in body]
+        self.assertTrue(blob_posts, "no scaffold blobs were written")
+        self.assertEqual(len(fake.patches), 1)
+        # ...but no ruleset was ever created.
+        ruleset_posts = [(a, b) for a, b in fake.posts if a[3] == f"repos/{REPO}/rulesets"]
+        self.assertEqual(ruleset_posts, [])
+
     def test_a_concurrent_push_after_bootstrap_blocks_activating_the_ruleset(self):
         # A concurrent push landing between apply_gaps's own write
         # finishing and the ruleset step activating protection doesn't
@@ -3473,6 +3502,21 @@ class BootstrapStepTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("SKIPPED", out)
         self.assertIn("branch has no commits yet", out)
+        self.assertEqual(fake.posts, [])  # dry run: no writes at all regardless
+
+    def test_dry_run_previews_the_never_reported_ruleset_skip_accurately(self):
+        # Same accuracy requirement as the no-commits-yet case above, for
+        # the never-reported-checks skip: --dry-run must show the same
+        # SKIPPED verdict and exit status the real run would, not report
+        # the ruleset as creatable when the real run would skip it.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = {"TODO.md"}
+        # fake.check_runs defaults to {} -- nothing has ever reported.
+        code, out, err = _run(fake, ["--dry-run", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("SKIPPED", out)
+        self.assertIn("never reported", out)
+        self.assertIn("add .github/workflows/ci.yml", out)  # bootstrap's own plan still shown
         self.assertEqual(fake.posts, [])  # dry run: no writes at all regardless
 
     def test_no_bootstrap_emptiness_check_failure_fails_closed(self):
