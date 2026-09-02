@@ -1,28 +1,32 @@
-"""`repo create` -- create an empty GitHub repository.
+"""`repo create` -- create an empty GitHub repository, scaffolded with the
+fleet's standard CI.
 
-Deliberately does one thing: create the repository, empty (no README, no
-default branch content), so the first push to it is the caller's own
-initial commit -- the "scaffolding commit made directly to an empty main"
-every AGENTS.md in this fleet already carries as the one exception to
-"never commit to main". Nothing here pushes a scaffold or picks a template:
-what belongs in a fresh repo varies by project type, and this module has no
-opinion on it.
+Creates the repository first, always empty (no README, no default-branch
+content from GitHub itself) -- then, unless --no-scaffold is given, pushes
+what's mechanically safe to generate (see scaffold.py's own docstring for
+the split between that and what genuinely needs project knowledge) as the
+repository's first commits -- two of them, a small bootstrap commit
+followed immediately by the real one; see push_initial_commit's own
+docstring for why a genuinely empty repository can't take this in a
+single write. Together they become the "scaffolding commit made directly
+to an empty main" every AGENTS.md in this fleet already carries as the
+one exception to "never commit to main" -- still the caller's first
+commits, just written by this tool instead of by hand.
 
-`repo setup` is the next step, not something this module calls for you --
-composing the two would need to guess whether to run it before any CI has
-ever reported (which only works with --force; see rules.py's
-never-reported-check guard) or wait for the caller to push workflow files
-and let CI run first, and that choice depends on what the caller is about
-to push, which this module doesn't know. So `create` prints the exact
-follow-up command instead of running it.
+`repo setup` is still a separate step, not something this module calls for
+you: it needs to know which fleet credentials/Apps/secrets this particular
+repository uses, none of which `create` has any way to guess. So `create`
+prints the exact follow-up command instead of running it.
 
-Exit status: 0 on success, 1 if gh failed, 2 for a usage error.
+Exit status: 0 on success, 1 if gh or the scaffold push failed, 2 for a
+usage error.
 """
 
+import argparse
 import json
 import re
 
-from repo_lib import gh
+from repo_lib import gh, scaffold
 from repo_lib.common import error, error_lines
 
 # Same shape as setup_cmd.py's/secrets_cmd.py's/audit_cmd.py's own
@@ -41,6 +45,12 @@ def add_arguments(parser):
     visibility = parser.add_mutually_exclusive_group(required=True)
     visibility.add_argument("--private", action="store_true", help="create a private repository")
     visibility.add_argument("--public", action="store_true", help="create a public repository")
+    parser.add_argument(
+        "--scaffold",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="push the fleet's standard CI files as the initial commit (default: yes)",
+    )
     parser.add_argument("repo", metavar="OWNER/REPO")
 
 
@@ -85,7 +95,7 @@ def run(args):
 
     body = {"name": name, "private": args.private}
     try:
-        gh.run_with_input(
+        raw = gh.run_with_input(
             ["api", "--method", "POST", endpoint, "--input", "-"], json.dumps(body).encode()
         )
     except gh.GhError as e:
@@ -94,6 +104,38 @@ def run(args):
 
     visibility = "private" if args.private else "public"
     print(f"{args.repo}: created ({visibility}, empty)")
-    print("Push your initial commit (workflows included), then run:")
+
+    if not args.scaffold:
+        print("Push your initial commit (workflows included), then run:")
+        print(f"  repo setup {args.repo} --force")
+        return 0
+
+    # GitHub sets this at creation from the account/org's configured
+    # default branch name -- true even though no ref exists yet, which is
+    # exactly what lets the scaffold commit below create that ref itself.
+    default_branch = (json.loads(raw) or {}).get("default_branch")
+    if not default_branch:
+        error(f"{args.repo} was created, but the response named no default branch;")
+        error("cannot scaffold. Push your initial commit by hand, then run:")
+        error(f"  repo setup {args.repo} --force")
+        raise SystemExit(1)
+
+    files = scaffold.build_scaffold_files(default_branch)
+    if files is None:
+        error(f"{args.repo} was created, but fetching the scaffold's template files failed")
+        error("(see above); nothing was pushed. Push your initial commit by hand, then run:")
+        error(f"  repo setup {args.repo} --force")
+        raise SystemExit(1)
+
+    if not scaffold.push_initial_commit(args.repo, default_branch, files):
+        error(f"{args.repo} was created, but pushing the scaffold commit failed (see above).")
+        error("Push your initial commit by hand, then run:")
+        error(f"  repo setup {args.repo} --force")
+        raise SystemExit(1)
+
+    print(f"{args.repo}: pushed the CI scaffold ({len(files)} files) to {default_branch}")
+    print("lanes, codex and zizmor will all report on the next push or pull request --")
+    print("ci.yml's placeholder job stands in for this project's real jobs until you")
+    print("replace it (see the TODO.md this pushed). Once something has reported, run:")
     print(f"  repo setup {args.repo} --force")
     return 0

@@ -24,17 +24,23 @@ threads one shared variable through its own usage() and arg-parsing
 default: so this can't silently drift from what repo-rules itself
 requires by default.
 
-What this checks that `repo setup`'s ruleset step does not manage
-(ported from the shell's own header comment): repo-rules sets
-required_status_checks and pull_request (conversation resolution, up to
-date, rebase-only) through a ruleset it owns by name, and deliberately
+What this checks independently of what `repo setup`'s ruleset step itself
+manages (ported from the shell's own header comment, since extended):
+`repo setup` sets required_status_checks, pull_request (conversation
+resolution, up to date, rebase-only), required_linear_history, and
+non_fast_forward through a ruleset it owns by name, and deliberately
 leaves every other field of that ruleset untouched on update -- including
 bypass_actors, which this module reads back and reports on every branch
 ruleset whose conditions plainly cover the target branch (literal match
 only -- a pattern such as "refs/heads/*" is reported unevaluated rather
-than guessed at). It also checks non_fast_forward and deletion, two rule
-types repo-rules has no opinion on: a required check means nothing if the
-branch it protects can be force-pushed or deleted out from under it. When
+than guessed at). This module checks required_linear_history and
+non_fast_forward too, on its own account rather than trusting `repo
+setup` wrote them: a bypass actor can defeat either regardless of what
+the ruleset says (see the note `repo setup` itself now prints when one
+exists), so this is independent verification of what actually holds, not
+a check on a field `repo setup` has no opinion on -- unlike deletion,
+which genuinely is one: a required check means nothing if the branch it
+protects can be force-pushed or deleted out from under it. When
 auditing the default branch (no --branch given), it flags a default
 branch not literally named "main". When AUDITING THE REPOSITORY'S REAL
 DEFAULT BRANCH -- determined directly via the repo's own .default_branch,
@@ -612,6 +618,11 @@ def run(args):
             )
     else:
         gap(f"no required_status_checks rule at all -- named: {' '.join(checks)}")
+
+    if any_rule("required_linear_history"):
+        ok("commit history must be linear")
+    else:
+        gap("merge commits are allowed (history can bypass what a required check saw)")
 
     if any_rule("non_fast_forward"):
         ok("force pushes are blocked")

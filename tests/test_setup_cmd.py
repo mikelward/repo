@@ -890,6 +890,53 @@ class SetupCmdTest(unittest.TestCase):
         self.assertEqual(fake.puts, [])
         self.assertIn("already matches; nothing to do", out)
 
+    def test_unchanged_ruleset_with_a_bypass_actor_still_notes_it(self):
+        # Codex review: the no-op path returns before _describe_plan is
+        # ever called, so a ruleset that already matches -- rules and
+        # all -- but carries a bypass actor used to report "matches" with
+        # no caveat at all, even though that actor can override every one
+        # of those rules. Same fixture as the no-op test above, plus
+        # bypass_actors.
+        fake = FakeGh()
+        fake.check_runs = {fake.default_head_sha: ["lanes"]}
+        fake.existing_ruleset_id = "7"
+        fake.all_ruleset_ids = ["7"]
+        fake.ruleset_objects["7"] = {
+            "id": 7,
+            "name": "merge gates",
+            "enforcement": "active",
+            "bypass_actors": [{"actor_id": 1, "actor_type": "Team"}],
+            "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+            "rules": [
+                {
+                    "type": "required_status_checks",
+                    "parameters": {
+                        "strict_required_status_checks_policy": True,
+                        "required_status_checks": [{"context": "lanes"}],
+                    },
+                },
+                {
+                    "type": "pull_request",
+                    "parameters": {
+                        "required_review_thread_resolution": True,
+                        "allowed_merge_methods": ["rebase"],
+                        "required_approving_review_count": 0,
+                        "dismiss_stale_reviews_on_push": False,
+                        "require_code_owner_review": False,
+                        "require_last_push_approval": False,
+                    },
+                },
+                {"type": "required_linear_history"},
+                {"type": "non_fast_forward"},
+            ],
+        }
+        code, out, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.puts, [])
+        self.assertIn("already matches; nothing to do", out)
+        self.assertIn("1 bypass actor(s)", out)
+        self.assertIn("repo audit", out)
+
     def test_dry_run_makes_no_writes(self):
         fake = FakeGh()
         fake.check_runs = {fake.default_head_sha: ["lanes"]}
