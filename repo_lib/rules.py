@@ -788,7 +788,10 @@ def apply_ruleset(
     caller rather than leaving them to re-derive from rendered text
     (which a --rule value matching NO_OP_MESSAGE could otherwise fool):
     report["needs_write"], report["existing_id"] (also fingerprint[0]),
-    report["fingerprint"].
+    report["fingerprint"]. report["never_reported"] is set instead, and
+    the other three left absent, when this refuses over the never-
+    reported-check guard without force -- the one refusal reason that
+    isn't a real problem with the request, only something to wait out.
 
     skip_confirm: True skips this function's own interactive _confirm()
     unconditionally, independent of `force`. The two are different
@@ -862,6 +865,15 @@ def apply_ruleset(
             error("(--force given; a merge will block until each one reports)")
         else:
             error("Add the check first. Pass --force to require it anyway.")
+            # Distinct from every other reason this function refuses: there
+            # is nothing wrong with the repository or the request, only a
+            # check that hasn't run yet -- recoverable by waiting, not by
+            # anything the caller can fix now. setup_cmd.py reads this back
+            # to tell that apart from a genuine preview failure, so it can
+            # skip only the ruleset step rather than refusing to apply
+            # anything else this run could otherwise finish.
+            if report is not None:
+                report["never_reported"] = missing
             return 1
 
     try:

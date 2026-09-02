@@ -720,6 +720,15 @@ def run(args):
 
     ruleset_lines = []
     ruleset_preview_failed = False
+    # Set instead of ruleset_preview_failed when the ONLY reason the
+    # preview refused is the never-reported-check guard: the checks this
+    # run's own bootstrap step is about to push haven't run yet, which
+    # isn't a problem with the request -- it's the ordinary state of a
+    # repository that has never had CI run against it. That's recoverable
+    # by waiting, not by anything this run can fix now, so it skips just
+    # the ruleset step (below) instead of refusing to apply anything at
+    # all -- everything else this run CAN finish, it does.
+    ruleset_never_reported = None
     ruleset_report = {}
     if not args.no_rules:
         buf = io.StringIO()
@@ -729,15 +738,11 @@ def run(args):
             # guard blocks outright or merely warns, and only an EXPLICIT
             # --force may waive that guard -- not this function's own
             # combined-plan confirmation, whether that comes from a "yes"
-            # or from --force. (The real apply below is different: it
-            # always passes force=True, because by the time it runs, the
-            # single confirmation this function already gates on has been
-            # given one way or another, and repassing force=args.force
-            # there would make apply_ruleset try to confirm a SECOND time
-            # via its own _confirm() -- but stdin's one line of input was
-            # already consumed by the confirmation just above, so that
-            # second read would see nothing left to answer with. Gating
-            # the never-reported guard specifically on args.force here, up
+            # or from --force. (The real apply below passes force=args.force
+            # too, not a hardcoded True, for the same reason -- see
+            # skip_confirm on that call for how it avoids trying to
+            # re-confirm from stdin a second time instead. Gating the
+            # never-reported guard specifically on args.force here, up
             # front -- before the single confirmation is ever offered --
             # gets the same "only --force overrides it" outcome without
             # that second read. Codex review.)
@@ -750,7 +755,10 @@ def run(args):
             # as a remote-state one.
             raise SystemExit(2)
         ruleset_lines = buf.getvalue().splitlines()
-        ruleset_preview_failed = code != 0
+        if code != 0:
+            ruleset_never_reported = ruleset_report.get("never_reported")
+            if not ruleset_never_reported:
+                ruleset_preview_failed = True
 
     # --no-bootstrap means bootstrap_plan stays None, so nothing above has
     # checked whether the branch has any commits -- needed here because a
@@ -807,6 +815,12 @@ def run(args):
                     "    SKIPPED: would strand this repository -- its branch has no commits "
                     "yet and --no-bootstrap means nothing here will add one"
                 )
+            if ruleset_never_reported:
+                lines.append(
+                    f"    SKIPPED: {rules.describe_missing(ruleset_never_reported)} never "
+                    "reported on this repo yet; rerun once they have (--force adds the "
+                    "ruleset anyway, blocking every merge until then)"
+                )
         if secret_previews:
             lines.append("  secrets (repo-secrets):")
             for spec, _entry, desc_lines in secret_previews:
@@ -842,6 +856,7 @@ def run(args):
             or auto_merge_state == "error"
             or (bootstrap_plan is not None and bootstrap_plan.error)
             or empty_branch_would_strand_ruleset
+            or ruleset_never_reported
         ):
             raise SystemExit(1)
         return 0
@@ -876,8 +891,13 @@ def run(args):
     # rather than silently skipping if it's ever somehow missing. An App
     # step is a no-op unless its verdict is ADD; an ERROR verdict needs no
     # confirmation either, since apply_step reports it as a failure
-    # without ever attempting a write, confirmed or not.
-    ruleset_needs_mutation = (not args.no_rules) and ruleset_report.get("needs_write", True)
+    # without ever attempting a write, confirmed or not. ruleset_never_
+    # reported is excluded outright: the Apply section below skips the
+    # step entirely rather than writing anything, so there is nothing
+    # for a confirmation to be about.
+    ruleset_needs_mutation = (
+        (not args.no_rules) and not ruleset_never_reported and ruleset_report.get("needs_write", True)
+    )
     apps_need_mutation = any(p.verdict == "ADD" for p in app_plans)
     needs_confirmation = (
         ruleset_needs_mutation
@@ -1004,7 +1024,8 @@ def run(args):
     # (not preview-snapshot) answer to whether this write introduces
     # protection (Codex review, mikelward/repo#14).
     if not args.no_rules and (
-        (bootstrap_failed and ruleset_report["introduces_pr_protection"]) or empty_branch_would_strand_ruleset
+        (bootstrap_failed and ruleset_report.get("introduces_pr_protection"))
+        or empty_branch_would_strand_ruleset
     ):
         if bootstrap_failed:
             error(
@@ -1024,6 +1045,21 @@ def run(args):
                 "initial commit by hand first (or drop --no-bootstrap so this scaffolds one), then "
                 "rerun."
             )
+        failed.append("ruleset")
+    elif not args.no_rules and ruleset_never_reported:
+        # The chicken-and-egg case: a repository whose required checks
+        # have never run has no way to satisfy them by the time this
+        # ruleset would take effect, so creating it now would just block
+        # every future merge. Nothing here is broken -- everything else
+        # this run could do (bootstrap included) already happened above
+        # -- so this skips only the ruleset step rather than the whole
+        # run refusing to change anything, and says what unblocks it.
+        error(
+            f"{repo}: skipping the ruleset step -- {rules.describe_missing(ruleset_never_reported)} "
+            "never reported on this repo yet, so requiring them now would block every merge with no "
+            "way to satisfy it. Rerun once they have (e.g. once this run's own scaffold push above "
+            "triggers them, or a pull request does) -- or pass --force to add the ruleset anyway."
+        )
         failed.append("ruleset")
     elif not args.no_rules:
         # expected_fingerprint carries forward what the preview call
