@@ -51,6 +51,13 @@ class FakeGh:
         bootstrap_fails=False,
         blob_fails=False,
         tree_fails=False,
+        # A 404 on the tree-create, exactly this many times before it
+        # succeeds -- models GitHub's git-data write endpoints lagging
+        # briefly right after a repository's first content lands, which
+        # _run_with_input_retrying_not_found exists to absorb. Distinct
+        # from tree_fails, which is a permanent, unrelated failure
+        # (HTTP 500) that must never retry.
+        tree_fails_404_times=0,
         commit_fails=False,
         ref_fails=False,
         # push_initial_commit's own pre-bootstrap recheck: by default the
@@ -90,6 +97,8 @@ class FakeGh:
         self.bootstrap_fails = bootstrap_fails
         self.blob_fails = blob_fails
         self.tree_fails = tree_fails
+        self.tree_fails_404_times = tree_fails_404_times
+        self._tree_404_count = 0
         self.commit_fails = commit_fails
         self.ref_fails = ref_fails
         self.ref_precheck_has_commits = ref_precheck_has_commits
@@ -201,6 +210,9 @@ class FakeGh:
         if endpoint.endswith("/git/trees"):
             if self.tree_fails:
                 raise gh.GhError("gh: HTTP 500 (fake tree failure)\n")
+            if self._tree_404_count < self.tree_fails_404_times:
+                self._tree_404_count += 1
+                raise gh.GhError("gh: Not Found (HTTP 404)\n")
             self.tree_payload = json.loads(input_bytes)
             return json.dumps({"sha": "tree-sha"}).encode()
         if endpoint.endswith("/git/commits"):
@@ -757,6 +769,31 @@ class ScaffoldFlagTest(unittest.TestCase):
         status, _, err = run_repo_create(fake, ["--private", "mikelward/newthing"])
         self.assertEqual(status, 1)
         self.assertIn("could not create the scaffold's tree", err)
+
+    def test_a_404_on_the_tree_create_retries_and_succeeds(self):
+        # GitHub's git-data write endpoints can 404 for a short window
+        # right after a repository's first content lands there -- this
+        # models that clearing within a few attempts, which the tool
+        # should absorb on its own rather than making the user rerun the
+        # whole command by hand.
+        fake = FakeGh(self_login="mikelward", tree_fails_404_times=3)
+        with patch("repo_lib.scaffold.time.sleep") as mock_sleep:
+            status, out, err = run_repo_create(fake, ["--private", "mikelward/newthing"])
+        self.assertEqual(status, 0, err)
+        self.assertIsNotNone(fake.tree_payload)
+        self.assertEqual(mock_sleep.call_count, 3)
+        self.assertIn("404", err)
+        self.assertIn("retrying", err)
+
+    def test_a_persistent_404_on_the_tree_create_still_fails_cleanly(self):
+        # More 404s than the retry budget allows -- must still fail with
+        # the ordinary, clear error rather than retrying forever.
+        fake = FakeGh(self_login="mikelward", tree_fails_404_times=99)
+        with patch("repo_lib.scaffold.time.sleep") as mock_sleep:
+            status, _, err = run_repo_create(fake, ["--private", "mikelward/newthing"])
+        self.assertEqual(status, 1)
+        self.assertIn("could not create the scaffold's tree", err)
+        self.assertEqual(mock_sleep.call_count, scaffold._WRITE_RETRY_ATTEMPTS - 1)
 
     def test_commit_failure_is_reported(self):
         fake = FakeGh(self_login="mikelward", commit_fails=True)

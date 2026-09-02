@@ -64,11 +64,62 @@ with no commits yet -- see push_initial_commit's own docstring for why).
 import base64
 import json
 import re
+import time
 import urllib.parse
 from dataclasses import dataclass, field
 
 from repo_lib import gh
 from repo_lib.common import error, error_lines
+
+# GitHub's git-data CREATE endpoints (blob/tree/commit) can 404 for a
+# short window right after a repository's own first content lands there
+# -- observed in practice: a freshly-bootstrapped repo's very next
+# tree-create 404'd, and so did the SAME repo's later gap-fill tree-
+# create, a couple of minutes afterward. Retried here, bounded and
+# visible, rather than left for the user to notice and rerun `repo setup`
+# by hand each time -- the tool is exactly the thing meant to reach the
+# correct end state without manual babysitting. Capped (not indefinite)
+# so a repository that's genuinely stuck for some OTHER reason still
+# fails and says so, rather than hanging silently. Deliberately NOT used
+# on either ref-update PATCH: each has (or, for the gap-fill one, IS) a
+# precondition that only holds immediately before the write, which a
+# blind retry minutes later would undermine -- see the two call sites'
+# own comments (Codex review, mikelward/repo#17).
+_WRITE_RETRY_ATTEMPTS = 6
+_WRITE_RETRY_DELAY_SECONDS = 2  # doubles each retry: 2+4+8+16+32 = 62s across 5 retries
+
+
+def _run_with_input_retrying_not_found(args, input_bytes):
+    """Same contract as gh.run_with_input, but retries a 404 specifically
+    (see _WRITE_RETRY_ATTEMPTS above) -- any other failure propagates on
+    the first attempt, unretried, since only "not found yet" matches the
+    backend-catching-up window this exists for. Only ever call this for a
+    pure create (blob/tree/commit): each is immutable and content-
+    addressed, so a blind retry can't observe or act on stale state the
+    way a ref update can (see its two call sites' own comments)."""
+    delay = _WRITE_RETRY_DELAY_SECONDS
+    for attempt in range(1, _WRITE_RETRY_ATTEMPTS + 1):
+        try:
+            return gh.run_with_input(args, input_bytes)
+        except gh.GhError as e:
+            if attempt == _WRITE_RETRY_ATTEMPTS or "HTTP 404" not in e.stderr:
+                raise
+            # The theory this retry is built on (a git-data backend that
+            # hasn't caught up yet) is a guess, not a certainty -- so
+            # relay gh's OWN error text every attempt rather than
+            # asserting the theory as fact and discarding it. If a LATER
+            # attempt ever comes back with something more specific (a
+            # permission/scope rejection reads very differently from a
+            # bare "Not Found"), this is what would show it, instead of
+            # silently retrying into the same guessed explanation.
+            error(
+                f"{args[3]} returned 404, possibly GitHub's git-data backend still catching up "
+                f"with this repository's own first content -- retrying in {delay}s "
+                f"({attempt}/{_WRITE_RETRY_ATTEMPTS}): {e.stderr.strip()}"
+            )
+            time.sleep(delay)
+            delay *= 2
+
 
 TEMPLATE_REPO = "mikelward/codex-review"
 TEMPLATE_FILES = ("codex-review.yml", "codex-review-check.yml", "codex-review-listener.yml")
@@ -506,7 +557,7 @@ def push_initial_commit(repo, default_branch, files):
     tree_entries = []
     for path, content in ordered:
         try:
-            raw = gh.run_with_input(
+            raw = _run_with_input_retrying_not_found(
                 ["api", "--method", "POST", f"repos/{repo}/git/blobs", "--input", "-"],
                 json.dumps({"content": content, "encoding": "utf-8"}).encode(),
             )
@@ -517,7 +568,7 @@ def push_initial_commit(repo, default_branch, files):
         tree_entries.append({"path": path, "mode": "100644", "type": "blob", "sha": blob_sha})
 
     try:
-        raw = gh.run_with_input(
+        raw = _run_with_input_retrying_not_found(
             ["api", "--method", "POST", f"repos/{repo}/git/trees", "--input", "-"],
             json.dumps({"tree": tree_entries}).encode(),
         )
@@ -527,7 +578,7 @@ def push_initial_commit(repo, default_branch, files):
     tree_sha = json.loads(raw)["sha"]
 
     try:
-        raw = gh.run_with_input(
+        raw = _run_with_input_retrying_not_found(
             ["api", "--method", "POST", f"repos/{repo}/git/commits", "--input", "-"],
             json.dumps(
                 {
@@ -543,6 +594,12 @@ def push_initial_commit(repo, default_branch, files):
     commit_sha = json.loads(raw)["sha"]
 
     try:
+        # Not the retrying wrapper: a bare push (no precheck at all right
+        # before it) is not the same risk as the gap-fill PATCH below,
+        # but there is nothing here to re-verify against if this DID
+        # retry blind, and no evidence this call is even affected by the
+        # same lag the create calls above are (Codex review,
+        # mikelward/repo#17).
         gh.run_with_input(
             [
                 "api",
@@ -796,7 +853,7 @@ def apply_gaps(repo, default_branch, plan):
     tree_entries = []
     for path, content in sorted(plan.missing.items()):
         try:
-            raw = gh.run_with_input(
+            raw = _run_with_input_retrying_not_found(
                 ["api", "--method", "POST", f"repos/{repo}/git/blobs", "--input", "-"],
                 json.dumps({"content": content, "encoding": "utf-8"}).encode(),
             )
@@ -807,7 +864,7 @@ def apply_gaps(repo, default_branch, plan):
         tree_entries.append({"path": path, "mode": "100644", "type": "blob", "sha": blob_sha})
 
     try:
-        raw = gh.run_with_input(
+        raw = _run_with_input_retrying_not_found(
             ["api", "--method", "POST", f"repos/{repo}/git/trees", "--input", "-"],
             json.dumps({"base_tree": plan.base_tree_sha, "tree": tree_entries}).encode(),
         )
@@ -820,7 +877,7 @@ def apply_gaps(repo, default_branch, plan):
         f"- {path}" for path in sorted(plan.missing)
     )
     try:
-        raw = gh.run_with_input(
+        raw = _run_with_input_retrying_not_found(
             ["api", "--method", "POST", f"repos/{repo}/git/commits", "--input", "-"],
             json.dumps(
                 {"message": message, "tree": tree_sha, "parents": [plan.base_commit_sha]}
@@ -858,6 +915,15 @@ def apply_gaps(repo, default_branch, plan):
         return None
 
     try:
+        # Not the retrying wrapper, deliberately: this PATCH's whole
+        # safety rests on the equality check just above happening
+        # IMMEDIATELY before the write. Retrying the same call blind
+        # for up to a minute would let the branch get deleted and
+        # recreated at an ancestor of plan.base_commit_sha in that
+        # window -- a later retry would then fast-forward from that
+        # ancestor and silently restore exactly what a reset meant to
+        # remove, the precise thing the check above exists to prevent
+        # (Codex review, mikelward/repo#17).
         gh.run_with_input(
             [
                 "api",
