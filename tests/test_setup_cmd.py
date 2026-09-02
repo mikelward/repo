@@ -532,6 +532,9 @@ class SetupCmdTest(unittest.TestCase):
             for c in rule["parameters"]["required_status_checks"]
         ]
         self.assertEqual(contexts, ["lanes", "codex", "zizmor"])
+        types = [rule["type"] for rule in body["rules"]]
+        self.assertIn("required_linear_history", types)
+        self.assertIn("non_fast_forward", types)
         self.assertIn(f"{REPO}: created ruleset", out)
 
     def test_default_checks_used_when_no_rule_given(self):
@@ -578,6 +581,8 @@ class SetupCmdTest(unittest.TestCase):
                         "require_last_push_approval": False,
                     },
                 },
+                {"type": "required_linear_history"},
+                {"type": "non_fast_forward"},
             ],
         }
         code, out, err = _run(fake, ["--force", "--rule", "lanes", REPO])
@@ -585,14 +590,75 @@ class SetupCmdTest(unittest.TestCase):
         self.assertEqual(len(fake.puts), 1)
         body = fake.puts[0][1]
         # Scope, target, and bypass_actors are all untouched -- an UPDATE
-        # only ever edits the two managed rules.
+        # only ever edits the managed rules.
         self.assertEqual(body["conditions"]["ref_name"]["include"], ["refs/heads/release"])
         self.assertEqual(body["bypass_actors"], [{"actor_id": 1, "actor_type": "Team"}])
         checks_rule = next(r for r in body["rules"] if r["type"] == "required_status_checks")
         self.assertEqual(
             checks_rule["parameters"]["required_status_checks"], [{"context": "lanes"}]
         )
+        # An already-present required_linear_history/non_fast_forward rule
+        # is left alone, not duplicated -- these two take no parameters, so
+        # managing them is purely a presence check.
+        types = [rule["type"] for rule in body["rules"]]
+        self.assertEqual(types.count("required_linear_history"), 1)
+        self.assertEqual(types.count("non_fast_forward"), 1)
         self.assertIn("scope is unchanged", out)
+        # A preserved bypass actor overrides every rule above, old and new
+        # alike -- the plan says so rather than reading as an unqualified
+        # guarantee. repo audit is what actually reports who they are. The
+        # note lands in the combined plan setup_cmd.py prints to stderr
+        # (the dry-run preview pass), not the real apply's own stdout.
+        self.assertIn("1 bypass actor(s)", err)
+        self.assertIn("repo audit", err)
+
+    def test_no_bypass_actor_note_when_the_ruleset_has_none(self):
+        fake = FakeGh()
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+        code, out, err = _run(fake, ["--force", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("bypass actor", err)
+
+    def test_update_adds_linear_history_and_block_force_pushes_when_missing(self):
+        # An existing ruleset created before this module managed these two
+        # rule types gets them appended on its next update, same as a
+        # missing required_status_checks/pull_request rule would.
+        fake = FakeGh()
+        fake.check_runs = {fake.default_head_sha: ["lanes"]}
+        fake.existing_ruleset_id = "42"
+        fake.all_ruleset_ids = ["42"]
+        fake.ruleset_objects["42"] = {
+            "id": 42,
+            "name": "merge gates",
+            "enforcement": "active",
+            "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+            "rules": [
+                {
+                    "type": "required_status_checks",
+                    "parameters": {
+                        "strict_required_status_checks_policy": True,
+                        "required_status_checks": [{"context": "lanes"}],
+                    },
+                },
+                {
+                    "type": "pull_request",
+                    "parameters": {
+                        "required_review_thread_resolution": True,
+                        "allowed_merge_methods": ["rebase"],
+                        "required_approving_review_count": 0,
+                        "dismiss_stale_reviews_on_push": False,
+                        "require_code_owner_review": False,
+                        "require_last_push_approval": False,
+                    },
+                },
+            ],
+        }
+        code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(fake.puts), 1)
+        types = [rule["type"] for rule in fake.puts[0][1]["rules"]]
+        self.assertIn("required_linear_history", types)
+        self.assertIn("non_fast_forward", types)
 
     def test_update_preserves_integration_id_for_a_matching_context(self):
         # An existing entry's integration_id (which binds a required check
@@ -815,6 +881,8 @@ class SetupCmdTest(unittest.TestCase):
                         "require_last_push_approval": False,
                     },
                 },
+                {"type": "required_linear_history"},
+                {"type": "non_fast_forward"},
             ],
         }
         code, out, err = _run(fake, ["--force", "--rule", "lanes", REPO])
@@ -874,12 +942,12 @@ class SetupCmdTest(unittest.TestCase):
             "name": "merge gates",
             "enforcement": "active",
             "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
-            "rules": [{"type": "non_fast_forward", "parameters": {}}],
+            "rules": [{"type": "commit_message_pattern", "parameters": {}}],
         }
         code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
         self.assertEqual(code, 1)
         self.assertIn("does not manage", err)
-        self.assertIn("non_fast_forward", err)
+        self.assertIn("commit_message_pattern", err)
         self.assertEqual(fake.puts, [])
 
     def test_conflicting_ruleset_blocks_the_write(self):
@@ -1160,6 +1228,8 @@ class SetupCmdTest(unittest.TestCase):
                         "require_last_push_approval": False,
                     },
                 },
+                {"type": "required_linear_history"},
+                {"type": "non_fast_forward"},
             ],
         }
         code, out, err = _run(fake, ["--rule", "lanes", REPO], isatty=False)
@@ -1229,6 +1299,8 @@ class SetupCmdTest(unittest.TestCase):
                         "require_last_push_approval": False,
                     },
                 },
+                {"type": "required_linear_history"},
+                {"type": "non_fast_forward"},
             ],
         }
 

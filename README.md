@@ -52,8 +52,9 @@ See `AGENTS.md` for testing and contribution conventions.
 `repo list`, `repo secrets`, `repo setup`, and `repo audit` are all
 implemented -- every shell tool in mikelward/scripts now has a Python
 equivalent here. `repo setup` composes three steps -- the required-checks
-branch ruleset (plus a standalone warning when a repository has an actual
-`master` branch), fanning a secret out via the same logic `repo secrets`
+branch ruleset (linear history required, force pushes blocked, plus a
+standalone warning when a repository has an actual `master` branch),
+fanning a secret out via the same logic `repo secrets`
 uses, and ensuring GitHub App installation membership -- behind one
 combined plan and a single confirmation for the whole repository. `repo
 audit` is the read-only counterpart: it reports whether a branch's rules
