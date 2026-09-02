@@ -31,8 +31,12 @@ anything that matters here.
 
 ## Requirements
 
-Python 3 (standard library only -- no dependencies to install) and the `gh`
-CLI, authenticated.
+Python 3.9+ (standard library only -- no dependencies to install) and the
+`gh` CLI, authenticated. The floor is `argparse.BooleanOptionalAction`
+(`repo create`'s `--scaffold`/`--no-scaffold`), added in 3.9; every
+subcommand's parser is built up front regardless of which one is invoked,
+so an older interpreter fails on any command, not just that one (Codex
+review, mikelward/repo#14).
 
 ## Usage
 
@@ -42,7 +46,7 @@ Run `./repo` directly from a checkout; nothing to install.
 repo list [--owner OWNER] [--include-forks] [--include-archived]
 repo create (--private|--public) [--no-scaffold] OWNER/REPO
 repo secrets --name NAME [--env ENV] --file PATH [--force] OWNER/REPO...
-repo setup [--dry-run] [--force] [--no-rules] [--rule CHECK]...
+repo setup [--dry-run] [--force] [--no-rules] [--no-bootstrap] [--rule CHECK]...
            [--secret NAME[@ENV]=PATH]... [--credential NAME=PATH]...
            [--app SLUG]... OWNER/REPO
 repo audit [--branch NAME] OWNER/REPO [CHECK...]
@@ -66,16 +70,33 @@ always current rather than a vendored copy going stale), `zizmor.yml`
 exceptions policy and `.github/lanes.conf` docs/code split those imply, a
 `ci.yml` wiring `mikelward/lanes`'s classify+gate job pair with a trivial
 placeholder standing in for the project's real jobs, and a `TODO.md`
-pointing at replacing it. `lanes`, `codex`, and `zizmor` all report from
-the scaffold's own CI run; only the placeholder's replacement with
-real project jobs is left undone (see `repo_lib/scaffold.py`'s own
-docstring for the full split between what's generated and what isn't).
-`repo setup` composes three steps -- the required-checks
+pointing at replacing it. `lanes` and `zizmor` report from the scaffold's
+own CI run; `codex` needs a pull request first, since its status-writing
+sweep triggers on pull-request activity, not a bare push (Codex review,
+mikelward/repo#14). Only the placeholder's replacement with real project
+jobs is left undone (see `repo_lib/scaffold.py`'s own docstring for the
+full split between what's generated and what isn't).
+`repo setup` composes four steps -- the required-checks
 branch ruleset (linear history required, force pushes blocked, plus a
 standalone warning when a repository has an actual `master` branch),
 fanning a secret out via the same logic `repo secrets`
-uses, and ensuring GitHub App installation membership -- behind one
-combined plan and a single confirmation for the whole repository. `repo
+uses, ensuring GitHub App installation membership, and (always on, like
+the fleet-credentials and auto-merge steps below; `--no-bootstrap` skips
+it) adding whichever of the fleet's own CI scaffold files an
+already-existing repository is still missing -- reusing `repo create
+--scaffold`'s own generated files, never overwriting one already there,
+as one commit on top of the branch's current tip (or, for a repository
+whose branch has no commits yet, the same two-commit bootstrap `repo
+create --scaffold` uses). This is what makes `repo setup --force`
+fix a repository regardless of its starting state in the common case: a
+brand-new repo, one only partway set up, and one already complete all
+converge on the same result -- behind one combined plan and a single
+confirmation for the whole repository. One case still doesn't converge
+(see TODO.md): a repository a PRIOR `repo setup` run already protected
+with a pull-request-requiring ruleset has no scaffold fix here yet --
+the direct ref update this step makes is exactly what that ruleset
+blocks, and closing it needs a branch-and-PR write path this tool
+doesn't have. `repo
 audit` is the read-only counterpart: it reports whether a branch's rules
 (required checks, conversation resolution, up-to-date merges, force-push
 and deletion protection, bypass actors, and -- when auditing the

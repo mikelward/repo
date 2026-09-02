@@ -46,6 +46,7 @@ class FakeGh:
         create_fails_stderr=None,
         default_branch="main",
         template_fetch_fails=None,  # the file name whose fetch should fail
+        template_resolve_fails=False,  # the codex-review main->sha resolve fails
         drift_zizmor_branches_line=False,  # re-spell zizmor.yml's own branches: line
         bootstrap_fails=False,
         blob_fails=False,
@@ -56,9 +57,20 @@ class FakeGh:
         # branch is still genuinely empty (a 404), matching every scenario
         # this file otherwise models. Set ref_precheck_has_commits to
         # model someone else having pushed to it in the meantime; set
-        # ref_precheck_fails for a non-404 read failure.
+        # ref_precheck_empty_409 to model the shape GitHub's real API
+        # actually returns here for a genuinely brand-new repository --
+        # HTTP 409 "Git Repository is empty" rather than 404, since a repo
+        # `repo create` just made has zero git objects at all, not merely
+        # a missing ref (Codex review, mikelward/repo#14); set
+        # ref_precheck_fails for an unrelated read failure.
         ref_precheck_has_commits=False,
+        ref_precheck_empty_409=False,
+        # A 409 that isn't specifically "Git Repository is empty" -- some
+        # other conflict against a branch that already has commits -- must
+        # not be read as "safe to bootstrap" (Codex review, mikelward/repo#14).
+        ref_precheck_ambiguous_409=False,
         ref_precheck_fails=False,
+        bootstrap_commit_parents=None,  # models the bootstrap PUT landing on someone else's commit
     ):
         self.self_login = self_login
         self.org_exists = org_exists
@@ -67,6 +79,13 @@ class FakeGh:
         self.create_fails_stderr = create_fails_stderr
         self.default_branch = default_branch
         self.template_fetch_fails = template_fetch_fails
+        self.template_resolve_fails = template_resolve_fails
+        # The fixed commit sha every template fetch must be pinned to,
+        # once _resolve_commit_sha resolves TEMPLATE_REPO's main -- the
+        # fetch handler below asserts every one of the three uses exactly
+        # this, not "main" independently, since that's the property the
+        # fix under test (Codex review, mikelward/repo#14) exists to give.
+        self.template_commit_sha = "faketemplateshaabc123"
         self.drift_zizmor_branches_line = drift_zizmor_branches_line
         self.bootstrap_fails = bootstrap_fails
         self.blob_fails = blob_fails
@@ -74,7 +93,10 @@ class FakeGh:
         self.commit_fails = commit_fails
         self.ref_fails = ref_fails
         self.ref_precheck_has_commits = ref_precheck_has_commits
+        self.ref_precheck_empty_409 = ref_precheck_empty_409
+        self.ref_precheck_ambiguous_409 = ref_precheck_ambiguous_409
         self.ref_precheck_fails = ref_precheck_fails
+        self.bootstrap_commit_parents = bootstrap_commit_parents
         self.calls = []
         self.posts = []  # (args, decoded body) for the repo-create call only
         self.bootstrap_payload = None  # decoded body of the contents PUT
@@ -91,10 +113,20 @@ class FakeGh:
             if self.self_login_fails:
                 raise gh.GhError("gh: simulated auth failure\n")
             return self.self_login + "\n"
+        if args[0] == "api" and args[1] == f"repos/{scaffold.TEMPLATE_REPO}/commits/main":
+            if self.template_resolve_fails:
+                raise gh.GhError("gh: HTTP 500 (fake template-resolve failure)\n")
+            return self.template_commit_sha + "\n"
         if args[0] == "api" and args[1].startswith(
             f"repos/{scaffold.TEMPLATE_REPO}/contents/templates/"
         ):
             name = args[1].split("templates/", 1)[1].split("?", 1)[0]
+            ref = args[1].split("?ref=", 1)[1] if "?ref=" in args[1] else None
+            if ref != self.template_commit_sha:
+                raise AssertionError(
+                    f"template fetch for {name} used ref={ref!r}, expected the resolved "
+                    f"{self.template_commit_sha!r} (Codex review, mikelward/repo#14)"
+                )
             if self.template_fetch_fails == name:
                 raise gh.GhError(f"gh: HTTP 404: Not Found (fake, {name})\n")
             return base64.b64encode(FAKE_TEMPLATE_CONTENT[name].encode()).decode() + "\n"
@@ -115,13 +147,20 @@ class FakeGh:
             if self.org_exists:
                 return True, ""
             return False, self.org_probe_stderr
-        if args[0] == "api" and "/git/refs/heads/" in args[1]:
+        if args[0] == "api" and "/git/ref/heads/" in args[1]:
             # push_initial_commit's own recheck, right before it bootstraps,
-            # that the branch is still empty.
+            # that the branch is still empty. Singular git/ref/... -- the
+            # documented read route; plural git/refs/... (used below, for
+            # the PATCH) has no GET route at all (Codex review,
+            # mikelward/repo#14).
             if self.ref_precheck_fails:
                 return False, "gh: HTTP 500 (fake ref-precheck failure)\n"
             if self.ref_precheck_has_commits:
                 return True, json.dumps({"object": {"sha": "concurrent-commit-sha"}})
+            if self.ref_precheck_empty_409:
+                return False, "gh: HTTP 409: Git Repository is empty.\n"
+            if self.ref_precheck_ambiguous_409:
+                return False, "gh: HTTP 409: Conflict\n"
             return False, "gh: HTTP 404: Not Found\n"
         raise AssertionError(f"unexpected gh.try_run call: {args}")
 
@@ -149,7 +188,10 @@ class FakeGh:
             if self.bootstrap_fails:
                 raise gh.GhError("gh: HTTP 500 (fake bootstrap failure)\n")
             self.bootstrap_payload = json.loads(input_bytes)
-            return json.dumps({"commit": {"sha": "bootstrap-commit-sha"}}).encode()
+            commit = {"sha": "bootstrap-commit-sha"}
+            if self.bootstrap_commit_parents:
+                commit["parents"] = self.bootstrap_commit_parents
+            return json.dumps({"commit": commit}).encode()
         if endpoint.endswith("/git/blobs"):
             if self.blob_fails:
                 raise gh.GhError("gh: HTTP 500 (fake blob failure)\n")
@@ -326,6 +368,34 @@ class ScaffoldFlagTest(unittest.TestCase):
         self.assertIn(f"pushed the CI scaffold ({EXPECTED_SCAFFOLD_FILE_COUNT} files)", out)
         self.assertIn("repo setup mikelward/newthing --force", out)
 
+    def test_scaffold_bootstraps_when_the_precheck_gets_the_real_409_shape(self):
+        # This is the intended input for `repo create --scaffold`: a
+        # repository this same run just created, which has zero git
+        # objects at all. GitHub's real API returns HTTP 409 ("Git
+        # Repository is empty") for that, not 404 -- the fixture's own
+        # default (404, matching every other test in this class) never
+        # actually exercised the code path `repo create --scaffold`'s
+        # real input takes. Treating only 404 as "still empty, proceed"
+        # would refuse to bootstrap here, so `repo create --scaffold`
+        # could never succeed on a genuinely fresh repository (Codex
+        # review, mikelward/repo#14).
+        fake = FakeGh(self_login="mikelward", ref_precheck_empty_409=True)
+        status, out, err = run_repo_create(fake, ["--private", "mikelward/newthing"])
+        self.assertEqual(status, 0, err)
+        self.assertIsNotNone(fake.bootstrap_payload)
+        self.assertIn(f"pushed the CI scaffold ({EXPECTED_SCAFFOLD_FILE_COUNT} files)", out)
+
+    def test_ambiguous_409_precheck_refuses_rather_than_bootstrapping(self):
+        # A 409 that isn't specifically "Git Repository is empty" -- some
+        # other conflict -- must not be read as "safe to bootstrap": that
+        # would let this write straight onto a branch that might actually
+        # have commits (Codex review, mikelward/repo#14).
+        fake = FakeGh(self_login="mikelward", ref_precheck_ambiguous_409=True)
+        status, _, err = run_repo_create(fake, ["--private", "mikelward/newthing"])
+        self.assertEqual(status, 1)
+        self.assertIn("could not re-check", err)
+        self.assertIsNone(fake.bootstrap_payload)
+
     def test_no_scaffold_flag_skips_the_scaffold_push(self):
         fake = FakeGh(self_login="mikelward")
         status, out, err = run_repo_create(fake, ["--private", "--no-scaffold", "mikelward/newthing"])
@@ -358,6 +428,50 @@ class ScaffoldFlagTest(unittest.TestCase):
         contents = [blob["content"] for blob in fake.blobs]
         self.assertTrue(any('branches: ["release,next"]' in c for c in contents))
 
+    def test_default_branch_with_url_metacharacters_is_percent_encoded_in_ref_calls(self):
+        # A branch name can carry a `#`, which sent raw into a URL path
+        # would be read as the start of a fragment (or otherwise misparse)
+        # rather than as part of the ref name (Codex review,
+        # mikelward/repo#14) -- credentials._ref_suffix hit the same class
+        # of bug for a query-string ref (Codex, mikelward/repo#13).
+        fake = FakeGh(self_login="mikelward", default_branch="release#1")
+        status, _, err = run_repo_create(fake, ["--private", "mikelward/newthing"])
+        self.assertEqual(status, 0, err)
+        # Singular git/ref/... for the precheck GET, plural git/refs/...
+        # for the PATCH that fast-forwards the branch -- see
+        # scaffold._branch_ref_path's own docstring (Codex review,
+        # mikelward/repo#14).
+        precheck_expected = "repos/mikelward/newthing/git/ref/heads/release%231"
+        self.assertTrue(
+            any(len(c) > 1 and c[1] == precheck_expected for c in fake.calls if c[0] == "api"),
+            f"no precheck call to {precheck_expected} in {fake.calls}",
+        )
+        self.assertEqual(fake.ref_endpoint, "repos/mikelward/newthing/git/refs/heads/release%231")
+
+    def test_default_branch_with_a_slash_keeps_it_literal_in_ref_calls(self):
+        # Unlike the query-string case above, an embedded "/" here is a
+        # real ref path separator (refs/heads/release/1.0) and must stay
+        # literal, not become %2F.
+        fake = FakeGh(self_login="mikelward", default_branch="release/1.0")
+        status, _, err = run_repo_create(fake, ["--private", "mikelward/newthing"])
+        self.assertEqual(status, 0, err)
+        self.assertEqual(fake.ref_endpoint, "repos/mikelward/newthing/git/refs/heads/release/1.0")
+
+    def test_a_commit_created_with_a_parent_refuses_rather_than_discarding_it(self):
+        # The precheck and the bootstrap PUT are two separate requests --
+        # someone can still push a real first commit in between. The PUT
+        # itself would succeed right on top of theirs (the Contents API
+        # doesn't require an empty branch), so the only place that race is
+        # visible is the returned commit's own parents (Codex review,
+        # mikelward/repo#14).
+        fake = FakeGh(self_login="mikelward")
+        fake.bootstrap_commit_parents = ["someone-elses-commit-sha"]
+        status, _, err = run_repo_create(fake, ["--private", "mikelward/newthing"])
+        self.assertEqual(status, 1)
+        self.assertIn("already had a commit by the time the bootstrap write landed", err)
+        self.assertEqual(fake.blobs, [])
+        self.assertEqual(fake.tree_payload, None)
+
     def test_missing_default_branch_in_the_create_response_is_reported(self):
         fake = FakeGh(self_login="mikelward", default_branch="")
         status, _, err = run_repo_create(fake, ["--private", "mikelward/newthing"])
@@ -376,6 +490,37 @@ class ScaffoldFlagTest(unittest.TestCase):
         # is what's missing.
         self.assertEqual(len(fake.posts), 1)
         self.assertEqual(fake.blobs, [])
+
+    def test_template_commit_resolve_failure_is_reported_and_nothing_is_fetched(self):
+        # Resolving codex-review's main to a commit sha is the first call
+        # build_scaffold_files makes for the three templates -- if it
+        # fails, none of the three fetches should even be attempted
+        # (Codex review, mikelward/repo#14).
+        fake = FakeGh(self_login="mikelward", template_resolve_fails=True)
+        status, _, err = run_repo_create(fake, ["--private", "mikelward/newthing"])
+        self.assertEqual(status, 1)
+        self.assertIn("could not resolve", err)
+        self.assertIn("fetching the scaffold's template files failed", err)
+        self.assertEqual(fake.blobs, [])
+
+    def test_all_three_templates_are_fetched_at_the_same_resolved_commit(self):
+        # FakeGh.run itself asserts every template fetch's ref equals the
+        # one resolved sha (raising AssertionError otherwise), so a
+        # regression back to each fetch resolving "main" independently
+        # would fail this test even without the explicit check below --
+        # this just makes the property being tested for legible on its own
+        # (Codex review, mikelward/repo#14).
+        fake = FakeGh(self_login="mikelward")
+        status, _, err = run_repo_create(fake, ["--private", "mikelward/newthing"])
+        self.assertEqual(status, 0, err)
+        template_fetch_calls = [
+            c
+            for c in fake.calls
+            if c[0] == "api" and c[1].startswith(f"repos/{scaffold.TEMPLATE_REPO}/contents/templates/")
+        ]
+        self.assertEqual(len(template_fetch_calls), len(scaffold.TEMPLATE_FILES))
+        for call in template_fetch_calls:
+            self.assertTrue(call[1].endswith(f"?ref={fake.template_commit_sha}"), call)
 
     def test_zizmor_workflow_fetch_failure_is_reported(self):
         fake = FakeGh(self_login="mikelward", template_fetch_fails="zizmor.yml")
@@ -397,7 +542,7 @@ class ScaffoldFlagTest(unittest.TestCase):
         )
         status, _, err = run_repo_create(fake, ["--private", "mikelward/newthing"])
         self.assertEqual(status, 1)
-        self.assertIn("no longer spells its push filter literally", err)
+        self.assertIn("isn't a single, unambiguous 'branches: [main]' line", err)
         self.assertIn("fetching the scaffold's template files failed", err)
         self.assertEqual(fake.blobs, [])
 
@@ -407,6 +552,157 @@ class ScaffoldFlagTest(unittest.TestCase):
         fake = FakeGh(self_login="mikelward", default_branch="main", drift_zizmor_branches_line=True)
         status, _, err = run_repo_create(fake, ["--private", "mikelward/newthing"])
         self.assertEqual(status, 0, err)
+
+    def test_branches_line_refuses_two_top_level_on_push_parented_occurrences(self):
+        # Two genuine `branches: [main]` lines, each under a TOP-LEVEL
+        # on: push: -- leaves no way to tell which one is the real push
+        # trigger this scaffold cares about. Rewriting whichever comes
+        # first would leave the OTHER one still pointed at "main" while
+        # reporting success (Codex review, mikelward/repo#14).
+        text = (
+            "name: zizmor\n"
+            "on:\n"
+            "  push:\n"
+            "    branches: [main]\n"
+            "on:\n"
+            "  push:\n"
+            "    branches: [main]\n"
+        )
+        result = scaffold._branches_line(text, "trunk")
+        self.assertIsNone(result)
+
+    def test_branches_line_ignores_an_on_push_branches_shape_not_at_top_level(self):
+        # Fresh evidence beyond the on:-grandparent fix: an on: push:
+        # branches: [main] shape that ISN'T itself at the document's top
+        # level (here nested under an unrelated "extra:" key) must not be
+        # mistaken for the real, top-level trigger -- especially
+        # dangerous when the real trigger is written in block style, since
+        # then this nested lookalike would be the only bracket-style match
+        # that otherwise clears the on:/push: ancestry check (Codex
+        # review, mikelward/repo#14).
+        text = (
+            "name: zizmor\n"
+            "on:\n"
+            "  push:\n"
+            "    branches:\n"
+            "      - main\n"
+            "extra:\n"
+            "  on:\n"
+            "    push:\n"
+            "      branches: [main]\n"
+        )
+        result = scaffold._branches_line(text, "trunk")
+        self.assertIsNone(result)
+
+    def test_branches_line_ignores_a_push_key_not_nested_under_on(self):
+        # Fresh evidence beyond the push:-parent-only fix: an unrelated
+        # `push:` mapping elsewhere in the file (not itself under `on:`)
+        # must not be mistaken for the real trigger either -- especially
+        # dangerous when the real trigger is written in block style, since
+        # then this lookalike would be the only bracket-style match at
+        # all under a push: parent. Requiring the grandparent to be `on:`
+        # too rejects it (Codex review, mikelward/repo#14).
+        text = (
+            "name: zizmor\n"
+            "on:\n"
+            "  push:\n"
+            "    branches:\n"
+            "      - main\n"
+            "hooks:\n"
+            "  push:\n"
+            "    branches: [main]\n"
+        )
+        result = scaffold._branches_line(text, "trunk")
+        self.assertIsNone(result)
+
+    def test_branches_line_ignores_a_lookalike_key_with_a_different_parent(self):
+        # A job's own unrelated key that happens to be named "branches"
+        # too (a matrix entry) sits under matrix:, not push: -- one
+        # whole-line match under push: and one under matrix: is NOT
+        # ambiguous, since only the push:-parented one is the real
+        # trigger. This is a precision improvement over the earlier
+        # whole-line-only fix, which would have counted both and refused
+        # a scaffold that's actually safe to rewrite.
+        text = (
+            "name: zizmor\n"
+            "on:\n"
+            "  push:\n"
+            "    branches: [main]\n"
+            "jobs:\n"
+            "  x:\n"
+            "    strategy:\n"
+            "      matrix:\n"
+            "        branches: [main]\n"
+        )
+        result = scaffold._branches_line(text, "trunk")
+        self.assertIsNotNone(result)
+        self.assertIn('branches: ["trunk"]', result)
+        # Only the real trigger line was rewritten -- the matrix entry's
+        # own "branches: [main]" is untouched.
+        self.assertIn("        branches: [main]\n", result)
+
+    def test_branches_line_refuses_when_the_only_bracket_style_match_is_a_lookalike(self):
+        # Fresh evidence beyond the earlier whole-line fix: the real on:
+        # push: filter here is written in BLOCK style ("- main"), which
+        # _BRANCHES_MAIN_LINE_RE never matches at all -- only a job's
+        # unrelated "branches: [main]" matrix entry does, whose parent is
+        # matrix:, not push:. A whole-line-only check would have found
+        # exactly that one match, treated it as unambiguous, and rewritten
+        # it -- leaving the REAL push filter still reading "main" while
+        # reporting success. Requiring a push: parent means there is no
+        # valid match at all here, so this must refuse rather than
+        # silently rewrite the lookalike (Codex review, mikelward/repo#14).
+        text = (
+            "name: zizmor\n"
+            "on:\n"
+            "  push:\n"
+            "    branches:\n"
+            "      - main\n"
+            "jobs:\n"
+            "  x:\n"
+            "    strategy:\n"
+            "      matrix:\n"
+            "        branches: [main]\n"
+        )
+        result = scaffold._branches_line(text, "trunk")
+        self.assertIsNone(result)
+
+    def test_branches_line_ignores_the_same_text_embedded_in_an_unrelated_line(self):
+        # A bare substring search can't tell the real `on: push: branches:`
+        # trigger apart from that exact text turning up somewhere else in
+        # the file that ISN'T its own whole line -- here, inside a shell
+        # one-liner in an unrelated step. Anchoring to a whole-line match
+        # is what tells them apart: only the real trigger line matches, so
+        # this still rewrites cleanly, leaving the one-liner's text alone.
+        text = (
+            "name: zizmor\n"
+            "on:\n"
+            "  push:\n"
+            "    branches: [main]\n"
+            "jobs:\n"
+            "  x:\n"
+            "    steps:\n"
+            "      - run: echo 'reminder: this filter says branches: [main]'\n"
+        )
+        result = scaffold._branches_line(text, "trunk")
+        self.assertIsNotNone(result)
+        self.assertIn('branches: ["trunk"]', result)
+        self.assertIn("reminder: this filter says branches: [main]", result)
+
+    def test_branches_line_ignores_a_commented_out_occurrence(self):
+        # A commented-out line doesn't count as the real trigger, so with
+        # exactly one REAL occurrence this still rewrites cleanly.
+        text = (
+            "name: zizmor\n"
+            "# old filter used to read: branches: [main]\n"
+            "on:\n"
+            "  push:\n"
+            "    branches: [main]\n"
+        )
+        result = scaffold._branches_line(text, "trunk")
+        self.assertIsNotNone(result)
+        self.assertIn('branches: ["trunk"]', result)
+        self.assertIn("# old filter used to read: branches: [main]", result)
 
     def test_a_concurrent_initial_commit_refuses_the_bootstrap_rather_than_discarding_it(self):
         # Someone else pushed a real first commit to the branch between
@@ -446,8 +742,15 @@ class ScaffoldFlagTest(unittest.TestCase):
         self.assertIn("could not create a blob", err)
         self.assertIn("pushing the scaffold commit failed", err)
         # The bootstrap commit already landed -- only the real commit and
-        # the ref update are what's missing.
+        # the ref update are what's missing. Telling the user to "push
+        # your initial commit by hand" here would be actively wrong: the
+        # branch isn't empty any more, so a normal, independently rooted
+        # push would be rejected as non-fast-forward against the bootstrap
+        # commit that's already there (Codex review, mikelward/repo#14).
         self.assertIsNotNone(fake.bootstrap_payload)
+        self.assertNotIn("push your initial commit by hand", err.lower())
+        self.assertIn("may already carry a partial bootstrap commit", err)
+        self.assertIn("repo setup mikelward/newthing --force", err)
 
     def test_tree_failure_is_reported(self):
         fake = FakeGh(self_login="mikelward", tree_fails=True)

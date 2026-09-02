@@ -650,20 +650,27 @@ def _build_update_body(repo, existing_id, checks, ruleset_name):
 
     target = dict(original)
     target["rules"] = new_rules
-    return target != original, target
+    return target != original, target, has_pull_request
 
 
 def _plan_write(repo, existing_id, checks, ruleset_name):
-    """Returns (needs_write, target_body): the full API body this step
-    would PUT to `existing_id` (or POST as a new ruleset, when
-    `existing_id` is falsy) to reach `checks`, and whether that differs
-    from what's there now (always True with no `existing_id`, since
-    nothing exists yet to compare against). The pair is apply_ruleset's
-    fingerprint of "what this call has decided to do" -- see its
-    expected_fingerprint doc."""
+    """Returns (needs_write, target_body, introduces_pr_protection): the
+    full API body this step would PUT to `existing_id` (or POST as a new
+    ruleset, when `existing_id` is falsy) to reach `checks`, whether that
+    differs from what's there now, and whether writing it would be what
+    FIRST makes the branch require a pull request. The third is computed
+    from the EXISTING ruleset's own rules, not from whether `existing_id`
+    is set -- an update-only check on `existing_id` misses a managed
+    ruleset that already had linear-history/force-push rules but no
+    pull_request one yet, which this call would still be the one to add
+    (Codex review, mikelward/repo#14). needs_write and target_body feed
+    apply_ruleset's fingerprint; introduces_pr_protection rides along in
+    `report` only, since it describes the ruleset's PRIOR state rather
+    than what this call is about to write."""
     if existing_id:
-        return _build_update_body(repo, existing_id, checks, ruleset_name)
-    return True, _create_body(ruleset_name, checks)
+        changed, target, had_pull_request = _build_update_body(repo, existing_id, checks, ruleset_name)
+        return changed, target, not had_pull_request
+    return True, _create_body(ruleset_name, checks), True
 
 
 def _bypass_actor_note(bypass_actors):
@@ -740,6 +747,8 @@ def apply_ruleset(
     expected_fingerprint=_NO_EXPECTATION,
     report=None,
     skip_confirm=False,
+    refuse_if_introduces_pr_protection=False,
+    verify_scaffold_before_introducing_pr_protection=None,
 ):
     """Runs the whole repo-rules port against `repo`. Returns 0 on success
     (including "nothing to change" and a clean --dry-run), 1 if any step
@@ -786,7 +795,38 @@ def apply_ruleset(
     things: `force` authorizes overriding the never-reported-check guard
     above; skip_confirm only says "don't ask a question here" -- for a
     caller (setup_cmd.py's real apply) whose own confirmation already
-    happened, with nothing left on stdin to answer a second one."""
+    happened, with nothing left on stdin to answer a second one.
+
+    refuse_if_introduces_pr_protection: checked against the FRESH
+    recompute right before the real write, not the earlier preview --
+    setup_cmd.py's own bootstrap-failure gate already skips calling this
+    function at all when the PREVIEW says a write would introduce
+    pull-request protection, but a preview-time answer is a snapshot: an
+    administrator could edit the existing ruleset during the confirmation
+    wait (removing its pull_request rule from one that otherwise still
+    needed a write) such that _plan_write's fresh call now answers True
+    where the preview said False, and _build_update_body would silently
+    reconstruct the same target body regardless -- passing the ordinary
+    fingerprint check, since that compares WHAT would be written, not why.
+    Refusing this here, from the same fresh recompute the fingerprint
+    check itself uses, is what actually closes that window rather than
+    narrowing it (Codex review, mikelward/repo#14).
+
+    verify_scaffold_before_introducing_pr_protection: when given, called
+    with the FRESH default_branch (the same re-read this function's own
+    fresh recompute already did) exactly when a real write would
+    introduce pull-request protection for the first time and
+    refuse_if_introduces_pr_protection didn't already refuse it -- the
+    return value is an error message (refuses and prints it) or None
+    (proceeds). This module knows nothing about the fleet CI scaffold;
+    the callback is how setup_cmd.py verifies that concern against the
+    branch this call is ACTUALLY about to protect, not a snapshot from
+    before this function re-read the default branch -- an administrator
+    changing the default branch itself, or introduces_pr_protection only
+    turning true here (an existing pull_request rule removed during the
+    wait, see the parameter above), both need the scaffold checked
+    against THIS branch, not whichever one an earlier snapshot named
+    (Codex review, mikelward/repo#14)."""
     checks = list(checks) if checks else list(DEFAULT_CHECKS)
 
     for check in checks:
@@ -841,7 +881,9 @@ def apply_ruleset(
         return 1
 
     try:
-        needs_write, target_body = _plan_write(repo, existing, checks, ruleset_name)
+        needs_write, target_body, introduces_pr_protection = _plan_write(
+            repo, existing, checks, ruleset_name
+        )
     except RulesetError:
         return 1
 
@@ -849,6 +891,7 @@ def apply_ruleset(
     if report is not None:
         report["needs_write"] = needs_write
         report["fingerprint"] = fingerprint
+        report["introduces_pr_protection"] = introduces_pr_protection
 
     if not needs_write:
         print(f"{repo}: ruleset '{ruleset_name}' (id {existing}) {NO_OP_MESSAGE}")
@@ -896,10 +939,26 @@ def apply_ruleset(
         return 1
 
     try:
-        fresh_needs_write, fresh_target_body = _plan_write(repo, fresh_existing, checks, ruleset_name)
+        fresh_needs_write, fresh_target_body, fresh_introduces_pr_protection = _plan_write(
+            repo, fresh_existing, checks, ruleset_name
+        )
     except RulesetError:
         error(f"could not re-read ruleset '{ruleset_name}' to write it")
         return 1
+
+    if fresh_introduces_pr_protection and refuse_if_introduces_pr_protection:
+        error(
+            f"ruleset '{ruleset_name}' on {repo} would now introduce pull-request protection "
+            "(it didn't when this was last checked -- its existing pull_request rule was "
+            "removed, or the ruleset itself, while this was waiting), and the caller asked to "
+            "refuse exactly that. Not writing it. Rerun to re-check."
+        )
+        return 1
+    if fresh_introduces_pr_protection and verify_scaffold_before_introducing_pr_protection is not None:
+        problem = verify_scaffold_before_introducing_pr_protection(default_branch)
+        if problem is not None:
+            error(problem)
+            return 1
 
     fresh_fingerprint = (fresh_existing, fresh_needs_write, fresh_target_body)
     want = fingerprint if expected_fingerprint is _NO_EXPECTATION else expected_fingerprint

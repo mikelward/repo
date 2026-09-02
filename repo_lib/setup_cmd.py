@@ -1,4 +1,5 @@
-"""`repo setup` -- compose rules, secrets, and App membership.
+"""`repo setup` -- compose rules, secrets, App membership, fleet credentials,
+auto-merge, and the fleet CI scaffold's gaps.
 
 Port of mikelward/scripts's repo-setup (see its own header comment for the
 full reasoning; repeated here only where the port changes something). A
@@ -86,7 +87,7 @@ from contextlib import redirect_stdout
 from dataclasses import dataclass
 from typing import Optional
 
-from repo_lib import apps, credentials, gh, rules, secrets_cmd
+from repo_lib import apps, credentials, gh, rules, scaffold, secrets_cmd
 from repo_lib.common import error, error_lines
 
 # The lookaheads reject `.` and `..` components: made of allowed
@@ -99,6 +100,11 @@ def add_arguments(parser):
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--force", action="store_true", help="apply without confirming")
     parser.add_argument("--no-rules", action="store_true", help="skip the ruleset step")
+    parser.add_argument(
+        "--no-bootstrap",
+        action="store_true",
+        help="skip adding any missing fleet CI scaffold file (codex-review, zizmor, lanes)",
+    )
     parser.add_argument("--rule", action="append", default=[], help="a required check (repeatable)")
     parser.add_argument(
         "--secret", action="append", default=[], metavar="NAME[@ENV]=PATH", help="repeatable"
@@ -538,6 +544,20 @@ def _plan_credentials(repo, specs):
     return plan
 
 
+def _bootstrap_default_branch(repo):
+    """`repo`'s default branch name for the bootstrap step, or None (with
+    the failure already reported) if the read fails. Reuses
+    credentials.default_branch rather than re-deriving the same `gh api
+    repos/{repo} --jq .default_branch` call setup_cmd already reaches for
+    via that module -- only the error handling differs, since credentials
+    raises ReadError and the other steps here report-and-return-None."""
+    try:
+        return credentials.default_branch(repo)
+    except credentials.ReadError as e:
+        error_lines(e.message, e.detail or "")
+        return None
+
+
 def _plan_auto_merge(repo):
     """Whether the repository allows auto-merge: ("allowed" | "enable" |
     "error", the plan lines). The weekly batches arm auto-merge on the pull
@@ -625,7 +645,24 @@ def run(args):
     credentials_idle = not (credentials_plan.moves or credentials_plan.unfixed or credentials_plan.failed)
     auto_merge_state, auto_merge_lines = _plan_auto_merge(repo)
 
-    if (
+    # Always on, like credentials and auto-merge: there is nothing to
+    # request here either, only one right state (the fleet's scaffold
+    # files present) and a diff against it. Unlike those two, --no-
+    # bootstrap can skip it outright -- a repository can have a genuine
+    # reason to carry no CI at all, and unlike a credential or a setting,
+    # there's no way to represent "leave this alone" other than not
+    # running the step.
+    bootstrap_plan = None
+    bootstrap_default_branch = None
+    if not args.no_bootstrap:
+        bootstrap_default_branch = _bootstrap_default_branch(repo)
+        if bootstrap_default_branch is None:
+            bootstrap_plan = scaffold.GapPlan(error=True)
+        else:
+            bootstrap_plan = scaffold.plan_gaps(repo, bootstrap_default_branch)
+    bootstrap_idle = args.no_bootstrap or (not bootstrap_plan.error and not bootstrap_plan.missing)
+
+    would_skip_everything = (
         args.no_rules
         and not secret_specs
         and not args.app
@@ -635,7 +672,40 @@ def run(args):
         and not credential_specs
         and credentials_idle
         and auto_merge_state == "allowed"
-    ):
+        and bootstrap_idle
+    )
+    if would_skip_everything and bootstrap_plan is not None and not bootstrap_plan.error:
+        # About to report "nothing to do" on bootstrap_idle's word alone --
+        # but that reflects plan_gaps's own read from a moment ago, and
+        # this path returns before the Apply section's own rename recheck
+        # ever runs, so an administrative rename since then would exit 0
+        # having never inspected the new default branch (Codex review,
+        # mikelward/repo#14). Re-verify here too; a mismatch or failed
+        # read falls through into the normal flow as a bootstrap failure
+        # instead of exiting early.
+        current_default_branch = _bootstrap_default_branch(repo)
+        if current_default_branch is None:
+            bootstrap_plan = scaffold.GapPlan(error=True)  # already reported
+            would_skip_everything = False
+        elif current_default_branch != bootstrap_default_branch:
+            error(
+                f"{repo}: default branch changed from '{bootstrap_default_branch}' to "
+                f"'{current_default_branch}' while this was waiting; refusing to report "
+                "nothing to do. Rerun to gap-fill the real default branch."
+            )
+            bootstrap_plan = scaffold.GapPlan(error=True)
+            would_skip_everything = False
+        elif scaffold.apply_gaps(repo, bootstrap_default_branch, bootstrap_plan) is None:
+            # Same branch name, but has ITS TIP moved -- a concurrent
+            # push could have deleted or replaced a scaffold file since
+            # plan_gaps read the tree (Codex review, mikelward/repo#14).
+            # bootstrap_idle guarantees plan.missing is empty here, so
+            # this call only re-verifies the tip; it writes nothing.
+            # apply_gaps already reported why it failed.
+            bootstrap_plan = scaffold.GapPlan(error=True)
+            would_skip_everything = False
+
+    if would_skip_everything:
         # Nothing requested actually mutates anything -- no ruleset step,
         # no secrets, no apps -- so there's nothing to build a plan for or
         # confirm. Codex review: reaching the confirmation gate below for
@@ -682,6 +752,39 @@ def run(args):
         ruleset_lines = buf.getvalue().splitlines()
         ruleset_preview_failed = code != 0
 
+    # --no-bootstrap means bootstrap_plan stays None, so nothing above has
+    # checked whether the branch has any commits -- needed here because a
+    # ruleset that first requires pull requests would strand a branch with
+    # none (no direct push could create it, no PR could target it). Computed
+    # during planning, not the Apply section, so --dry-run previews it too;
+    # and independent of the preview's own introduces_pr_protection, which
+    # can go stale by the time the real write happens (Codex review,
+    # mikelward/repo#14).
+    empty_branch_would_be_stranded = False
+    if bootstrap_plan is None and not args.no_rules:
+        no_bootstrap_default_branch = _bootstrap_default_branch(repo)
+        if no_bootstrap_default_branch is None:
+            empty_branch_would_be_stranded = True
+        else:
+            ok, ref_raw = gh.try_run(
+                # Singular git/ref/... -- see scaffold.push_initial_commit's
+                # own comment; plural git/refs/... has no GET route at all
+                # and would 404 a populated branch here too (Codex review,
+                # mikelward/repo#14).
+                ["api", f"repos/{repo}/git/ref/{scaffold._branch_ref_path(no_bootstrap_default_branch)}"]
+            )
+            if not ok:
+                if not scaffold._ref_missing_commits(ref_raw):
+                    error_lines(
+                        f"could not check whether {repo}'s '{no_bootstrap_default_branch}' branch "
+                        "has any commits yet:",
+                        ref_raw,
+                    )
+                empty_branch_would_be_stranded = True
+    empty_branch_would_strand_ruleset = (
+        not args.no_rules and empty_branch_would_be_stranded and ruleset_report.get("introduces_pr_protection")
+    )
+
     secret_previews = []  # (SecretSpec, (repo, state, env_state), description lines)
     secrets_preview_failed = False
     for spec in secret_specs:
@@ -699,6 +802,11 @@ def run(args):
         if not args.no_rules:
             lines.append("  ruleset (repo-rules):")
             lines += [f"    {line}" for line in ruleset_lines]
+            if empty_branch_would_strand_ruleset:
+                lines.append(
+                    "    SKIPPED: would strand this repository -- its branch has no commits "
+                    "yet and --no-bootstrap means nothing here will add one"
+                )
         if secret_previews:
             lines.append("  secrets (repo-secrets):")
             for spec, _entry, desc_lines in secret_previews:
@@ -714,6 +822,9 @@ def run(args):
             lines.append("    nothing to do")
         lines.append("  auto-merge:")
         lines += [f"    {line}" for line in auto_merge_lines]
+        if not args.no_bootstrap:
+            lines.append("  bootstrap (fleet CI scaffold):")
+            lines += [f"    {line}" for line in scaffold.describe_gap_plan(bootstrap_plan)]
         return lines
 
     if args.dry_run:
@@ -729,6 +840,8 @@ def run(args):
             or credentials_plan.failed
             or credentials_plan.unfixed
             or auto_merge_state == "error"
+            or (bootstrap_plan is not None and bootstrap_plan.error)
+            or empty_branch_would_strand_ruleset
         ):
             raise SystemExit(1)
         return 0
@@ -772,6 +885,7 @@ def run(args):
         or apps_need_mutation
         or bool(credentials_plan.moves)
         or auto_merge_state == "enable"
+        or (bootstrap_plan is not None and not bootstrap_plan.error and bool(bootstrap_plan.missing))
     )
 
     # Printed unconditionally -- including under --force, and even when
@@ -804,7 +918,114 @@ def run(args):
 
     failed = []
 
-    if not args.no_rules:
+    # Runs FIRST, before the ruleset step: apply_gaps writes straight to
+    # the branch (a plain, non-force ref update -- see its own docstring),
+    # and a ruleset requiring pull requests blocks exactly that kind of
+    # direct push for any caller that isn't a configured bypass actor --
+    # which this tool's own ruleset step never configures one to be. Apply
+    # the scaffold while the branch is still unprotected (a fresh
+    # repository's first-ever `repo setup --force`) or before this run's
+    # own ruleset write takes effect, rather than after. This does not
+    # cover a repository a PRIOR run already protected: apply_gaps's own
+    # ref-update failure there is exactly this rejection, reported as
+    # whatever GitHub's own error says rather than guessed at (Codex
+    # review, mikelward/repo#14) -- there is no direct-push path once
+    # protection is active, and adding one (via a pull request instead of
+    # a ref update) is follow-up work, not this step's job today.
+    bootstrap_failed = False
+    # The branch's tip right after the bootstrap step verified or wrote
+    # it -- carried into the ruleset gate below so it can re-check the
+    # scaffold is still intact right before activating protection, not
+    # just whether bootstrap itself succeeded (Codex review,
+    # mikelward/repo#14).
+    bootstrap_completed_sha = None
+    if bootstrap_plan is not None:
+        if bootstrap_plan.error:
+            # Already reported (either the default-branch read's own
+            # failure, or plan_gaps's) when the plan was built.
+            failed.append("bootstrap")
+            bootstrap_failed = True
+        else:
+            # Re-verify the default branch is still the one plan_gaps
+            # built this plan against, whether or not anything was
+            # missing -- an administrative rename (repo settings, not a
+            # push) during the wait must not let a no-op plan ("the old
+            # branch was already complete") silently skip inspecting the
+            # new one, which the ruleset step below would then go on to
+            # protect while it's still wholly unscaffolded (Codex review,
+            # mikelward/repo#14).
+            current_default_branch = _bootstrap_default_branch(repo)
+            if current_default_branch is None:
+                failed.append("bootstrap")
+                bootstrap_failed = True
+            elif current_default_branch != bootstrap_default_branch:
+                error(
+                    f"{repo}: default branch changed from '{bootstrap_default_branch}' to "
+                    f"'{current_default_branch}' while this was waiting; refusing to add the "
+                    "scaffold to a branch that's no longer current. Rerun to gap-fill the real "
+                    "default branch."
+                )
+                failed.append("bootstrap")
+                bootstrap_failed = True
+            else:
+                # apply_gaps itself re-verifies the tip before reporting
+                # success either way -- write or, for a no-op plan, just
+                # the recheck -- and returns it, so nothing further is
+                # needed here beyond capturing what it returned.
+                bootstrap_completed_sha = scaffold.apply_gaps(repo, bootstrap_default_branch, bootstrap_plan)
+                if bootstrap_completed_sha is None:
+                    failed.append("bootstrap")
+                    bootstrap_failed = True
+                elif bootstrap_plan.missing:
+                    print(f"{repo}: added {len(bootstrap_plan.missing)} fleet CI scaffold file(s)")
+
+    # empty_branch_would_be_stranded (the --no-bootstrap-on-an-empty-branch
+    # case) was already computed above during planning, not here -- see its
+    # own comment there for why. bootstrap_failed, above, is the only thing
+    # this Apply section still needs to determine fresh: a real write's
+    # success or failure genuinely can't be known ahead of attempting it.
+
+    # Blocks the ruleset step only when its write would be the one that
+    # FIRST makes the branch require a pull request -- from the existing
+    # ruleset's own rules (ruleset_report["introduces_pr_protection"]), not
+    # merely whether it already exists, since an update that ADDS
+    # pull_request to a ruleset that didn't have it is just as dangerous as
+    # creating one fresh (per TODO.md, apply_gaps has no direct-push path
+    # past that protection once it's active). An update that doesn't
+    # introduce it is let through regardless -- unchanged exposure either
+    # way. empty_branch_would_strand_ruleset (planning, above) is the same
+    # guard from the other direction: --no-bootstrap on an empty branch
+    # rather than a failed one (Codex review, mikelward/repo#14). A
+    # concurrent push moving the scaffold branch after bootstrap finished
+    # (or an administrator changing the default branch itself) is a
+    # separate, later check -- verify_scaffold_before_introducing_pr_
+    # protection, passed to the real apply_ruleset call below, since only
+    # ITS fresh recompute knows the CURRENT default branch and the CURRENT
+    # (not preview-snapshot) answer to whether this write introduces
+    # protection (Codex review, mikelward/repo#14).
+    if not args.no_rules and (
+        (bootstrap_failed and ruleset_report["introduces_pr_protection"]) or empty_branch_would_strand_ruleset
+    ):
+        if bootstrap_failed:
+            error(
+                f"{repo}: skipping the ruleset step -- it would make its branch require a pull "
+                "request for the first time, and the bootstrap step that must land first (see "
+                "above) failed. Activating pull-request protection now would leave this repository "
+                "permanently missing the fleet CI scaffold (see TODO.md). Fix the bootstrap failure "
+                "and rerun."
+            )
+        else:
+            error(
+                f"{repo}: skipping the ruleset step -- it would make its branch require a pull "
+                "request for the first time, and the branch has no commits yet (--no-bootstrap "
+                "means nothing here will add one). Activating pull-request protection now would "
+                "permanently strand the repository: no direct push could create the branch, and no "
+                "pull request can target one that doesn't exist yet to use as a base. Push an "
+                "initial commit by hand first (or drop --no-bootstrap so this scaffolds one), then "
+                "rerun."
+            )
+        failed.append("ruleset")
+    elif not args.no_rules:
         # expected_fingerprint carries forward what the preview call
         # decided and showed -- which ruleset (or none) and the exact body
         # it would write -- so this refuses rather than silently acting on
@@ -834,6 +1055,30 @@ def run(args):
         # what the user actually passed, so the guard still blocks unless
         # they explicitly authorized overriding it. See apply_ruleset's own
         # doc for both parameters.
+        def _verify_scaffold_still_current(fresh_default_branch):
+            """Called by apply_ruleset itself, only when its OWN fresh
+            recompute says this write would introduce pull-request
+            protection -- so fresh_default_branch is the CURRENT default
+            branch, not bootstrap_default_branch, which an administrator
+            could have repointed at an unscaffolded branch since bootstrap
+            ran (Codex review, mikelward/repo#14)."""
+            if fresh_default_branch != bootstrap_default_branch:
+                return (
+                    f"{repo}: default branch is now '{fresh_default_branch}', not the "
+                    f"'{bootstrap_default_branch}' this run's bootstrap step scaffolded -- "
+                    "refusing to activate pull-request protection on a branch whose scaffold "
+                    "state is unknown. Rerun to check it."
+                )
+            current_sha = scaffold._recheck_branch_sha(repo, fresh_default_branch)
+            if current_sha is None or current_sha != bootstrap_completed_sha:
+                return (
+                    f"{repo}: '{fresh_default_branch}' changed after the bootstrap step finished "
+                    "verifying the scaffold (a concurrent push). Refusing to activate "
+                    "pull-request protection over what might now be an incomplete scaffold "
+                    "(see TODO.md). Rerun to check its current state."
+                )
+            return None
+
         if (
             rules.apply_ruleset(
                 repo,
@@ -842,6 +1087,21 @@ def run(args):
                 force=args.force,
                 expected_fingerprint=ruleset_report["fingerprint"],
                 skip_confirm=True,
+                # The gate above uses the PREVIEW's introduces_pr_protection,
+                # a snapshot; passing this through has apply_ruleset's own
+                # fresh recompute (right before the real write) refuse if it
+                # only became true during the confirmation wait -- covering
+                # both bootstrap_failed and the --no-bootstrap-on-an-empty-
+                # branch case, which never sets bootstrap_failed on its own
+                # (Codex review, mikelward/repo#14).
+                refuse_if_introduces_pr_protection=bootstrap_failed or empty_branch_would_be_stranded,
+                # Only meaningful once bootstrap has actually verified a
+                # tip to compare against -- bootstrap_failed above already
+                # blocks the case where it hasn't (Codex review,
+                # mikelward/repo#14).
+                verify_scaffold_before_introducing_pr_protection=(
+                    _verify_scaffold_still_current if bootstrap_completed_sha is not None else None
+                ),
             )
             != 0
         ):
