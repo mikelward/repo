@@ -45,9 +45,16 @@ DEFAULT_RULESET_NAME = "merge gates"
 # review verdict, zizmor's workflow-injection scan -- used when --rule was
 # never given, matching repo-rules' own default.
 DEFAULT_CHECKS = ["lanes", "codex", "zizmor"]
-# The two rule types this module manages. A ruleset holding any other type
-# is not ours to overwrite -- see _check_ruleset_ownership.
-_MANAGED_RULE_TYPES = {"required_status_checks", "pull_request"}
+# The rule types this module manages. A ruleset holding any other type is
+# not ours to overwrite -- see _check_ruleset_ownership. required_linear_history
+# and non_fast_forward take no parameters, unlike the other two: managing them
+# is purely a presence check (see _build_update_body).
+_MANAGED_RULE_TYPES = {
+    "required_status_checks",
+    "pull_request",
+    "required_linear_history",
+    "non_fast_forward",
+}
 # GitHub's ref-name conditions accept fnmatch-style globs; a ref containing
 # one of these is not something this module's literal matching can safely
 # evaluate for a merge-method conflict (see _find_merge_method_conflicts).
@@ -542,6 +549,8 @@ def _create_body(ruleset_name, checks):
                     "require_last_push_approval": False,
                 },
             },
+            {"type": "required_linear_history"},
+            {"type": "non_fast_forward"},
         ],
     }
 
@@ -582,6 +591,8 @@ def _build_update_body(repo, existing_id, checks, ruleset_name):
     wanted_contexts = [{"context": c} for c in checks]
     has_status_checks = False
     has_pull_request = False
+    has_linear_history = False
+    has_non_fast_forward = False
     new_rules = []
     for rule in original.get("rules") or []:
         rule = dict(rule)
@@ -602,6 +613,10 @@ def _build_update_body(repo, existing_id, checks, ruleset_name):
             params["required_review_thread_resolution"] = True
             params["allowed_merge_methods"] = ["rebase"]
             rule["parameters"] = params
+        elif rule.get("type") == "required_linear_history":
+            has_linear_history = True
+        elif rule.get("type") == "non_fast_forward":
+            has_non_fast_forward = True
         new_rules.append(rule)
 
     if not has_status_checks:
@@ -628,6 +643,10 @@ def _build_update_body(repo, existing_id, checks, ruleset_name):
                 },
             }
         )
+    if not has_linear_history:
+        new_rules.append({"type": "required_linear_history"})
+    if not has_non_fast_forward:
+        new_rules.append({"type": "non_fast_forward"})
 
     target = dict(original)
     target["rules"] = new_rules
@@ -647,7 +666,7 @@ def _plan_write(repo, existing_id, checks, ruleset_name):
     return True, _create_body(ruleset_name, checks)
 
 
-def _describe_plan(repo, existing_id, default_branch, checks, ruleset_name):
+def _describe_plan(repo, existing_id, default_branch, checks, ruleset_name, bypass_actors=()):
     lines = []
     if existing_id:
         lines.append(f"{repo}: would update ruleset '{ruleset_name}' (id {existing_id}); scope unchanged")
@@ -659,6 +678,20 @@ def _describe_plan(repo, existing_id, default_branch, checks, ruleset_name):
     lines.append("  review conversations must be resolved")
     lines.append("  the branch must be up to date with the base")
     lines.append("  rebase is the only merge method")
+    lines.append("  commit history must be linear")
+    lines.append("  force pushes are blocked")
+    if bypass_actors:
+        # Every rule above is a statement about this ruleset's own rule
+        # list, not a guarantee that it actually holds against everyone --
+        # a bypass actor overrides all of them, old and new alike. This
+        # module never adds or removes bypass_actors on an UPDATE (see
+        # _build_update_body's own doc); `repo audit` is what actually
+        # checks who they are and reports the gap, so this stays a pointer
+        # rather than a re-derivation of that logic here.
+        lines.append(
+            f"  note: {len(bypass_actors)} bypass actor(s) on this ruleset can override "
+            "all of the above -- see `repo audit`"
+        )
     return lines
 
 
@@ -810,7 +843,9 @@ def apply_ruleset(
         print(f"{repo}: ruleset '{ruleset_name}' (id {existing}) {NO_OP_MESSAGE}")
         return 0
 
-    plan_lines = _describe_plan(repo, existing, default_branch, checks, ruleset_name)
+    plan_lines = _describe_plan(
+        repo, existing, default_branch, checks, ruleset_name, target_body.get("bypass_actors") or []
+    )
 
     if dry_run:
         for line in plan_lines:
