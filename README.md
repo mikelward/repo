@@ -40,7 +40,7 @@ Run `./repo` directly from a checkout; nothing to install.
 
 ```
 repo list [--owner OWNER] [--include-forks] [--include-archived]
-repo create (--private|--public) OWNER/REPO
+repo create (--private|--public) [--no-scaffold] OWNER/REPO
 repo secrets --name NAME [--env ENV] --file PATH [--force] OWNER/REPO...
 repo setup [--dry-run] [--force] [--no-rules] [--rule CHECK]...
            [--secret NAME[@ENV]=PATH]... [--credential NAME=PATH]...
@@ -52,9 +52,25 @@ See `AGENTS.md` for testing and contribution conventions.
 
 ## Status
 
-`repo list`, `repo secrets`, `repo setup`, and `repo audit` are all
-implemented -- every shell tool in mikelward/scripts now has a Python
-equivalent here. `repo setup` composes three steps -- the required-checks
+`repo list`, `repo create`, `repo secrets`, `repo setup`, and `repo audit`
+are all implemented -- every shell tool in mikelward/scripts now has a
+Python equivalent here, plus `repo create`, which has none. `repo create`
+creates an empty repository and, unless `--no-scaffold` is given, pushes
+everything mechanically safe to generate as its first commits (two --
+GitHub's API needs an existing commit before it will create a branch ref
+at all, so a genuinely empty repository can't take this as one write; see
+`push_initial_commit`'s own docstring): codex-review's three workflow
+files (fetched live from `mikelward/codex-review`,
+always current rather than a vendored copy going stale), `zizmor.yml`
+(from `mikelward/lanes`, its self-identified pilot), the `.github/zizmor.yml`
+exceptions policy and `.github/lanes.conf` docs/code split those imply, a
+`ci.yml` wiring `mikelward/lanes`'s classify+gate job pair with a trivial
+placeholder standing in for the project's real jobs, and a `TODO.md`
+pointing at replacing it. `lanes`, `codex`, and `zizmor` all report from
+the scaffold's own CI run; only the placeholder's replacement with
+real project jobs is left undone (see `repo_lib/scaffold.py`'s own
+docstring for the full split between what's generated and what isn't).
+`repo setup` composes three steps -- the required-checks
 branch ruleset (linear history required, force pushes blocked, plus a
 standalone warning when a repository has an actual `master` branch),
 fanning a secret out via the same logic `repo secrets`

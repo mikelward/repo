@@ -81,6 +81,7 @@ def _status_checks_rule(contexts, strict=True):
 DEFAULT_EFFECTIVE_RULES = [
     _pull_request_rule(),
     _status_checks_rule(["lanes", "codex", "zizmor"]),
+    {"type": "required_linear_history", "parameters": {}},
     {"type": "non_fast_forward", "parameters": {}},
     {"type": "deletion", "parameters": {}},
 ]
@@ -465,7 +466,21 @@ class AuditCmdTest(unittest.TestCase):
         code, out, _ = _run(fake, [REPO])
         self.assertIn("[ok] the branch must be up to date with the base before merging", out)
 
-    # ---- non_fast_forward / deletion -----------------------------------
+    # ---- required_linear_history / non_fast_forward / deletion ----------
+
+    def test_missing_required_linear_history_rule_is_a_gap(self):
+        fake = FakeGh()
+        fake.effective_rules = [
+            r for r in DEFAULT_EFFECTIVE_RULES if r["type"] != "required_linear_history"
+        ]
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 1, err)
+        self.assertIn("[GAP] merge commits are allowed", out)
+
+    def test_present_required_linear_history_rule_is_ok(self):
+        fake = FakeGh()
+        code, out, _ = _run(fake, [REPO])
+        self.assertIn("[ok] commit history must be linear", out)
 
     def test_missing_non_fast_forward_rule_is_a_gap(self):
         fake = FakeGh()
@@ -796,6 +811,7 @@ class AuditCmdTest(unittest.TestCase):
         fake.effective_rules = [
             _pull_request_rule(),
             _status_checks_rule(["release-build"]),
+            {"type": "required_linear_history", "parameters": {}},
             {"type": "non_fast_forward", "parameters": {}},
             {"type": "deletion", "parameters": {}},
         ]
@@ -839,6 +855,7 @@ class AuditCmdTest(unittest.TestCase):
         fake.effective_rules = [
             _pull_request_rule(),
             _status_checks_rule([("lanes", 42), "codex", "zizmor"]),
+            {"type": "required_linear_history", "parameters": {}},
             {"type": "non_fast_forward", "parameters": {}},
             {"type": "deletion", "parameters": {}},
         ]
@@ -1006,7 +1023,11 @@ class AuditCmdTest(unittest.TestCase):
         fake = FakeGh()
         fake.effective_rules_pages = [
             [_pull_request_rule(), _status_checks_rule(["lanes"])],
-            [{"type": "non_fast_forward", "parameters": {}}, {"type": "deletion", "parameters": {}}],
+            [
+                {"type": "required_linear_history", "parameters": {}},
+                {"type": "non_fast_forward", "parameters": {}},
+                {"type": "deletion", "parameters": {}},
+            ],
         ]
         code, out, err = _run(fake, [REPO, "lanes"])
         self.assertEqual(code, 0, err)

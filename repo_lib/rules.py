@@ -666,6 +666,26 @@ def _plan_write(repo, existing_id, checks, ruleset_name):
     return True, _create_body(ruleset_name, checks)
 
 
+def _bypass_actor_note(bypass_actors):
+    """None, or one line saying a preserved bypass actor can override
+    every rule this ruleset states -- old ones and the two this module
+    just added alike. Shared between _describe_plan (the would-write
+    path) and apply_ruleset's own no-op message (Codex review,
+    mikelward/repo#14: the no-op path returns before _describe_plan is
+    ever called, so an already-compliant ruleset with a bypass actor
+    reported "matches" with no caveat at all -- the exact case this note
+    exists for). This module never adds or removes bypass_actors on an
+    UPDATE (see _build_update_body's own doc); `repo audit` is what
+    actually checks who they are and reports the gap, so this stays a
+    pointer rather than a re-derivation of that logic here."""
+    if not bypass_actors:
+        return None
+    return (
+        f"  note: {len(bypass_actors)} bypass actor(s) on this ruleset can override "
+        "all of the above -- see `repo audit`"
+    )
+
+
 def _describe_plan(repo, existing_id, default_branch, checks, ruleset_name, bypass_actors=()):
     lines = []
     if existing_id:
@@ -680,18 +700,9 @@ def _describe_plan(repo, existing_id, default_branch, checks, ruleset_name, bypa
     lines.append("  rebase is the only merge method")
     lines.append("  commit history must be linear")
     lines.append("  force pushes are blocked")
-    if bypass_actors:
-        # Every rule above is a statement about this ruleset's own rule
-        # list, not a guarantee that it actually holds against everyone --
-        # a bypass actor overrides all of them, old and new alike. This
-        # module never adds or removes bypass_actors on an UPDATE (see
-        # _build_update_body's own doc); `repo audit` is what actually
-        # checks who they are and reports the gap, so this stays a pointer
-        # rather than a re-derivation of that logic here.
-        lines.append(
-            f"  note: {len(bypass_actors)} bypass actor(s) on this ruleset can override "
-            "all of the above -- see `repo audit`"
-        )
+    note = _bypass_actor_note(bypass_actors)
+    if note:
+        lines.append(note)
     return lines
 
 
@@ -841,6 +852,9 @@ def apply_ruleset(
 
     if not needs_write:
         print(f"{repo}: ruleset '{ruleset_name}' (id {existing}) {NO_OP_MESSAGE}")
+        note = _bypass_actor_note((target_body or {}).get("bypass_actors") or [])
+        if note:
+            print(note)
         return 0
 
     plan_lines = _describe_plan(
