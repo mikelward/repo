@@ -116,26 +116,43 @@ def run(args):
     default_branch = (json.loads(raw) or {}).get("default_branch")
     if not default_branch:
         error(f"{args.repo} was created, but the response named no default branch;")
-        error("cannot scaffold. Push your initial commit by hand, then run:")
+        error("cannot scaffold. Nothing was pushed. Run:")
         error(f"  repo setup {args.repo} --force")
+        error("once that's resolved -- its bootstrap step scaffolds a still-empty branch too.")
         raise SystemExit(1)
 
     files = scaffold.build_scaffold_files(default_branch)
     if files is None:
         error(f"{args.repo} was created, but fetching the scaffold's template files failed")
-        error("(see above); nothing was pushed. Push your initial commit by hand, then run:")
+        error("(see above); nothing was pushed. Run:")
         error(f"  repo setup {args.repo} --force")
+        error("once that's resolved -- its bootstrap step scaffolds a still-empty branch too.")
         raise SystemExit(1)
 
-    if not scaffold.push_initial_commit(args.repo, default_branch, files):
+    if scaffold.push_initial_commit(args.repo, default_branch, files) is None:
+        # push_initial_commit can fail after its own bootstrap write already
+        # landed a seed file (see its own docstring) -- the branch is then
+        # no longer empty, so telling the user to "push your initial
+        # commit by hand" is actively wrong: a normal, independently
+        # rooted push would be rejected as non-fast-forward against that
+        # commit, obscuring the partial state rather than fixing it (Codex
+        # review, mikelward/repo#14). repo setup --force's own bootstrap
+        # step handles both a still-empty branch and one left holding only
+        # that seed file, so it's the right next step either way -- no
+        # manual push, no need to tell the two cases apart here.
         error(f"{args.repo} was created, but pushing the scaffold commit failed (see above).")
-        error("Push your initial commit by hand, then run:")
+        error("The branch may already carry a partial bootstrap commit -- don't push an")
+        error("independent initial commit by hand. Run:")
         error(f"  repo setup {args.repo} --force")
+        error("to finish it; its bootstrap step gap-fills a partial scaffold the same way it")
+        error("bootstraps a still-empty one.")
         raise SystemExit(1)
 
     print(f"{args.repo}: pushed the CI scaffold ({len(files)} files) to {default_branch}")
-    print("lanes, codex and zizmor will all report on the next push or pull request --")
-    print("ci.yml's placeholder job stands in for this project's real jobs until you")
-    print("replace it (see the TODO.md this pushed). Once something has reported, run:")
+    print("lanes and zizmor will report on this push; ci.yml's placeholder job stands")
+    print("in for this project's real jobs until you replace it (see the TODO.md this")
+    print("pushed). codex needs a pull request -- its status-writing sweep only")
+    print("triggers on pull-request activity, not a bare push (Codex review,")
+    print("mikelward/repo#14). Once something has reported, run:")
     print(f"  repo setup {args.repo} --force")
     return 0

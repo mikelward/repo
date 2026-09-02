@@ -76,6 +76,34 @@
       repository-level credential through `inherit`, so nothing is
       broken by the lax reading, only less isolated than it will be.
 
+## repo setup: fleet CI scaffold
+
+- [x] `repo setup` fills in whichever of the fleet's own CI scaffold
+      files an already-existing repository is still missing, always on
+      like the fleet-credentials and auto-merge steps (`--no-bootstrap`
+      to skip it): builds the same file set `repo create --scaffold`
+      generates, diffs it against the target's current tree, and pushes
+      whatever's missing as one commit -- never overwriting a path
+      already occupied by anything, file or directory. Applies BEFORE
+      the ruleset step in the same run, since a ruleset requiring pull
+      requests blocks the direct ref update this uses (Codex review,
+      mikelward/repo#14).
+- [ ] **A repository a PRIOR `repo setup` run already protected has no
+      path to a scaffold fix here at all.** The ordering fix above only
+      covers a ruleset THIS run is the one creating; apply_gaps's direct
+      `git/refs/heads/{branch}` PATCH is still the only write this step
+      knows how to make, and any ruleset requiring pull requests blocks
+      it outright for a non-bypass caller (which `repo setup` never
+      configures itself to be). Today that shows up as a plain write
+      failure -- `failed on: bootstrap`, GitHub's own rejection relayed
+      verbatim -- rather than a fix. Closing it for real needs a second
+      write path: create a new (unprotected) branch off the current tip,
+      push the missing files there, open a pull request, and either wait
+      for it or auto-merge it once its own checks (which the scaffold it
+      is adding may be the very thing that makes exist) pass. Until then,
+      an already-protected repository missing a scaffold file needs it
+      added by hand, through an ordinary PR.
+
 ## Decisions needing review
 
 - **`repo setup` fails (exit 1) on a fleet credential it cannot move,
