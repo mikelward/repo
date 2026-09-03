@@ -473,7 +473,8 @@ def _plan_credentials(repo, specs):
         unread = credentials.unread_mentions(texts, prefix)
         if unread:
             plan.unfixed.append(
-                f"{label}: {', '.join(unread)} mentions {prefix} in a shape this cannot read as a "
+                f"{label}: {credentials.workflow_labels(unread)} mentions {prefix} in a shape "
+                f"this cannot read as a "
                 f"caller -- whether it is used there cannot be told, so nothing is deleted; write "
                 f"the caller as a job-level `uses:`, or delete the credential by hand"
             )
@@ -492,7 +493,10 @@ def _plan_credentials(repo, specs):
             def still_unused():
                 reason, callers_now = now()
                 if reason is None and callers_now:
-                    reason = f"{', '.join(sorted(callers_now))} appeared since the plan was built"
+                    reason = (
+                        f"{credentials.workflow_labels(sorted(callers_now))} "
+                        "appeared since the plan was built"
+                    )
                 return reason
 
             unused(
@@ -512,11 +516,14 @@ def _plan_credentials(repo, specs):
             if set(callers_now) != set(found):
                 return (
                     f"the callers changed since the plan was built "
-                    f"({', '.join(sorted(callers_now)) or 'none'} now)"
+                    f"({credentials.workflow_labels(sorted(callers_now)) or 'none'} now)"
                 )
             naming = sorted(name for name, inherits in callers_now.items() if not inherits)
             if naming:
-                return f"{', '.join(naming)} no longer passes `secrets: inherit`"
+                return (
+                    f"{credentials.workflow_labels(naming)} no longer passes "
+                    "`secrets: inherit`"
+                )
             return None
 
         failing = sorted(name for name, inherits in found.items() if not inherits)
@@ -526,7 +533,7 @@ def _plan_credentials(repo, specs):
             listed,
             env_secrets,
             env,
-            ", ".join(failing or sorted(found)),
+            credentials.workflow_labels(failing or sorted(found)),
             not failing,
             usable,
             suggest,

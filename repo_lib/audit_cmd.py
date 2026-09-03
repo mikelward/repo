@@ -286,7 +286,8 @@ def audit_secrets(repo, ok, fix):
     hubs = [hub for hub in credentials.BATCH_HUBS if found[hub] and hub not in unknown]
     for hub in unknown:
         fix(
-            f"{hub}: {', '.join(unread[hub])} mentions {credentials.hub_workflow(hub)} in a shape "
+            f"{hub}: {credentials.workflow_labels(unread[hub])} mentions "
+            f"{credentials.hub_workflow(hub)} in a shape "
             f"this cannot read as a caller -- whether the batch runs there cannot be told; write "
             f"the caller as a job-level `uses:` (`repo setup` moves or deletes nothing of its "
             f"until then)"
@@ -307,7 +308,8 @@ def audit_secrets(repo, ok, fix):
             if not verdict:
                 inherits = False
                 fix(
-                    f"{hub}: {caller} passes its secrets by name, so a credential in the '{hub}' "
+                    f"{hub}: {credentials.workflow_label(caller)} passes its secrets by name, "
+                    f"so a credential in the '{hub}' "
                     f"environment never reaches the batch -- convert the caller to `secrets: inherit`"
                 )
         if as_repository:
@@ -379,7 +381,8 @@ def audit_secrets(repo, ok, fix):
     environment, env_secrets = environment_secrets(label)
     if unread:
         fix(
-            f"{label}: {', '.join(unread)} mentions {prefix} in a shape this cannot read as a "
+            f"{label}: {credentials.workflow_labels(unread)} mentions {prefix} in a shape "
+            f"this cannot read as a "
             f"caller -- whether the token is used there cannot be told; write the caller as a "
             f"job-level `uses:` (`repo setup` moves or deletes nothing of its until then)"
         )
@@ -400,7 +403,8 @@ def audit_secrets(repo, ok, fix):
             if not verdict:
                 inherits = False
                 fix(
-                    f"{label}: {caller} passes its secrets by name, so a token in the '{label}' "
+                    f"{label}: {credentials.workflow_label(caller)} passes its secrets by name, "
+                    f"so a token in the '{label}' "
                     f"environment never reaches the commit-back workflow -- convert the caller to "
                     f"`secrets: inherit`"
                 )
