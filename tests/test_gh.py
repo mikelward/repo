@@ -146,14 +146,42 @@ class GhWrapperTest(unittest.TestCase):
             result = gh.try_run(["api", "orgs/x"])
         self.assertEqual(result, (True, "{}\n"))
 
-    def test_run_with_input_retries_a_secondary_rate_limit_and_succeeds(self):
-        limited = FakeCompletedProcess(
-            1, stderr=b"gh: You have exceeded a secondary rate limit. (HTTP 403)\n"
-        )
-        ok = FakeCompletedProcess(0, stdout=b"ok")
-        with patch("subprocess.run", side_effect=[limited, ok]), patch("repo_lib.gh.time.sleep"):
-            result = gh.run_with_input(["secret", "set", "NAME"], b"the-value")
-        self.assertEqual(result, b"ok")
+    def test_run_with_input_does_not_retry_a_secondary_rate_limit(self):
+        # run_with_input always carries a body -- it's a write, and a write
+        # may be the second half of a check-then-act sequence whose safety
+        # depends on the precondition check having run immediately before
+        # it (Codex review, mikelward/repo#19: apply_gaps's ref-update
+        # PATCH, _ensure_environment's existence check, more than one
+        # secrets_cmd.py write). A 60s+ wait-and-retry between that check
+        # and the write reopens the exact race PR #17 already fixed for
+        # the ref-update PATCH specifically -- so no write retries here,
+        # regardless of which gh.py entry point it came through.
+        with patch(
+            "subprocess.run",
+            return_value=FakeCompletedProcess(
+                1, stderr=b"gh: You have exceeded a secondary rate limit. (HTTP 403)\n"
+            ),
+        ) as mock_run, patch("repo_lib.gh.time.sleep") as mock_sleep:
+            with self.assertRaises(gh.GhError):
+                gh.run_with_input(["secret", "set", "NAME"], b"the-value")
+        self.assertEqual(mock_run.call_count, 1)
+        mock_sleep.assert_not_called()
+
+    def test_run_does_not_retry_a_mutating_api_call(self):
+        # gh.run() is not read-only either -- credentials.py's environment
+        # delete is `gh.run(["api", "--method", "DELETE", ...])`. Detected
+        # by --method, not by which of run/try_run/run_with_input was
+        # called (Codex review, mikelward/repo#19).
+        with patch(
+            "subprocess.run",
+            return_value=FakeCompletedProcess(
+                1, stderr="gh: You have exceeded a secondary rate limit. (HTTP 403)\n"
+            ),
+        ) as mock_run, patch("repo_lib.gh.time.sleep") as mock_sleep:
+            with self.assertRaises(gh.GhError):
+                gh.run(["api", "--method", "DELETE", "repos/o/r/environments/e"])
+        self.assertEqual(mock_run.call_count, 1)
+        mock_sleep.assert_not_called()
 
     def test_a_persistent_secondary_rate_limit_still_fails_cleanly(self):
         # More secondary-limit failures than the retry budget allows --
