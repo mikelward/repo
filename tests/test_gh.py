@@ -220,6 +220,16 @@ class GhWrapperTest(unittest.TestCase):
         with patch("subprocess.run", return_value=FakeCompletedProcess(0, stdout=raw)):
             self.assertIsNone(gh.token_scopes())
 
+    def test_token_scopes_returns_none_when_the_header_is_present_but_empty(self):
+        # Codex review, mikelward/repo#18: an empty-but-present header
+        # parsed to set() rather than None, which a caller then read as
+        # "confirmed no scopes" and blocked a token this couldn't actually
+        # make that claim about -- distinct from test_..._is_absent above
+        # (no header at all), but must land on the same None.
+        raw = "HTTP/2.0 200 OK\r\nX-OAuth-Scopes: \r\n\r\n{}"
+        with patch("subprocess.run", return_value=FakeCompletedProcess(0, stdout=raw)):
+            self.assertIsNone(gh.token_scopes())
+
     def test_token_scopes_returns_none_on_a_failed_read(self):
         with patch(
             "subprocess.run",
