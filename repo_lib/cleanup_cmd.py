@@ -28,7 +28,15 @@ which is the safe direction: they are offered, never swept.
 Deleting a branch is not quite reversible from here, so:
 
 - **Merged branches are the only thing deleted without asking per branch**,
-  and only after the plan is printed and confirmed (or --force given).
+  and only after the plan is written and confirmed (or --force given).
+- **The plan prints; the deletion stream after it does not.** The plan is
+  what the confirmation is about. The two lines each deletion writes are
+  not, and hundreds of them scrolled past are not a record either, so they
+  and every restore command go to a log file, with a carriage-returned
+  counter on the terminal in their place. The file is opened BEFORE
+  anything is deleted, and each branch's restore command is flushed
+  before its own delete request -- sweeping with nowhere to write the way
+  back is sweeping with no way back.
 - **Unmerged branches are never swept.** With --include-unmerged, each is
   offered individually, with its age, how many commits would be lost, and
   whether its pull request was closed without merging. Which ones get
@@ -82,7 +90,9 @@ revalidation or failed, or any read needed to build the plan failed,
 """
 
 import datetime
+import errno
 import json
+import os
 import re
 import shlex
 import sys
@@ -137,6 +147,20 @@ def add_arguments(parser):
         help=(
             "also offer each unmerged branch older than --older-than, one at "
             "a time. Cannot be combined with --force"
+        ),
+    )
+    parser.add_argument(
+        "--log",
+        metavar="FILE",
+        help=(
+            "where to write the run's full record -- the plan, every "
+            "deletion with the command that restores it, and every refusal "
+            "(default: a timestamped file under $XDG_STATE_HOME/repo, or "
+            "~/.local/state/repo). Appended to, never truncated, so an "
+            "earlier run's restore commands survive. The terminal gets a "
+            "summary and the path. "
+            "Not written by --dry-run, which prints its plan and changes "
+            "nothing"
         ),
     )
     parser.add_argument("repo", metavar="OWNER/REPO")
@@ -693,12 +717,41 @@ def _why_no_longer_safe(repo, entry):
     return None
 
 
-def _delete(repo, entry):
-    """Delete one branch. Returns None on success, gh's error text on
-    failure. The full SHA is printed on success: once the ref is gone this
-    line is the only record of it, and an abbreviation is no use for the
-    API restore below -- which is the form that works from anywhere, unlike
-    a `git push` needing a clone that already has the object."""
+def _delete(repo, entry, log):
+    """Delete one branch. Returns (gone, error): whether the ref is now
+    gone, and an error string if anything failed.
+
+    Both can be true at once -- a branch really deleted whose outcome line
+    could not be written. Collapsing that into a single error made the run
+    report `could not delete <name>` for a branch that WAS deleted, and
+    left it out of the count (Codex review, mikelward/repo#23). A user
+    reading that would believe the branch survived.
+
+    The restore record is written and FSYNCED BEFORE the delete request.
+    Once the ref is gone this log is the only record of its SHA -- the
+    plan carries no SHAs -- so a process killed between the request and
+    the write, or a disk that fills at exactly that moment, would take the
+    branch with nothing left to recreate it -- and a flush alone only
+    reaches the kernel, so a power loss or a late writeback error would
+    take it too. Syncing first also puts a full disk on the safe side of
+    the delete, `os.fsync`'s own delayed ENOSPC included: the write
+    fails, and the branch stays (Codex reviews, mikelward/repo#23).
+
+    Written for EVERY deletion, not just the offered ones -- `--force` is
+    the path that deletes the most branches and it was the one omitting
+    the recovery line it advertises (Codex review, mikelward/repo#20).
+    Emitted here so the two can never drift apart again. The SHA is full,
+    since an abbreviation is no use for the API restore -- the form that
+    works from anywhere, unlike a `git push` needing a clone that already
+    has the object.
+    """
+    try:
+        log(f"deleting {entry['name']} (was {entry['sha']})")
+        log(_restore_hint(repo, entry), sync=True)
+    except OSError as e:
+        # Nothing is deleted on this branch, and every later one fails the
+        # same way, so the sweep cannot run on unrecorded.
+        return False, f"could not write the restore record, so it was not deleted: {e}"
     ok, output = gh.try_run(
         [
             "api",
@@ -708,14 +761,182 @@ def _delete(repo, entry):
         ]
     )
     if not ok:
-        return output
-    print(f"deleted {entry['name']} (was {entry['sha']})")
-    # Printed for EVERY deletion, not just the offered ones -- `--force` is
-    # the path that deletes the most branches and it was the one omitting
-    # the recovery line it advertises (Codex review, mikelward/repo#20).
-    # Emitted here so the two can never drift apart again.
-    print(_restore_hint(repo, entry))
+        _log_outcome(log, "  NOT deleted -- the request failed; the branch is still there")
+        return False, output
+    return True, _log_outcome(log, f"deleted {entry['name']} (was {entry['sha']})")
+
+
+def _log_outcome(log, line):
+    """Record what happened to a branch after the request was made.
+    Returns None, or an error string if the write failed.
+
+    The restore command is already flushed by the time this runs, so a
+    failure here loses the outcome, not the way back. It is still reported
+    and still makes the run exit non-zero -- but as a returned error rather
+    than an escaping one, which would abandon every remaining branch and
+    the closing summary after a branch had already been deleted (Codex
+    review, mikelward/repo#23).
+    """
+    try:
+        log(line)
+    except OSError as e:
+        return f"the branch is gone, but the outcome could not be logged: {e}"
     return None
+
+
+def _progress(done, total):
+    """Overwrite one line with a running count, on a terminal only.
+
+    Redirected, `\r` is just a character in the file, so a scripted run
+    would collect one line per branch of a counter nobody watched. The
+    caller clears the line before printing anything else."""
+    if not sys.stderr.isatty():
+        return
+    print(f"\rdeleting {done}/{total}...", file=sys.stderr, end="", flush=True)
+
+
+def _clear_progress():
+    if sys.stderr.isatty():
+        print("\r\033[K", file=sys.stderr, end="", flush=True)
+
+
+def _default_log_path(repo, now):
+    """A timestamped file under the XDG state directory -- state, not
+    cache: the restore commands are the only record of what a run deleted,
+    so a directory something else is entitled to clear would be the wrong
+    home for them."""
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(
+        os.path.expanduser("~"), ".local", "state"
+    )
+    stamp = now.strftime("%Y%m%dT%H%M%SZ")
+    return os.path.join(base, "repo", f"cleanup-{repo.replace('/', '-')}-{stamp}.log")
+
+
+def _open_log(path):
+    """The log handle, or None with the failure already reported.
+
+    Opened BEFORE anything is deleted, and a failure to open it stops the
+    run: the restore command for a deleted branch exists nowhere else, so
+    deleting with nowhere to write it would be deleting with no way back.
+
+    APPENDED, never truncated. A `--log` pointed at a previous run's file,
+    or two default-path runs starting inside the same second, would
+    otherwise destroy the only copy of that run's restore commands --
+    before this run had even asked for confirmation (Codex review,
+    mikelward/repo#23). Each run's header names the repository and the
+    time, so a shared file still reads as a sequence of runs.
+    """
+    try:
+        directory = os.path.dirname(path)
+        if directory:
+            _makedirs_synced(directory)
+        handle = open(path, "a", encoding="utf-8")
+        try:
+            _sync_directory(directory or ".")
+        except OSError:
+            handle.close()
+            raise
+        return handle
+    except OSError as e:
+        error_lines(f"could not open the log at {path} for durable writing:", str(e))
+        error("Nothing was deleted. That log is where the command restoring each")
+        error("deleted branch is written, so a run with nowhere to write it would")
+        error("be a run with no way back. Pass --log FILE to choose another path.")
+        return None
+
+
+def _sync(handle):
+    """Push what is buffered all the way to durable storage.
+
+    `flush()` only moves bytes from Python into the kernel; a power loss,
+    or a writeback error the kernel reports late, still discards them --
+    and the DELETE that follows would already have succeeded (Codex
+    review, mikelward/repo#23). `os.fsync` is also where a delayed ENOSPC
+    surfaces, so its failure is left to propagate: the caller treats it
+    like any other failure to record, and does not delete.
+
+    Not every handle has a file descriptor (the tests write to a
+    StringIO), and one without a descriptor has nothing to sync.
+    """
+    try:
+        fd = handle.fileno()
+    except (AttributeError, OSError, ValueError):
+        return
+    os.fsync(fd)
+
+
+def _makedirs_synced(path):
+    """Create `path`, and make each directory it had to create durable.
+
+    A directory's own entry lives in its PARENT, so syncing only the leaf
+    leaves the state hierarchy above it -- created on a machine's first
+    run -- able to vanish in a crash, taking the log inside it and the
+    only restore records with it (Codex review, mikelward/repo#23).
+    """
+    missing = []
+    probe = path
+    while probe and not os.path.isdir(probe):
+        missing.append(probe)
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    os.makedirs(path, exist_ok=True)
+    for created in missing:
+        _sync_directory(os.path.dirname(created) or ".")
+
+
+def _sync_directory(path):
+    """Make a newly created log's directory entry durable: the file's own
+    bytes can survive a crash while the entry naming them does not.
+
+    A real write failure here is raised, so `_open_log` stops the run
+    before a branch is deleted -- an entry that may not survive a crash
+    is no better than no log (Codex review, mikelward/repo#23).
+
+    Two cases are NOT failures and are passed over: a platform with no
+    directory handle to sync at all (Windows), and a filesystem that does
+    not sync directories (EINVAL/ENOTSUP -- some network filesystems).
+    Those say the operation does not exist there, not that a write was
+    lost, and refusing to run would cost the whole command for no
+    durability gained.
+
+    The platform is decided by name, not by catching whatever `os.open`
+    raises. A blanket catch there read EIO, EMFILE and a concurrent
+    ENOENT as "Windows" and let the sweep start anyway (Codex review,
+    mikelward/repo#23); and the errno Windows does raise, EACCES, means
+    something real on POSIX.
+    """
+    if os.name != "posix":
+        return
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    except OSError as e:
+        if e.errno not in (errno.EINVAL, errno.ENOTSUP):
+            raise
+    finally:
+        os.close(fd)
+
+
+def _close_log(handle, path):
+    """Close the log, reporting rather than raising. True if anything was
+    lost.
+
+    Closing flushes, so this is the last place a full disk can bite -- and
+    by then branches are already deleted. Every restore command was
+    flushed before its own delete, so what a failure here loses is outcome
+    text, never a way back.
+    """
+    try:
+        handle.close()
+    except OSError as e:
+        error_lines(f"the log at {path} could not be completed:", str(e))
+        error("Its last lines are missing. Every restore command was flushed")
+        error("before its own delete, so what is missing is outcome text, not")
+        error("a way back.")
+        return True
+    return False
 
 
 def _restore_hint(repo, entry):
@@ -795,55 +1016,170 @@ def run(args):
         report_classification_failures()
         raise SystemExit(1 if failed else 0)
 
-    # Printed unconditionally -- including under --force -- so an
-    # unattended run still leaves the full account of what it touched and
-    # what it left alone in its own output. --force skips the question, not
-    # the record.
-    for line in lines:
-        print(line, file=sys.stderr)
+    log_path = args.log or _default_log_path(repo, now)
+    handle = _open_log(log_path)
+    if handle is None:
+        return 1
 
-    # Relayed before the confirmation gate, so declining it -- or any later
-    # exit -- cannot swallow them.
-    report_classification_failures()
+    # Not `with handle:`. Closing a file flushes what is still buffered, so
+    # its implicit close can raise OSError -- after branches have been
+    # deleted, escaping `run` as a traceback instead of the contextual
+    # error and controlled exit this promises everywhere else (Codex
+    # review, mikelward/repo#23). Closed explicitly below, and again in
+    # `finally` for the paths that leave early; a second close is a no-op.
+    unwritten_lines = []
 
-    errors = []
-    refused = []
+    try:
 
-    if deletable:
-        if not args.force and not _confirm(len(deletable)):
-            raise SystemExit(1)
+        def log(line="", sync=False):
+            print(line, file=handle)
+            if sync:
+                handle.flush()
+                _sync(handle)
 
-    def delete_checked(entry):
-        reason = _why_no_longer_safe(repo, entry)
-        if reason is not None:
-            refused.append((entry["name"], reason))
-            return
-        err = _delete(repo, entry)
-        if err is not None:
-            errors.append((entry["name"], err))
+        def log_best_effort(line):
+            """A log write whose failure must not take the run down: it
+            duplicates something already on the terminal, or it runs after
+            a branch has been deleted.
 
-    if deletable:
-        for entry in deletable:
-            delete_checked(entry)
+            The failure is still remembered, because the run advertises a
+            full record and this one is short of it -- reporting the write
+            and then exiting 0 would say otherwise (Codex review,
+            mikelward/repo#23).
+            """
+            try:
+                log(line)
+            except OSError as e:
+                error(f"  (and it could not be written to {log_path}: {e})")
+                unwritten_lines.append(e)
 
-    if args.include_unmerged and offerable:
-        print("", file=sys.stderr)
-        error("Now asking about each unmerged branch. Each deletion prints the full")
-        error("SHA and the command that recreates the branch from it.")
-        for entry in offerable:
-            answer = _offer(entry)
-            if answer is None:
-                error("no more input; leaving the remaining branches alone.")
-                break
-            if not answer:
-                continue
-            delete_checked(entry)
+        def both(line):
+            """A line the terminal needs AND the log has to keep: an error
+            read once on a scrolling terminal is not a record.
 
-    for name, reason in refused:
-        error(f"{name} was NOT deleted -- {reason}")
-        error("  It was left alone rather than deleted on a plan that no longer")
-        error("  describes it. Re-run to see it classified as it now stands.")
-    for name, err in errors:
-        error_lines(f"could not delete {name}:", err)
+            The terminal comes first, and the log write is allowed to fail:
+            these run after branches have been deleted, so a full disk here
+            must not take the report down with it (Codex review,
+            mikelward/repo#23).
+            """
+            error(line)
+            log_best_effort(line)
 
-    return 1 if (errors or failed or refused) else 0
+        # Written unconditionally -- including under --force -- so an
+        # unattended run still leaves the full account of what it touched
+        # and what it left alone. --force skips the question, not the
+        # record.
+        try:
+            log(f"repo cleanup {repo} at {now.strftime('%Y-%m-%d %H:%M:%SZ')}")
+            log(f"default branch: {default_branch}")
+            log("")
+            for line in lines:
+                log(line)
+            log("", sync=True)
+        except OSError as e:
+            # Nothing has been deleted yet, so this is the cheap place to
+            # stop: a run whose plan never reached the file is a run whose
+            # record starts blank.
+            error_lines(f"could not write the plan to {log_path}:", str(e))
+            error("Nothing was deleted.")
+            return 1
+
+        # The plan is printed as well as logged: it is what the question
+        # below is about, and a confirmation nobody can check is one they
+        # can only answer by guessing. Grouped by shared prefix, it stays
+        # short even at fleet scale. What does NOT print is the deletion
+        # stream -- two lines a branch, and the restore command in it is
+        # the half that has to outlive the terminal.
+        for line in lines:
+            print(line, file=sys.stderr)
+        error(f"full record: {log_path}")
+
+        # Relayed before the confirmation gate, so declining it -- or any
+        # later exit -- cannot swallow them.
+        report_classification_failures()
+        for name, err in failed:
+            log_best_effort(f"could not classify {name}, so it was left alone: {err}")
+
+        errors = []
+        refused = []
+        unrecorded = []
+        deleted = []
+
+        if deletable:
+            if not args.force and not _confirm(len(deletable)):
+                log_best_effort("not confirmed; no branches were deleted.")
+                raise SystemExit(1)
+
+        def delete_checked(entry):
+            reason = _why_no_longer_safe(repo, entry)
+            if reason is not None:
+                refused.append((entry["name"], reason))
+                return
+            gone, err = _delete(repo, entry, log)
+            if gone:
+                deleted.append(entry["name"])
+                if err is not None:
+                    unrecorded.append((entry["name"], err))
+            elif err is not None:
+                errors.append((entry["name"], err))
+
+        if deletable:
+            for i, entry in enumerate(deletable, 1):
+                _progress(i, len(deletable))
+                delete_checked(entry)
+            _clear_progress()
+
+        if args.include_unmerged and offerable:
+            print("", file=sys.stderr)
+            error("Now asking about each unmerged branch. Each deletion writes the")
+            error("full SHA and the command that recreates the branch from it to")
+            error(f"{log_path}.")
+            for entry in offerable:
+                answer = _offer(entry)
+                if answer is None:
+                    both("no more input; leaving the remaining branches alone.")
+                    break
+                if not answer:
+                    log_best_effort(f"declined {entry['name']}")
+                    continue
+                delete_checked(entry)
+
+        for name, reason in refused:
+            both(f"{name} was NOT deleted -- {reason}")
+            both("  It was left alone rather than deleted on a plan that no longer")
+            both("  describes it. Re-run to see it classified as it now stands.")
+        for name, err in errors:
+            error_lines(f"could not delete {name}:", err)
+            log_best_effort(f"could not delete {name}: {err}")
+        for name, err in unrecorded:
+            # Named apart from the failures above: this branch IS gone, and
+            # calling it a failure to delete would tell the reader the
+            # opposite of what happened.
+            error_lines(f"{name} was deleted, but not fully recorded:", err)
+            error("  Its restore command was synced before the delete, so the way")
+            error("  back is in the log even though the outcome line is not.")
+
+        if deleted:
+            error(
+                f"deleted {len(deleted)}; the command restoring each is in {log_path}"
+            )
+
+        # Closed here rather than by a context manager, so the flush it
+        # performs can be reported and counted toward the exit status.
+        unwritten = _close_log(handle, log_path)
+        return (
+            1
+            if (
+                errors
+                or failed
+                or refused
+                or unrecorded
+                or unwritten
+                or unwritten_lines
+            )
+            else 0
+        )
+    finally:
+        # For the paths that left early -- the plan-write failure above, or
+        # a declined confirmation. Closing twice is a no-op.
+        _close_log(handle, log_path)

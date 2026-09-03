@@ -51,7 +51,7 @@ repo setup [--dry-run] [--force] [-v|--verbose] [--no-rules] [--no-bootstrap]
            [--credential NAME=PATH]... [--app SLUG]... OWNER/REPO
 repo audit [--branch NAME] OWNER/REPO [CHECK...]
 repo cleanup [--dry-run] [--force] [--older-than DAYS] [--include-unmerged]
-             OWNER/REPO
+             [--log FILE] OWNER/REPO
 ```
 
 See `AGENTS.md` for testing and contribution conventions.
@@ -166,7 +166,27 @@ stack merges into the lower one -- so it falls through to the comparison,
 which is swept when the base did land and only offered when it did not.
 
 Merged branches are the only ones swept, behind the same printed-plan-then-
-confirm flow `repo secrets` uses. Unmerged branches are never swept: with
+confirm flow `repo secrets` uses. The plan prints -- it is what the question is
+about, and a confirmation nobody can check is one they can only answer by
+guessing. What does not print is the deletion stream after it: two lines a
+branch, hundreds of them on a repository with a weekly dependency batch, and
+scrolled past, none of it is a record. So the run writes the whole account --
+the plan, every deletion with the command that restores it, every refusal and
+every error -- to a timestamped file under `$XDG_STATE_HOME/repo`
+(`~/.local/state/repo` by default), or to `--log FILE`, and the terminal gets a
+carriage-returned `deleting 12/166...` counter in its place. State rather than
+cache, because those restore commands are the only record of what a run
+deleted. The file is opened *before* anything is deleted, and each branch's
+restore command is written and fsynced before its own delete request -- a
+flush alone only reaches the kernel, which a power loss or a late writeback
+error still discards; a run that cannot open or write it deletes nothing and
+says so, since sweeping with
+nowhere to write the way back is sweeping with no way back. It is appended to,
+never truncated, so pointing `--log` at an earlier run's file -- or two
+default-path runs starting inside the same second -- cannot destroy that run's
+restore commands. `--dry-run` writes no log: it changes
+nothing, a file appearing where none was asked for is a change, and its plan is
+the whole of its output. Unmerged branches are never swept: with
 `--include-unmerged` each is offered individually, showing its age, how many
 commits would be lost, and whether its own pull request was closed without
 merging. Which ones are offered turns on that last point. A branch whose pull
@@ -181,7 +201,7 @@ A branch with **no pull request** is offered once its last commit is
 `--older-than` days old (7 by default), since a date is the only evidence there
 is and recent work should not be asked about. That flag refuses `--force`,
 because a per-branch judgment cannot be made unattended, and every deletion
-prints the full SHA it removed alongside the `gh api` call that recreates the
+logs the full SHA it removed alongside the `gh api` call that recreates the
 ref from it -- shell-quoted, since a branch name may legally contain `$(...)`
 and the line is meant to be pasted, and in the API form because a `git push`
 needs a clone that already holds the object. Each branch's SHA and
