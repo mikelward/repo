@@ -28,23 +28,12 @@ def require_gh():
         raise SystemExit(1)
 
 
-# GitHub documents two different rate limits (docs.github.com/rest/using-the-
-# rest-api/rate-limits-for-the-rest-api), and they call for different
-# responses, not one blind retry-everything policy:
-#
-# - The SECONDARY (abuse-detection) limit is a short-lived burst throttle --
-#   GitHub's own guidance is to wait at least a minute and retry with
-#   backoff, since it clears on its own. Retried here, bounded --
-#   but ONLY for a plain read (see _is_mutating below).
-# - The PRIMARY limit is the fixed 5000-requests/hour quota. Its reset can be
-#   up to an hour away, and blocking a script for that long with no
-#   explanation is worse than failing loudly and letting the caller decide
-#   whether to wait -- so this is reported, not retried.
-#
-# Detected on gh's own relayed error text (the API's `message` field, which
-# gh prints verbatim) rather than a response header: both messages are
-# GitHub's own stable, documented wording, not a guess about internal
-# behavior the way the git-data-write retry once removed here was.
+# GitHub's two rate limits (docs.github.com/rest/using-the-rest-api/rate-
+# limits-for-the-rest-api) call for different responses: the SECONDARY
+# (abuse-detection) limit is a short burst throttle GitHub's own guidance
+# says to wait out and retry, so that's retried here, bounded; the PRIMARY
+# limit's reset can be up to an hour away, so it's reported instead --
+# blocking a script that long with no explanation is worse than failing.
 _RATE_LIMIT_RETRY_ATTEMPTS = 5
 _RATE_LIMIT_RETRY_DELAY_SECONDS = 60  # GitHub's own floor for a secondary limit
 
@@ -55,20 +44,9 @@ def _is_secondary_rate_limit(stderr):
 
 def _is_mutating(argv, kwargs):
     """True if this call is a write (POST/PUT/PATCH/DELETE, or anything
-    carrying an input body), not a plain read.
-
-    A write may be the second half of a check-then-act sequence whose
-    safety depends on the precondition check having run IMMEDIATELY before
-    it -- apply_gaps's ref-update PATCH re-verifies the branch hasn't moved
-    right before writing, _ensure_environment checks an environment is
-    still absent right before creating it, and more than one secrets_cmd.py
-    write follows the same shape. Injecting a 60s+ wait-and-retry between
-    that check and the write reopens exactly the race PR #17 already fixed
-    by never retrying that specific PATCH blind (Codex review,
-    mikelward/repo#19) -- so this only ever retries a read, which has no
-    precondition to go stale. A write fails immediately on a rate limit
-    instead, exactly as it already did for every other kind of failure:
-    rerun to retry, same as before this existed."""
+    carrying an input body), not a plain read. A write may depend on a
+    precondition its caller checked immediately before calling this; a
+    delayed retry can invalidate that, so only a read retries here."""
     if kwargs.get("input") is not None:
         return True
     try:
