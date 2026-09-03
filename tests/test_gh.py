@@ -230,12 +230,19 @@ class GhWrapperTest(unittest.TestCase):
         with patch("subprocess.run", return_value=FakeCompletedProcess(0, stdout=raw)):
             self.assertIsNone(gh.token_scopes())
 
-    def test_token_scopes_returns_none_on_a_failed_read(self):
+    def test_token_scopes_reports_and_returns_none_on_a_failed_read(self):
+        # Codex review, mikelward/repo#18: a genuine probe failure (auth,
+        # network, GitHub down) must not be silently indistinguishable
+        # from the routine "this token doesn't use scopes" case -- a
+        # caller falling through to the same opaque 404 this exists to
+        # diagnose would otherwise never see it was reported at all.
         with patch(
             "subprocess.run",
             return_value=FakeCompletedProcess(1, stderr="gh: HTTP 401: Bad credentials\n"),
-        ):
+        ), patch("repo_lib.gh.error") as mock_error:
             self.assertIsNone(gh.token_scopes())
+        mock_error.assert_called_once()
+        self.assertIn("Bad credentials", mock_error.call_args.args[0])
 
     def test_require_gh_raises_when_gh_is_missing(self):
         with patch("shutil.which", return_value=None):

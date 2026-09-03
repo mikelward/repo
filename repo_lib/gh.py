@@ -117,21 +117,23 @@ def token_scopes():
     Read from the X-OAuth-Scopes response header on an authenticated GET --
     the same thing a user checking by hand would run (`gh api -i user`).
 
-    None covers three different cases a caller should treat the same way:
-    the read itself failed, the header is simply absent, or it's present
-    but empty -- all because this token doesn't use OAuth scopes at all (a
-    fine-grained PAT or a GitHub App installation token -- both real, both
-    fine, both a different permission model). Either way there's nothing
-    to check a specific scope against, so a caller gating on a scope's
-    presence should not block just because this couldn't answer -- only
-    act on an explicit "no" (a non-empty returned set that doesn't contain
-    it), never on "couldn't tell" (Codex review, mikelward/repo#18: an
-    empty-but-present header parsed to set() rather than None, which read
-    as "confirmed no scopes" and blocked a token this couldn't actually
-    make that claim about)."""
+    A caller gating on a scope's presence should not block just because
+    this couldn't answer -- only act on an explicit "no" (a non-empty
+    returned set that doesn't contain it), never on "couldn't tell" (Codex
+    review, mikelward/repo#18: an empty-but-present header parsed to set()
+    rather than None, which read as "confirmed no scopes" and blocked a
+    token this couldn't actually make that claim about). But "couldn't
+    tell" still covers two very different situations, and only one of them
+    is silent: the header being absent or empty is routine -- a
+    fine-grained PAT or a GitHub App installation token doesn't use OAuth
+    scopes at all, nothing to report -- while the probe read itself
+    failing (auth, network, GitHub down) is a real failure a caller falling
+    through to the same opaque 404 this exists to diagnose would otherwise
+    never see reported at all (Codex review, mikelward/repo#18)."""
     try:
         raw = run(["api", "-i", "user"])
-    except GhError:
+    except GhError as e:
+        error(f"could not check this gh token's OAuth scopes (continuing without that check): {e.stderr.strip()}")
         return None
     headers, _, _ = raw.partition("\n\n")
     for line in headers.splitlines():
