@@ -29,10 +29,18 @@ Deleting a branch is not quite reversible from here, so:
 
 - **Merged branches are the only thing deleted without asking per branch**,
   and only after the plan is printed and confirmed (or --force given).
-- **Unmerged branches are never swept.** With --include-unmerged, each one
-  older than --older-than is offered individually, with its age, how many
-  commits would be lost, and whether its pull request was closed without
-  merging (the strongest abandoned signal available here). That flag
+- **Unmerged branches are never swept.** With --include-unmerged, each is
+  offered individually, with its age, how many commits would be lost, and
+  whether its pull request was closed without merging. Which ones get
+  offered turns on that last point: a branch whose pull request was CLOSED
+  without merging AGAINST THE DEFAULT BRANCH is offered whatever its age,
+  because somebody has already said it is finished with. Against any other
+  base it keeps the age gate -- GitHub closes a pull request automatically
+  when its base branch is deleted, so a stack's upper one goes closed with
+  nobody deciding anything, and this command can cause that itself by
+  sweeping the merged lower branch. A branch with NO pull request is
+  offered only once its last commit is --older-than days old, since a date
+  is the only evidence there is and recent work should not be asked about. That flag
   refuses --force: a per-branch judgment cannot be made unattended.
 - **Every deletion prints the full SHA it deleted**, with the `gh api`
   call that recreates the ref from it -- the form that works from
@@ -114,7 +122,13 @@ def add_arguments(parser):
         help=(
             "how old an unmerged branch's last commit must be before "
             f"--include-unmerged offers it (default {DEFAULT_OLDER_THAN_DAYS}). "
-            "Merged branches are not filtered by age -- merged is merged."
+            "Not applied to a branch whose pull request was closed "
+            "without merging against the default branch: that is somebody "
+            "saying it is abandoned, rather than a guess from a date. A "
+            "closure against any other base still gets the age gate, since "
+            "deleting a base closes its pull requests automatically. "
+            "Merged branches are not filtered by age either -- merged is "
+            "merged."
         ),
     )
     parser.add_argument(
@@ -373,9 +387,21 @@ def _classify(
             # documents resetting and reusing a pinned branch name, so
             # this is the workflow rather than a naming coincidence (Codex
             # review, mikelward/repo#20).
-            unmerged_pr.setdefault(ref, {}).setdefault(
-                pull.get("head_sha"), pull["number"]
-            )
+            # (number, did ANY of them target the default branch). One
+            # tip can carry several closed pull requests, so the flag is
+            # aggregated rather than taken from the first: a stacked
+            # closure listed ahead of a default-base one would otherwise
+            # mask it. The number shown prefers the default-base closure,
+            # since that is what justifies the offer (Codex review,
+            # mikelward/repo#22).
+            on_default = pull.get("base_ref") == default_branch
+            at_sha = unmerged_pr.setdefault(ref, {})
+            sha_key = pull.get("head_sha")
+            previous = at_sha.get(sha_key)
+            if previous is None:
+                at_sha[sha_key] = (pull["number"], on_default)
+            elif on_default and not previous[1]:
+                at_sha[sha_key] = (pull["number"], True)
 
     deletable, offerable, kept, skipped, failed = [], [], [], [], []
 
@@ -445,15 +471,26 @@ def _classify(
             continue
 
         age = _age_days(_parse_timestamp(last_commit), now)
+        closed = unmerged_pr.get(name, {}).get(sha)
         entry = {
             "name": name,
             "sha": sha,
             "ahead_by": ahead_by,
             "age_days": age,
-            "closed_pr": unmerged_pr.get(name, {}).get(sha),
+            "closed_pr": closed[0] if closed else None,
+            "closed_on_default": bool(closed and closed[1]),
         }
         entry["why"] = _describe_unmerged(entry)
-        if age is None or age < older_than:
+        # A closure against the default branch skips --older-than: age is
+        # only a proxy for "abandoned", and that is somebody saying so.
+        # Against any other base it does NOT, because GitHub closes a pull
+        # request automatically when its base branch is deleted -- so a
+        # stack's upper one goes closed with nobody deciding anything, and
+        # `repo cleanup` causes exactly that by sweeping the merged lower
+        # branch (Codex review, mikelward/repo#22).
+        if entry["closed_on_default"]:
+            offerable.append(entry)
+        elif age is None or age < older_than:
             # Too recent, or no readable age to compare against
             # --older-than. Either way it is kept, never offered: the flag
             # exists to hold back recent work, and "no idea how old" is not
@@ -475,14 +512,50 @@ def _describe_unmerged(entry):
     return ", ".join(parts)
 
 
-def _describe_plan(repo, plan, older_than, include_unmerged):
+def _grouped_lines(entries, indent="  "):
+    """Plan lines for `entries`, with a shared branch prefix printed once.
+
+    A fleet-sized listing is mostly one prefix repeated: simmo's 184 dead
+    branches were 172 `claude/`, 5 `codex/` and 2 `deps/`. Printing that
+    prefix on every line buries the part that differs, which is the part
+    being read (maintainer, 2026-09-03).
+
+    So a prefix shared by two or more branches becomes a heading and its
+    members lose it. A prefix held by ONE branch does not: a heading over a
+    single line is worse than the repetition it saves, so those print in
+    full, after the groups, alongside any name with no prefix at all.
+    """
+    groups = {}
+    singles = []
+    for entry in entries:
+        prefix, sep, rest = entry["name"].partition("/")
+        if sep:
+            groups.setdefault(prefix, []).append((rest, entry))
+        else:
+            singles.append(entry)
+
+    for prefix in sorted(groups):
+        if len(groups[prefix]) < 2:
+            singles.extend(entry for _rest, entry in groups.pop(prefix))
+
+    lines = []
+    for prefix in sorted(groups):
+        members = sorted(groups[prefix])
+        lines.append(f"{indent}{prefix}/ ({len(members)}):")
+        for rest, entry in members:
+            lines.append(f"{indent}  {rest}: {entry['why']}")
+    for entry in sorted(singles, key=lambda e: e["name"]):
+        lines.append(f"{indent}{entry['name']}: {entry['why']}")
+    return lines
+
+
+def _describe_plan(repo, plan, default_branch, older_than, include_unmerged):
     deletable, offerable, kept, skipped, failed = plan
     lines = []
 
     if deletable:
         lines.append(f"Merged branches on {repo}, to delete ({len(deletable)}):")
-        for entry in deletable:
-            lines.append(f"  {entry['name']}: {entry['why']}")
+        lines.extend(_grouped_lines(deletable))
     else:
         lines.append(f"No merged branches to delete on {repo}.")
 
@@ -490,19 +563,21 @@ def _describe_plan(repo, plan, older_than, include_unmerged):
         lines.append("")
         verb = "to offer one at a time" if include_unmerged else "NOT deleted"
         lines.append(
-            f"Unmerged, last commit at least {older_than}d ago, "
+            f"Unmerged -- pull request closed against {default_branch}, or "
+            f"last commit at least {older_than}d ago -- "
             f"{verb} ({len(offerable)}):"
         )
-        for entry in offerable:
-            lines.append(f"  {entry['name']}: {entry['why']}")
+        lines.extend(_grouped_lines(offerable))
         if not include_unmerged:
             lines.append("  (pass --include-unmerged to be asked about each of these)")
 
     if kept:
         lines.append("")
+        # Not "no pull request": a pull request closed against a
+        # non-default base lands here too, keeping its age gate, and its
+        # own line says so (Codex review, mikelward/repo#22).
         lines.append(f"Unmerged and too recent to offer ({len(kept)}):")
-        for entry in kept:
-            lines.append(f"  {entry['name']}: {entry['why']}")
+        lines.extend(_grouped_lines(kept))
 
     if skipped:
         lines.append("")
@@ -699,7 +774,9 @@ def run(args):
     )
     deletable, offerable, _kept, _skipped, failed = plan
 
-    lines = _describe_plan(repo, plan, args.older_than, args.include_unmerged)
+    lines = _describe_plan(
+        repo, plan, default_branch, args.older_than, args.include_unmerged
+    )
 
     def report_classification_failures():
         # The plan names an unclassifiable branch but not WHY, so this says

@@ -528,6 +528,75 @@ class ProtectionTest(CleanupTestCase):
         self.assertEqual(fake.deleted(), ["claude/done"])
 
 
+class PlanGroupingTest(CleanupTestCase):
+    """A fleet-sized plan is mostly one prefix repeated -- simmo's 184 dead
+    branches were 172 `claude/`, 5 `codex/` and 2 `deps/`. Printing it once
+    per group leaves the part that differs (maintainer, 2026-09-03)."""
+
+    def _merged(self, *names):
+        return FakeGh(
+            branches=[("main", "aaa", True)]
+            + [(n, f"sha{i}", False) for i, n in enumerate(names)],
+            closed_pulls=[
+                {
+                    "number": i,
+                    "head_ref": n,
+                    "merged_at": "x",
+                    "head_sha": f"sha{i}",
+                }
+                for i, n in enumerate(names)
+            ],
+        )
+
+    def test_a_shared_prefix_is_printed_once_and_dropped_from_members(self):
+        fake = self._merged("claude/one", "claude/two", "claude/three")
+        code, out, err = self.invoke(fake, [REPO, "--dry-run"])
+        self.assertIn("  claude/ (3):", out)
+        self.assertIn("    one: ", out)
+        self.assertIn("    two: ", out)
+        # The prefix appears in the heading and nowhere else.
+        self.assertEqual(out.count("claude/"), 1)
+
+    def test_a_prefix_held_by_one_branch_gets_no_heading(self):
+        # A heading over a single line is worse than the repetition it
+        # saves, so it prints in full instead.
+        fake = self._merged("claude/one", "claude/two", "codex/only")
+        code, out, err = self.invoke(fake, [REPO, "--dry-run"])
+        self.assertIn("  claude/ (2):", out)
+        self.assertNotIn("codex/ (1):", out)
+        self.assertIn("  codex/only: ", out)
+
+    def test_a_branch_with_no_prefix_prints_in_full(self):
+        fake = self._merged("claude/one", "claude/two", "hotfix")
+        code, out, err = self.invoke(fake, [REPO, "--dry-run"])
+        self.assertIn("  hotfix: ", out)
+
+    def test_groups_come_before_the_ungrouped_remainder(self):
+        fake = self._merged("zz/one", "zz/two", "aaa-loose")
+        code, out, err = self.invoke(fake, [REPO, "--dry-run"])
+        lines = [l for l in out.splitlines() if l.strip()]
+        self.assertLess(
+            lines.index("  zz/ (2):"),
+            next(i for i, l in enumerate(lines) if l.startswith("  aaa-loose:")),
+        )
+
+    def test_the_offered_and_kept_sections_group_too(self):
+        fake = FakeGh(
+            branches=[("main", "aaa", True)]
+            + [(f"claude/old{i}", f"o{i}", False) for i in range(2)]
+            + [(f"claude/new{i}", f"n{i}", False) for i in range(2)],
+            compares={
+                **{f"claude/old{i}": (1, days_ago(90)) for i in range(2)},
+                **{f"claude/new{i}": (1, days_ago(0)) for i in range(2)},
+            },
+        )
+        code, out, err = self.invoke(
+            fake, [REPO, "--include-unmerged", "--dry-run"]
+        )
+        # Once in the offered section, once in the too-recent one.
+        self.assertEqual(out.count("claude/ (2):"), 2)
+
+
 class AgeTest(CleanupTestCase):
     def test_an_unmerged_branch_newer_than_the_threshold_is_not_offered(self):
         fake = FakeGh(
@@ -550,6 +619,220 @@ class AgeTest(CleanupTestCase):
         )
         self.assertIn("to offer one at a time", out)
         self.assertNotIn("too recent to offer", out)
+
+    def test_a_closed_pull_request_is_offered_however_recent(self):
+        # Age is a proxy for abandonment. A closed pull request is somebody
+        # saying so outright, so the proxy has nothing to add -- a branch
+        # closed an hour ago is as finished with as one closed in March
+        # (maintainer, 2026-09-03).
+        fake = FakeGh(
+            branches=[("main", "aaa", True), ("claude/dropped", "bbb", False)],
+            compares={"claude/dropped": (2, days_ago(0))},
+            closed_pulls=[
+                {"number": 31, "head_ref": "claude/dropped", "head_sha": "bbb"}
+            ],
+        )
+        code, out, err = self.invoke(
+            fake, [REPO, "--include-unmerged", "--dry-run"]
+        )
+        self.assertIn("to offer one at a time", out)
+        self.assertNotIn("too recent to offer", out)
+        self.assertIn("PR #31 closed without merging", out)
+
+    def test_a_stacked_pull_request_closed_by_base_deletion_keeps_the_age_gate(
+        self,
+    ):
+        # GitHub closes a pull request automatically when its base branch is
+        # deleted, so in a stack the upper one goes closed without anybody
+        # deciding anything -- and its head may be live work. `repo cleanup`
+        # can cause exactly that itself by sweeping the merged lower branch
+        # (Codex review, mikelward/repo#22).
+        fake = FakeGh(
+            branches=[("main", "aaa", True), ("claude/upper", "bbb", False)],
+            compares={"claude/upper": (2, days_ago(0))},
+            closed_pulls=[
+                {
+                    "number": 41,
+                    "head_ref": "claude/upper",
+                    "head_sha": "bbb",
+                    "base_ref": "claude/lower",
+                }
+            ],
+        )
+        code, out, err = self.invoke(
+            fake, [REPO, "--include-unmerged", "--dry-run"]
+        )
+        self.assertIn("too recent to offer", out)
+        self.assertNotIn("to offer one at a time", out)
+        # The label still shows -- it is informative; only the age exemption
+        # is withheld.
+        self.assertIn("PR #41 closed without merging", out)
+
+    def test_a_non_default_closure_does_not_mask_a_default_one(self):
+        # One SHA can carry several closed pull requests. Keeping whichever
+        # the API listed first let a stacked closure hide a default-branch
+        # one and withhold the exemption (Codex review, mikelward/repo#22).
+        # The non-default one is listed FIRST here, which is the order that
+        # used to lose.
+        fake = FakeGh(
+            branches=[("main", "aaa", True), ("claude/both", "bbb", False)],
+            compares={"claude/both": (2, days_ago(0))},
+            closed_pulls=[
+                {
+                    "number": 50,
+                    "head_ref": "claude/both",
+                    "head_sha": "bbb",
+                    "base_ref": "claude/lower",
+                },
+                {
+                    "number": 51,
+                    "head_ref": "claude/both",
+                    "head_sha": "bbb",
+                    "base_ref": "main",
+                },
+            ],
+        )
+        code, out, err = self.invoke(
+            fake, [REPO, "--include-unmerged", "--dry-run"]
+        )
+        self.assertIn("to offer one at a time", out)
+        self.assertNotIn("too recent to offer", out)
+        # And it names the closure that justifies the offer, not the one
+        # that happened to be listed first.
+        self.assertIn("PR #51 closed without merging", out)
+
+    def test_only_non_default_closures_still_keep_the_age_gate(self):
+        # The aggregate is `any`, not `first` -- with no default-base
+        # closure among them the exemption stays withheld.
+        fake = FakeGh(
+            branches=[("main", "aaa", True), ("claude/both", "bbb", False)],
+            compares={"claude/both": (2, days_ago(0))},
+            closed_pulls=[
+                {
+                    "number": 52,
+                    "head_ref": "claude/both",
+                    "head_sha": "bbb",
+                    "base_ref": "claude/lower",
+                },
+                {
+                    "number": 53,
+                    "head_ref": "claude/both",
+                    "head_sha": "bbb",
+                    "base_ref": "claude/other",
+                },
+            ],
+        )
+        code, out, err = self.invoke(
+            fake, [REPO, "--include-unmerged", "--dry-run"]
+        )
+        self.assertIn("too recent to offer", out)
+
+    def test_the_too_recent_heading_does_not_contradict_its_own_lines(self):
+        # The held-back group is not "no pull request": a closure against a
+        # non-default base lands here too, and its detail line says so, so a
+        # heading claiming otherwise contradicts the entry beneath it (Codex
+        # review, mikelward/repo#22).
+        fake = FakeGh(
+            branches=[("main", "aaa", True), ("claude/upper", "bbb", False)],
+            compares={"claude/upper": (2, days_ago(0))},
+            closed_pulls=[
+                {
+                    "number": 43,
+                    "head_ref": "claude/upper",
+                    "head_sha": "bbb",
+                    "base_ref": "claude/lower",
+                }
+            ],
+        )
+        code, out, err = self.invoke(
+            fake, [REPO, "--include-unmerged", "--dry-run"]
+        )
+        self.assertIn("Unmerged and too recent to offer (1):", out)
+        self.assertNotIn("no pull request", out)
+        self.assertIn("PR #43 closed without merging", out)
+
+    def test_the_offered_heading_names_the_default_branch(self):
+        # The exemption is a closure against the default branch specifically,
+        # so the heading says which branch that is rather than implying any
+        # closure qualifies.
+        fake = FakeGh(
+            branches=[("main", "aaa", True), ("claude/dropped", "bbb", False)],
+            compares={"claude/dropped": (2, days_ago(0))},
+            closed_pulls=[
+                {"number": 44, "head_ref": "claude/dropped", "head_sha": "bbb"}
+            ],
+        )
+        code, out, err = self.invoke(
+            fake, [REPO, "--include-unmerged", "--dry-run"]
+        )
+        self.assertIn("pull request closed against main", out)
+
+    def test_a_stacked_closed_pull_request_is_still_offered_once_old(self):
+        # Withholding the exemption is not withholding the branch: the age
+        # gate reaches it like any other unmerged branch.
+        fake = FakeGh(
+            branches=[("main", "aaa", True), ("claude/upper", "bbb", False)],
+            compares={"claude/upper": (2, days_ago(90))},
+            closed_pulls=[
+                {
+                    "number": 42,
+                    "head_ref": "claude/upper",
+                    "head_sha": "bbb",
+                    "base_ref": "claude/lower",
+                }
+            ],
+        )
+        code, out, err = self.invoke(
+            fake, [REPO, "--include-unmerged", "--dry-run"]
+        )
+        self.assertIn("to offer one at a time", out)
+
+    def test_a_recent_branch_with_no_pull_request_is_still_held_back(self):
+        # The other half of the same rule: with no pull request there is no
+        # signal but the date, so recent work is not asked about.
+        fake = FakeGh(
+            branches=[("main", "aaa", True), ("claude/wip", "bbb", False)],
+            compares={"claude/wip": (2, days_ago(0))},
+        )
+        code, out, err = self.invoke(
+            fake, [REPO, "--include-unmerged", "--dry-run"]
+        )
+        self.assertIn("too recent to offer", out)
+        self.assertNotIn("to offer one at a time", out)
+
+    def test_a_closed_pull_request_on_a_reused_name_does_not_bypass_the_age_gate(
+        self,
+    ):
+        # The label is matched by SHA, so a name reset onto new work does
+        # not inherit the old occupant's closed pull request -- and must not
+        # inherit its exemption from --older-than either, or the reuse the
+        # guide encourages would drag live work into the prompt.
+        fake = FakeGh(
+            branches=[("main", "aaa", True), ("claude/reused", "newsha", False)],
+            compares={"claude/reused": (2, days_ago(0))},
+            closed_pulls=[
+                {"number": 32, "head_ref": "claude/reused", "head_sha": "oldsha"}
+            ],
+        )
+        code, out, err = self.invoke(
+            fake, [REPO, "--include-unmerged", "--dry-run"]
+        )
+        self.assertIn("too recent to offer", out)
+        self.assertNotIn("PR #32", out)
+
+    def test_a_closed_pull_request_branch_is_actually_offered_and_deleted(self):
+        # Not just classified into the right group -- the prompt reaches it.
+        fake = FakeGh(
+            branches=[("main", "aaa", True), ("claude/dropped", "bbb", False)],
+            compares={"claude/dropped": (2, days_ago(0))},
+            closed_pulls=[
+                {"number": 33, "head_ref": "claude/dropped", "head_sha": "bbb"}
+            ],
+        )
+        code, out, err = self.invoke(
+            fake, [REPO, "--include-unmerged"], answers=["y"]
+        )
+        self.assertEqual(fake.deleted(), ["claude/dropped"])
 
     def test_a_truncated_compare_dates_the_branch_by_its_tip(self):
         # GitHub caps compare's `commits` at 250, so a branch further ahead
