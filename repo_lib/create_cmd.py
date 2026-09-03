@@ -129,6 +129,20 @@ def run(args):
         error("once that's resolved -- its bootstrap step scaffolds a still-empty branch too.")
         raise SystemExit(1)
 
+    if scaffold._missing_workflow_scope(files):
+        # Checked before attempting the write at all, not left for
+        # push_initial_commit's own tree-create to discover as a 404: that
+        # 404 is indistinguishable from any other failure without this
+        # check, and no amount of waiting or retrying fixes it -- it's a
+        # permission wall, not a timing one (mikelward/repo#18).
+        error(f"{args.repo} was created, but this gh token is missing the 'workflow' OAuth scope,")
+        error("needed to push the .github/workflows/ files the scaffold includes. Nothing was")
+        error("pushed. Run `gh auth refresh -s workflow` (or add the scope your token's own way),")
+        error("then:")
+        error(f"  repo setup {args.repo} --force")
+        error("to finish scaffolding it.")
+        raise SystemExit(1)
+
     if scaffold.push_initial_commit(args.repo, default_branch, files) is None:
         # push_initial_commit can fail after its own bootstrap write already
         # landed a seed file (see its own docstring) -- the branch is then

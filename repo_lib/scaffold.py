@@ -59,66 +59,52 @@ without touching anything else `repo setup`'s other steps did. Applying
 the result, when there is one, costs one blob per missing file, one tree,
 one commit, and one ref update (two commits total only for a repository
 with no commits yet -- see push_initial_commit's own docstring for why).
+One more read, only when something missing is under .github/workflows/:
+_missing_workflow_scope checks this gh token's own OAuth scopes before
+attempting the write at all (see its own docstring, mikelward/repo#18).
 """
 
 import base64
 import json
 import re
-import time
 import urllib.parse
 from dataclasses import dataclass, field
 
 from repo_lib import gh
 from repo_lib.common import error, error_lines
 
-# GitHub's git-data CREATE endpoints (blob/tree/commit) can 404 for a
-# short window right after a repository's own first content lands there
-# -- observed in practice: a freshly-bootstrapped repo's very next
-# tree-create 404'd, and so did the SAME repo's later gap-fill tree-
-# create, a couple of minutes afterward. Retried here, bounded and
-# visible, rather than left for the user to notice and rerun `repo setup`
-# by hand each time -- the tool is exactly the thing meant to reach the
-# correct end state without manual babysitting. Capped (not indefinite)
-# so a repository that's genuinely stuck for some OTHER reason still
-# fails and says so, rather than hanging silently. Deliberately NOT used
-# on either ref-update PATCH: each has (or, for the gap-fill one, IS) a
-# precondition that only holds immediately before the write, which a
-# blind retry minutes later would undermine -- see the two call sites'
-# own comments (Codex review, mikelward/repo#17).
-_WRITE_RETRY_ATTEMPTS = 6
-_WRITE_RETRY_DELAY_SECONDS = 2  # doubles each retry: 2+4+8+16+32 = 62s across 5 retries
+# A prior version of this module retried a git-data CREATE call (blob/
+# tree/commit) on a 404, on the theory that GitHub's git-data backend
+# could take a short while to catch up right after a repository's first
+# content landed. That theory turned out to be wrong: the actual, only
+# real-world cause found (mikelward/repo#18) was a gh token missing the
+# `workflow` OAuth scope, which makes a tree-create referencing a
+# `.github/workflows/*` path 404 -- every time, indefinitely, regardless
+# of how long a caller waits, since it's a permission wall rather than a
+# timing window. _missing_workflow_scope below checks for that specific,
+# confirmed cause up front instead, so this fails in milliseconds with an
+# actionable message rather than after 62 seconds of pointless retrying
+# into the same unhelpful "Not Found".
 
 
-def _run_with_input_retrying_not_found(args, input_bytes):
-    """Same contract as gh.run_with_input, but retries a 404 specifically
-    (see _WRITE_RETRY_ATTEMPTS above) -- any other failure propagates on
-    the first attempt, unretried, since only "not found yet" matches the
-    backend-catching-up window this exists for. Only ever call this for a
-    pure create (blob/tree/commit): each is immutable and content-
-    addressed, so a blind retry can't observe or act on stale state the
-    way a ref update can (see its two call sites' own comments)."""
-    delay = _WRITE_RETRY_DELAY_SECONDS
-    for attempt in range(1, _WRITE_RETRY_ATTEMPTS + 1):
-        try:
-            return gh.run_with_input(args, input_bytes)
-        except gh.GhError as e:
-            if attempt == _WRITE_RETRY_ATTEMPTS or "HTTP 404" not in e.stderr:
-                raise
-            # The theory this retry is built on (a git-data backend that
-            # hasn't caught up yet) is a guess, not a certainty -- so
-            # relay gh's OWN error text every attempt rather than
-            # asserting the theory as fact and discarding it. If a LATER
-            # attempt ever comes back with something more specific (a
-            # permission/scope rejection reads very differently from a
-            # bare "Not Found"), this is what would show it, instead of
-            # silently retrying into the same guessed explanation.
-            error(
-                f"{args[3]} returned 404, possibly GitHub's git-data backend still catching up "
-                f"with this repository's own first content -- retrying in {delay}s "
-                f"({attempt}/{_WRITE_RETRY_ATTEMPTS}): {e.stderr.strip()}"
-            )
-            time.sleep(delay)
-            delay *= 2
+def _missing_workflow_scope(missing_paths):
+    """True if `missing_paths` includes anything under .github/workflows/
+    AND this gh token's own OAuth scopes are known and don't include
+    `workflow` -- the one confirmed cause of a scaffold tree-create
+    404ing no matter how long a caller waits (mikelward/repo#18: blob-
+    create, which carries no path, always succeeded; tree-create, the
+    first point a path gets attached to content, 404'd every time, on
+    two separate days, for a token whose scopes were `gist, read:org,
+    repo` -- no `workflow`).
+
+    False (not blocking) when gh.token_scopes() can't tell -- a
+    fine-grained PAT or GitHub App token carries no OAuth scopes at all,
+    so "can't tell" must not read as "missing"; only an explicit absence
+    in a real scope list is grounds to skip the write outright."""
+    if not any(path.startswith(".github/workflows/") for path in missing_paths):
+        return False
+    scopes = gh.token_scopes()
+    return scopes is not None and "workflow" not in scopes
 
 
 TEMPLATE_REPO = "mikelward/codex-review"
@@ -557,7 +543,7 @@ def push_initial_commit(repo, default_branch, files):
     tree_entries = []
     for path, content in ordered:
         try:
-            raw = _run_with_input_retrying_not_found(
+            raw = gh.run_with_input(
                 ["api", "--method", "POST", f"repos/{repo}/git/blobs", "--input", "-"],
                 json.dumps({"content": content, "encoding": "utf-8"}).encode(),
             )
@@ -568,7 +554,7 @@ def push_initial_commit(repo, default_branch, files):
         tree_entries.append({"path": path, "mode": "100644", "type": "blob", "sha": blob_sha})
 
     try:
-        raw = _run_with_input_retrying_not_found(
+        raw = gh.run_with_input(
             ["api", "--method", "POST", f"repos/{repo}/git/trees", "--input", "-"],
             json.dumps({"tree": tree_entries}).encode(),
         )
@@ -578,7 +564,7 @@ def push_initial_commit(repo, default_branch, files):
     tree_sha = json.loads(raw)["sha"]
 
     try:
-        raw = _run_with_input_retrying_not_found(
+        raw = gh.run_with_input(
             ["api", "--method", "POST", f"repos/{repo}/git/commits", "--input", "-"],
             json.dumps(
                 {
@@ -594,12 +580,6 @@ def push_initial_commit(repo, default_branch, files):
     commit_sha = json.loads(raw)["sha"]
 
     try:
-        # Not the retrying wrapper: a bare push (no precheck at all right
-        # before it) is not the same risk as the gap-fill PATCH below,
-        # but there is nothing here to re-verify against if this DID
-        # retry blind, and no evidence this call is even affected by the
-        # same lag the create calls above are (Codex review,
-        # mikelward/repo#17).
         gh.run_with_input(
             [
                 "api",
@@ -629,9 +609,18 @@ class GapPlan:
     branch has no commits yet -- plan_gaps still builds `missing` as every
     scaffold file in that case, and apply_gaps falls back to
     push_initial_commit's own empty-repository bootstrap for it, rather
-    than this dataclass needing a second shape for that case."""
+    than this dataclass needing a second shape for that case.
+
+    `missing_workflow_scope` is distinct from `error`, the same way
+    rules.py's own `never_reported` is distinct from a genuine ruleset
+    preview failure: nothing is wrong with the repository or the request,
+    only with what this gh token is allowed to write, and that's
+    recoverable (add the scope, rerun) rather than something to retry or
+    give up on. setup_cmd.py reads it to skip only the bootstrap step
+    while still doing everything else this run can (mikelward/repo#18)."""
 
     error: bool = False
+    missing_workflow_scope: bool = False
     base_commit_sha: str = None
     base_tree_sha: str = None
     present: list = field(default_factory=list)
@@ -659,7 +648,7 @@ def plan_gaps(repo, default_branch):
             # against, so every scaffold file counts as missing and
             # apply_gaps bootstraps it the same way `repo create
             # --scaffold` does for a brand-new repository.
-            return GapPlan(missing=files)
+            return GapPlan(missing=files, missing_workflow_scope=_missing_workflow_scope(files))
         error_lines(f"could not read {repo}'s '{default_branch}' branch:", ref_raw)
         return GapPlan(error=True)
 
@@ -761,7 +750,11 @@ def plan_gaps(repo, default_branch):
         return GapPlan(error=True)
 
     return GapPlan(
-        base_commit_sha=commit_sha, base_tree_sha=tree_sha, present=sorted(present), missing=missing
+        base_commit_sha=commit_sha,
+        base_tree_sha=tree_sha,
+        present=sorted(present),
+        missing=missing,
+        missing_workflow_scope=_missing_workflow_scope(missing),
     )
 
 
@@ -771,6 +764,13 @@ def describe_gap_plan(plan):
     secrets_cmd._describe_plan)."""
     if plan.error:
         return ["could not plan (see above); nothing added"]
+    if plan.missing_workflow_scope:
+        workflow_count = sum(1 for path in plan.missing if path.startswith(".github/workflows/"))
+        return [
+            f"SKIPPED: this gh token is missing the 'workflow' OAuth scope, needed to add "
+            f"{workflow_count} file(s) under .github/workflows/ -- run `gh auth refresh -s "
+            "workflow` (or add the scope your token's own way) and rerun"
+        ]
     lines = [f"add {path}" for path in sorted(plan.missing)]
     if plan.present:
         lines.append(f"already present, untouched: {len(plan.present)} file(s)")
@@ -853,7 +853,7 @@ def apply_gaps(repo, default_branch, plan):
     tree_entries = []
     for path, content in sorted(plan.missing.items()):
         try:
-            raw = _run_with_input_retrying_not_found(
+            raw = gh.run_with_input(
                 ["api", "--method", "POST", f"repos/{repo}/git/blobs", "--input", "-"],
                 json.dumps({"content": content, "encoding": "utf-8"}).encode(),
             )
@@ -864,7 +864,7 @@ def apply_gaps(repo, default_branch, plan):
         tree_entries.append({"path": path, "mode": "100644", "type": "blob", "sha": blob_sha})
 
     try:
-        raw = _run_with_input_retrying_not_found(
+        raw = gh.run_with_input(
             ["api", "--method", "POST", f"repos/{repo}/git/trees", "--input", "-"],
             json.dumps({"base_tree": plan.base_tree_sha, "tree": tree_entries}).encode(),
         )
@@ -877,7 +877,7 @@ def apply_gaps(repo, default_branch, plan):
         f"- {path}" for path in sorted(plan.missing)
     )
     try:
-        raw = _run_with_input_retrying_not_found(
+        raw = gh.run_with_input(
             ["api", "--method", "POST", f"repos/{repo}/git/commits", "--input", "-"],
             json.dumps(
                 {"message": message, "tree": tree_sha, "parents": [plan.base_commit_sha]}
@@ -915,15 +915,6 @@ def apply_gaps(repo, default_branch, plan):
         return None
 
     try:
-        # Not the retrying wrapper, deliberately: this PATCH's whole
-        # safety rests on the equality check just above happening
-        # IMMEDIATELY before the write. Retrying the same call blind
-        # for up to a minute would let the branch get deleted and
-        # recreated at an ancestor of plan.base_commit_sha in that
-        # window -- a later retry would then fast-forward from that
-        # ancestor and silently restore exactly what a reset meant to
-        # remove, the precise thing the check above exists to prevent
-        # (Codex review, mikelward/repo#17).
         gh.run_with_input(
             [
                 "api",

@@ -279,22 +279,16 @@ class FakeGh:
         self.bootstrap_occupied_entries = {}
         self.bootstrap_blob_fails = False
         self.bootstrap_tree_create_fails = False
-        # A 404 on the gap-fill's tree-create, exactly this many times
-        # before it succeeds -- models GitHub's git-data write endpoints
-        # lagging briefly right after a repository's first content lands,
-        # which scaffold._run_with_input_retrying_not_found exists to
-        # absorb. Distinct from bootstrap_tree_create_fails, a permanent,
-        # unrelated failure (HTTP 500) that must never retry.
-        self.bootstrap_tree_fails_404_times = 0
-        self._bootstrap_tree_404_count = 0
         self.bootstrap_commit_create_fails = False
         self.bootstrap_ref_update_fails = False
-        # A 404 on the ref-update PATCH -- distinct from the 422 above --
-        # to prove this call is NOT wrapped in the create-only retry
-        # helper: retrying it blind would undermine the equality check
-        # apply_gaps just did immediately before this write (Codex
-        # review, mikelward/repo#17).
-        self.bootstrap_ref_update_404s = False
+        # The gh token's own OAuth scopes, as scaffold._missing_workflow_
+        # scope reads them (via gh.token_scopes -> X-OAuth-Scopes). None
+        # (the default) models a token this can't tell the scopes of at
+        # all (a fine-grained PAT/GitHub App token) -- never blocks. Pass
+        # a tuple missing "workflow" to model mikelward/repo#18's real
+        # cause: a tree-create referencing a .github/workflows/* path
+        # 404ing no matter how long a caller waits.
+        self.token_scopes = None
         self._bootstrap_blob_seq = 0
 
     # -- repo_lib.gh.run/try_run/run_with_input replacements --------------
@@ -322,6 +316,13 @@ class FakeGh:
     def run(self, args):
         self.calls.append(list(args))
         assert args[0] == "api", args
+        if args == ["api", "-i", "user"]:
+            # gh.token_scopes()'s own read -- raw headers, a blank line,
+            # then a body, same shape `gh api -i` really prints.
+            header = (
+                f"X-OAuth-Scopes: {', '.join(self.token_scopes)}\n" if self.token_scopes is not None else ""
+            )
+            return f"HTTP/2.0 200 OK\n{header}\n{{}}"
         endpoint, method, jq = _parse_api_args(args[1:])
 
         m = _DEFAULT_BRANCH_RE.match(endpoint)
@@ -683,9 +684,6 @@ class FakeGh:
             if _SCAFFOLD_TREE_CREATE_RE.match(endpoint):
                 if self.bootstrap_tree_create_fails:
                     raise gh.GhError("gh: HTTP 500: Internal Server Error\n")
-                if self._bootstrap_tree_404_count < self.bootstrap_tree_fails_404_times:
-                    self._bootstrap_tree_404_count += 1
-                    raise gh.GhError("gh: Not Found (HTTP 404)\n")
                 self.posts.append((args, body))
                 return json.dumps({"sha": "newscaffoldtreesha"}).encode()
             if _SCAFFOLD_COMMIT_CREATE_RE.match(endpoint):
@@ -697,8 +695,6 @@ class FakeGh:
         elif method == "PATCH":
             if _SCAFFOLD_REF_WRITE_RE.match(endpoint) and self.bootstrap_ref_update_fails:
                 raise gh.GhError("gh: HTTP 422: Reference update failed\n")
-            if _SCAFFOLD_REF_WRITE_RE.match(endpoint) and self.bootstrap_ref_update_404s:
-                raise gh.GhError("gh: Not Found (HTTP 404)\n")
             if self.patch_fails:
                 raise gh.GhError("gh: HTTP 403: Must have admin rights to Repository.\n")
             self.patches.append((args, body))
@@ -3184,48 +3180,52 @@ class BootstrapStepTest(unittest.TestCase):
         ruleset_posts = [(a, b) for a, b in fake.posts if a[3] == f"repos/{REPO}/rulesets"]
         self.assertEqual(ruleset_posts, [])
 
-    def test_a_404_on_the_gap_fill_tree_create_retries_and_succeeds(self):
-        # Reported directly: `repo setup OWNER/REPO --no-rules --force` on
-        # a repo with real gaps 404'd on the gap-fill's tree-create and
-        # added nothing, even on a second attempt run by hand two minutes
-        # later. GitHub's git-data write endpoints can lag briefly right
-        # after a repository's first content lands there -- this models
-        # that clearing within a few attempts, which the tool should
-        # absorb on its own instead of making the user rerun by hand.
+    def test_missing_workflow_scope_skips_the_bootstrap_step_before_any_write(self):
+        # Reported directly (mikelward/repo#18): `repo setup OWNER/REPO
+        # --no-rules --force` on a repo with real gaps 404'd on the
+        # gap-fill's tree-create, every time, on two separate days -- not
+        # a timing window at all. Root cause: a gh token missing the
+        # `workflow` OAuth scope, which blocks writing anything under
+        # .github/workflows/ -- checked up front now, before any write is
+        # attempted, rather than discovered as an opaque, unretryable 404.
         fake = FakeGh()
         fake.bootstrap_existing_paths = {"TODO.md"}  # real gaps to fill
-        fake.bootstrap_tree_fails_404_times = 3
-        with patch("repo_lib.scaffold.time.sleep") as mock_sleep:
-            code, out, err = _run(fake, ["--no-rules", "--force", REPO])
+        fake.token_scopes = ("gist", "read:org", "repo")
+        code, out, err = _run(fake, ["--no-rules", "--force", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("skipping the bootstrap step", err)
+        self.assertIn("workflow", err)
+        self.assertIn("gh auth refresh", err)
+        self.assertNotIn(f"{REPO}: added", out)
+        self.assertEqual(fake.posts, [])
+        self.assertEqual(fake.patches, [])
+
+    def test_missing_workflow_scope_message_counts_only_workflow_files(self):
+        # Codex review, mikelward/repo#18: the skip message counted
+        # len(plan.missing) -- every still-missing scaffold file, not just
+        # the ones under .github/workflows/ -- so on a repo missing a
+        # non-workflow file too (here, .github/lanes.conf, alongside the
+        # scaffold's five workflow files) it overstated how many files the
+        # missing scope actually blocks.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = {"TODO.md"}  # only TODO.md already present
+        fake.token_scopes = ("gist", "read:org", "repo")
+        code, out, err = _run(fake, ["--no-rules", "--force", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("5 file(s) under .github/workflows/", err)
+        self.assertNotIn("6 file(s)", err)
+
+    def test_unknown_token_scopes_do_not_block_the_gap_fill(self):
+        # A fine-grained PAT or GitHub App token carries no OAuth scopes
+        # at all -- "can't tell" must not read as "missing", or every
+        # such token would be refused a gap-fill it could actually write.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = {"TODO.md"}  # real gaps to fill
+        fake.token_scopes = None
+        code, out, err = _run(fake, ["--no-rules", "--force", REPO])
         self.assertEqual(code, 0, err)
         self.assertIn(f"{REPO}: added", out)
-        self.assertEqual(mock_sleep.call_count, 3)
-        self.assertIn("404", err)
-        self.assertIn("retrying", err)
-        # gh's own error text, not just a generic phrase -- so if a LATER
-        # retry ever comes back with something more specific than a bare
-        # 404 (a permission/scope rejection, say), that's what shows up
-        # here instead of being silently discarded.
-        self.assertIn("Not Found", err)
-
-    def test_a_404_on_the_gap_fill_ref_update_does_not_retry(self):
-        # Codex review: unlike blob/tree/commit create, the ref-update
-        # PATCH's safety depends entirely on the equality check apply_gaps
-        # just did (immediately before this write) still holding -- a
-        # blind retry over the next ~62s could act on a branch that was
-        # deleted and recreated at an ancestor commit in that window,
-        # silently restoring what a deliberate reset removed. So this call
-        # must fail on the FIRST 404, exactly like every other genuine
-        # ref-update failure, not retry at all.
-        fake = FakeGh()
-        fake.bootstrap_existing_paths = {"TODO.md"}  # real gaps to fill
-        fake.bootstrap_ref_update_404s = True
-        with patch("repo_lib.scaffold.time.sleep") as mock_sleep:
-            code, out, err = _run(fake, ["--no-rules", "--force", REPO])
-        self.assertEqual(code, 1)
-        self.assertIn("could not update", err)
-        self.assertNotIn(f"{REPO}: added", out)
-        mock_sleep.assert_not_called()
+        self.assertEqual(len(fake.patches), 1)
 
     def test_a_concurrent_push_after_bootstrap_blocks_activating_the_ruleset(self):
         # A concurrent push landing between apply_gaps's own write
