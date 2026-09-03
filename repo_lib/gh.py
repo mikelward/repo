@@ -34,7 +34,8 @@ def require_gh():
 #
 # - The SECONDARY (abuse-detection) limit is a short-lived burst throttle --
 #   GitHub's own guidance is to wait at least a minute and retry with
-#   backoff, since it clears on its own. Retried here, bounded.
+#   backoff, since it clears on its own. Retried here, bounded --
+#   but ONLY for a plain read (see _is_mutating below).
 # - The PRIMARY limit is the fixed 5000-requests/hour quota. Its reset can be
 #   up to an hour away, and blocking a script for that long with no
 #   explanation is worse than failing loudly and letting the caller decide
@@ -52,11 +53,37 @@ def _is_secondary_rate_limit(stderr):
     return "secondary rate limit" in stderr.lower()
 
 
+def _is_mutating(argv, kwargs):
+    """True if this call is a write (POST/PUT/PATCH/DELETE, or anything
+    carrying an input body), not a plain read.
+
+    A write may be the second half of a check-then-act sequence whose
+    safety depends on the precondition check having run IMMEDIATELY before
+    it -- apply_gaps's ref-update PATCH re-verifies the branch hasn't moved
+    right before writing, _ensure_environment checks an environment is
+    still absent right before creating it, and more than one secrets_cmd.py
+    write follows the same shape. Injecting a 60s+ wait-and-retry between
+    that check and the write reopens exactly the race PR #17 already fixed
+    by never retrying that specific PATCH blind (Codex review,
+    mikelward/repo#19) -- so this only ever retries a read, which has no
+    precondition to go stale. A write fails immediately on a rate limit
+    instead, exactly as it already did for every other kind of failure:
+    rerun to retry, same as before this existed."""
+    if kwargs.get("input") is not None:
+        return True
+    try:
+        return argv[argv.index("--method") + 1].upper() != "GET"
+    except ValueError:
+        return False
+
+
 def _run_subprocess_retrying_secondary_rate_limit(argv, **kwargs):
     """subprocess.run(argv, **kwargs), retrying only GitHub's secondary rate
-    limit (see the constants above) -- every other failure, the primary rate
-    limit included, is returned on the first attempt for the caller to
-    handle exactly as before."""
+    limit on a plain read (see _is_mutating) -- every other failure, the
+    primary rate limit and any write included, is returned on the first
+    attempt for the caller to handle exactly as before."""
+    if _is_mutating(argv, kwargs):
+        return subprocess.run(argv, **kwargs)
     delay = _RATE_LIMIT_RETRY_DELAY_SECONDS
     for attempt in range(1, _RATE_LIMIT_RETRY_ATTEMPTS + 1):
         proc = subprocess.run(argv, **kwargs)
