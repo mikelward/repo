@@ -699,9 +699,7 @@ def _describe_plan(repo, existing_id, default_branch, checks, ruleset_name, bypa
         lines.append(f"{repo}: would update ruleset '{ruleset_name}' (id {existing_id}); scope unchanged")
     else:
         lines.append(f"{repo}: would create ruleset '{ruleset_name}' on {default_branch}, main and master")
-    lines.append("  required checks:")
-    for check in checks:
-        lines.append(f"    {check}")
+    lines.append("  required checks: " + ", ".join(checks))
     lines.append("  review conversations must be resolved")
     lines.append("  the branch must be up to date with the base")
     lines.append("  rebase is the only merge method")
@@ -749,6 +747,7 @@ def apply_ruleset(
     skip_confirm=False,
     refuse_if_introduces_pr_protection=False,
     verify_scaffold_before_introducing_pr_protection=None,
+    quiet=False,
 ):
     """Runs the whole repo-rules port against `repo`. Returns 0 on success
     (including "nothing to change" and a clean --dry-run), 1 if any step
@@ -829,7 +828,14 @@ def apply_ruleset(
     turning true here (an existing pull_request rule removed during the
     wait, see the parameter above), both need the scaffold checked
     against THIS branch, not whichever one an earlier snapshot named
-    (Codex review, mikelward/repo#14)."""
+    (Codex review, mikelward/repo#14).
+
+    quiet: suppresses the "nothing to do" no-op report (and its bypass-
+    actor note) -- setup_cmd.py's real apply call passes this when the
+    caller wants only what changed, not an audit trail of everything this
+    checked. Never suppresses a real write's own report, a dry-run
+    preview, or anything from `error()`: quiet means "nothing happened
+    here", not "don't say what did"."""
     checks = list(checks) if checks else list(DEFAULT_CHECKS)
 
     for check in checks:
@@ -906,10 +912,11 @@ def apply_ruleset(
         report["introduces_pr_protection"] = introduces_pr_protection
 
     if not needs_write:
-        print(f"{repo}: ruleset '{ruleset_name}' (id {existing}) {NO_OP_MESSAGE}")
-        note = _bypass_actor_note((target_body or {}).get("bypass_actors") or [])
-        if note:
-            print(note)
+        if not quiet:
+            print(f"{repo}: ruleset '{ruleset_name}' (id {existing}) {NO_OP_MESSAGE}")
+            note = _bypass_actor_note((target_body or {}).get("bypass_actors") or [])
+            if note:
+                print(note)
         return 0
 
     plan_lines = _describe_plan(
@@ -992,7 +999,10 @@ def apply_ruleset(
         except gh.GhError as e:
             error_lines(f"could not update ruleset '{ruleset_name}' on {repo}:", e.stderr)
             return 1
-        print(f"{repo}: updated ruleset '{ruleset_name}' (its scope is unchanged)")
+        print(
+            f"{repo}: updated ruleset '{ruleset_name}' (its scope is unchanged); "
+            f"required checks: {', '.join(checks)}"
+        )
     else:
         try:
             gh.run_with_input(
@@ -1002,10 +1012,10 @@ def apply_ruleset(
         except gh.GhError as e:
             error_lines(f"could not create ruleset '{ruleset_name}' on {repo}:", e.stderr)
             return 1
-        print(f"{repo}: created ruleset '{ruleset_name}' on {default_branch}, main and master")
-
-    for check in checks:
-        print(f"  {check}")
+        print(
+            f"{repo}: created ruleset '{ruleset_name}' on {default_branch}, main and master; "
+            f"required checks: {', '.join(checks)}"
+        )
     return 0
 
 

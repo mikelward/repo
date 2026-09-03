@@ -11,10 +11,13 @@ duplicated here. Only the App-installation step is native (see apps.py),
 because there is no sibling implementation to port from yet.
 
 Every requested step runs its own dry-run/plan first, and the combined
-plan is printed and confirmed ONCE for the whole repository -- not once
-per step. --force skips the confirmation, not the plan output. Once
-confirmed, each step is applied for real with its own force=True, since
-this function's own confirmation already stands in for that step's.
+plan is confirmed ONCE for the whole repository -- not once per step.
+Once confirmed, each step is applied for real with its own force=True,
+since this function's own confirmation already stands in for that
+step's. The plan is also PRINTED once, but only when there's an actual
+question to show it for (needs_confirmation and not --force) or under
+--verbose; otherwise this stays quiet by default and Apply reports only
+what actually changed -- see show_plan and _progress.
 
 Every step is attempted regardless of whether an earlier one failed -- a
 secret write failing must not also skip fixing the ruleset, or vice versa.
@@ -84,7 +87,7 @@ import json
 import re
 import sys
 from contextlib import redirect_stdout
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from repo_lib import apps, credentials, gh, rules, scaffold, secrets_cmd
@@ -96,9 +99,26 @@ from repo_lib.common import error, error_lines
 OWNER_REPO_RE = re.compile(r"^(?!\.\.?/)[A-Za-z0-9._-]+/(?!\.\.?$)[A-Za-z0-9._-]+$")
 
 
+def _progress(args, message):
+    """A one-line "still working" marker for a step that's about to make
+    a handful of gh calls -- shown only under --verbose. Run over a fleet
+    of repositories with nothing printed in between, a step that takes a
+    few seconds looks identical to one that's hung; this is what makes
+    the difference visible without also dumping the full plan by default
+    (see show_plan, on the combined-plan dump below, for that split)."""
+    if args.verbose:
+        error(message)
+
+
 def add_arguments(parser):
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--force", action="store_true", help="apply without confirming")
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="show the full plan (not just what changed) and per-step progress",
+    )
     parser.add_argument("--no-rules", action="store_true", help="skip the ruleset step")
     parser.add_argument(
         "--no-bootstrap",
@@ -284,6 +304,13 @@ class CredentialsPlan:
     lines: list  # what the combined plan shows, one per action or fact
     moves: list  # CredentialMove, in order
     unfixed: list  # what this run cannot fix, each reason a failure at the end
+    # A subset of `lines`: a --credential value the caller supplied that
+    # this run did nothing with (nothing here uses it). Never gated behind
+    # --verbose or a confirmation, unlike the rest of `lines` -- a
+    # supplied value going nowhere, with no move to apply and so no
+    # Apply-time print of its own, is exactly the silent-drop this exists
+    # to prevent (Codex, mikelward/repo#13).
+    always_report: list = field(default_factory=list)
     failed: bool = False  # a read failed; `lines` carries the error
 
 
@@ -367,7 +394,9 @@ def _plan_credentials(repo, specs):
                 move.deletes.append((name, listed))
                 plan.lines.append(f"{label}: delete {name} from environment '{listed}' -- {why}")
             if name in given:
-                plan.lines.append(f"{label}: {name} not set -- {why}")
+                line = f"{label}: {name} not set -- {why}"
+                plan.lines.append(line)
+                plan.always_report.append(line)
         if move.deletes:
             plan.moves.append(move)
 
@@ -641,8 +670,10 @@ def run(args):
     # early return below so that a run requesting nothing else still
     # closes a gap it found; a repository already in shape costs the reads
     # and nothing more.
+    _progress(args, f"{repo}: checking fleet credentials")
     credentials_plan = _plan_credentials(repo, credential_specs)
     credentials_idle = not (credentials_plan.moves or credentials_plan.unfixed or credentials_plan.failed)
+    _progress(args, f"{repo}: checking auto-merge")
     auto_merge_state, auto_merge_lines = _plan_auto_merge(repo)
 
     # Always on, like credentials and auto-merge: there is nothing to
@@ -655,6 +686,7 @@ def run(args):
     bootstrap_plan = None
     bootstrap_default_branch = None
     if not args.no_bootstrap:
+        _progress(args, f"{repo}: checking the fleet CI scaffold")
         bootstrap_default_branch = _bootstrap_default_branch(repo)
         if bootstrap_default_branch is None:
             bootstrap_plan = scaffold.GapPlan(error=True)
@@ -731,6 +763,7 @@ def run(args):
     ruleset_never_reported = None
     ruleset_report = {}
     if not args.no_rules:
+        _progress(args, f"{repo}: checking rules")
         buf = io.StringIO()
         with redirect_stdout(buf):
             # force=args.force here, NOT hardcoded True: this is the call
@@ -795,6 +828,8 @@ def run(args):
 
     secret_previews = []  # (SecretSpec, (repo, state, env_state), description lines)
     secrets_preview_failed = False
+    if secret_specs:
+        _progress(args, f"{repo}: checking secrets")
     for spec in secret_specs:
         plan = secrets_cmd._build_plan([repo], spec.name, spec.env)
         entry = plan[0]
@@ -802,6 +837,8 @@ def run(args):
             secrets_preview_failed = True
         secret_previews.append((spec, entry, secrets_cmd._describe_plan(spec.name, spec.env, plan)))
 
+    if args.app:
+        _progress(args, f"{repo}: checking App installation membership")
     app_plans = [apps.plan_app_step(repo, repo_owner, slug) for slug in args.app]
     app_plan_has_error = any(p.verdict == "ERROR" for p in app_plans)
 
@@ -914,15 +951,19 @@ def run(args):
         )
     )
 
-    # Printed unconditionally -- including under --force, and even when
-    # nothing actually needs confirming -- so a forced, unattended run
-    # still leaves the full plan (notably any secret's own OVERWRITES-an-
-    # existing-value warning) in its own output, not just silently
-    # applied. --force (and a no-mutations plan) skip the confirmation
-    # *question* below, not this audit trail -- matching secrets_cmd.py's
-    # own established convention for exactly this reason. Codex review.
-    for line in describe_combined_plan():
-        error(line)
+    # Shown under --verbose unconditionally -- the full audit trail
+    # (notably any secret's own OVERWRITES-an-existing-value warning),
+    # even under --force and even when nothing needs confirming. Without
+    # --verbose it's shown only when there's an actual question to answer
+    # below (needs_confirmation and not args.force): the user needs to see
+    # what they're agreeing to, or -- stdin not a terminal -- what this
+    # refused to apply unconfirmed. A --force run with nothing to confirm
+    # (the common case running this over a whole fleet) stays quiet here;
+    # Apply, below, still prints whatever it actually changes.
+    show_plan = args.verbose or (needs_confirmation and not args.force)
+    if show_plan:
+        for line in describe_combined_plan():
+            error(line)
 
     if needs_confirmation and not args.force:
         if not sys.stdin.isatty():
@@ -1163,6 +1204,11 @@ def run(args):
                 verify_scaffold_before_introducing_pr_protection=(
                     _verify_scaffold_still_current if bootstrap_completed_sha is not None else None
                 ),
+                # Nothing needing a write here is itself "what changed",
+                # so suppress its own no-op report under the same default
+                # that suppresses the plan dump above -- see _progress's
+                # docstring for the quiet/verbose split.
+                quiet=not args.verbose,
             )
             != 0
         ):
@@ -1257,10 +1303,25 @@ def run(args):
     for reason in credentials_plan.unfixed:
         error(f"not fixed: {reason}")
         failed.append(f"credential:{reason.split(':', 1)[0]}")
+    if not show_plan:
+        # A supplied --credential this run did nothing with -- never
+        # gated behind quiet mode; see CredentialsPlan.always_report.
+        # Skipped when show_plan already printed all of credentials_plan
+        # .lines (a superset), so this doesn't double it.
+        for line in credentials_plan.always_report:
+            error(line)
     if credentials_plan.failed:
-        # The read failure is already in the plan above. Like an App-plan
-        # error, it fails this step alone: a ruleset or secret write must
-        # not be held back by a listing this step could not get.
+        # The read failure is in credentials_plan.lines -- shown already
+        # if show_plan printed the combined plan above, but quiet mode
+        # (no --verbose, nothing to confirm) skips that, and this is a
+        # genuine failure, not a routine "nothing to report": print it
+        # here too rather than leaving "failed on: credentials" with no
+        # explanation. Like an App-plan error, it fails this step alone: a
+        # ruleset or secret write must not be held back by a listing this
+        # step could not get.
+        if not show_plan:
+            for line in credentials_plan.lines:
+                error(line)
         failed.append("credentials")
 
     if auto_merge_state == "enable":
@@ -1275,8 +1336,13 @@ def run(args):
         else:
             print(f"{repo}: enabled auto-merge")
     elif auto_merge_state == "error":
-        # Already in the plan above; a step failure of its own, same as a
-        # failed credentials read.
+        # Same reasoning as credentials_plan.failed just above: the
+        # explanation is in auto_merge_lines, already shown if show_plan
+        # printed the combined plan, otherwise printed here so a genuine
+        # failure is never silent.
+        if not show_plan:
+            for line in auto_merge_lines:
+                error(line)
         failed.append("auto-merge")
 
     if failed:
