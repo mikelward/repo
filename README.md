@@ -167,10 +167,19 @@ which is swept when the base did land and only offered when it did not.
 
 Merged branches are the only ones swept, behind the same printed-plan-then-
 confirm flow `repo secrets` uses. Unmerged branches are never swept: with
-`--include-unmerged` each one whose last commit is at least `--older-than` days
-old (7 by default) is offered individually, showing its age, how many commits
-would be lost, and whether its own pull request was closed without merging --
-the strongest abandoned signal the API offers. That flag refuses `--force`,
+`--include-unmerged` each is offered individually, showing its age, how many
+commits would be lost, and whether its own pull request was closed without
+merging. Which ones are offered turns on that last point. A branch whose pull
+request was **closed without merging against the default branch** is offered
+whatever its age -- somebody has already said it is finished with, and age is
+only a proxy for exactly that. Only against the default branch, because GitHub
+closes a pull request automatically when its base is deleted: in a stack, that
+happens to the upper one the moment the lower branch goes, so its closure says
+nothing about whether the work is live. Nobody deletes the default branch, so a
+closure against it was a person's decision.
+A branch with **no pull request** is offered once its last commit is
+`--older-than` days old (7 by default), since a date is the only evidence there
+is and recent work should not be asked about. That flag refuses `--force`,
 because a per-branch judgment cannot be made unattended, and every deletion
 prints the full SHA it removed alongside the `gh api` call that recreates the
 ref from it -- shell-quoted, since a branch name may legally contain `$(...)`
@@ -200,6 +209,11 @@ What it cannot see is a branch whose content landed under different
 commits and a different pull request (patch-equivalence, which `git cherry`
 finds and no GitHub API does); those report as unmerged, which is the safe
 direction.
+
+The plan groups branches by the prefix they share, so a fleet-sized listing
+prints `claude/` once with 166 topics under it rather than 166 times. A prefix
+only one branch carries gets no heading -- that would cost more than the
+repetition it saves -- so those print in full alongside any unprefixed name.
 
 Across a fleet: `repo list | xargs -n1 repo cleanup --force`. Budget for
 that: a repository with ~190 branches, ~180 of them merged, costs roughly
