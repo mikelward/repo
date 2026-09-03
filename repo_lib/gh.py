@@ -117,15 +117,18 @@ def token_scopes():
     Read from the X-OAuth-Scopes response header on an authenticated GET --
     the same thing a user checking by hand would run (`gh api -i user`).
 
-    None covers two different cases a caller should treat the same way:
-    the read itself failed, or the header is simply absent because this
-    token doesn't use OAuth scopes at all (a fine-grained PAT or a GitHub
-    App installation token -- both real, both fine, both a different
-    permission model). Either way there's nothing to check a specific
-    scope against, so a caller gating on a scope's presence should not
-    block just because this couldn't answer -- only act on an explicit
-    "no" (a returned set that doesn't contain it), never on "couldn't
-    tell"."""
+    None covers three different cases a caller should treat the same way:
+    the read itself failed, the header is simply absent, or it's present
+    but empty -- all because this token doesn't use OAuth scopes at all (a
+    fine-grained PAT or a GitHub App installation token -- both real, both
+    fine, both a different permission model). Either way there's nothing
+    to check a specific scope against, so a caller gating on a scope's
+    presence should not block just because this couldn't answer -- only
+    act on an explicit "no" (a non-empty returned set that doesn't contain
+    it), never on "couldn't tell" (Codex review, mikelward/repo#18: an
+    empty-but-present header parsed to set() rather than None, which read
+    as "confirmed no scopes" and blocked a token this couldn't actually
+    make that claim about)."""
     try:
         raw = run(["api", "-i", "user"])
     except GhError:
@@ -134,5 +137,6 @@ def token_scopes():
     for line in headers.splitlines():
         name, sep, value = line.partition(":")
         if sep and name.strip().lower() == "x-oauth-scopes":
-            return {s.strip() for s in value.split(",") if s.strip()}
+            scopes = {s.strip() for s in value.split(",") if s.strip()}
+            return scopes or None
     return None
