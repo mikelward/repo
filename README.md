@@ -1,13 +1,13 @@
 # repo
 
 Fleet-management CLI for GitHub repositories: `repo list`, `repo create`,
-`repo secrets`, `repo setup`, `repo audit`. Four of the five are a Python
-rewrite of the `repo-list`/`repo-secrets`/`repo-setup`/`repo-rules-audit`
+`repo secrets`, `repo setup`, `repo audit`, `repo cleanup`. Four of the six
+are a Python rewrite of the `repo-list`/`repo-secrets`/`repo-setup`/`repo-rules-audit`
 shell scripts in [mikelward/scripts](https://github.com/mikelward/scripts),
 which stay in place unchanged -- this is a fresh implementation, not a
 migration, and the shell versions remain the source of truth for behavior
-until this catches up. `repo create` has no shell-script counterpart; it's
-new here.
+until this catches up. `repo create` and `repo cleanup` have no shell-script
+counterparts; they're new here.
 
 ## Why Python, not another shell rewrite
 
@@ -50,15 +50,18 @@ repo setup [--dry-run] [--force] [-v|--verbose] [--no-rules] [--no-bootstrap]
            [--rule CHECK]... [--secret NAME[@ENV]=PATH]...
            [--credential NAME=PATH]... [--app SLUG]... OWNER/REPO
 repo audit [--branch NAME] OWNER/REPO [CHECK...]
+repo cleanup [--dry-run] [--force] [--older-than DAYS] [--include-unmerged]
+             OWNER/REPO
 ```
 
 See `AGENTS.md` for testing and contribution conventions.
 
 ## Status
 
-`repo list`, `repo create`, `repo secrets`, `repo setup`, and `repo audit`
-are all implemented -- every shell tool in mikelward/scripts now has a
-Python equivalent here, plus `repo create`, which has none. `repo create`
+`repo list`, `repo create`, `repo secrets`, `repo setup`, `repo audit`, and
+`repo cleanup` are all implemented -- every shell tool in mikelward/scripts
+now has a Python equivalent here, plus `repo create` and `repo cleanup`,
+which have none. `repo create`
 creates an empty repository and, unless `--no-scaffold` is given, pushes
 everything mechanically safe to generate as its first commits (two --
 GitHub's API needs an existing commit before it will create a branch ref
@@ -147,5 +150,63 @@ one flag that places it). It refuses -- and says so, as
 environment holds nothing and no value was given (GitHub never returns a
 secret's value, so a move needs it handed in). Across a fleet:
 `repo list | xargs -n1 repo setup --force --credential NPM_UPDATE_PAT=pat.txt --credential GRADLE_UPDATE_PAT=pat.txt --credential RUST_UPDATE_PAT=pat.txt --credential CI_COMMIT_ARTIFACT_TOKEN=token.txt`.
+`repo cleanup` deletes the branches a repository has finished with. It exists
+because this fleet leaves GitHub's "automatically delete head branches" off and
+nothing else sweeps up -- mikelward/simmo reached 192 branches, 184 of them
+dead. The hard part is that the fleet **rebase-merges**, so a merged branch's
+commits are rewritten and every ancestry test calls it unmerged; judged that
+way almost nothing here is ever deletable. So a branch counts as merged when a
+pull request whose head it was has `merged_at` set **and targeted the default
+branch** (authoritative whatever the merge style, since GitHub records the
+merge against the pull request, not the rewritten commits), or when `compare`
+reports it already contained in the default branch (which catches one merged
+with no pull request at all). A pull request merged into some other branch
+proves only that the commits reached *that* branch -- the upper half of a
+stack merges into the lower one -- so it falls through to the comparison,
+which is swept when the base did land and only offered when it did not.
+
+Merged branches are the only ones swept, behind the same printed-plan-then-
+confirm flow `repo secrets` uses. Unmerged branches are never swept: with
+`--include-unmerged` each one whose last commit is at least `--older-than` days
+old (7 by default) is offered individually, showing its age, how many commits
+would be lost, and whether its own pull request was closed without merging --
+the strongest abandoned signal the API offers. That flag refuses `--force`,
+because a per-branch judgment cannot be made unattended, and every deletion
+prints the full SHA it removed alongside the `gh api` call that recreates the
+ref from it -- shell-quoted, since a branch name may legally contain `$(...)`
+and the line is meant to be pasted, and in the API form because a `git push`
+needs a clone that already holds the object. Each branch's SHA and
+protection are re-read immediately before its own delete, because the plan is
+built before the confirmation prompt: one that moved or became protected while
+the question waited is refused rather than deleted on a plan that no longer
+describes it, and the run exits non-zero saying which. That is one request per
+branch and deliberately the whole of it -- earlier revisions also re-read the
+repository's open pull requests and re-ran the default-branch comparison here,
+which grew to about a quarter of the module. A plan that has gone stale in any
+other way is answered by re-running the command, which reclassifies from
+scratch.
+
+Four kinds of branch are never touched whatever their state: the default
+branch, a protected branch, the head of an open pull request, and the *base* of
+an open pull request -- deleting that last one closes the child pull request,
+which is how a stacked pair gets destroyed by a sweep that only looked at
+heads. The repository's canonical name is resolved once up front, so invoking a
+renamed or transferred repository by a name it merely redirects from still
+matches its pull requests -- which report canonically -- rather than reading
+every one of them as a fork and leaving open pull requests' head branches
+unprotected.
+
+What it cannot see is a branch whose content landed under different
+commits and a different pull request (patch-equivalence, which `git cherry`
+finds and no GitHub API does); those report as unmerged, which is the safe
+direction.
+
+Across a fleet: `repo list | xargs -n1 repo cleanup --force`. Budget for
+that: a repository with ~190 branches, ~180 of them merged, costs roughly
+380 requests against the shared 5,000-an-hour limit -- about a dozen such
+repositories an hour. A sweep that does hit the limit stops partway with
+the failures named, and re-running once it resets picks up what remains,
+since each deletion is independent.
+
 See `TODO.md` for where the port deliberately diverges
 from the shell porting source.

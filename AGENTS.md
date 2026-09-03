@@ -6,8 +6,8 @@ Conventions for AI agents working in this repository.
 conventions. Edit `AGENTS.md`.
 
 This repository is a Python fleet-management CLI for GitHub repositories:
-`repo list`, `repo secrets`, `repo setup`. It is a fresh implementation of
-the `repo-list`/`repo-secrets`/`repo-setup` shell scripts in
+`repo list`, `repo secrets`, `repo setup`, `repo cleanup`. It is a fresh
+implementation of the `repo-list`/`repo-secrets`/`repo-setup` shell scripts in
 [mikelward/scripts](https://github.com/mikelward/scripts), which stay in
 place unchanged for now -- not a migration, so don't touch that repo as part
 of work here. See the README for why this is Python rather than another
@@ -27,8 +27,9 @@ one that has stopped biting.
   `sys.path` so `import repo_lib` resolves without installing anything, then
   dispatches into `repo_lib.cli`.
 - `repo_lib/cli.py` -- argument parsing and subcommand dispatch.
-- `repo_lib/list_cmd.py`, `secrets_cmd.py`, `setup_cmd.py` -- one module per
-  subcommand, each with `add_arguments(parser)` and `run(args)`.
+- `repo_lib/list_cmd.py`, `secrets_cmd.py`, `setup_cmd.py`, `cleanup_cmd.py`
+  -- one module per subcommand, each with `add_arguments(parser)` and
+  `run(args)`.
 - `tests/` -- `unittest`, run via `make test` (`python3 -m unittest discover
   -s tests`).
 
