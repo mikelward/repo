@@ -46,9 +46,9 @@ Run `./repo` directly from a checkout; nothing to install.
 repo list [--owner OWNER] [--include-forks] [--include-archived]
 repo create (--private|--public) [--no-scaffold] OWNER/REPO
 repo secrets --name NAME [--env ENV] --file PATH [--force] OWNER/REPO...
-repo setup [--dry-run] [--force] [--no-rules] [--no-bootstrap] [--rule CHECK]...
-           [--secret NAME[@ENV]=PATH]... [--credential NAME=PATH]...
-           [--app SLUG]... OWNER/REPO
+repo setup [--dry-run] [--force] [-v|--verbose] [--no-rules] [--no-bootstrap]
+           [--rule CHECK]... [--secret NAME[@ENV]=PATH]...
+           [--credential NAME=PATH]... [--app SLUG]... OWNER/REPO
 repo audit [--branch NAME] OWNER/REPO [CHECK...]
 ```
 
@@ -91,7 +91,12 @@ create --scaffold` uses). This is what makes `repo setup --force`
 fix a repository regardless of its starting state in the common case: a
 brand-new repo, one only partway set up, and one already complete all
 converge on the same result -- behind one combined plan and a single
-confirmation for the whole repository. One case still doesn't converge
+confirmation for the whole repository. By default it prints only what it
+actually changed, so `repo list | xargs -n1 repo setup --force` stays
+quiet across an already-in-shape fleet; `-v`/`--verbose` shows the full
+plan (what a repository already has, not just what moved) and a
+progress line per step, for a closer look at one repository or a run
+you're debugging. One case still doesn't converge
 (see TODO.md): a repository a PRIOR `repo setup` run already protected
 with a pull-request-requiring ruleset has no scaffold fix here yet --
 the direct ref update this step makes is exactly what that ruleset

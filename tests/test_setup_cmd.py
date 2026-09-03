@@ -825,7 +825,7 @@ class SetupCmdTest(unittest.TestCase):
                 {"type": "non_fast_forward"},
             ],
         }
-        code, out, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        code, out, err = _run(fake, ["--force", "-v", "--rule", "lanes", REPO])
         self.assertEqual(code, 0, err)
         self.assertEqual(len(fake.puts), 1)
         body = fake.puts[0][1]
@@ -1125,7 +1125,7 @@ class SetupCmdTest(unittest.TestCase):
                 {"type": "non_fast_forward"},
             ],
         }
-        code, out, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        code, out, err = _run(fake, ["--force", "-v", "--rule", "lanes", REPO])
         self.assertEqual(code, 0, err)
         self.assertEqual(fake.puts, [])
         self.assertIn("already matches; nothing to do", out)
@@ -1170,7 +1170,7 @@ class SetupCmdTest(unittest.TestCase):
                 {"type": "non_fast_forward"},
             ],
         }
-        code, out, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        code, out, err = _run(fake, ["--force", "-v", "--rule", "lanes", REPO])
         self.assertEqual(code, 0, err)
         self.assertEqual(fake.puts, [])
         self.assertIn("already matches; nothing to do", out)
@@ -1454,17 +1454,32 @@ class SetupCmdTest(unittest.TestCase):
         self.assertEqual(fake.posts, [])
         self.assertEqual(fake.puts, [])
 
-    def test_force_still_prints_the_full_plan_before_applying(self):
-        # Codex review: --force skips the confirmation QUESTION, not the
-        # audit trail -- notably a secret's own OVERWRITES-an-existing-
-        # value warning, which a forced/unattended run must still leave
-        # in its own output rather than silently applying it unseen.
+    def test_force_does_not_print_the_full_plan_by_default(self):
+        # --force skips the confirmation QUESTION and, by default, the
+        # full audit trail too -- notably a secret's own OVERWRITES-an-
+        # existing-value warning: a forced/unattended run over a fleet
+        # stays quiet unless it changed something (see the real "set
+        # 'TOKEN'" print below) or -v asked for the full plan.
         with tempfile.TemporaryDirectory() as tmp:
             path = _secret_file(tmp, "value.txt")
             fake = FakeGh()
             fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
             fake.secret_names = {"TOKEN"}  # already exists -> OVERWRITES warning
-            code, _, err = _run(fake, ["--force", "--secret", f"TOKEN={path}", REPO])
+            code, out, err = _run(fake, ["--force", "--secret", f"TOKEN={path}", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("OVERWRITES an existing value", err)
+        self.assertIn(f"{REPO}: set 'TOKEN'", out)
+
+    def test_verbose_prints_the_full_plan_even_under_force(self):
+        # -v restores the full audit trail -- notably a secret's own
+        # OVERWRITES-an-existing-value warning -- even though --force
+        # means there's no question left to answer about it.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _secret_file(tmp, "value.txt")
+            fake = FakeGh()
+            fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+            fake.secret_names = {"TOKEN"}  # already exists -> OVERWRITES warning
+            code, _, err = _run(fake, ["--force", "-v", "--secret", f"TOKEN={path}", REPO])
         self.assertEqual(code, 0, err)
         self.assertIn("OVERWRITES an existing value", err)
 
@@ -1519,7 +1534,7 @@ class SetupCmdTest(unittest.TestCase):
                 {"type": "non_fast_forward"},
             ],
         }
-        code, out, err = _run(fake, ["--rule", "lanes", REPO], isatty=False)
+        code, out, err = _run(fake, ["--rule", "lanes", "-v", REPO], isatty=False)
         self.assertEqual(code, 0, err)
         self.assertNotIn("stdin is not a terminal", err)
         self.assertIn("already matches; nothing to do", out)
@@ -2080,12 +2095,11 @@ class AppStepTest(unittest.TestCase):
         fake = FakeGh()
         fake.installations = [("codex", "111", "selected", "owner")]
         fake.install_members = {"111": {REPO}}
-        code, out, err = _run(fake, ["--no-rules", "--app", "codex", REPO], isatty=False)
+        code, out, err = _run(fake, ["--no-rules", "--app", "codex", "-v", REPO], isatty=False)
         self.assertEqual(code, 0, err)
         self.assertNotIn("stdin is not a terminal", err)
-        # The plan (including "already a member") is always printed to
-        # stderr, unconditionally -- see the "Codex review" comment above
-        # the print loop in setup_cmd.run().
+        # -v shows the plan (including "already a member") unconditionally
+        # -- see setup_cmd.run()'s show_plan comment.
         self.assertIn("already a member", err)
 
     def test_app_membership_write_failure_is_reported(self):
@@ -2122,6 +2136,8 @@ class CombinedPlanTest(unittest.TestCase):
         self.assertIn("secrets (repo-secrets):", out)
         self.assertIn("App installation membership:", out)
         self.assertIn("would add", out)
+        # Required checks collapse onto one line, not one line each.
+        self.assertIn("required checks: lanes, codex, zizmor", out)
 
     def test_no_terminal_and_no_force_changes_nothing_across_every_step(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2234,6 +2250,63 @@ class CombinedPlanTest(unittest.TestCase):
         self.assertIn("branch literally named 'master'", err)
 
 
+class VerbosityTest(unittest.TestCase):
+    """Quiet by default (only what changed); -v restores the full plan
+    audit trail and per-step progress markers. See _progress's docstring
+    and the show_plan comment in setup_cmd.run()."""
+
+    def test_quiet_by_default_shows_only_what_changed(self):
+        fake = FakeGh()
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+        code, out, err = _run(fake, ["--force", REPO])
+        self.assertEqual(code, 0, err)
+        # What changed: on stdout, unconditionally.
+        self.assertIn(f"{REPO}: created ruleset", out)
+        # The full plan audit trail: not shown by default.
+        self.assertNotIn("ruleset (repo-rules):", err)
+        self.assertNotIn("would create ruleset", err)
+        self.assertNotIn("checking rules", err)
+
+    def test_verbose_shows_the_full_plan_and_progress_markers(self):
+        fake = FakeGh()
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+        code, out, err = _run(fake, ["--force", "-v", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"{REPO}: created ruleset", out)
+        self.assertIn("ruleset (repo-rules):", err)
+        self.assertIn(f"{REPO}: checking rules", err)
+        self.assertIn(f"{REPO}: checking fleet credentials", err)
+        self.assertIn(f"{REPO}: checking auto-merge", err)
+        self.assertIn(f"{REPO}: checking the fleet CI scaffold", err)
+
+    def test_verbose_long_flag_is_equivalent_to_short(self):
+        fake = FakeGh()
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+        code, out, err = _run(fake, ["--force", "--verbose", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("ruleset (repo-rules):", err)
+
+    def test_progress_markers_for_secrets_and_apps_only_when_requested(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _secret_file(tmp, "value.txt")
+            fake = FakeGh()
+            fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+            fake.installations = [("codex", "111", "selected", "owner")]
+            code, _, err = _run(
+                fake, ["--force", "-v", "--secret", f"TOKEN={path}", "--app", "codex", REPO]
+            )
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"{REPO}: checking secrets", err)
+        self.assertIn(f"{REPO}: checking App installation membership", err)
+
+        fake2 = FakeGh()
+        fake2.check_runs = {fake2.default_head_sha: ["lanes", "codex", "zizmor"]}
+        code2, _, err2 = _run(fake2, ["--force", "-v", REPO])
+        self.assertEqual(code2, 0, err2)
+        self.assertNotIn("checking secrets", err2)
+        self.assertNotIn("checking App installation", err2)
+
+
 class CredentialsStepTest(unittest.TestCase):
     """The fleet-credentials step: always on, it sets a supplied credential
     in the environment it belongs in, deletes the copies that leaves
@@ -2313,7 +2386,7 @@ class CredentialsStepTest(unittest.TestCase):
             fake = self._consumer()
             fake.secret_names = {"GRADLE_UPDATE_PAT"}
             code, out, err = _run(
-                fake, ["--force", "--no-rules", "--credential", f"GRADLE_UPDATE_PAT={path}", REPO]
+                fake, ["--force", "-v", "--no-rules", "--credential", f"GRADLE_UPDATE_PAT={path}", REPO]
             )
         self.assertEqual(code, 0, err)
         self.assertIn("gradle-update: set GRADLE_UPDATE_PAT in environment 'gradle-update' (new)", err)
@@ -2339,7 +2412,7 @@ class CredentialsStepTest(unittest.TestCase):
         fake = self._consumer()
         fake.secret_names = {"GRADLE_UPDATE_PAT"}
         fake.env_secret_names = {"gradle-update": {"GRADLE_UPDATE_PAT"}}
-        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        code, out, err = _run(fake, ["--force", "-v", "--no-rules", REPO])
         self.assertEqual(code, 0, err)
         self.assertIn(
             "gradle-update: delete repository secret GRADLE_UPDATE_PAT -- the 'gradle-update' "
@@ -2462,8 +2535,10 @@ class CredentialsStepTest(unittest.TestCase):
         fake.env_secret_names = {"gradle-update": {"GRADLE_UPDATE_PAT"}}
         code, out, err = _run(fake, ["--force", "--no-rules", REPO])
         self.assertEqual(code, 1)
+        # "not fixed: ..." is Apply's own unconditional report of a real
+        # failure -- printed whether or not --verbose showed the plan too.
         self.assertIn(
-            "NOT FIXED: gradle-update: gradle-update.yml mentions mikelward/gradle-update/ in a shape "
+            "not fixed: gradle-update: gradle-update.yml mentions mikelward/gradle-update/ in a shape "
             "this cannot read as a caller",
             err,
         )
@@ -2523,12 +2598,11 @@ class CredentialsStepTest(unittest.TestCase):
         code, out, err = _run(fake, ["--force", "--no-rules", REPO])
         self.assertEqual(code, 1)
         self.assertIn(
-            "NOT FIXED: gradle-update: environment 'gradle-update' holds no credential -- pass "
+            "not fixed: gradle-update: environment 'gradle-update' holds no credential -- pass "
             "--credential GRADLE_UPDATE_PAT=PATH to set one; GRADLE_UPDATE_PAT stays a "
             "repository secret until then",
             err,
         )
-        self.assertIn("not fixed: gradle-update:", err)
         self.assertIn("failed on: credential:gradle-update", err)
         self.assertEqual(fake.deleted_secrets, [])
 
@@ -2545,7 +2619,7 @@ class CredentialsStepTest(unittest.TestCase):
             )
         self.assertEqual(code, 1)
         self.assertIn(
-            "NOT FIXED: gradle-update: gradle-update.yml passes its secrets by name, so a "
+            "not fixed: gradle-update: gradle-update.yml passes its secrets by name, so a "
             "credential in the 'gradle-update' environment would never reach it -- convert the "
             "caller to `secrets: inherit` first; GRADLE_UPDATE_PAT left as is",
             err,
@@ -2573,7 +2647,7 @@ class CredentialsStepTest(unittest.TestCase):
         code, out, err = _run(fake, ["--force", "--no-rules", REPO])
         self.assertEqual(code, 1)
         self.assertIn(
-            "NOT FIXED: gradle-update: gradle-update.yml passes its secrets by name, so a "
+            "not fixed: gradle-update: gradle-update.yml passes its secrets by name, so a "
             "credential in the 'gradle-update' environment would never reach it -- convert the "
             "caller to `secrets: inherit` first\n",
             err,
@@ -2689,7 +2763,7 @@ class CredentialsStepTest(unittest.TestCase):
             fake.secret_names = {"NPM_UPDATE_PAT", "OTHER"}
             fake.env_secret_names = {"rust-update": {"RUST_UPDATE_PAT", "KEEP"}, "lanes": {"LANES_TOKEN"}}
             code, out, err = _run(
-                fake, ["--force", "--no-rules", "--credential", f"NPM_UPDATE_PAT={path}", REPO]
+                fake, ["--force", "-v", "--no-rules", "--credential", f"NPM_UPDATE_PAT={path}", REPO]
             )
         self.assertEqual(code, 0, err)
         self.assertEqual(
@@ -2722,7 +2796,7 @@ class CredentialsStepTest(unittest.TestCase):
             fake.secret_names = {"CI_COMMIT_ARTIFACT_TOKEN"}
             code, out, err = _run(
                 fake,
-                ["--force", "--no-rules", "--credential", f"CI_COMMIT_ARTIFACT_TOKEN={path}", REPO],
+                ["--force", "-v", "--no-rules", "--credential", f"CI_COMMIT_ARTIFACT_TOKEN={path}", REPO],
             )
         self.assertEqual(code, 0, err)
         self.assertIn(
@@ -2747,7 +2821,7 @@ class CredentialsStepTest(unittest.TestCase):
                 ["--force", "--no-rules", "--credential", f"CI_COMMIT_ARTIFACT_TOKEN={path}", REPO],
             )
         self.assertEqual(code, 1)
-        self.assertIn("NOT FIXED: ci-commit-artifact: nightly.yml passes its secrets by name", err)
+        self.assertIn("not fixed: ci-commit-artifact: nightly.yml passes its secrets by name", err)
         self.assertEqual(fake.written_secrets, [])
         self.assertEqual(fake.deleted_secrets, [])
 
@@ -2765,12 +2839,12 @@ class CredentialsStepTest(unittest.TestCase):
         code, out, err = _run(fake, ["--force", "--no-rules", REPO])
         self.assertEqual(code, 1)
         self.assertIn(
-            "NOT FIXED: ci-commit-artifact: ci.yml mentions mikelward/ci-commit-artifact/ in a shape "
+            "not fixed: ci-commit-artifact: ci.yml mentions mikelward/ci-commit-artifact/ in a shape "
             "this cannot read as a caller -- whether it is used there cannot be told, so nothing is deleted",
             err,
         )
         self.assertIn(
-            "NOT FIXED: npm-update: batch.yml mentions mikelward/npm-update/ in a shape this cannot "
+            "not fixed: npm-update: batch.yml mentions mikelward/npm-update/ in a shape this cannot "
             "read as a caller",
             err,
         )
@@ -2798,7 +2872,7 @@ class CredentialsStepTest(unittest.TestCase):
         fake.workflow_texts = {"ci.yml": "jobs:\n  build:\n    steps:\n      - uses: mikelward/lanes@main\n"}
         fake.secret_names = {"CI_COMMIT_ARTIFACT_TOKEN"}
         fake.env_secret_names = {"ci-commit-artifact": {"CI_COMMIT_ARTIFACT_TOKEN"}}
-        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        code, out, err = _run(fake, ["--force", "-v", "--no-rules", REPO])
         self.assertEqual(code, 0, err)
         self.assertIn(
             "ci-commit-artifact: delete repository secret CI_COMMIT_ARTIFACT_TOKEN -- no workflow "
@@ -3006,7 +3080,7 @@ class AutoMergeStepTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("stdin is not a terminal", err)
         self.assertEqual(fake.patches, [])
-        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        code, out, err = _run(fake, ["--force", "-v", "--no-rules", REPO])
         self.assertEqual(code, 0, err)
         self.assertIn(
             "enable auto-merge on the repository (the weekly batches arm it on their pull requests)",
@@ -3363,7 +3437,7 @@ class BootstrapStepTest(unittest.TestCase):
                 {"type": "non_fast_forward"},
             ],
         }
-        code, out, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        code, out, err = _run(fake, ["--force", "-v", "--rule", "lanes", REPO])
         self.assertEqual(code, 1)
         self.assertIn("bootstrap", err)
         self.assertNotIn("skipping the ruleset step", err)
