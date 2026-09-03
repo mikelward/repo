@@ -855,6 +855,7 @@ def run(args):
             or credentials_plan.unfixed
             or auto_merge_state == "error"
             or (bootstrap_plan is not None and bootstrap_plan.error)
+            or (bootstrap_plan is not None and bootstrap_plan.missing_workflow_scope)
             or empty_branch_would_strand_ruleset
             or ruleset_never_reported
         ):
@@ -905,7 +906,12 @@ def run(args):
         or apps_need_mutation
         or bool(credentials_plan.moves)
         or auto_merge_state == "enable"
-        or (bootstrap_plan is not None and not bootstrap_plan.error and bool(bootstrap_plan.missing))
+        or (
+            bootstrap_plan is not None
+            and not bootstrap_plan.error
+            and not bootstrap_plan.missing_workflow_scope
+            and bool(bootstrap_plan.missing)
+        )
     )
 
     # Printed unconditionally -- including under --force, and even when
@@ -963,6 +969,25 @@ def run(args):
         if bootstrap_plan.error:
             # Already reported (either the default-branch read's own
             # failure, or plan_gaps's) when the plan was built.
+            failed.append("bootstrap")
+            bootstrap_failed = True
+        elif bootstrap_plan.missing_workflow_scope:
+            # Same shape as ruleset.py's never_reported skip below:
+            # nothing is wrong with the repository or the request, only
+            # with what this gh token may write, and that's recoverable
+            # by the caller (add the scope, rerun) -- not something to
+            # attempt and watch fail, or to let block everything else
+            # this run could otherwise still do (mikelward/repo#18).
+            workflow_count = sum(
+                1 for path in bootstrap_plan.missing if path.startswith(".github/workflows/")
+            )
+            error(
+                f"{repo}: skipping the bootstrap step -- this gh token is missing the 'workflow' "
+                f"OAuth scope, needed to add {workflow_count} file(s) under "
+                ".github/workflows/. Run `gh auth refresh -s workflow` (or add the scope your "
+                "token's own way) and rerun; nothing under .github/workflows/ was touched, and "
+                "this run's other steps still ran."
+            )
             failed.append("bootstrap")
             bootstrap_failed = True
         else:

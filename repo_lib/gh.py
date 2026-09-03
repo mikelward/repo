@@ -110,3 +110,29 @@ def run_with_input(args, input_bytes):
     if proc.returncode != 0:
         raise GhError(proc.stderr.decode(errors="replace"))
     return proc.stdout
+
+
+def token_scopes():
+    """The OAuth scopes this token carries, or None if that can't be told.
+    Read from the X-OAuth-Scopes response header on an authenticated GET --
+    the same thing a user checking by hand would run (`gh api -i user`).
+
+    None covers two different cases a caller should treat the same way:
+    the read itself failed, or the header is simply absent because this
+    token doesn't use OAuth scopes at all (a fine-grained PAT or a GitHub
+    App installation token -- both real, both fine, both a different
+    permission model). Either way there's nothing to check a specific
+    scope against, so a caller gating on a scope's presence should not
+    block just because this couldn't answer -- only act on an explicit
+    "no" (a returned set that doesn't contain it), never on "couldn't
+    tell"."""
+    try:
+        raw = run(["api", "-i", "user"])
+    except GhError:
+        return None
+    headers, _, _ = raw.partition("\n\n")
+    for line in headers.splitlines():
+        name, sep, value = line.partition(":")
+        if sep and name.strip().lower() == "x-oauth-scopes":
+            return {s.strip() for s in value.split(",") if s.strip()}
+    return None

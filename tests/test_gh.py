@@ -197,6 +197,36 @@ class GhWrapperTest(unittest.TestCase):
         self.assertEqual(mock_run.call_count, gh._RATE_LIMIT_RETRY_ATTEMPTS)
         self.assertEqual(mock_sleep.call_count, gh._RATE_LIMIT_RETRY_ATTEMPTS - 1)
 
+    def test_token_scopes_parses_the_x_oauth_scopes_header(self):
+        raw = "HTTP/2.0 200 OK\r\nContent-Type: application/json\r\nX-OAuth-Scopes: gist, read:org, repo\r\n\r\n{}"
+        with patch("subprocess.run", return_value=FakeCompletedProcess(0, stdout=raw)) as mock_run:
+            scopes = gh.token_scopes()
+        self.assertEqual(scopes, {"gist", "read:org", "repo"})
+        mock_run.assert_called_once_with(
+            ["gh", "api", "-i", "user"], capture_output=True, text=True
+        )
+
+    def test_token_scopes_header_name_matched_case_insensitively(self):
+        raw = "HTTP/2.0 200 OK\r\nx-oauth-scopes: repo, workflow\r\n\r\n{}"
+        with patch("subprocess.run", return_value=FakeCompletedProcess(0, stdout=raw)):
+            self.assertEqual(gh.token_scopes(), {"repo", "workflow"})
+
+    def test_token_scopes_returns_none_when_the_header_is_absent(self):
+        # A fine-grained PAT or GitHub App installation token carries no
+        # OAuth scopes at all -- this must read as "can't tell", not as
+        # "confirmed empty" (mikelward/repo#18: a caller gating a write on
+        # a missing scope must not block a token this can't answer for).
+        raw = "HTTP/2.0 200 OK\r\nContent-Type: application/json\r\n\r\n{}"
+        with patch("subprocess.run", return_value=FakeCompletedProcess(0, stdout=raw)):
+            self.assertIsNone(gh.token_scopes())
+
+    def test_token_scopes_returns_none_on_a_failed_read(self):
+        with patch(
+            "subprocess.run",
+            return_value=FakeCompletedProcess(1, stderr="gh: HTTP 401: Bad credentials\n"),
+        ):
+            self.assertIsNone(gh.token_scopes())
+
     def test_require_gh_raises_when_gh_is_missing(self):
         with patch("shutil.which", return_value=None):
             with self.assertRaises(SystemExit) as cm:
