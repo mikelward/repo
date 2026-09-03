@@ -1,12 +1,15 @@
 import datetime
+import errno
 import io
 import json
+import os
+import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import patch
 from urllib.parse import unquote
 
-from repo_lib import gh
+from repo_lib import cleanup_cmd, gh
 from repo_lib.cli import main
 
 REPO = "owner/repo"
@@ -232,7 +235,14 @@ class FakeGh:
 
 class CleanupTestCase(unittest.TestCase):
     def invoke(self, fake, argv, stdin_isatty=True, answers=(), clock=None):
-        """Run `repo cleanup ...` against `fake`, returning (code, out, err).
+        """Run `repo cleanup ...` against `fake`, returning
+        (code, out, err, log).
+
+        `log` is the run's log file read back, or "" where none was
+        written. A `--log` already in `argv` is left alone; otherwise one
+        is pointed at a temporary directory, so no test writes into the
+        real state directory and every test can assert on both halves --
+        what the terminal said and what the record kept.
 
         `clock`, when given, is a callable returning the current time; the
         index-staleness tests advance it per call rather than sleeping.
@@ -249,6 +259,24 @@ class CleanupTestCase(unittest.TestCase):
                 raise EOFError
 
         out, err = io.StringIO(), io.StringIO()
+        argv = list(argv)
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = os.path.join(tmp, "cleanup.log")
+            if "--log" not in argv:
+                argv += ["--log", log_path]
+            else:
+                log_path = argv[argv.index("--log") + 1]
+            code = self._invoke(
+                fake, argv, stdin_isatty, fake_input, out, err, clock
+            )
+            try:
+                with open(log_path, encoding="utf-8") as f:
+                    log = f.read()
+            except OSError:
+                log = ""
+        return code, out.getvalue(), err.getvalue(), log
+
+    def _invoke(self, fake, argv, stdin_isatty, fake_input, out, err, clock):
         with patch.object(gh, "run", fake.run), patch.object(
             gh, "try_run", fake.try_run
         ), patch.object(gh, "require_gh", lambda: None), patch(
@@ -264,7 +292,7 @@ class CleanupTestCase(unittest.TestCase):
                     code = main(["cleanup", *argv])
             except SystemExit as e:
                 code = e.code
-        return code, out.getvalue(), err.getvalue()
+        return code
 
 
 class ClassificationTest(CleanupTestCase):
@@ -276,10 +304,10 @@ class ClassificationTest(CleanupTestCase):
             branches=[("main", "aaa", True), ("claude/done", "bbb", False)],
             closed_pulls=[{"number": 7, "head_ref": "claude/done", "merged_at": "x"}],
         )
-        code, out, err = self.invoke(fake, [REPO, "--force"])
+        code, out, err, log = self.invoke(fake, [REPO, "--force"])
         self.assertEqual(code, 0)
         self.assertEqual(fake.deleted(), ["claude/done"])
-        self.assertIn("merged by PR #7", err)
+        self.assertIn("merged by PR #7", log)
         # No compare was needed -- the merged pull request answered it.
         self.assertFalse(
             [c for c in fake.calls if len(c) > 1 and "/compare/" in str(c[1])]
@@ -290,21 +318,21 @@ class ClassificationTest(CleanupTestCase):
             branches=[("main", "aaa", True), ("old", "bbb", False)],
             compares={"old": (0, days_ago(200))},
         )
-        code, out, err = self.invoke(fake, [REPO, "--force"])
+        code, out, err, log = self.invoke(fake, [REPO, "--force"])
         self.assertEqual(code, 0)
         self.assertEqual(fake.deleted(), ["old"])
-        self.assertIn("already contained in main", err)
+        self.assertIn("already contained in main", log)
 
     def test_an_unmerged_branch_is_never_swept_by_default(self):
         fake = FakeGh(
             branches=[("main", "aaa", True), ("claude/wip", "bbb", False)],
             compares={"claude/wip": (3, days_ago(30))},
         )
-        code, out, err = self.invoke(fake, [REPO, "--force"])
+        code, out, err, log = self.invoke(fake, [REPO, "--force"])
         self.assertEqual(code, 0)
         self.assertEqual(fake.deleted(), [])
-        self.assertIn("3 commits not on the default branch", err)
-        self.assertIn("--include-unmerged", err)
+        self.assertIn("3 commits not on the default branch", log)
+        self.assertIn("--include-unmerged", log)
 
     def test_a_closed_unmerged_pull_request_is_reported_as_the_abandoned_signal(self):
         fake = FakeGh(
@@ -314,9 +342,9 @@ class ClassificationTest(CleanupTestCase):
             ],
             compares={"claude/dropped": (2, days_ago(40))},
         )
-        code, out, err = self.invoke(fake, [REPO, "--force"])
+        code, out, err, log = self.invoke(fake, [REPO, "--force"])
         self.assertEqual(code, 0)
-        self.assertIn("PR #12 closed without merging", err)
+        self.assertIn("PR #12 closed without merging", log)
 
     def test_a_merged_pull_request_wins_over_a_closed_one_on_the_same_branch(self):
         # A branch reopened and re-merged has both; the merge is what counts.
@@ -327,9 +355,9 @@ class ClassificationTest(CleanupTestCase):
                 {"number": 4, "head_ref": "claude/retried", "merged_at": "x"},
             ],
         )
-        code, out, err = self.invoke(fake, [REPO, "--force"])
+        code, out, err, log = self.invoke(fake, [REPO, "--force"])
         self.assertEqual(fake.deleted(), ["claude/retried"])
-        self.assertIn("merged by PR #4", err)
+        self.assertIn("merged by PR #4", log)
 
     def test_a_merged_pull_request_from_a_fork_does_not_mark_a_local_branch(self):
         # The fork's branch happens to share a name with a live local one.
@@ -346,9 +374,9 @@ class ClassificationTest(CleanupTestCase):
             ],
             compares={"patch-1": (5, days_ago(3))},
         )
-        code, out, err = self.invoke(fake, [REPO, "--force"])
+        code, out, err, log = self.invoke(fake, [REPO, "--force"])
         self.assertEqual(fake.deleted(), [])
-        self.assertIn("5 commits not on the default branch", err)
+        self.assertIn("5 commits not on the default branch", log)
 
 
 class ProtectionTest(CleanupTestCase):
@@ -359,10 +387,10 @@ class ProtectionTest(CleanupTestCase):
                 ("release", "bbb", True),
             ],
         )
-        code, out, err = self.invoke(fake, [REPO, "--force"])
+        code, out, err, log = self.invoke(fake, [REPO, "--force"])
         self.assertEqual(fake.deleted(), [])
-        self.assertIn("main: the default branch", err)
-        self.assertIn("release: protected", err)
+        self.assertIn("main: the default branch", log)
+        self.assertIn("release: protected", log)
 
     def test_an_open_pull_requests_head_is_left_alone_even_when_merged_before(self):
         # Reopened work: an older merged PR would otherwise mark it deletable
@@ -372,9 +400,9 @@ class ProtectionTest(CleanupTestCase):
             open_pulls=[{"number": 20, "head_ref": "claude/live"}],
             closed_pulls=[{"number": 5, "head_ref": "claude/live", "merged_at": "x"}],
         )
-        code, out, err = self.invoke(fake, [REPO, "--force"])
+        code, out, err, log = self.invoke(fake, [REPO, "--force"])
         self.assertEqual(fake.deleted(), [])
-        self.assertIn("head of open PR #20", err)
+        self.assertIn("head of open PR #20", log)
 
     def test_an_open_pull_requests_base_is_left_alone(self):
         # The stacked-pair trap: `lower` is merged and looks sweepable, but
@@ -391,10 +419,10 @@ class ProtectionTest(CleanupTestCase):
             closed_pulls=[{"number": 30, "head_ref": "claude/lower", "merged_at": "x"}],
             compares={"claude/upper": (1, days_ago(1))},
         )
-        code, out, err = self.invoke(fake, [REPO, "--force"])
+        code, out, err, log = self.invoke(fake, [REPO, "--force"])
         self.assertEqual(fake.deleted(), [])
-        self.assertIn("base of open PR #31", err)
-        self.assertIn("would close that PR", err)
+        self.assertIn("base of open PR #31", log)
+        self.assertIn("would close that PR", log)
 
     def test_a_traversing_branch_name_is_left_alone(self):
         # No encoding fixes a name whose segments address a different
@@ -403,9 +431,9 @@ class ProtectionTest(CleanupTestCase):
             branches=[("main", "aaa", True), ("bad/../name", "bbb", False)],
             closed_pulls=[{"number": 1, "head_ref": "bad/../name", "merged_at": "x"}],
         )
-        code, out, err = self.invoke(fake, [REPO, "--force"])
+        code, out, err, log = self.invoke(fake, [REPO, "--force"])
         self.assertEqual(fake.deleted(), [])
-        self.assertIn("safely address as a ref path", err)
+        self.assertIn("safely address as a ref path", log)
 
     def test_a_legal_but_awkward_branch_name_is_encoded_not_skipped(self):
         # `release#1` and `release%231` are legal branch names. Refusing
@@ -417,7 +445,7 @@ class ProtectionTest(CleanupTestCase):
                     branches=[("main", "aaa", True), (name, "bbb", False)],
                     closed_pulls=[{"number": 1, "head_ref": name, "merged_at": "x"}],
                 )
-                code, out, err = self.invoke(fake, [REPO, "--force"])
+                code, out, err, log = self.invoke(fake, [REPO, "--force"])
                 self.assertEqual(fake.deleted(), [name])
 
     def test_a_fork_pull_requests_base_branch_is_still_protected(self):
@@ -438,9 +466,9 @@ class ProtectionTest(CleanupTestCase):
                 {"number": 49, "head_ref": "claude/target", "merged_at": "x"}
             ],
         )
-        code, out, err = self.invoke(fake, [REPO, "--force"])
+        code, out, err, log = self.invoke(fake, [REPO, "--force"])
         self.assertEqual(fake.deleted(), [])
-        self.assertIn("base of open PR #50", err)
+        self.assertIn("base of open PR #50", log)
 
     def test_a_renamed_repository_invoked_by_its_old_name_still_protects_heads(
         self,
@@ -471,9 +499,9 @@ class ProtectionTest(CleanupTestCase):
             # between this branch and the sweep.
             compares={"claude/live": (0, "2026-08-01T00:00:00Z")},
         )
-        code, out, err = self.invoke(fake, ["owner/oldname", "--force"])
+        code, out, err, log = self.invoke(fake, ["owner/oldname", "--force"])
         self.assertEqual(fake.deleted(), [])
-        self.assertIn("head of open PR #77", err)
+        self.assertIn("head of open PR #77", log)
 
     def test_a_renamed_repository_uses_the_canonical_name_for_later_calls(self):
         # The corollary, asserted directly rather than inferred: only the
@@ -495,7 +523,7 @@ class ProtectionTest(CleanupTestCase):
                 }
             ],
         )
-        code, out, err = self.invoke(fake, ["owner/oldname", "--force"])
+        code, out, err, log = self.invoke(fake, ["owner/oldname", "--force"])
         self.assertEqual(fake.deleted(), ["claude/done"])
         aliased = [
             c
@@ -523,7 +551,7 @@ class ProtectionTest(CleanupTestCase):
                 }
             ],
         )
-        code, out, err = self.invoke(fake, ["Owner/Repo", "--force"])
+        code, out, err, log = self.invoke(fake, ["Owner/Repo", "--force"])
         self.assertEqual(code, 0)
         self.assertEqual(fake.deleted(), ["claude/done"])
 
@@ -550,7 +578,7 @@ class PlanGroupingTest(CleanupTestCase):
 
     def test_a_shared_prefix_is_printed_once_and_dropped_from_members(self):
         fake = self._merged("claude/one", "claude/two", "claude/three")
-        code, out, err = self.invoke(fake, [REPO, "--dry-run"])
+        code, out, err, log = self.invoke(fake, [REPO, "--dry-run"])
         self.assertIn("  claude/ (3):", out)
         self.assertIn("    one: ", out)
         self.assertIn("    two: ", out)
@@ -561,19 +589,19 @@ class PlanGroupingTest(CleanupTestCase):
         # A heading over a single line is worse than the repetition it
         # saves, so it prints in full instead.
         fake = self._merged("claude/one", "claude/two", "codex/only")
-        code, out, err = self.invoke(fake, [REPO, "--dry-run"])
+        code, out, err, log = self.invoke(fake, [REPO, "--dry-run"])
         self.assertIn("  claude/ (2):", out)
         self.assertNotIn("codex/ (1):", out)
         self.assertIn("  codex/only: ", out)
 
     def test_a_branch_with_no_prefix_prints_in_full(self):
         fake = self._merged("claude/one", "claude/two", "hotfix")
-        code, out, err = self.invoke(fake, [REPO, "--dry-run"])
+        code, out, err, log = self.invoke(fake, [REPO, "--dry-run"])
         self.assertIn("  hotfix: ", out)
 
     def test_groups_come_before_the_ungrouped_remainder(self):
         fake = self._merged("zz/one", "zz/two", "aaa-loose")
-        code, out, err = self.invoke(fake, [REPO, "--dry-run"])
+        code, out, err, log = self.invoke(fake, [REPO, "--dry-run"])
         lines = [l for l in out.splitlines() if l.strip()]
         self.assertLess(
             lines.index("  zz/ (2):"),
@@ -590,7 +618,7 @@ class PlanGroupingTest(CleanupTestCase):
                 **{f"claude/new{i}": (1, days_ago(0)) for i in range(2)},
             },
         )
-        code, out, err = self.invoke(
+        code, out, err, log = self.invoke(
             fake, [REPO, "--include-unmerged", "--dry-run"]
         )
         # Once in the offered section, once in the too-recent one.
@@ -603,7 +631,7 @@ class AgeTest(CleanupTestCase):
             branches=[("main", "aaa", True), ("claude/fresh", "bbb", False)],
             compares={"claude/fresh": (1, days_ago(2))},
         )
-        code, out, err = self.invoke(
+        code, out, err, log = self.invoke(
             fake, [REPO, "--include-unmerged", "--dry-run"], answers=[]
         )
         self.assertEqual(code, 0)
@@ -614,7 +642,7 @@ class AgeTest(CleanupTestCase):
             branches=[("main", "aaa", True), ("claude/fresh", "bbb", False)],
             compares={"claude/fresh": (1, days_ago(2))},
         )
-        code, out, err = self.invoke(
+        code, out, err, log = self.invoke(
             fake, [REPO, "--include-unmerged", "--older-than", "1", "--dry-run"]
         )
         self.assertIn("to offer one at a time", out)
@@ -632,7 +660,7 @@ class AgeTest(CleanupTestCase):
                 {"number": 31, "head_ref": "claude/dropped", "head_sha": "bbb"}
             ],
         )
-        code, out, err = self.invoke(
+        code, out, err, log = self.invoke(
             fake, [REPO, "--include-unmerged", "--dry-run"]
         )
         self.assertIn("to offer one at a time", out)
@@ -659,7 +687,7 @@ class AgeTest(CleanupTestCase):
                 }
             ],
         )
-        code, out, err = self.invoke(
+        code, out, err, log = self.invoke(
             fake, [REPO, "--include-unmerged", "--dry-run"]
         )
         self.assertIn("too recent to offer", out)
@@ -692,7 +720,7 @@ class AgeTest(CleanupTestCase):
                 },
             ],
         )
-        code, out, err = self.invoke(
+        code, out, err, log = self.invoke(
             fake, [REPO, "--include-unmerged", "--dry-run"]
         )
         self.assertIn("to offer one at a time", out)
@@ -722,7 +750,7 @@ class AgeTest(CleanupTestCase):
                 },
             ],
         )
-        code, out, err = self.invoke(
+        code, out, err, log = self.invoke(
             fake, [REPO, "--include-unmerged", "--dry-run"]
         )
         self.assertIn("too recent to offer", out)
@@ -744,7 +772,7 @@ class AgeTest(CleanupTestCase):
                 }
             ],
         )
-        code, out, err = self.invoke(
+        code, out, err, log = self.invoke(
             fake, [REPO, "--include-unmerged", "--dry-run"]
         )
         self.assertIn("Unmerged and too recent to offer (1):", out)
@@ -762,7 +790,7 @@ class AgeTest(CleanupTestCase):
                 {"number": 44, "head_ref": "claude/dropped", "head_sha": "bbb"}
             ],
         )
-        code, out, err = self.invoke(
+        code, out, err, log = self.invoke(
             fake, [REPO, "--include-unmerged", "--dry-run"]
         )
         self.assertIn("pull request closed against main", out)
@@ -782,7 +810,7 @@ class AgeTest(CleanupTestCase):
                 }
             ],
         )
-        code, out, err = self.invoke(
+        code, out, err, log = self.invoke(
             fake, [REPO, "--include-unmerged", "--dry-run"]
         )
         self.assertIn("to offer one at a time", out)
@@ -794,7 +822,7 @@ class AgeTest(CleanupTestCase):
             branches=[("main", "aaa", True), ("claude/wip", "bbb", False)],
             compares={"claude/wip": (2, days_ago(0))},
         )
-        code, out, err = self.invoke(
+        code, out, err, log = self.invoke(
             fake, [REPO, "--include-unmerged", "--dry-run"]
         )
         self.assertIn("too recent to offer", out)
@@ -814,7 +842,7 @@ class AgeTest(CleanupTestCase):
                 {"number": 32, "head_ref": "claude/reused", "head_sha": "oldsha"}
             ],
         )
-        code, out, err = self.invoke(
+        code, out, err, log = self.invoke(
             fake, [REPO, "--include-unmerged", "--dry-run"]
         )
         self.assertIn("too recent to offer", out)
@@ -829,7 +857,7 @@ class AgeTest(CleanupTestCase):
                 {"number": 33, "head_ref": "claude/dropped", "head_sha": "bbb"}
             ],
         )
-        code, out, err = self.invoke(
+        code, out, err, log = self.invoke(
             fake, [REPO, "--include-unmerged"], answers=["y"]
         )
         self.assertEqual(fake.deleted(), ["claude/dropped"])
@@ -845,7 +873,7 @@ class AgeTest(CleanupTestCase):
             truncated_compares=["claude/long"],
             commit_dates={"tipsha": days_ago(1)},
         )
-        code, out, err = self.invoke(
+        code, out, err, log = self.invoke(
             fake, [REPO, "--include-unmerged", "--dry-run"], stdin_isatty=False
         )
         self.assertIn("last commit 1d ago", out)
@@ -856,7 +884,7 @@ class AgeTest(CleanupTestCase):
             branches=[("main", "aaa", True), ("claude/x", "bbb", False)],
             compares={"claude/x": (3, days_ago(30))},
         )
-        code, out, err = self.invoke(fake, [REPO, "--dry-run"])
+        code, out, err, log = self.invoke(fake, [REPO, "--dry-run"])
         self.assertFalse(
             [c for c in fake.calls if len(c) > 1 and "/commits/" in str(c[1])]
         )
@@ -868,7 +896,7 @@ class AgeTest(CleanupTestCase):
             truncated_compares=["claude/long"],
             commit_date_failures=["tipsha"],
         )
-        code, out, err = self.invoke(fake, [REPO, "--dry-run"])
+        code, out, err, log = self.invoke(fake, [REPO, "--dry-run"])
         self.assertEqual(code, 1)
         self.assertIn("COULD NOT CLASSIFY", out)
 
@@ -877,7 +905,7 @@ class AgeTest(CleanupTestCase):
             branches=[("main", "aaa", True), ("claude/odd", "bbb", False)],
             compares={"claude/odd": (1, "not-a-date")},
         )
-        code, out, err = self.invoke(
+        code, out, err, log = self.invoke(
             fake, [REPO, "--include-unmerged", "--older-than", "0", "--dry-run"]
         )
         self.assertIn("age unknown", out)
@@ -900,7 +928,7 @@ class OfferTest(CleanupTestCase):
 
     def test_each_offered_branch_is_asked_about_individually(self):
         fake = self._two_stale()
-        code, out, err = self.invoke(
+        code, out, err, log = self.invoke(
             fake, [REPO, "--include-unmerged"], answers=["y", "n"]
         )
         self.assertEqual(code, 0)
@@ -908,7 +936,7 @@ class OfferTest(CleanupTestCase):
 
     def test_declining_leaves_the_branch_alone(self):
         fake = self._two_stale()
-        code, out, err = self.invoke(
+        code, out, err, log = self.invoke(
             fake, [REPO, "--include-unmerged"], answers=["n", "n"]
         )
         self.assertEqual(fake.deleted(), [])
@@ -917,22 +945,22 @@ class OfferTest(CleanupTestCase):
         fake = self._two_stale()
         # One answer for two questions: end-of-input at the second must stop
         # the loop, not be read as a yes and sweep the rest.
-        code, out, err = self.invoke(fake, [REPO, "--include-unmerged"], answers=["y"])
+        code, out, err, log = self.invoke(fake, [REPO, "--include-unmerged"], answers=["y"])
         self.assertEqual(fake.deleted(), ["claude/a"])
         self.assertIn("no more input", err)
 
-    def test_the_deleted_sha_is_printed_so_the_branch_can_be_restored(self):
+    def test_the_deleted_sha_is_logged_so_the_branch_can_be_restored(self):
         fake = self._two_stale()
-        code, out, err = self.invoke(
+        code, out, err, log = self.invoke(
             fake, [REPO, "--include-unmerged"], answers=["y", "n"]
         )
-        self.assertIn("deleted claude/a (was bbb)", out)
+        self.assertIn("deleted claude/a (was bbb)", log)
         # The full SHA and an API restore, not a `git push` needing a clone
         # that already holds the object (Codex review, mikelward/repo#20).
         self.assertIn(
             "gh api --method POST repos/owner/repo/git/refs "
             "-f ref=refs/heads/claude/a -f sha=bbb",
-            out,
+            log,
         )
 
 
@@ -950,7 +978,7 @@ class RevalidationTest(CleanupTestCase):
 
     def test_a_branch_pushed_to_during_the_prompt_is_refused(self):
         fake = self._one_merged(recheck={"claude/done": ("ccc", False)})
-        code, out, err = self.invoke(fake, [REPO, "--force"])
+        code, out, err, log = self.invoke(fake, [REPO, "--force"])
         self.assertEqual(code, 1)
         self.assertEqual(fake.deleted(), [])
         self.assertIn("was NOT deleted", err)
@@ -958,14 +986,14 @@ class RevalidationTest(CleanupTestCase):
 
     def test_a_branch_protected_during_the_prompt_is_refused(self):
         fake = self._one_merged(recheck={"claude/done": ("bbb", True)})
-        code, out, err = self.invoke(fake, [REPO, "--force"])
+        code, out, err, log = self.invoke(fake, [REPO, "--force"])
         self.assertEqual(code, 1)
         self.assertEqual(fake.deleted(), [])
         self.assertIn("it is protected now", err)
 
     def test_an_unreadable_recheck_refuses_rather_than_deleting(self):
         fake = self._one_merged(recheck_failures=["claude/done"])
-        code, out, err = self.invoke(fake, [REPO, "--force"])
+        code, out, err, log = self.invoke(fake, [REPO, "--force"])
         self.assertEqual(code, 1)
         self.assertEqual(fake.deleted(), [])
         self.assertIn("could not be re-read", err)
@@ -975,7 +1003,7 @@ class RevalidationTest(CleanupTestCase):
             branches=[("main", "aaa", True), ("old", "bbb", False)],
             compares={"old": (0, days_ago(200))},
         )
-        code, out, err = self.invoke(fake, [REPO, "--force"])
+        code, out, err, log = self.invoke(fake, [REPO, "--force"])
         self.assertEqual(code, 0)
         self.assertEqual(fake.deleted(), ["old"])
 
@@ -986,7 +1014,7 @@ class RevalidationTest(CleanupTestCase):
             branches=[("main", "aaa", True), ("claude/done", "bbb", False)],
             closed_pulls=[{"number": 7, "head_ref": "claude/done", "merged_at": "x"}],
         )
-        code, out, err = self.invoke(fake, [REPO, "--force"])
+        code, out, err, log = self.invoke(fake, [REPO, "--force"])
         self.assertEqual(fake.deleted(), ["claude/done"])
         self.assertEqual(fake.compare_reads, {})
 
@@ -996,7 +1024,7 @@ class RevalidationTest(CleanupTestCase):
             compares={"claude/a": (1, days_ago(30))},
             recheck={"claude/a": ("ccc", False)},
         )
-        code, out, err = self.invoke(
+        code, out, err, log = self.invoke(
             fake, [REPO, "--include-unmerged"], answers=["y"]
         )
         self.assertEqual(fake.deleted(), [])
@@ -1030,14 +1058,14 @@ class MergedIntoNonDefaultBaseTest(CleanupTestCase):
         # main and this branch is the only ref left to them -- but its
         # merged pull request said "merged" all the same.
         fake = self._stacked(compares={"claude/upper": (3, "2026-08-01T00:00:00Z")})
-        code, out, err = self.invoke(fake, [REPO, "--force"])
+        code, out, err, log = self.invoke(fake, [REPO, "--force"])
         self.assertEqual(fake.deleted(), [])
 
     def test_a_stack_whose_base_landed_is_still_swept(self):
         # No capability lost: the compare answers the question that matters
         # and this is deleted, just as `contained` rather than `merged-pr`.
         fake = self._stacked(compares={"claude/upper": (0, "2026-08-01T00:00:00Z")})
-        code, out, err = self.invoke(fake, [REPO, "--force"])
+        code, out, err, log = self.invoke(fake, [REPO, "--force"])
         self.assertEqual(fake.deleted(), ["claude/upper"])
         # One compare: the classification's. The pre-delete re-read asks
         # only about the branch itself now.
@@ -1058,7 +1086,7 @@ class MergedIntoNonDefaultBaseTest(CleanupTestCase):
                 }
             ],
         )
-        code, out, err = self.invoke(fake, [REPO, "--force"])
+        code, out, err, log = self.invoke(fake, [REPO, "--force"])
         self.assertEqual(fake.deleted(), ["claude/done"])
         self.assertEqual(fake.compare_reads, {})
 
@@ -1081,9 +1109,9 @@ class ReusedBranchNameTest(CleanupTestCase):
             ],
             compares={"claude/reused": (4, days_ago(2))},
         )
-        code, out, err = self.invoke(fake, [REPO, "--force"])
+        code, out, err, log = self.invoke(fake, [REPO, "--force"])
         self.assertEqual(fake.deleted(), [])
-        self.assertIn("4 commits not on the default branch", err)
+        self.assertIn("4 commits not on the default branch", log)
 
     def test_a_reused_name_does_not_inherit_the_old_closed_pr_label(self):
         # The offer prompt's abandonment signal must describe the commits
@@ -1102,7 +1130,7 @@ class ReusedBranchNameTest(CleanupTestCase):
             ],
             compares={"claude/reused": (2, days_ago(40))},
         )
-        code, out, err = self.invoke(fake, [REPO, "--dry-run"])
+        code, out, err, log = self.invoke(fake, [REPO, "--dry-run"])
         self.assertIn("claude/reused", out)
         self.assertNotIn("PR #12 closed without merging", out)
 
@@ -1119,7 +1147,7 @@ class ReusedBranchNameTest(CleanupTestCase):
             ],
             compares={"claude/dropped": (2, days_ago(40))},
         )
-        code, out, err = self.invoke(fake, [REPO, "--dry-run"])
+        code, out, err, log = self.invoke(fake, [REPO, "--dry-run"])
         self.assertIn("PR #12 closed without merging", out)
 
     def test_a_branch_still_at_its_merged_sha_is_swept(self):
@@ -1134,23 +1162,513 @@ class ReusedBranchNameTest(CleanupTestCase):
                 }
             ],
         )
-        code, out, err = self.invoke(fake, [REPO, "--force"])
+        code, out, err, log = self.invoke(fake, [REPO, "--force"])
         self.assertEqual(fake.deleted(), ["claude/done"])
 
 
+class LogFileTest(CleanupTestCase):
+    """The plan runs to hundreds of lines on a repository with a weekly
+    batch and every deletion adds two more, so the record goes to a file
+    and the terminal gets a summary and its path."""
+
+    def _merged(self):
+        return FakeGh(
+            branches=[("main", "aaa", True), ("claude/done", "bbb", False)],
+            closed_pulls=[{"number": 7, "head_ref": "claude/done", "merged_at": "x"}],
+        )
+
+    def test_the_plan_prints_and_the_deletion_stream_does_not(self):
+        # The plan is what the confirmation is about, so it prints. The two
+        # lines a deletion writes are what the log is for -- and the
+        # restore command in them is the half that outlives the terminal.
+        code, out, err, log = self.invoke(self._merged(), [REPO, "--force"])
+        self.assertEqual(code, 0)
+        self.assertIn("Merged branches on owner/repo, to delete (1):", err)
+        self.assertIn("Merged branches on owner/repo, to delete (1):", log)
+        self.assertIn("gh api --method POST", log)
+        self.assertNotIn("gh api --method POST", err)
+        self.assertNotIn("deleted claude/done (was bbb)", err)
+        self.assertEqual(out, "")
+
+    def test_the_terminal_names_the_log_and_the_count_deleted(self):
+        # What is left on the terminal has to be enough to act on: that it
+        # happened, and where to read the rest of it.
+        fake = self._merged()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "run.log")
+            code, out, err, log = self.invoke(fake, [REPO, "--force", "--log", path])
+        self.assertIn(f"full record: {path}", err)
+        self.assertIn(f"deleted 1; the command restoring each is in {path}", err)
+
+    def test_the_progress_counter_is_a_terminal_only_overwrite(self):
+        # Redirected, `\r` is just a character in the file, so a scripted
+        # run would collect one line per branch of a counter nobody
+        # watched.
+        fake = FakeGh(
+            branches=[
+                ("main", "aaa", True),
+                ("claude/a", "bbb", False),
+                ("claude/b", "ccc", False),
+            ],
+            closed_pulls=[
+                {"number": 1, "head_ref": "claude/a", "merged_at": "x"},
+                {"number": 2, "head_ref": "claude/b", "merged_at": "x"},
+            ],
+        )
+        code, out, err, log = self.invoke(fake, [REPO, "--force"])
+        self.assertEqual(sorted(fake.deleted()), ["claude/a", "claude/b"])
+        # stderr is a StringIO here, so isatty() is False.
+        self.assertNotIn("\r", err)
+        self.assertNotIn("deleting 1/2", err)
+
+        class Tty(io.StringIO):
+            def isatty(self):
+                return True
+
+        tty = Tty()
+        fake = FakeGh(
+            branches=[
+                ("main", "aaa", True),
+                ("claude/a", "bbb", False),
+                ("claude/b", "ccc", False),
+            ],
+            closed_pulls=[
+                {"number": 1, "head_ref": "claude/a", "merged_at": "x"},
+                {"number": 2, "head_ref": "claude/b", "merged_at": "x"},
+            ],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "run.log")
+            self._invoke(
+                fake,
+                [REPO, "--force", "--log", path],
+                True,
+                lambda: "",
+                io.StringIO(),
+                tty,
+                lambda: NOW,
+            )
+        shown = tty.getvalue()
+        self.assertIn("\rdeleting 1/2...", shown)
+        self.assertIn("\rdeleting 2/2...", shown)
+        # Cleared, so the summary that follows is not printed onto the
+        # tail of the counter.
+        self.assertIn("\r\033[K", shown)
+
+    def test_the_default_path_is_under_the_state_directory(self):
+        fake = self._merged()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"XDG_STATE_HOME": tmp}):
+                # No --log, so the command picks its own path.
+                code = self._invoke(
+                    fake, [REPO, "--force"], True, lambda: "", io.StringIO(), io.StringIO()
+                    , lambda: NOW
+                )
+            written = os.listdir(os.path.join(tmp, "repo"))
+        self.assertEqual(code, 0)
+        self.assertEqual(written, ["cleanup-owner-repo-20260903T000000Z.log"])
+
+    def test_a_dry_run_writes_no_log_and_still_prints_its_plan(self):
+        # --dry-run changes nothing, and a file appearing where none was
+        # asked for is a change. Its plan is the whole of its output, so it
+        # stays on stdout where it can be piped.
+        fake = self._merged()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "run.log")
+            code, out, err, log = self.invoke(
+                fake, [REPO, "--dry-run", "--log", path]
+            )
+            self.assertFalse(os.path.exists(path))
+        self.assertIn("Merged branches on owner/repo, to delete (1):", out)
+        self.assertEqual(fake.deleted(), [])
+
+    def test_a_log_that_cannot_be_opened_stops_the_run(self):
+        # The restore command for a deleted branch exists nowhere else, so
+        # deleting with nowhere to write it would be deleting with no way
+        # back. Refuse instead of sweeping unrecorded.
+        fake = self._merged()
+        with tempfile.TemporaryDirectory() as tmp:
+            # A directory where the log file should be: open() fails, and
+            # the failure is the filesystem's rather than a stub's.
+            path = os.path.join(tmp, "run.log")
+            os.mkdir(path)
+            code, out, err, log = self.invoke(fake, [REPO, "--force", "--log", path])
+        # Asserted before the exit code: the harm this guards against is a
+        # branch swept with its restore command written nowhere.
+        self.assertEqual(fake.deleted(), [])
+        self.assertEqual(code, 1)
+        self.assertIn("could not open the log", err)
+        self.assertIn("Nothing was deleted", err)
+
+    def test_the_restore_record_is_on_disk_before_the_ref_is_deleted(self):
+        # The plan carries no SHAs, so this log is the only record of one.
+        # A process killed between the DELETE and the write -- or a disk
+        # that fills there -- would take the branch with nothing left to
+        # recreate it (Codex review, mikelward/repo#23).
+        fake = self._merged()
+        seen = []
+        inner = fake.try_run
+
+        def try_run(argv):
+            if "DELETE" in argv:
+                with open(path, encoding="utf-8") as f:
+                    seen.append(f.read())
+            return inner(argv)
+
+        fake.try_run = try_run
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "run.log")
+            self._invoke(
+                fake,
+                [REPO, "--force", "--log", path],
+                True,
+                lambda: "",
+                io.StringIO(),
+                io.StringIO(),
+                lambda: NOW,
+            )
+        self.assertEqual(len(seen), 1)
+        # Flushed, not merely written into a buffer the kill would lose.
+        self.assertIn("deleting claude/done (was bbb)", seen[0])
+        self.assertIn("-f sha=bbb", seen[0])
+
+    def test_the_restore_record_is_fsynced_before_the_ref_is_deleted(self):
+        # A flush only reaches the kernel: a power loss, or a writeback
+        # error reported late, would discard the record after the DELETE
+        # had already succeeded (Codex review, mikelward/repo#23).
+        fake = self._merged()
+        order = []
+        inner = fake.try_run
+
+        def try_run(argv):
+            if "DELETE" in argv:
+                order.append("delete")
+            return inner(argv)
+
+        fake.try_run = try_run
+        real_sync = cleanup_cmd._sync
+
+        def sync(handle):
+            # The log handle's own sync, not the directory entry's -- the
+            # directory is fsynced at open, so watching os.fsync itself
+            # passes whether or not the record is ever synced.
+            order.append("sync")
+            return real_sync(handle)
+
+        with patch.object(cleanup_cmd, "_sync", sync):
+            code, out, err, log = self.invoke(fake, [REPO, "--force"])
+        self.assertIn("sync", order)
+        self.assertLess(order.index("sync"), order.index("delete"))
+
+    def test_a_plan_that_cannot_be_written_stops_before_any_delete(self):
+        # Nothing has been deleted yet, so this is the cheap place to
+        # stop: a run whose plan never reached the file is a run whose
+        # record starts blank.
+        fake = self._merged()
+
+        class Full(io.StringIO):
+            def flush(self):
+                raise OSError("No space left on device")
+
+        with patch.object(cleanup_cmd, "_open_log", lambda path: Full()):
+            code, out, err, log = self.invoke(fake, [REPO, "--force"])
+        self.assertEqual(fake.deleted(), [])
+        self.assertEqual(code, 1)
+        self.assertIn("could not write the plan", err)
+
+    def test_every_directory_created_for_the_log_has_its_entry_synced(self):
+        # A directory's own entry lives in its PARENT, so syncing only the
+        # leaf leaves the hierarchy above it -- created on a machine's
+        # first run -- able to vanish in a crash, taking the log and the
+        # only restore records with it (Codex review, mikelward/repo#23).
+        fake = self._merged()
+        synced = []
+        real = cleanup_cmd._sync_directory
+
+        def record(path):
+            synced.append(os.path.realpath(path))
+            return real(path)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "state", "repo", "run.log")
+            with patch.object(cleanup_cmd, "_sync_directory", record):
+                self._invoke(
+                    fake,
+                    [REPO, "--force", "--log", path],
+                    True,
+                    lambda: "",
+                    io.StringIO(),
+                    io.StringIO(),
+                    lambda: NOW,
+                )
+            root = os.path.realpath(tmp)
+            # The parent of each directory created, plus the leaf holding
+            # the log file itself.
+            self.assertIn(root, synced)
+            self.assertIn(os.path.join(root, "state"), synced)
+            self.assertIn(os.path.join(root, "state", "repo"), synced)
+
+    def test_a_directory_sync_failure_stops_before_any_delete(self):
+        # A directory entry that may not survive a crash is no better than
+        # no log, and the file it names holds the only restore commands
+        # (Codex review, mikelward/repo#23).
+        fake = self._merged()
+        real_fsync = os.fsync
+        calls = []
+
+        def fsync(fd):
+            calls.append(fd)
+            if len(calls) == 1:
+                # The first fsync of a run is the directory's, at open.
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return real_fsync(fd)
+
+        with patch.object(cleanup_cmd.os, "fsync", fsync):
+            code, out, err, log = self.invoke(fake, [REPO, "--force"])
+        self.assertEqual(fake.deleted(), [])
+        self.assertEqual(code, 1)
+        self.assertIn("for durable writing", err)
+
+    def test_a_failure_opening_the_log_directory_stops_before_any_delete(self):
+        # A blanket catch here read EIO, EMFILE and a concurrent ENOENT as
+        # "this platform has no directory handle" and let the sweep start
+        # anyway (Codex review, mikelward/repo#23).
+        fake = self._merged()
+        real_open = os.open
+
+        def opener(path, flags, *args, **kwargs):
+            if flags == os.O_RDONLY:
+                raise OSError(errno.EIO, "Input/output error")
+            return real_open(path, flags, *args, **kwargs)
+
+        with patch.object(cleanup_cmd.os, "open", opener):
+            code, out, err, log = self.invoke(fake, [REPO, "--force"])
+        self.assertEqual(fake.deleted(), [])
+        self.assertEqual(code, 1)
+        self.assertIn("for durable writing", err)
+
+    def test_a_platform_with_no_directory_handle_still_runs(self):
+        # Decided by name rather than by catching whatever os.open raises:
+        # the errno Windows gives is EACCES, which means something real on
+        # POSIX.
+        fake = self._merged()
+
+        real_open = os.open
+        opened = []
+
+        def opener(path, flags, *args, **kwargs):
+            # Patching os.open reaches the real module, which tempfile and
+            # the harness also use -- so record rather than refuse.
+            if flags == os.O_RDONLY and os.path.isdir(path):
+                opened.append(path)
+            return real_open(path, flags, *args, **kwargs)
+
+        with patch.object(cleanup_cmd.os, "name", "nt"), patch.object(
+            cleanup_cmd.os, "open", opener
+        ):
+            code, out, err, log = self.invoke(fake, [REPO, "--force"])
+        self.assertEqual(opened, [])
+        self.assertEqual(fake.deleted(), ["claude/done"])
+        self.assertEqual(code, 0)
+
+    def test_a_filesystem_that_cannot_sync_directories_still_runs(self):
+        # EINVAL says the operation does not exist here, not that a write
+        # was lost. Refusing to run would cost the whole command on such a
+        # filesystem for no durability gained.
+        fake = self._merged()
+        real_fsync = os.fsync
+        calls = []
+
+        def fsync(fd):
+            calls.append(fd)
+            if len(calls) == 1:
+                raise OSError(errno.EINVAL, "Invalid argument")
+            return real_fsync(fd)
+
+        with patch.object(cleanup_cmd.os, "fsync", fsync):
+            code, out, err, log = self.invoke(fake, [REPO, "--force"])
+        self.assertEqual(fake.deleted(), ["claude/done"])
+        self.assertEqual(code, 0)
+
+    def test_a_restore_record_that_cannot_be_written_leaves_the_branch_alone(self):
+        # A full disk lands on the safe side of the delete: the write
+        # fails, and the branch stays.
+        fake = self._merged()
+
+        class FullOnRestore(io.StringIO):
+            def write(self, text):
+                if text.startswith("  restore:"):
+                    raise OSError("No space left on device")
+                return super().write(text)
+
+        with patch.object(cleanup_cmd, "_open_log", lambda path: FullOnRestore()):
+            code, out, err, log = self.invoke(fake, [REPO, "--force"])
+        self.assertEqual(fake.deleted(), [])
+        self.assertEqual(code, 1)
+        self.assertIn("could not write the restore record", err)
+
+    def test_a_best_effort_write_failure_still_makes_the_run_nonzero(self):
+        # The run advertises a full record; reporting a write it could not
+        # make and then exiting 0 would say otherwise (Codex review,
+        # mikelward/repo#23).
+        fake = FakeGh(
+            branches=[("main", "aaa", True), ("claude/a", "bbb", False)],
+            compares={"claude/a": (1, days_ago(30))},
+        )
+
+        class FullOnDecline(io.StringIO):
+            def write(self, text):
+                if text.startswith("declined "):
+                    raise OSError("No space left on device")
+                return super().write(text)
+
+        with patch.object(cleanup_cmd, "_open_log", lambda path: FullOnDecline()):
+            code, out, err, log = self.invoke(
+                fake, [REPO, "--include-unmerged"], answers=["n"]
+            )
+        # Nothing failed except the record itself, and that is enough.
+        self.assertEqual(fake.deleted(), [])
+        self.assertIn("could not be written", err)
+        self.assertEqual(code, 1)
+
+    def test_declining_an_offer_survives_an_unwritable_log(self):
+        # The one write left outside the guarded path. It can run after
+        # confirmed merged branches have already been deleted, so escaping
+        # would skip the remaining offers and the summary (Codex review,
+        # mikelward/repo#23).
+        fake = FakeGh(
+            branches=[
+                ("main", "aaa", True),
+                ("claude/a", "bbb", False),
+                ("claude/b", "ccc", False),
+            ],
+            compares={
+                "claude/a": (1, days_ago(30)),
+                "claude/b": (2, days_ago(40)),
+            },
+        )
+
+        class FullOnDecline(io.StringIO):
+            def write(self, text):
+                if text.startswith("declined "):
+                    raise OSError("No space left on device")
+                return super().write(text)
+
+        with patch.object(cleanup_cmd, "_open_log", lambda path: FullOnDecline()):
+            code, out, err, log = self.invoke(
+                fake, [REPO, "--include-unmerged"], answers=["n", "y"]
+            )
+        # Declining the first did not abandon the second.
+        self.assertEqual(fake.deleted(), ["claude/b"])
+        self.assertIn("could not be written", err)
+
+    def test_a_failure_closing_the_log_is_reported_not_raised(self):
+        # Closing flushes, so it is the last place a full disk can bite --
+        # and by then branches are deleted. A context manager's implicit
+        # close would escape `run` as a traceback (Codex review,
+        # mikelward/repo#23).
+        fake = self._merged()
+
+        class FullOnClose(io.StringIO):
+            def close(self):
+                raise OSError("No space left on device")
+
+        with patch.object(cleanup_cmd, "_open_log", lambda path: FullOnClose()):
+            code, out, err, log = self.invoke(fake, [REPO, "--force"])
+        self.assertEqual(fake.deleted(), ["claude/done"])
+        self.assertEqual(code, 1)
+        self.assertIn("could not be completed", err)
+
+    def test_an_existing_log_is_appended_to_not_truncated(self):
+        # A --log pointed at a previous run's file, or two default-path
+        # runs starting inside the same second, would otherwise destroy
+        # the only copy of that run's restore commands -- before this run
+        # had even asked for confirmation (Codex review,
+        # mikelward/repo#23).
+        fake = self._merged()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "run.log")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("restore: gh api ... -f sha=earlier\n")
+            code, out, err, log = self.invoke(fake, [REPO, "--force", "--log", path])
+        self.assertIn("-f sha=earlier", log)
+        self.assertIn("-f sha=bbb", log)
+
+    def test_a_log_failure_after_the_delete_is_reported_not_raised(self):
+        # The restore command is already flushed, so this loses the
+        # outcome and not the way back -- but escaping would abandon every
+        # remaining branch and the closing summary AFTER a branch had been
+        # deleted (Codex review, mikelward/repo#23).
+        fake = FakeGh(
+            branches=[
+                ("main", "aaa", True),
+                ("claude/a", "bbb", False),
+                ("claude/b", "ccc", False),
+            ],
+            closed_pulls=[
+                {"number": 1, "head_ref": "claude/a", "merged_at": "x"},
+                {"number": 2, "head_ref": "claude/b", "merged_at": "x"},
+            ],
+        )
+
+        class FullAfterFlush(io.StringIO):
+            """Writes until the first branch's restore record is flushed,
+            then fails -- the disk filling mid-sweep."""
+
+            def __init__(self):
+                super().__init__()
+                self.flushed = False
+
+            def flush(self):
+                self.flushed = True
+
+            def write(self, text):
+                if self.flushed and text.startswith("deleted "):
+                    raise OSError("No space left on device")
+                return super().write(text)
+
+        with patch.object(cleanup_cmd, "_open_log", lambda path: FullAfterFlush()):
+            code, out, err, log = self.invoke(fake, [REPO, "--force"])
+        # The first branch really was deleted, and the run said so rather
+        # than dying: the summary is still printed and the exit is nonzero.
+        self.assertIn("claude/a", fake.deleted())
+        self.assertIn("the outcome could not be logged", err)
+        self.assertEqual(code, 1)
+        # And it is reported as what it is. Calling it a failure to delete
+        # would tell the reader the opposite of what happened, and drop it
+        # from the count (Codex review, mikelward/repo#23).
+        self.assertIn("claude/a was deleted, but not fully recorded", err)
+        self.assertNotIn("could not delete claude/a", err)
+        self.assertIn("deleted 2;", err)
+
+    def test_a_refusal_reaches_both_the_terminal_and_the_log(self):
+        # Read once on a scrolling terminal is not a record, and the log is
+        # what the user still has tomorrow.
+        fake = FakeGh(
+            branches=[("main", "aaa", True), ("claude/done", "bbb", False)],
+            closed_pulls=[{"number": 7, "head_ref": "claude/done", "merged_at": "x"}],
+            recheck={"claude/done": ("ccc", False)},
+        )
+        code, out, err, log = self.invoke(fake, [REPO, "--force"])
+        self.assertEqual(code, 1)
+        self.assertEqual(fake.deleted(), [])
+        for text in (err, log):
+            self.assertIn("claude/done was NOT deleted", text)
+
+
 class RestoreHintTest(CleanupTestCase):
-    def test_a_merged_sweep_prints_the_restore_command_too(self):
+    def test_a_merged_sweep_logs_the_restore_command_too(self):
         # --force deletes the most branches and was the path omitting the
         # recovery line it advertises (Codex review, mikelward/repo#20).
         fake = FakeGh(
             branches=[("main", "aaa", True), ("claude/done", "bbb", False)],
             closed_pulls=[{"number": 7, "head_ref": "claude/done", "merged_at": "x"}],
         )
-        code, out, err = self.invoke(fake, [REPO, "--force"])
+        code, out, err, log = self.invoke(fake, [REPO, "--force"])
         self.assertIn(
             "gh api --method POST repos/owner/repo/git/refs "
             "-f ref=refs/heads/claude/done -f sha=bbb",
-            out,
+            log,
         )
 
     def test_a_branch_name_with_shell_metacharacters_is_quoted(self):
@@ -1163,23 +1681,23 @@ class RestoreHintTest(CleanupTestCase):
             branches=[("main", "aaa", True), (name, "bbb", False)],
             closed_pulls=[{"number": 7, "head_ref": name, "merged_at": "x"}],
         )
-        code, out, err = self.invoke(fake, [REPO, "--force"])
+        code, out, err, log = self.invoke(fake, [REPO, "--force"])
         self.assertEqual(fake.deleted(), [name])
-        self.assertIn("'refs/heads/topic$(id)'", out)
+        self.assertIn("'refs/heads/topic$(id)'", log)
         self.assertNotIn("-f ref=refs/heads/topic$(id)", out)
 
 
 class UsageTest(CleanupTestCase):
     def test_include_unmerged_refuses_to_combine_with_force(self):
         fake = FakeGh(branches=[("main", "aaa", True)])
-        code, out, err = self.invoke(fake, [REPO, "--include-unmerged", "--force"])
+        code, out, err, log = self.invoke(fake, [REPO, "--include-unmerged", "--force"])
         self.assertEqual(code, 2)
         self.assertIn("cannot be combined", err)
         self.assertEqual(fake.calls, [])
 
     def test_include_unmerged_refuses_a_non_terminal_stdin(self):
         fake = FakeGh(branches=[("main", "aaa", True)])
-        code, out, err = self.invoke(
+        code, out, err, log = self.invoke(
             fake, [REPO, "--include-unmerged"], stdin_isatty=False
         )
         self.assertEqual(code, 2)
@@ -1192,20 +1710,20 @@ class UsageTest(CleanupTestCase):
             branches=[("main", "aaa", True), ("claude/x", "bbb", False)],
             compares={"claude/x": (1, days_ago(30))},
         )
-        code, out, err = self.invoke(
+        code, out, err, log = self.invoke(
             fake, [REPO, "--include-unmerged", "--dry-run"], stdin_isatty=False
         )
         self.assertEqual(code, 0)
 
     def test_a_bad_repository_name_is_rejected_before_any_call(self):
         fake = FakeGh()
-        code, out, err = self.invoke(fake, ["not-a-repo-name"])
+        code, out, err, log = self.invoke(fake, ["not-a-repo-name"])
         self.assertEqual(code, 2)
         self.assertEqual(fake.calls, [])
 
     def test_a_negative_older_than_is_rejected(self):
         fake = FakeGh()
-        code, out, err = self.invoke(fake, [REPO, "--older-than", "-1"])
+        code, out, err, log = self.invoke(fake, [REPO, "--older-than", "-1"])
         self.assertEqual(code, 2)
         self.assertEqual(fake.calls, [])
 
@@ -1219,33 +1737,33 @@ class ConfirmationTest(CleanupTestCase):
 
     def test_declining_the_confirmation_deletes_nothing(self):
         fake = self._one_merged()
-        code, out, err = self.invoke(fake, [REPO], answers=["n"])
+        code, out, err, log = self.invoke(fake, [REPO], answers=["n"])
         self.assertEqual(code, 1)
         self.assertEqual(fake.deleted(), [])
         self.assertIn("no branches were deleted", err)
 
     def test_confirming_deletes(self):
         fake = self._one_merged()
-        code, out, err = self.invoke(fake, [REPO], answers=["y"])
+        code, out, err, log = self.invoke(fake, [REPO], answers=["y"])
         self.assertEqual(code, 0)
         self.assertEqual(fake.deleted(), ["claude/done"])
 
     def test_a_non_terminal_without_force_deletes_nothing(self):
         fake = self._one_merged()
-        code, out, err = self.invoke(fake, [REPO], stdin_isatty=False)
+        code, out, err, log = self.invoke(fake, [REPO], stdin_isatty=False)
         self.assertEqual(code, 1)
         self.assertEqual(fake.deleted(), [])
         self.assertIn("stdin is not a terminal", err)
 
-    def test_force_still_prints_the_whole_plan(self):
+    def test_force_still_records_the_whole_plan(self):
         # --force skips the question, not the record of what it touched.
         fake = self._one_merged()
-        code, out, err = self.invoke(fake, [REPO, "--force"])
-        self.assertIn("Merged branches on owner/repo, to delete (1):", err)
+        code, out, err, log = self.invoke(fake, [REPO, "--force"])
+        self.assertIn("Merged branches on owner/repo, to delete (1):", log)
 
     def test_a_dry_run_writes_nothing(self):
         fake = self._one_merged()
-        code, out, err = self.invoke(fake, [REPO, "--dry-run"])
+        code, out, err, log = self.invoke(fake, [REPO, "--dry-run"])
         self.assertEqual(code, 0)
         self.assertEqual(fake.deleted(), [])
         self.assertIn("claude/done: merged by PR #7", out)
@@ -1277,14 +1795,14 @@ class DecliningStillReportsTest(CleanupTestCase):
 
     def test_declining_the_prompt_still_says_why_a_branch_failed(self):
         fake = self._mixed()
-        code, out, err = self.invoke(fake, [REPO], answers=["n"])
+        code, out, err, log = self.invoke(fake, [REPO], answers=["n"])
         self.assertEqual(fake.deleted(), [])
         self.assertIn("could not classify claude/broken", err)
         self.assertIn("HTTP 500", err)
 
     def test_a_non_terminal_run_without_force_still_says_why(self):
         fake = self._mixed()
-        code, out, err = self.invoke(fake, [REPO], stdin_isatty=False)
+        code, out, err, log = self.invoke(fake, [REPO], stdin_isatty=False)
         self.assertEqual(fake.deleted(), [])
         self.assertIn("could not classify claude/broken", err)
         self.assertIn("HTTP 500", err)
@@ -1304,7 +1822,7 @@ class FailureTest(CleanupTestCase):
             ],
             delete_failures=["claude/a"],
         )
-        code, out, err = self.invoke(fake, [REPO, "--force"])
+        code, out, err, log = self.invoke(fake, [REPO, "--force"])
         self.assertEqual(code, 1)
         # The other branch is still attempted -- one failure does not abort.
         self.assertIn("claude/b", fake.deleted())
@@ -1318,7 +1836,7 @@ class FailureTest(CleanupTestCase):
             branches=[("main", "aaa", True), ("claude/x", "bbb", False)],
             compare_failures=["claude/x"],
         )
-        code, out, err = self.invoke(fake, [REPO, "--dry-run"])
+        code, out, err, log = self.invoke(fake, [REPO, "--dry-run"])
         self.assertEqual(code, 1)
         self.assertIn("COULD NOT CLASSIFY", out)
         self.assertIn("could not classify claude/x", err)
@@ -1329,22 +1847,22 @@ class FailureTest(CleanupTestCase):
             branches=[("main", "aaa", True), ("claude/x", "bbb", False)],
             compare_failures=["claude/x"],
         )
-        code, out, err = self.invoke(fake, [REPO, "--force"])
+        code, out, err, log = self.invoke(fake, [REPO, "--force"])
         self.assertEqual(code, 1)
         self.assertEqual(fake.deleted(), [])
-        self.assertIn("COULD NOT CLASSIFY", err)
+        self.assertIn("COULD NOT CLASSIFY", log)
         self.assertIn("could not classify claude/x", err)
 
     def test_a_failed_repository_read_stops_before_any_deletion(self):
         fake = FakeGh(repo_read_fails=True)
-        code, out, err = self.invoke(fake, [REPO, "--force"])
+        code, out, err, log = self.invoke(fake, [REPO, "--force"])
         self.assertEqual(code, 1)
         self.assertEqual(fake.deleted(), [])
         self.assertIn("could not read owner/repo", err)
 
     def test_a_failed_branch_list_stops_before_any_deletion(self):
         fake = FakeGh(branches_read_fails=True)
-        code, out, err = self.invoke(fake, [REPO, "--force"])
+        code, out, err, log = self.invoke(fake, [REPO, "--force"])
         self.assertEqual(code, 1)
         self.assertEqual(fake.deleted(), [])
         self.assertIn("could not list owner/repo's branches", err)
@@ -1357,7 +1875,7 @@ class FailureTest(CleanupTestCase):
             branches=[("main", "aaa", True), ("claude/a", "bbb", False)],
             pulls_read_fails=True,
         )
-        code, out, err = self.invoke(fake, [REPO, "--force"])
+        code, out, err, log = self.invoke(fake, [REPO, "--force"])
         self.assertEqual(code, 1)
         self.assertEqual(fake.deleted(), [])
         self.assertIn("pull requests", err)
@@ -1366,9 +1884,9 @@ class FailureTest(CleanupTestCase):
 class NothingToDoTest(CleanupTestCase):
     def test_a_repository_with_nothing_to_delete_says_so_and_exits_zero(self):
         fake = FakeGh(branches=[("main", "aaa", True)])
-        code, out, err = self.invoke(fake, [REPO])
+        code, out, err, log = self.invoke(fake, [REPO])
         self.assertEqual(code, 0)
-        self.assertIn("No merged branches to delete", err)
+        self.assertIn("No merged branches to delete", log)
         self.assertEqual(fake.deleted(), [])
 
 
