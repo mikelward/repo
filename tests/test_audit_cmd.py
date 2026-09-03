@@ -1118,7 +1118,7 @@ class SecretsAuditTest(unittest.TestCase):
         code, out, err = _run(fake, [REPO])
         self.assertEqual(code, 0, err)
         self.assertIn(
-            "[FIX] gradle-update: gradle-update.yml passes its secrets by name, so a credential in the "
+            "[FIX] gradle-update: gradle-update passes its secrets by name, so a credential in the "
             "'gradle-update' environment never reaches the batch -- convert the caller to `secrets: inherit`",
             out,
         )
@@ -1170,7 +1170,7 @@ class SecretsAuditTest(unittest.TestCase):
         fake.environments = {"gradle-update": ["GRADLE_UPDATE_PAT"]}
         code, out, err = _run(fake, [REPO])
         self.assertEqual(code, 0, err)
-        self.assertIn("[FIX] gradle-update: gradle-update.yaml passes its secrets by name", out)
+        self.assertIn("[FIX] gradle-update: gradle-update passes its secrets by name", out)
         self.assertNotIn("[ok] gradle-update:", out)
 
     def test_a_caller_under_another_name_is_read_too(self):
@@ -1188,7 +1188,7 @@ class SecretsAuditTest(unittest.TestCase):
         fake.environments = {"gradle-update": ["GRADLE_UPDATE_PAT"]}
         code, out, err = _run(fake, [REPO])
         self.assertEqual(code, 0, err)
-        self.assertIn("[FIX] gradle-update: weekly.yml passes its secrets by name", out)
+        self.assertIn("[FIX] gradle-update: weekly passes its secrets by name", out)
         self.assertNotIn("[ok] gradle-update:", out)
 
     def test_a_mention_no_caller_resolves_is_cannot_tell(self):
@@ -1203,7 +1203,7 @@ class SecretsAuditTest(unittest.TestCase):
         code, out, err = _run(fake, [REPO])
         self.assertEqual(code, 0, err)
         self.assertIn(
-            "[FIX] gradle-update: batch.yml mentions mikelward/gradle-update/ in a shape this cannot read as a caller",
+            "[FIX] gradle-update: batch mentions mikelward/gradle-update/ in a shape this cannot read as a caller",
             out,
         )
         self.assertNotIn("does not run", out)
@@ -1226,7 +1226,7 @@ class SecretsAuditTest(unittest.TestCase):
         fake.environments = {"gradle-update": ["GRADLE_UPDATE_PAT"]}
         code, out, err = _run(fake, [REPO])
         self.assertEqual(code, 0, err)
-        self.assertIn("[FIX] gradle-update: batch.yml mentions mikelward/gradle-update/", out)
+        self.assertIn("[FIX] gradle-update: batch mentions mikelward/gradle-update/", out)
         self.assertNotIn("[ok] gradle-update:", out)
         self.assertNotIn("moves it into the 'gradle-update' environment", out)
         self.assertNotIn("does not run", out)
@@ -1247,7 +1247,7 @@ class SecretsAuditTest(unittest.TestCase):
         }
         code, out, err = _run(fake, [REPO])
         self.assertEqual(code, 0, err)
-        self.assertIn("[FIX] ci-commit-artifact: ci.yml passes its secrets by name", out)
+        self.assertIn("[FIX] ci-commit-artifact: ci passes its secrets by name", out)
         self.assertNotIn("[ok] ci-commit-artifact:", out)
         # Nowhere at all: the commit-back pushes as GITHUB_TOKEN.
         fake.workflow_texts = {"ci.yml": self.SYNC}
@@ -1288,7 +1288,7 @@ class SecretsAuditTest(unittest.TestCase):
         fake.environments = {"gradle-update": ["GRADLE_UPDATE_PAT"]}
         code, out, err = _run(fake, [REPO])
         self.assertEqual(code, 0, err)
-        self.assertIn("[FIX] gradle-update: weekly.yml on feature passes its secrets by name", out)
+        self.assertIn("[FIX] gradle-update: weekly on feature passes its secrets by name", out)
         self.assertNotIn("does not run", out)
 
     def test_a_credential_in_the_environment_alone_is_ok(self):

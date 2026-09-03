@@ -20,8 +20,9 @@ why `repo setup` needs the value handed to it to complete a move.
 """
 
 import base64
-import urllib.parse
+import dataclasses
 import re
+import urllib.parse
 
 from repo_lib import gh
 
@@ -37,6 +38,77 @@ def batch_credentials(hub):
     """The secret names a hub's publish job reads: (PAT, App ID, App key)."""
     prefix = hub.upper().replace("-", "_")
     return (f"{prefix}_PAT", f"{prefix}_APP_ID", f"{prefix}_APP_PRIVATE_KEY")
+
+
+@dataclasses.dataclass(frozen=True)
+class WorkflowName:
+    """A workflow, and the branch it was read from when that is not the
+    default one.
+
+    The two used to travel as `f"{file} on {branch}"`, which no rule can
+    take apart again: a workflow file may legally be named
+    `build.yml on prod.yml`, and that is indistinguishable from `build.yml`
+    read on a branch named `prod.yml` (Codex review, mikelward/repo#23).
+    AGENTS.md asks for a real data structure rather than a string-encoded
+    collection, and this is why.
+
+    It renders as the identity it always had -- `str()` is what names the
+    workflow in an error or a key -- while `label` is the prose form, with
+    the file's extension dropped and the branch's left alone.
+    """
+
+    file: str
+    branch: str = None
+
+    def __str__(self):
+        return self.file if self.branch is None else f"{self.file} on {self.branch}"
+
+    @property
+    def label(self):
+        return _strip_extension(self.file) + (
+            "" if self.branch is None else f" on {self.branch}"
+        )
+
+    def __lt__(self, other):
+        # Ordered by hand rather than by `order=True`: the generated one
+        # compares the fields as a tuple, and `None < "feature"` raises.
+        # Both audit and setup sort these, and a workflow that exists on
+        # the default branch AND differs on another produces exactly that
+        # pair -- so the routine case aborted the whole command (Codex
+        # review, mikelward/repo#23). A ref name is never empty, so the
+        # default-branch copy sorts first.
+        if not isinstance(other, WorkflowName):
+            return NotImplemented
+        return (self.file, self.branch or "") < (other.file, other.branch or "")
+
+
+def _strip_extension(name):
+    for suffix in (".yml", ".yaml"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+def workflow_label(name):
+    """`name` as it should READ, not as it is stored: `gradle-update.yml`
+    is written `gradle-update`.
+
+    A caller is usually named after the batch it calls, so a line naming
+    both said the same word twice with one `.yml` hung off it. The
+    extension identifies a file, and these sentences are about a workflow.
+    Only for prose -- a path being read or written keeps its real name.
+    A `WorkflowName` answers for itself, since it kept the file and the
+    branch apart; a bare string is a file name and nothing else.
+    """
+    if isinstance(name, WorkflowName):
+        return name.label
+    return _strip_extension(name)
+
+
+def workflow_labels(names):
+    """`workflow_label` over a comma-joined list, for prose naming several
+    callers at once."""
+    return ", ".join(workflow_label(n) for n in names)
 
 
 def hub_workflow(hub):
@@ -258,13 +330,17 @@ def workflow_texts(repo):
     reads the same."""
     default = default_branch(repo)
     entries = workflow_entries(repo)
-    texts = {name: workflow_text(repo, name) for name in entries if _is_workflow(name)}
+    texts = {
+        WorkflowName(name): workflow_text(repo, name)
+        for name in entries
+        if _is_workflow(name)
+    }
     for branch in branches(repo):
         if branch == default:
             continue
         for name, sha in workflow_entries(repo, branch).items():
             if _is_workflow(name) and entries.get(name) != sha:
-                texts[f"{name} on {branch}"] = workflow_text(repo, name, branch)
+                texts[WorkflowName(name, branch)] = workflow_text(repo, name, branch)
     return texts
 
 

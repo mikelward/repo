@@ -169,6 +169,79 @@ class CallerInheritsTest(unittest.TestCase):
         self.assertFalse(credentials.mentions(odd, "mikelward/npm-update/"))
 
 
+class WorkflowLabelTest(unittest.TestCase):
+    """Workflow names are printed as they READ, not as they are stored: a
+    caller is usually named after the batch it calls, so a line naming both
+    said the same word twice with a `.yml` hung off one of them."""
+
+    def test_an_extension_is_stripped(self):
+        self.assertEqual(credentials.workflow_label("gradle-update.yml"), "gradle-update")
+        self.assertEqual(credentials.workflow_label("ci.yaml"), "ci")
+
+    def test_a_name_with_no_extension_is_unchanged(self):
+        self.assertEqual(credentials.workflow_label("gradle-update"), "gradle-update")
+
+    def test_an_inner_dot_is_kept(self):
+        # Only the trailing extension goes; the rest of the name is the name.
+        self.assertEqual(credentials.workflow_label("ci.release.yml"), "ci.release")
+
+    def test_a_branch_qualified_name_keeps_its_branch(self):
+        # `workflow_texts` reads other branches too, and only the file part
+        # is a file name.
+        name = credentials.WorkflowName("weekly.yml", "feature")
+        self.assertEqual(credentials.workflow_label(name), "weekly on feature")
+        self.assertEqual(str(name), "weekly.yml on feature")
+        self.assertEqual(
+            credentials.workflow_label(
+                credentials.WorkflowName("weekly.yml", "feature/x#1")
+            ),
+            "weekly on feature/x#1",
+        )
+
+    def test_the_two_parts_are_never_parsed_back_out_of_one_string(self):
+        # `_is_workflow` accepts any name ending in `.yml`/`.yaml`, spaces
+        # included, so a filename may itself contain ` on ` -- and
+        # `build.yml on prod.yml` as a filename is indistinguishable from
+        # `build.yml` read on a branch named `prod.yml`. No rule can take
+        # the old `f"{file} on {branch}"` key apart again, so the parts are
+        # carried separately (Codex review, mikelward/repo#23).
+        as_file = credentials.WorkflowName("build.yml on prod.yml")
+        on_branch = credentials.WorkflowName("build.yml", "prod.yml")
+        self.assertEqual(str(as_file), str(on_branch))
+        self.assertEqual(credentials.workflow_label(as_file), "build.yml on prod")
+        self.assertEqual(credentials.workflow_label(on_branch), "build on prod.yml")
+        # And the same for a filename holding ` on ` with no branch at all.
+        self.assertEqual(
+            credentials.workflow_label(credentials.WorkflowName("deploy on push.yml")),
+            "deploy on push",
+        )
+
+    def test_the_same_file_sorts_against_its_own_branch_copy(self):
+        # `workflow_texts` keeps both when a workflow exists on the default
+        # branch AND differs on another, and both audit and setup sort the
+        # keys -- so a generated tuple ordering, comparing None with a
+        # branch name, aborted the whole command on that routine case
+        # (Codex review, mikelward/repo#23).
+        default = credentials.WorkflowName("ci.yml")
+        on_branch = credentials.WorkflowName("ci.yml", "feature")
+        self.assertEqual(
+            [str(n) for n in sorted([on_branch, default])],
+            ["ci.yml", "ci.yml on feature"],
+        )
+
+    def test_a_bare_string_is_a_file_name_and_nothing_else(self):
+        # Nothing parses ` on ` any more, so a plain string is only ever a
+        # file: its extension goes and the rest is left alone.
+        self.assertEqual(
+            credentials.workflow_label("deploy on push.yml"), "deploy on push"
+        )
+
+    def test_a_list_is_joined(self):
+        self.assertEqual(
+            credentials.workflow_labels(["ci.yml", "release.yaml"]), "ci, release"
+        )
+
+
 class RefQueryTest(unittest.TestCase):
     def test_a_branch_name_is_percent_encoded(self):
         # Sent raw, `feature/x#1` would read as `feature/x`.

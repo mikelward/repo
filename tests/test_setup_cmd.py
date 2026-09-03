@@ -2444,7 +2444,7 @@ class CredentialsStepTest(unittest.TestCase):
         fake.env_secret_names = {"gradle-update": {"GRADLE_UPDATE_PAT"}}
         code, out, err = _run(fake, ["--force", "--no-rules", REPO])
         self.assertEqual(code, 1)
-        self.assertIn("gradle-update: gradle-update.yaml passes its secrets by name", out + err)
+        self.assertIn("gradle-update: gradle-update passes its secrets by name", out + err)
         self.assertEqual(fake.deleted_secrets, [])
 
     def test_a_second_caller_added_while_the_plan_waited_keeps_the_repository_copy(self):
@@ -2458,7 +2458,7 @@ class CredentialsStepTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn(
             "GRADLE_UPDATE_PAT kept: the callers changed since the plan was built "
-            "(gradle-update.yaml, gradle-update.yml now)",
+            "(gradle-update, gradle-update now)",
             err,
         )
         self.assertEqual(fake.deleted_secrets, [])
@@ -2490,7 +2490,7 @@ class CredentialsStepTest(unittest.TestCase):
         fake.env_secret_names = {"gradle-update": {"GRADLE_UPDATE_PAT"}}
         code, out, err = _run(fake, ["--force", "--no-rules", REPO])
         self.assertEqual(code, 1)
-        self.assertIn("gradle-update: weekly.yml passes its secrets by name", out + err)
+        self.assertIn("gradle-update: weekly passes its secrets by name", out + err)
         self.assertEqual(fake.deleted_secrets, [])
 
     def test_a_credential_removed_from_the_environment_while_the_plan_waited_keeps_the_copy(self):
@@ -2538,7 +2538,7 @@ class CredentialsStepTest(unittest.TestCase):
         # "not fixed: ..." is Apply's own unconditional report of a real
         # failure -- printed whether or not --verbose showed the plan too.
         self.assertIn(
-            "not fixed: gradle-update: gradle-update.yml mentions mikelward/gradle-update/ in a shape "
+            "not fixed: gradle-update: gradle-update mentions mikelward/gradle-update/ in a shape "
             "this cannot read as a caller",
             err,
         )
@@ -2556,7 +2556,7 @@ class CredentialsStepTest(unittest.TestCase):
         fake.env_secret_names = {"gradle-update": {"GRADLE_UPDATE_PAT"}}
         code, out, err = _run(fake, ["--force", "--no-rules", REPO])
         self.assertEqual(code, 1)
-        self.assertIn("gradle-update: weekly.yml on feature passes its secrets by name", out + err)
+        self.assertIn("gradle-update: weekly on feature passes its secrets by name", out + err)
         self.assertEqual(fake.deleted_secrets, [])
         # The unchanged ci.yml is not re-read on the branch: same blob.
         self.assertFalse(any("ci.yml?ref=feature" in " ".join(c) for c in fake.calls))
@@ -2569,7 +2569,7 @@ class CredentialsStepTest(unittest.TestCase):
         fake.env_secret_names = {"gradle-update": {"GRADLE_UPDATE_PAT"}}
         code, out, err = _run(fake, ["--force", "--no-rules", REPO])
         self.assertEqual(code, 1)
-        self.assertIn("gradle-update: weekly.yml on feature/x#1 passes its secrets by name", out + err)
+        self.assertIn("gradle-update: weekly on feature/x#1 passes its secrets by name", out + err)
         self.assertTrue(any("?ref=feature%2Fx%231" in " ".join(c) for c in fake.calls))
         self.assertEqual(fake.deleted_secrets, [])
         # Inheriting there, the caller lets the move go ahead.
@@ -2619,7 +2619,7 @@ class CredentialsStepTest(unittest.TestCase):
             )
         self.assertEqual(code, 1)
         self.assertIn(
-            "not fixed: gradle-update: gradle-update.yml passes its secrets by name, so a "
+            "not fixed: gradle-update: gradle-update passes its secrets by name, so a "
             "credential in the 'gradle-update' environment would never reach it -- convert the "
             "caller to `secrets: inherit` first; GRADLE_UPDATE_PAT left as is",
             err,
@@ -2647,7 +2647,7 @@ class CredentialsStepTest(unittest.TestCase):
         code, out, err = _run(fake, ["--force", "--no-rules", REPO])
         self.assertEqual(code, 1)
         self.assertIn(
-            "not fixed: gradle-update: gradle-update.yml passes its secrets by name, so a "
+            "not fixed: gradle-update: gradle-update passes its secrets by name, so a "
             "credential in the 'gradle-update' environment would never reach it -- convert the "
             "caller to `secrets: inherit` first\n",
             err,
@@ -2669,10 +2669,10 @@ class CredentialsStepTest(unittest.TestCase):
             )
         self.assertEqual(code, 1)
         self.assertIn(
-            "GRADLE_UPDATE_PAT kept: gradle-update.yml no longer passes `secrets: inherit`", err
+            "GRADLE_UPDATE_PAT kept: gradle-update no longer passes `secrets: inherit`", err
         )
         self.assertIn(
-            "GRADLE_UPDATE_PAT not set: gradle-update.yml no longer passes `secrets: inherit`", err
+            "GRADLE_UPDATE_PAT not set: gradle-update no longer passes `secrets: inherit`", err
         )
         self.assertIn("failed on: credential:gradle-update", err)
         self.assertEqual(fake.written_secrets, [])
@@ -2692,7 +2692,7 @@ class CredentialsStepTest(unittest.TestCase):
             )
         self.assertEqual(code, 1)
         self.assertIn(
-            "GRADLE_UPDATE_PAT not set: gradle-update.yml no longer passes `secrets: inherit`", err
+            "GRADLE_UPDATE_PAT not set: gradle-update no longer passes `secrets: inherit`", err
         )
         self.assertIn("failed on: credential:gradle-update", err)
         self.assertEqual(fake.written_secrets, [])
@@ -2706,7 +2706,7 @@ class CredentialsStepTest(unittest.TestCase):
         fake.secret_names = {"NPM_UPDATE_PAT"}
         code, out, err = _run(fake, ["--force", "--no-rules", REPO])
         self.assertEqual(code, 1)
-        self.assertIn("NPM_UPDATE_PAT kept: npm-update.yml appeared since the plan was built", err)
+        self.assertIn("NPM_UPDATE_PAT kept: npm-update appeared since the plan was built", err)
         self.assertEqual(fake.deleted_secrets, [])
 
     def test_a_delete_that_cannot_be_re_validated_does_not_happen(self):
@@ -2731,7 +2731,7 @@ class CredentialsStepTest(unittest.TestCase):
         fake.env_secret_names = {"ci-commit-artifact": {"CI_COMMIT_ARTIFACT_TOKEN"}}
         code, out, err = _run(fake, ["--force", "--no-rules", REPO])
         self.assertEqual(code, 1)
-        self.assertIn("CI_COMMIT_ARTIFACT_TOKEN kept: ci.yml no longer passes `secrets: inherit`", err)
+        self.assertIn("CI_COMMIT_ARTIFACT_TOKEN kept: ci no longer passes `secrets: inherit`", err)
         self.assertEqual(fake.deleted_secrets, [])
 
     def test_a_caller_file_that_calls_nothing_is_no_caller(self):
@@ -2821,7 +2821,7 @@ class CredentialsStepTest(unittest.TestCase):
                 ["--force", "--no-rules", "--credential", f"CI_COMMIT_ARTIFACT_TOKEN={path}", REPO],
             )
         self.assertEqual(code, 1)
-        self.assertIn("not fixed: ci-commit-artifact: nightly.yml passes its secrets by name", err)
+        self.assertIn("not fixed: ci-commit-artifact: nightly passes its secrets by name", err)
         self.assertEqual(fake.written_secrets, [])
         self.assertEqual(fake.deleted_secrets, [])
 
@@ -2839,12 +2839,12 @@ class CredentialsStepTest(unittest.TestCase):
         code, out, err = _run(fake, ["--force", "--no-rules", REPO])
         self.assertEqual(code, 1)
         self.assertIn(
-            "not fixed: ci-commit-artifact: ci.yml mentions mikelward/ci-commit-artifact/ in a shape "
+            "not fixed: ci-commit-artifact: ci mentions mikelward/ci-commit-artifact/ in a shape "
             "this cannot read as a caller -- whether it is used there cannot be told, so nothing is deleted",
             err,
         )
         self.assertIn(
-            "not fixed: npm-update: batch.yml mentions mikelward/npm-update/ in a shape this cannot "
+            "not fixed: npm-update: batch mentions mikelward/npm-update/ in a shape this cannot "
             "read as a caller",
             err,
         )
