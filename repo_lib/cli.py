@@ -1,6 +1,6 @@
 """Argument dispatch for the `repo` command.
 
-Each subcommand (list, secrets, setup) lives in its own module with a
+Each subcommand (list, secrets, setup, cleanup) lives in its own module with a
 `run(args)` entry point, mirroring the standalone repo-list/repo-secrets/
 repo-setup scripts in mikelward/scripts that this project is replacing --
 one subcommand per concern, composed rather than duplicated.
@@ -9,7 +9,14 @@ one subcommand per concern, composed rather than duplicated.
 import argparse
 import sys
 
-from repo_lib import audit_cmd, create_cmd, list_cmd, secrets_cmd, setup_cmd
+from repo_lib import (
+    audit_cmd,
+    cleanup_cmd,
+    create_cmd,
+    list_cmd,
+    secrets_cmd,
+    setup_cmd,
+)
 
 PROGRAM = "repo"
 
@@ -41,6 +48,12 @@ def build_parser():
     )
     setup_cmd.add_arguments(setup_parser)
     setup_parser.set_defaults(func=setup_cmd.run)
+
+    cleanup_parser = subparsers.add_parser(
+        "cleanup", help="delete the branches a repository has finished with"
+    )
+    cleanup_cmd.add_arguments(cleanup_parser)
+    cleanup_parser.set_defaults(func=cleanup_cmd.run)
 
     audit_parser = subparsers.add_parser(
         "audit", help="report whether a repository's branch rules actually hold"

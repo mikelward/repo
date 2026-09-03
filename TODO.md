@@ -104,6 +104,63 @@
       an already-protected repository missing a scaffold file needs it
       added by hand, through an ordinary PR.
 
+## repo cleanup
+
+- [ ] **Patch-equivalence is invisible to `repo cleanup`, so those branches
+      are reported as unmerged forever.** A branch whose *content* landed
+      under different commits and a different pull request -- reworked and
+      relanded under a new name, or superseded by a hand-written
+      equivalent -- has no merged pull request of its own and is not
+      contained in the default branch, so it reports as unmerged and is
+      only ever offered, never swept. `git cherry` finds exactly these (it
+      compares patch ids), and no GitHub API does, so closing this needs a
+      clone -- which every other subcommand here avoids, deliberately: the
+      whole tool is `gh api` calls against a repository it never checks
+      out. Measured on mikelward/simmo, the gap is real but small: of 184
+      dead branches, the merged-pull-request check accounted for all but
+      about a dozen. Not worth a clone yet; revisit if the offered list
+      routinely fills with branches that have obviously landed.
+- [ ] **A merged pull request stays `merged_at` even if the default branch
+      is later force-pushed past the merge**, so `repo cleanup` would sweep
+      a branch that is now the only ref to those commits, without ever
+      running a comparison. Real, and unlike the prompt-window findings this
+      state can exist before cleanup starts -- the plan itself would be
+      wrong, not merely stale. Deferred (maintainer, 2026-09-03): confirming it
+      needs one `compare` per merged branch, which is ~180 extra requests on
+      a ~190-branch sweep, taking it from ~380 to ~560 against a shared
+      5,000-an-hour limit -- and it would rule out something this fleet
+      structurally prevents. `repo setup` writes a `non_fast_forward` rule on
+      the default branch (so GitHub itself rejects the push), `repo audit`
+      reports its absence as a `[FIX]`, and every repo's `AGENTS.md` says
+      `main` is never force-pushed. Worth revisiting if `repo cleanup` is
+      ever pointed at repositories outside this fleet, where neither the
+      ruleset nor the convention holds.
+
+- [x] **Revalidation was cut back to a SHA-and-protection re-read**
+      (maintainer, 2026-09-03). Before the delete, `repo cleanup` re-reads
+      each branch and refuses one that moved or became protected since the
+      plan was built. It used to also re-read the repository's open pull
+      requests and re-run the default-branch comparison, behind a
+      bounded-staleness cache (`INDEX_MAX_AGE_SECONDS`) added to make the
+      per-branch version affordable. That reached ~281 of ~1010 lines --
+      about a quarter of the module -- and six consecutive rounds of review
+      each found a defect in the machinery added by the round before.
+      What it defended was a window of seconds, against changes only this
+      operator could make, on a fleet where nobody else pushes to
+      `claude/*` branches. Removed; the answer to a plan that has gone
+      stale in some other way is to re-run the command, which reclassifies
+      from scratch. **If you want any of it back, weigh it against that
+      history first** -- the individual findings were each correct, and the
+      trouble was that the design kept needing another layer to hold them.
+- [ ] **Only the merged sweep is fleet-safe; the offers are one repository
+      at a time.** `repo list | xargs -n1 repo cleanup --force` works
+      because `--force` refuses `--include-unmerged`. There is no
+      equivalent for the unmerged offers, and there should not be a
+      `--force`-shaped one -- but a fleet-wide *report* (every repository's
+      stale unmerged branches in one listing, nothing deleted) would be
+      useful and is not yet possible without running `--dry-run` per
+      repository and reading past the merged section each time.
+
 ## Decisions needing review
 
 - **`repo setup` fails (exit 1) on a fleet credential it cannot move,
