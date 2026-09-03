@@ -102,6 +102,73 @@ class GhWrapperTest(unittest.TestCase):
             ["gh", "secret", "set", "NAME", "--repo", "o/r; rm -rf /"],
         )
 
+    def test_run_retries_a_secondary_rate_limit_and_succeeds(self):
+        # GitHub's own wording for this (docs.github.com/rest/using-the-
+        # rest-api/rate-limits-for-the-rest-api), which gh relays verbatim.
+        limited = FakeCompletedProcess(
+            1,
+            stderr=(
+                "gh: You have exceeded a secondary rate limit. Please wait a few minutes "
+                "before you try again. (HTTP 403)\n"
+            ),
+        )
+        ok = FakeCompletedProcess(0, stdout="ok\n")
+        with patch("subprocess.run", side_effect=[limited, ok]) as mock_run, patch(
+            "repo_lib.gh.time.sleep"
+        ) as mock_sleep:
+            result = gh.run(["api", "user"])
+        self.assertEqual(result, "ok\n")
+        self.assertEqual(mock_run.call_count, 2)
+        mock_sleep.assert_called_once_with(60)
+
+    def test_run_does_not_retry_the_primary_rate_limit(self):
+        # The fixed 5000/hour quota -- distinct wording from the secondary
+        # limit above, and NOT retried: its reset can be up to an hour
+        # away, so blocking a script that long with no explanation is
+        # worse than failing and letting the caller decide to wait.
+        with patch(
+            "subprocess.run",
+            return_value=FakeCompletedProcess(
+                1, stderr="gh: API rate limit exceeded for user ID 12345. (HTTP 403)\n"
+            ),
+        ) as mock_run, patch("repo_lib.gh.time.sleep") as mock_sleep:
+            with self.assertRaises(gh.GhError):
+                gh.run(["api", "user"])
+        self.assertEqual(mock_run.call_count, 1)
+        mock_sleep.assert_not_called()
+
+    def test_try_run_retries_a_secondary_rate_limit_and_succeeds(self):
+        limited = FakeCompletedProcess(
+            1, stderr="gh: You have exceeded a secondary rate limit. (HTTP 403)\n"
+        )
+        ok = FakeCompletedProcess(0, stdout="{}\n")
+        with patch("subprocess.run", side_effect=[limited, ok]), patch("repo_lib.gh.time.sleep"):
+            result = gh.try_run(["api", "orgs/x"])
+        self.assertEqual(result, (True, "{}\n"))
+
+    def test_run_with_input_retries_a_secondary_rate_limit_and_succeeds(self):
+        limited = FakeCompletedProcess(
+            1, stderr=b"gh: You have exceeded a secondary rate limit. (HTTP 403)\n"
+        )
+        ok = FakeCompletedProcess(0, stdout=b"ok")
+        with patch("subprocess.run", side_effect=[limited, ok]), patch("repo_lib.gh.time.sleep"):
+            result = gh.run_with_input(["secret", "set", "NAME"], b"the-value")
+        self.assertEqual(result, b"ok")
+
+    def test_a_persistent_secondary_rate_limit_still_fails_cleanly(self):
+        # More secondary-limit failures than the retry budget allows --
+        # must still fail with the ordinary GhError, not retry forever.
+        limited = FakeCompletedProcess(
+            1, stderr="gh: You have exceeded a secondary rate limit. (HTTP 403)\n"
+        )
+        with patch("subprocess.run", return_value=limited) as mock_run, patch(
+            "repo_lib.gh.time.sleep"
+        ) as mock_sleep:
+            with self.assertRaises(gh.GhError):
+                gh.run(["api", "user"])
+        self.assertEqual(mock_run.call_count, gh._RATE_LIMIT_RETRY_ATTEMPTS)
+        self.assertEqual(mock_sleep.call_count, gh._RATE_LIMIT_RETRY_ATTEMPTS - 1)
+
     def test_require_gh_raises_when_gh_is_missing(self):
         with patch("shutil.which", return_value=None):
             with self.assertRaises(SystemExit) as cm:
