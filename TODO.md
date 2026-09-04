@@ -362,16 +362,56 @@ doesn't set today).
       green, for the entire time the new run takes to reach its own
       `gate` step -- during which the check reads "satisfied" even though
       the diff being re-evaluated might turn out to fail. `init`'s whole
-      job is to post `pending` immediately so that window doesn't exist;
-      that's a correctness property, not extra credit. `repo`'s own
-      generated `classify` step already sets `mode: classify` early for
-      a different reason (docs-lane skip), but nothing there posts
-      `pending` for `lanes` itself the way `init` does. The detector
-      needs to require BOTH a credentialed `init` step early in the
-      trigger's run AND a credentialed `gate` step as the terminal one --
-      `init` is no longer "additional evidence when present," it's a
-      second required element, and the compliant predicate below needs
-      to check for it the same way.
+      job is to post `pending` as early as the new run reaches it, which
+      SHRINKS that window drastically compared to `gate`-only; that's a
+      correctness property, not extra credit. `repo`'s own generated
+      `classify` step already sets `mode: classify` early for a different
+      reason (docs-lane skip), but nothing there posts `pending` for
+      `lanes` itself the way `init` does. The detector needs to require
+      BOTH a credentialed `init` step early in the trigger's run AND a
+      credentialed `gate` step as the terminal one -- `init` is no longer
+      "additional evidence when present," it's a second required element,
+      and the compliant predicate below needs to check for it the same
+      way.
+      **`init` NARROWS the window, and this item should not have claimed
+      it makes the window "not exist" -- a real residual gap remains, and
+      it is a GitHub platform limit this tool cannot close, not something
+      `init` failed to do** (Codex review, mikelward/repo#26): between the
+      triggering event (the title edit, the retarget) and the moment
+      `init`'s own API call actually completes, the previous status is
+      still the latest one on record -- GitHub has to schedule the new
+      workflow run before anything in it executes, and that scheduling
+      latency plus one HTTP round-trip is real, non-zero time during which
+      a merge (manual, or an auto-merge already armed on the strength of
+      the old green status) can still land against a diff whose
+      re-evaluation hasn't started. No mechanism this design has access
+      to -- `init`, a webhook, a required check -- can make that interval
+      exactly zero; closing it fully would need GitHub itself to
+      invalidate a status synchronously with the triggering event, which
+      is not a capability the platform offers. `init` is still worth
+      requiring because it turns a whole-run-duration window into a
+      scheduling-latency one, but this item should say that precisely
+      rather than claim the window is closed, and should carry the
+      residual gap forward as an explicit, named limit rather than a
+      solved problem.
+      **"Credentialed" isn't a precise enough bar for `init` either --
+      every structural check this item spells out in detail for `gate`
+      (the right `pr:`, the right environment, a condition that doesn't
+      quietly skip it, isolation from untrusted steps) applies to `init`
+      just as much, and leaving those unstated for `init` reopens the
+      exact gap requiring it was meant to close** (Codex review,
+      mikelward/repo#26): an `init` job that references
+      `LANES_APP_ID`/`LANES_APP_PRIVATE_KEY` but omits `environment:
+      lanes`, targets the wrong `pr:`, or sits behind a condition that
+      evaluates false for the run that needs it, satisfies "a credentialed
+      `init` step" by name while never actually posting `pending` -- the
+      previous status stays green exactly as long as it would with no
+      `init` at all. The detector needs to hold `init` to the same
+      structural bar as `gate`: the `pr:` input, `environment: lanes`, a
+      condition that runs it for the triggering event, and the same
+      same-job isolation from untrusted execution -- not a separate,
+      looser "credentialed" check that only verifies the two secret
+      inputs are present.
       **The step's own trigger matters too -- a credentialed `gate` step
       inside a workflow that never runs `pull_request_target` is not a
       working publisher for pull requests either** (Codex review,
@@ -679,7 +719,23 @@ doesn't set today).
       any repository with a realistic number of environments, but worth
       stating as "scales with environment count" rather than "a handful,"
       since a repository with an unusual number of environments is where
-      that stops being negligible. Interactive, not scheduled either way,
+      that stops being negligible.
+      **The environment sweep is not the only variable-cost operation
+      here -- the organization-secret check below scales the same way,
+      and this note still named the sweep as the sole one** (Codex review,
+      mikelward/repo#26): confirming no org-level `LANES_APP_ID`/
+      `LANES_APP_PRIVATE_KEY` reaches the repository needs listing the
+      organization's Actions secrets, and for each one scoped to
+      "selected" visibility, reading (and paginating) which repositories
+      it's shared with to check whether this one is among them. In an
+      organization with many selected-visibility secrets that's real,
+      variable latency and rate-limit usage, not a fixed handful of calls
+      either -- the same shape of cost as the environment sweep, for the
+      same reason (a per-item enumeration this codebase hasn't needed
+      before). Both belong in this estimate together, and both fail
+      closed the same way: an unavailable or incomplete read refuses the
+      step rather than reporting a clean sweep it couldn't actually
+      confirm. Interactive, not scheduled either way,
       so a slow or failed call is a visible error for the person running
       the command, not a silent gap -- and per this section's own
       fail-closed posture throughout, a failed branch-policy, membership,
