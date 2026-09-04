@@ -359,6 +359,29 @@ doesn't set today).
       release this rollout wants to support has to be added deliberately,
       which is real ongoing maintenance -- state that cost plainly rather
       than assuming a minimum-version check was the cheaper equivalent.
+      **An allowlist only protects the moment it's checked -- if the
+      consumer's own `uses:` reference is a mutable branch or tag, what it
+      resolves to keeps changing after that moment, silently, with no
+      further check** (Codex review, mikelward/repo#26, P1): resolving
+      `@main` (or any tag) to a SHA and comparing THAT against the
+      allowlist only proves the workflow was compatible at the instant of
+      the check. `scaffold.py` itself generates `uses:
+      mikelward/lanes@main` -- if `main` moves after the final
+      pre-binding revalidation, or between one `repo audit` run and the
+      next, the workflow's very next `pull_request_target` trigger
+      executes whatever `main` NOW points to, entirely independent of
+      what was reviewed and allowlisted, while the repository keeps
+      reading "compliant" until someone happens to audit it again. A
+      regression stops publication silently; a compromise of
+      `mikelward/lanes` itself hands the App key to whatever that compromise
+      contains. An allowlist of resolved SHAs closes this only if the
+      CONSUMER is also required to pin to one of those SHAs directly in
+      its own `uses:` line -- not merely to reference something that
+      currently resolves to one. The detector and the compliant predicate
+      both need to require a full, immutable commit SHA in the `uses:`
+      reference itself, treating `@main` or any other branch/tag
+      reference as `[FIX]` regardless of what it happens to resolve to
+      right now.
       **Reading the referenced revision's own `action.yml` -- floated as
       an equal alternative directly above -- does not actually establish
       the thing that matters, and isn't a substitute for the
@@ -448,6 +471,25 @@ doesn't set today).
       `classify`'s own outputs rather than a literal or an unrelated
       expression, failing closed on a `results:` expression or dependency
       graph it can't fully resolve rather than assuming correspondence.
+      **"Corresponds to `gate`'s own `needs:` graph" cannot catch a job
+      that's missing from BOTH `needs:` and `results:` -- correspondence
+      between two things says nothing about a third thing neither of them
+      mentions** (Codex review, mikelward/repo#26, P1): a `security` or
+      `test` job the workflow defines but never wires into `gate.needs`
+      (and therefore never into `results:` either, since that's built
+      from the same dependency edges) lies entirely outside the
+      comparison this check performs -- `results:` still corresponds
+      perfectly to `needs:` because neither one mentions the omitted job,
+      and `gate` can publish success regardless of whether that job ran,
+      failed, or was skipped. The correspondence check alone cannot close
+      this; it needs an INDEPENDENT definition of the complete set of jobs
+      that must gate `lanes` -- every job the workflow defines other than
+      `classify`/`init`/`gate` themselves (or, more conservatively,
+      whatever `scaffold.py`'s own generated job set establishes as the
+      baseline a migrated `ci.yml` is expected to preserve) -- and confirm
+      EVERY one of them is both a `gate` prerequisite and has a
+      corresponding `results:` entry, not merely that whatever already
+      appears in both places agrees with itself.
       **Confirming `gate`'s inputs come from `needs.classify.*` syntactically
       still says nothing about whether `classify` ITSELF is a real
       classifier -- only that gate is wired to whatever job happens to be
@@ -979,6 +1021,29 @@ doesn't set today).
       the full structural publisher check against each one, not just the
       branch named on the command line -- refusing to bind, not merely
       noting the gap, when any targeted branch can't be confirmed.
+      **A structurally valid publisher workflow on a non-default target
+      branch can still never actually RUN -- GitHub's own scheduling
+      rules for `pull_request_target`, not anything this workflow's text
+      gets wrong, is what stops it** (Codex review, mikelward/repo#26,
+      P1): GitHub only discovers and schedules a workflow from a copy that
+      exists on the repository's DEFAULT branch -- a `pull_request_target`
+      workflow that lives only on a non-default target branch (never
+      merged to default) does not get triggered at all, the same platform
+      behavior that governs `workflow_dispatch`/scheduled workflows. A
+      manually disabled workflow (via the Actions UI, or GitHub's own
+      60-day-idle auto-disable) or repository Actions being turned off
+      entirely produce the identical symptom: a workflow that reads as a
+      perfectly valid publisher and simply never fires. Every check this
+      item has added confirms the workflow TEXT is correct; none of them
+      confirm GitHub will actually run it. Closing this needs three more
+      reads before binding: the candidate workflow file exists (by the
+      same content, or at least the same recognized shape) on the DEFAULT
+      branch, its workflow state is `active` (`GET
+      .../actions/workflows/{id}` reports this), and the repository's
+      Actions are enabled -- folding all three into the cost/failure
+      estimate alongside everything else there, and refusing to bind on
+      an unavailable or incomplete read the same way as every other check
+      in this item.
       **The same failure mode shows up through the trigger's OWN filters
       too, and it gets the same fix, not a separate "documented gap"** --
       confirming the event name is `pull_request_target` is not confirming
