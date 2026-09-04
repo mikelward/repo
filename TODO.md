@@ -435,6 +435,21 @@ doesn't set today).
       same-job isolation from untrusted execution -- not a separate,
       looser "credentialed" check that only verifies the two secret
       inputs are present.
+      **None of those checks say WHEN `init` runs, and an `init` job
+      gated behind `needs:` on a heavy job passes every one of them while
+      recreating the exact whole-run window requiring `init` was meant to
+      shrink** (Codex review, mikelward/repo#26): `init`'s value is
+      entirely in posting `pending` as early as possible -- an `init` job
+      with `needs: build` can carry the right `pr:`, `environment: lanes`,
+      an `if: ${{ !cancelled() }}` condition, and clean isolation, and
+      still not post anything until `build` finishes, during which the
+      previous run's status is exactly as stale as it would be with no
+      `init` at all. The detector needs to also confirm `init` has no
+      `needs:` (or, if it does, that every job it depends on is itself
+      near-instant and not part of the heavy-job graph being checked) --
+      the safe, checkable shape is simply "first in the graph, nothing it
+      waits on," which is what the real design's own `init` job already
+      is (typelauncher's `ci.yml`: "First in the graph, no `needs:`").
       **The step's own trigger matters too -- a credentialed `gate` step
       inside a workflow that never runs `pull_request_target` is not a
       working publisher for pull requests either** (Codex review,
@@ -711,14 +726,31 @@ doesn't set today).
       status nothing posts), and a history-based preflight can look
       green in the meantime on the strength of an old status from before
       the protection was added. `repo audit`'s compliant predicate needs
-      to also read the environment's protection rules (the same
-      `GET /repos/{owner}/{repo}/environments/{env}` response already
-      being read for the branch policy carries them) and treat required
+      to also read the environment's protection rules and treat required
       reviewers, a wait timer, or a custom rule as `[FIX]`, not just an
       exact-or-not branch-policy set; `repo setup` needs to remove or
       explicitly refuse to touch an incompatible one before placing the
       credential, the same posture as the extra-branch-policy-entry case
       just above.
+      **"The same environment GET response carries all three" was wrong
+      for the custom-rule case -- a genuinely custom, App-backed
+      deployment protection rule lives behind its OWN endpoint, not in
+      the plain environment response this item already reads for the
+      branch policy** (Codex review, mikelward/repo#26): the
+      `GET /repos/{owner}/{repo}/environments/{env}` response's built-in
+      `protection_rules` array does cover required reviewers and a wait
+      timer, but an ENABLED custom deployment protection rule (a
+      third-party or in-house App gating deployments) is exposed only
+      through the separate `deployment_protection_rules` sub-resource
+      (`GET .../environments/{env}/deployment_protection_rules`). Reading
+      only the environment response and treating a `custom` entry there
+      as sufficient would miss a genuinely custom rule, report the
+      environment clean, and leave `init`/`gate` runs stalled on an
+      approval this item's own audit never saw. Closing this needs a
+      second read against that endpoint, with its own cost/latency/
+      failure note alongside the environment-response one this section
+      already carries -- fail closed the same way on an unavailable or
+      incomplete read.
       **Widening the branch policy to all three targets does not by
       itself make all three branches' WORKFLOWS App publishers, and this
       item can't fix that -- it's a general limit of how this tool audits,
@@ -795,7 +827,12 @@ doesn't set today).
       variable latency and rate-limit usage, not a fixed handful of calls
       either -- the same shape of cost as the environment sweep, for the
       same reason (a per-item enumeration this codebase hasn't needed
-      before). Both belong in this estimate together, and both fail
+      before). A third read belongs here too: the separate
+      `deployment_protection_rules` endpoint the custom-rule correction
+      above needs is one more fixed call per repository (not variable,
+      unlike the other two), alongside the environment response already
+      read for the branch policy and the built-in reviewer/wait-timer
+      checks. All three belong in this estimate together, and all fail
       closed the same way: an unavailable or incomplete read refuses the
       step rather than reporting a clean sweep it couldn't actually
       confirm. Interactive, not scheduled either way,
@@ -816,11 +853,15 @@ doesn't set today).
       the hardened three-ref set for a freshly created ruleset, or the
       existing ruleset's own conditions when one was already there, per
       `_compute_scope` -- and nothing more; see the branch-policy item's
-      own note on this), the lanes App still
-      covering the repository, AND the ruleset's `lanes` entry bound to
-      THAT App's own id specifically (compliant); `pull_request_target`
-      with the secrets missing, repository-scoped, or in the wrong
-      environment, the environment's branch policy missing an entry or
+      own note on this) AND NO organization-scoped copy of either secret
+      reaching the repository (see the credential-placement item's own
+      note on this -- fail closed, "cannot confirm," when that read isn't
+      available, rather than silently treating it as clean), the lanes App
+      still covering the repository, AND the ruleset's `lanes` entry bound
+      to THAT App's own id specifically (compliant); `pull_request_target`
+      with the secrets missing, repository-scoped, in the wrong
+      environment, OR reachable via an inherited organization secret, the
+      environment's branch policy missing an entry or
       carrying an extra one, the App no longer covering the repository,
       OR the ruleset entry unbound or bound to a different App's id
       (broken, `[FIX]`); and
