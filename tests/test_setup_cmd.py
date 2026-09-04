@@ -969,7 +969,7 @@ class SetupCmdTest(unittest.TestCase):
         self.assertEqual(fake.puts, [])
         self.assertIn("already matches; nothing to do", out)
 
-    def test_an_exclusion_is_left_alone_and_the_plan_says_it_may_narrow_this(self):
+    def test_an_exclusion_that_defeats_the_widening_is_named(self):
         # This module never edits an exclusion -- deleting one somebody
         # wrote is a different decision from adding a ref to an include
         # list. So a ruleset excluding the very ref just added still
@@ -982,8 +982,60 @@ class SetupCmdTest(unittest.TestCase):
         self.assertEqual(code, 0, err)
         plan = out + err
         self.assertIn("scope: also targeting refs/heads/main, refs/heads/master", plan)
-        self.assertIn("exclusions are left alone", plan)
+        self.assertIn("excludes refs/heads/master, so it does not protect that branch", plan)
         self.assertEqual(fake.puts, [])
+
+    def test_all_branches_with_one_excluded_is_not_reported_as_complete(self):
+        # Codex review, mikelward/repo#31: ~ALL short-circuits the
+        # widening because it already covers every branch -- but an
+        # exclusion outranks an include, so a ruleset including ~ALL and
+        # excluding refs/heads/master leaves master exactly as
+        # unprotected as before. Nothing else here needs a write, so
+        # without this the run reported "nothing to do" and exited 0 over
+        # the very backdoor the widening exists to close.
+        fake = FakeGh()
+        self._ruleset_with_scope(fake, ["~ALL"], exclude=["refs/heads/master"])
+        code, out, err = _run(fake, ["--force", "-v", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("already matches; nothing to do", out)
+        self.assertIn("excludes refs/heads/master, so it does not protect that branch", err)
+        self.assertIn("repo audit", err)
+
+    def test_an_exclusion_of_the_default_branch_by_name_is_named_too(self):
+        # An exclusion names a ref, never the ~DEFAULT_BRANCH token, so
+        # the comparison resolves the token first -- otherwise excluding
+        # the repository's actual default branch by name would read as
+        # excluding nothing this cares about.
+        fake = FakeGh()
+        self._ruleset_with_scope(fake, list(_HARDENED_SCOPE), exclude=["refs/heads/main"])
+        code, out, err = _run(fake, ["--force", "-v", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("already matches; nothing to do", out)
+        self.assertIn("excludes refs/heads/main", err)
+
+    def test_the_exclusion_finding_is_reported_once_not_once_per_pass(self):
+        # setup_cmd previews the ruleset step and then applies it, so a
+        # finding printed on both passes reads as two separate problems.
+        # The real apply runs quiet (absent --verbose, which asks for the
+        # full audit trail of both passes on purpose) for exactly this
+        # reason.
+        fake = FakeGh()
+        self._ruleset_with_scope(fake, ["refs/heads/main"], exclude=["refs/heads/master"])
+        code, out, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(fake.puts), 1)
+        self.assertEqual((out + err).count("excludes refs/heads/master"), 1)
+
+    def test_a_pattern_in_the_exclusions_is_reported_as_unevaluated(self):
+        # Literal matching only, here as everywhere else in this module:
+        # a glob might or might not carve out a hardened ref, and
+        # answering would mean reimplementing GitHub's ref matching.
+        fake = FakeGh()
+        self._ruleset_with_scope(fake, list(_HARDENED_SCOPE), exclude=["refs/heads/mast*"])
+        code, out, err = _run(fake, ["--force", "-v", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("has a pattern in its exclusions", err)
+        self.assertIn("Check it by hand", err)
 
     def test_widening_is_checked_against_the_merge_methods_on_the_refs_it_adds(self):
         # The scan that stops two rulesets from intersecting to no

@@ -308,6 +308,27 @@
 
 ## Decisions needing review
 
+- **A ruleset exclusion that keeps a hardened ref out is reported, not
+  failed and not deleted** (autopilot, 2026-09-04, answering Codex's P1 on
+  mikelward/repo#31). An exclusion outranks an include, so a ruleset
+  including `~ALL` -- or all three refs literally -- while excluding
+  `refs/heads/master` leaves master exactly as unprotected as before, and
+  `repo setup` used to report "nothing to do" over it. It now names the
+  ref on every path. What it does not do is either of the two stronger
+  answers. **Deleting the exclusion** is out because this module never
+  edits one: that is a narrowing decision about a rule somebody wrote, and
+  the whole design here is that an update only ever widens. **Failing the
+  step** was the closer call, since the fleet-credentials precedent below
+  says a clean exit should mean the repository is in shape -- but the
+  ruleset step's non-zero return travels through `setup_cmd`'s
+  `ruleset_preview_failed`, which aborts the ENTIRE run before any other
+  step applies, so one exclusion would refuse the whole repository. The
+  gap is already counted where a gap belongs: `audit_cmd._targeting_status`
+  reports it as a `[GAP]` and fails `repo audit`. Reversible in either
+  direction -- the reporting is one function, and failing it would need
+  `setup_cmd` to tell "this step found something it cannot fix" apart from
+  "this step could not run" first.
+
 - **The scaffold's `lanes.conf` keeps the narrow docs pair
   (`docs *.md` + `docs docs/**/*.md`), not the shorthand `docs **/*.md`**
   (autopilot, 2026-09-04; the question had been put to the maintainer and
