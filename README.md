@@ -85,7 +85,10 @@ blocked, plus a standalone warning when a repository has an actual
 `master` branch; a ruleset already carrying that name, or a name this tool
 used before it, is adopted and updated in place -- renamed where needed --
 rather than gaining a second one beside it, since rulesets aggregate and
-two of them are only ever confusing),
+two of them are only ever confusing, and where both names exist the older
+one is deleted when its content is identical to what the surviving one
+will hold, and reported when it is not; an existing ruleset's own scope is
+widened to cover all three refs, never narrowed or replaced),
 fanning a secret out via the same logic `repo secrets`
 uses, ensuring GitHub App installation membership, and (always on, like
 the fleet-credentials and auto-merge steps below; `--no-bootstrap` skips
@@ -113,8 +116,9 @@ audit` is the read-only counterpart: it reports whether a branch's rules
 (required checks, conversation resolution, up-to-date merges, force-push
 and deletion protection, bypass actors, and -- when auditing the
 repository's real default branch -- whether every covering ruleset also
-targets `refs/heads/main` and `refs/heads/master`) already hold, without
-writing anything. It also audits where secrets live. The fleet's shared credentials -- the
+targets `refs/heads/main` and `refs/heads/master`, and whether a ruleset
+under a name this tool used before `main` is still there) already hold,
+without writing anything. It also audits where secrets live. The fleet's shared credentials -- the
 weekly dependency batches' `<HUB>_PAT` (or `<HUB>_APP_ID` +
 `<HUB>_APP_PRIVATE_KEY` pair, for mikelward/npm-update, gradle-update and
 rust-update) and mikelward/ci-commit-artifact's `CI_COMMIT_ARTIFACT_TOKEN`
