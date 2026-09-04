@@ -369,6 +369,20 @@ doesn't set today).
       (`if: ${{ !cancelled() }}` or an equivalent that isn't strictly
       narrower), and fail closed on a condition expression it can't
       analyze.
+      **A job-level `if: !cancelled()` does not, by itself, make the
+      `gate` STEP run either -- steps have their own independent default,
+      and the paragraph above stopped one level too high** (Codex review,
+      mikelward/repo#26): each step in a job evaluates its own `if:`
+      condition, defaulting to `success()` when none is given, regardless
+      of what the enclosing job's own `if:` says. A job with
+      `if: ${{ !cancelled() }}` and an earlier step that fails still skips
+      every later step that carries no override of its own -- so a `gate`
+      step sitting after some other step in the same job, with no `if:`
+      on the `gate` step itself, is skipped exactly the way the job-level
+      fix above was meant to prevent, whenever that earlier step fails.
+      The detector needs to check the `gate` STEP's own condition (not
+      just its job's), unless it is the only step in the job -- and fail
+      closed the same way on a step-level condition it can't analyze.
       **The step alone is not enough -- the ENCLOSING JOB has to select
       the `lanes` environment too, or the move this detector triggers
       breaks the very thing it's meant to protect** (Codex review,
@@ -438,6 +452,27 @@ doesn't set today).
       same `default_branch(repo)` lookup this codebase already has)
       plus the literal names `main` and `master` -- not the ruleset's own
       encoding of those three targets.
+      **That three-name set is only right for a FRESHLY CREATED ruleset --
+      `rules.py`'s own `_compute_scope` (`rules.py:410-`) preserves an
+      EXISTING ruleset's actual conditions on update instead of replacing
+      them with `_HARDENED_INCLUDE`, and this item assumed the opposite**
+      (Codex review, mikelward/repo#26): `_create_body` (`rules.py:527-`)
+      does write the hardened three-ref set for a brand-new ruleset, but
+      `_compute_scope` explicitly reads back `.conditions.ref_name` from
+      the ruleset that already exists rather than overwriting it, which is
+      precisely how `repo setup` avoids clobbering a repository that has
+      genuinely widened its own ruleset -- to include a `release` branch,
+      say. A branch policy hard-coded to default/`main`/`master` would
+      then be wrong for that repository: `pull_request_target` runs
+      targeting the branch the ruleset actually protects but this item
+      doesn't know about can't read the credential and can never publish
+      `lanes` there. The branch policy needs to be derived from the
+      SAME conditions `_compute_scope` reads for the repository's actual
+      ruleset -- the hardened three-ref set only when creating one fresh,
+      the existing ruleset's own `ref_name.include` when updating one --
+      not a fixed three-name assumption, and it needs to fail closed on a
+      condition shape (a glob, an exclude, `~ALL`) it can't safely
+      translate into a plain branch-name policy entry.
       **Covering those three is necessary but not sufficient -- the
       policy also has to contain NOTHING else, and "compliant" has to
       check that, not just that the three are present** (Codex review,
@@ -572,6 +607,23 @@ doesn't set today).
       no longer succeed, so no legitimate `lanes` status can be published
       at all -- reading the secret placement alone reports it compliant
       while its publisher is actually dead.
+      **Covering the repository is not the same as being ABLE TO PUBLISH
+      to it -- an installation can stay a member while suspended, or
+      while its granted permissions no longer include the Statuses API
+      write lanes needs** (Codex review, mikelward/repo#26): GitHub lets
+      an organization admin suspend an App installation (`suspended_at`
+      on the installation object) without removing it from the account,
+      and lets them downgrade what it's granted at any time -- either way
+      `plan_app_step` can still return `ALREADY_MEMBER`/`ALREADY_ALL`,
+      since membership and suspension/permissions are different fields on
+      the same object, and neither is what that function currently reads.
+      A stale App-attributed status from before the suspension or the
+      permission downgrade can keep the history-based preflight looking
+      fine in the meantime. `repo audit`'s compliant predicate needs to
+      also read the installation's `suspended_at` (must be null) and its
+      `permissions` map (must still grant the Statuses API write) as part
+      of the App-membership check, not just that the repo appears on a
+      member/all-repos list.
       **"Bound" isn't enough either -- it has to be bound to THE LANES
       APP specifically, not merely bound to something** (Codex review,
       mikelward/repo#26): an earlier revision of this item's compliant
@@ -876,7 +928,32 @@ doesn't set today).
       each one to `pull_request_target`, switch its checkout to the merge
       snapshot, and verify it references no `secrets.*` -- exactly the
       per-repo work lanes' own TODO.md defers to "whichever pull request
-      actually pilots a consumer onto this." `repo setup`/`repo audit`
+      actually pilots a consumer onto this."
+      **"References no `secrets.*`" is necessary but not sufficient for
+      the ambient `GITHUB_TOKEN`, which is available to a
+      `pull_request_target` job whether or not anything names it** (Codex
+      review, mikelward/repo#26): the whole reason this design needs
+      `pull_request_target` at all is that it runs with base-branch
+      permissions against attacker-controlled PR content, and two things
+      leak that token into reach of that content by default. First,
+      `permissions:` defaults to whatever the repository or organization
+      grants `GITHUB_TOKEN` (which can be write access) unless the
+      workflow or job explicitly narrows it -- checking for an explicit
+      `secrets.GITHUB_TOKEN`/`secrets.*` reference says nothing about the
+      ambient token every step already has via `github.token` /
+      `GITHUB_TOKEN`, with no `secrets.` prefix to grep for. Second,
+      `actions/checkout` persists that token into the local git
+      credential store by default (`persist-credentials: true`), so any
+      code that then runs in the checked-out merge snapshot -- exactly
+      the untrusted content this design exists to run safely -- can push
+      with it unless the step sets `persist-credentials: false`. Neither
+      is specific to lanes' own `init`/`gate` steps; both are properties
+      of the *heavy job* being migrated onto `pull_request_target`, which
+      is the actual per-repo migration work this item is about. The
+      migration checklist needs an explicit least-privilege `permissions:`
+      block (job- or workflow-level) and `persist-credentials: false` on
+      every `pull_request_target` checkout of PR content, not just a scan
+      for named secrets. `repo setup`/`repo audit`
       carry the credential/App-membership/ruleset-binding side (the items
       above) and can flag which repos are wired for which design; the
       workflow-file rewrite itself stays a human-or-agent-authored PR per
