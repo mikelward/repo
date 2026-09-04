@@ -601,10 +601,23 @@ doesn't set today).
       isolation, the group key itself -- can pass independently for BOTH
       publishers while this failure mode still exists. The detector needs
       to also confirm there is exactly one qualifying publisher pair on
-      the audited branch (per the branch-scoping note above), or -- if a
-      repository genuinely has more than one for some reason -- that every
-      one of them shares the SAME concurrency group, and fail closed on
-      more than one pair it can't prove share a group.
+      the audited branch (per the branch-scoping note above); more than
+      one is `[FIX]`, full stop.
+      **"Or every pair shares the same group" was a wrong escape hatch --
+      sharing a group stops one from overwriting the other's STATUS, but
+      says nothing about whether they check the same things** (Codex
+      review, mikelward/repo#26): `concurrency:` cancellation launches both
+      runs for the same event and then cancels one, ordering-dependent,
+      until a single survivor remains -- it does not prevent both from
+      starting, and it does not require the two workflows' job graphs to
+      match. If one publisher's `gate` covers `build`+`test` and the
+      other's covers only `test`, whichever survives can post success on
+      the strength of a narrower check than the one that got canceled --
+      the canceled workflow's `build` might have failed, and nothing ever
+      reports that. A shared group is not equivalence, so it can't stand
+      in for uniqueness. The detector's requirement is simply exactly one
+      qualifying pair; more than one is `[FIX]` regardless of whether they
+      share a group.
       **The step alone is not enough -- the ENCLOSING JOB has to select
       the `lanes` environment too, or the move this detector triggers
       breaks the very thing it's meant to protect** (Codex review,
@@ -769,44 +782,51 @@ doesn't set today).
       already carries -- fail closed the same way on an unavailable or
       incomplete read.
       **Widening the branch policy to all three targets does not by
-      itself make all three branches' WORKFLOWS App publishers, and this
-      item can't fix that -- it's a general limit of how this tool audits,
-      not a new gap this rollout introduces** (Codex review,
-      mikelward/repo#26): a repository could genuinely have migrated only
-      one of the ruleset's targeted branches (typically the default one)
-      while another -- a real leftover `master`, say -- still carries the
-      old plain-`pull_request` workflow. The credential being *readable*
-      from all three refs says nothing about whether all three branches'
-      `ci.yml` actually calls `mode: gate` with it; a single ruleset
-      binding still applies uniformly across every branch it targets, so
-      the unmigrated one's ordinary Actions check-run can never satisfy
-      it either. But `repo audit`/`repo setup` already inspect one branch
-      at a time (`repo audit [--branch NAME]`), not every ruleset-covered
-      branch's workflow content in a single pass -- so detecting this
-      fully needs auditing each hardened target's own branch, which is a
-      characteristic of the whole tool's model, not something to design a
-      fix for inside this one item. Worth naming as a real edge case a
-      partial migration can hit, not something the `--branch` default
-      already covers.
-      **The same "not every covered PR necessarily gets a publisher" gap
-      also shows up through the trigger's OWN filters, not just a
-      per-branch workflow difference -- confirming the event name is
-      `pull_request_target` is not confirming it fires for every PR the
-      ruleset protects** (Codex review, mikelward/repo#26): a `branches:`,
-      `paths:`, or narrowed `types:` filter on that trigger can exclude a
-      protected PR the same way an unmigrated branch does, and a filter
-      that DID match once is enough to satisfy the history-based preflight
-      even though a differently-shaped PR then waits forever. Parsing
-      every GitHub Actions filter shape correctly (branch globs, path
-      globs, `branches-ignore`, the interaction between them) is real
-      static-analysis work, not a detector tweak, and it is the same
-      category of gap as the per-branch one just above -- so this item
-      draws the same boundary around it: name the trigger's event
-      filters as an additional way the "confirmed as App-published" read
-      can be wrong, without promising a filter parser here. Whoever
-      builds the detector should decide then whether to fail closed on
-      any filtered trigger (safe, but any repository) or leave this as a
-      documented residual gap alongside the per-branch one.
+      itself make all three branches' WORKFLOWS App publishers, and
+      leaving that as a documented tool-model limitation was wrong -- this
+      item's whole point is preventing a protected PR from waiting forever
+      on a publisher that doesn't exist for it, and an unmigrated target
+      branch is exactly that failure, not a different category of one**
+      (Codex review, mikelward/repo#26, escalating an earlier round's own
+      "worth naming, not fixing here" framing): a repository could
+      genuinely have migrated only one of the ruleset's targeted branches
+      (typically the default one) while another -- a real leftover
+      `master`, say -- still carries the old plain-`pull_request`
+      workflow. The credential being *readable* from all three refs says
+      nothing about whether all three branches' `ci.yml` actually calls
+      `mode: gate` with it; a single ruleset binding still applies
+      uniformly across every branch it targets, so the unmigrated one's
+      ordinary Actions check-run can never satisfy it either. `repo
+      audit`/`repo setup` inspecting one branch at a time
+      (`repo audit [--branch NAME]`) is a real constraint on how the check
+      runs, but it doesn't excuse the binding step from the requirement:
+      before writing `integration_id`, `repo setup` needs to resolve every
+      concrete branch the ruleset's own conditions target (the same
+      `_compute_scope` read the branch-policy item already uses) and run
+      the full structural publisher check against each one, not just the
+      branch named on the command line -- refusing to bind, not merely
+      noting the gap, when any targeted branch can't be confirmed.
+      **The same failure mode shows up through the trigger's OWN filters
+      too, and it gets the same fix, not a separate "documented gap"** --
+      confirming the event name is `pull_request_target` is not confirming
+      it fires for every PR the ruleset protects** (Codex review,
+      mikelward/repo#26, same escalation): a `branches:`, `paths:`, or
+      narrowed `types:` filter on that trigger can exclude a protected PR
+      the same way an unmigrated branch does, and a filter that DID match
+      once is enough to satisfy the history-based preflight even though a
+      differently-shaped PR then waits forever. Parsing every GitHub
+      Actions filter shape correctly (branch globs, path globs,
+      `branches-ignore`, the interaction between them) to PROVE coverage
+      is real static-analysis work this item isn't taking on -- but
+      accepting an unprovable filter as compliant, with a footnote, is not
+      a safe substitute for that proof. The detector doesn't need to parse
+      every filter shape to close this: it needs to require the trigger
+      have NO narrowing filter beyond a safe default (bare
+      `pull_request_target:`, or an explicit `types:` list that still
+      covers every ruleset-relevant event) and fail closed -- report
+      "cannot confirm," `[FIX]` -- on any `branches:`, `paths:`, or
+      narrowed `types:` it finds, rather than accepting the filter's
+      presence as a documented, tolerated gap.
       **This same gap is latent in the existing batch credentials too**
       (`NPM_UPDATE_APP_ID`/`GRADLE_UPDATE_APP_ID`/`RUST_UPDATE_APP_ID` and
       their private keys) -- `_ensure_environment` gives every one of them
@@ -822,9 +842,10 @@ doesn't set today).
       calls): free, on the same GitHub REST API and the same
       5,000-authenticated-requests-an-hour limit `rules.py` and
       `apps.py`'s own module docstrings already budget against. Most of
-      this section adds only a handful of calls per repository (a
-      branch-policy read and, when missing, a write; the App-membership
-      read) on top of what `repo setup`/`repo audit` already make --
+      this section adds only a handful of fixed calls per repository (a
+      branch-policy read and, when missing, a write) on top of what
+      `repo setup`/`repo audit` already make -- except the App-membership
+      read, which paginates with installation size (see below), and
       except the credential-placement item's environment sweep, which is
       one secrets-list call per environment the repository has, not a
       fixed count; still free and still well inside the rate limit for
@@ -833,18 +854,12 @@ doesn't set today).
       since a repository with an unusual number of environments is where
       that stops being negligible.
       **The environment sweep is not the only variable-cost operation
-      here -- the organization-secret check below scales the same way,
-      and this note still named the sweep as the sole one** (Codex review,
-      mikelward/repo#26): confirming no org-level `LANES_APP_ID`/
-      `LANES_APP_PRIVATE_KEY` reaches the repository needs listing the
-      organization's Actions secrets, and for each one scoped to
-      "selected" visibility, reading (and paginating) which repositories
-      it's shared with to check whether this one is among them. In an
-      organization with many selected-visibility secrets that's real,
-      variable latency and rate-limit usage, not a fixed handful of calls
-      either -- the same shape of cost as the environment sweep, for the
-      same reason (a per-item enumeration this codebase hasn't needed
-      before). A third read belongs here too: the separate
+      here -- the organization-secret check below scales too (though only
+      with the two secrets that matter here, per the correction on that
+      item -- reading them by name rather than scanning every org secret
+      is what keeps this bounded to at most two lookups plus pagination,
+      not thousands), and this note still named the sweep as the sole
+      one** (Codex review, mikelward/repo#26). A third read belongs here too: the separate
       `deployment_protection_rules` endpoint the custom-rule correction
       above needs is one more fixed call per repository (not variable,
       unlike the other two), alongside the environment response already
@@ -863,7 +878,17 @@ doesn't set today).
       same shape of cost as the environment sweep and the org-secret
       check, for the same reason: a per-item reconciliation this codebase
       hasn't needed before.
-      All four belong in this estimate together, and all fail
+      **A fifth operation was budgeted as "a handful of calls" when it
+      isn't fixed either: the App-membership read paginates over the
+      installation's own repository list** (Codex review, mikelward/repo#26):
+      `plan_app_step` (`apps.py:143-144`) calls
+      `user/installations/{id}/repositories --paginate` -- for a
+      "selected" installation covering many repositories, that's however
+      many pages the installation has, not a single call, however the
+      earlier framing of this estimate had it. Its latency, rate-limit
+      usage, and failure behavior belong alongside the other four variable-
+      cost operations, not folded into "a handful" the way it was.
+      All five belong in this estimate together, and all fail
       closed the same way: an unavailable or incomplete read refuses the
       step rather than reporting a clean sweep it couldn't actually
       confirm. Interactive, not scheduled either way,
@@ -1067,6 +1092,32 @@ doesn't set today).
       instead name it as an open decision -- which of the two paths, with
       its cost/reliability note -- that has to be made before any of it is
       buildable, not merely before it's built.
+      **Even once an implementation exists, `repo audit` (and `repo setup`
+      run without `--credential`) can NEVER perform this validation against
+      an already-placed secret -- GitHub's secret-read API returns names
+      only, never values, so there is no private-key bytes to sign a JWT
+      with** (Codex review, mikelward/repo#26): this item's revised text
+      talks about "signing a JWT with the private key" as if reading the
+      existing `LANES_APP_PRIVATE_KEY` secret and using its value were an
+      implementation detail to fill in -- it isn't reachable at all.
+      `GET /repos/{owner}/{repo}/actions/secrets/{name}` (and the
+      environment-scoped equivalent) returns only the name and timestamps;
+      the value is write-only by design, the same reason `credentials.py`
+      and `secrets_cmd.py` never read one back anywhere in this codebase
+      today. The only place this tool ever sees a credential's actual
+      value is a `--credential NAME=value` invocation, at the moment the
+      operator supplies it for placement. So real validation can only ever
+      happen there: `repo setup --credential LANES_APP_ID=...
+      --credential LANES_APP_PRIVATE_KEY=...` signs and exchanges the
+      JWT with the freshly-supplied pair before placing it, and carries
+      that successful exchange forward as what makes the placement (and
+      later the binding) trustworthy. `repo audit`, and `repo setup` run
+      without `--credential` against an already-placed secret, can never
+      confirm authenticity this way -- the compliant predicate needs to
+      say so plainly ("credential shape and placement confirmed;
+      authenticity cannot be confirmed without resupplying it") rather
+      than implying a future audit-only check that the platform makes
+      impossible.
       **Out of scope for this item, on purpose: a repository whose lanes
       workflow has been removed from the default branch entirely, with no
       App secrets left either** (Codex review, mikelward/repo#26). None of
@@ -1126,15 +1177,26 @@ doesn't set today).
       could add an ordinary job -- no `environment: lanes` needed -- that
       reads the inherited copy and forges the status, while this item's
       own audit reports the repository compliant the whole time. Closing
-      it needs reading the org's secret grants (`GET
-      /orgs/{org}/actions/secrets` and which repos each is shared with),
-      which is a genuinely different permission footprint than anything
-      else this tool reads -- every other call here is repository-scoped;
-      this one needs organization-level Actions-secrets visibility, which
-      a fine-grained token may not carry even when it can do everything
-      else `repo setup`/`repo audit` do. Fail closed (report "cannot
-      confirm no org secret is granted") when that read isn't available,
-      rather than silently skipping it. **This is also latent in every
+      it needs reading the org's secret grants -- but only for the two
+      names that matter here, not a scan of every org secret (Codex
+      review, mikelward/repo#26: enumerating all of an org's Actions
+      secrets and checking each selected-visibility one's repo grants
+      could be thousands of unrelated paginated calls in a large org, when
+      only `LANES_APP_ID` and `LANES_APP_PRIVATE_KEY` can possibly affect
+      this check). `GET /orgs/{org}/actions/secrets/{secret_name}` reads
+      each of those two BY NAME directly -- a 404 means that name isn't
+      granted at the org level at all, nothing further to do for it; a
+      200 means paginating its selected-repository grants (only if its
+      visibility is "selected") to check whether this repository is among
+      them. At most two lookups plus pagination for whichever of those
+      two secrets actually exists, not an org-wide sweep. This is a
+      genuinely different permission footprint than anything else this
+      tool reads -- every other call here is repository-scoped; this one
+      needs organization-level Actions-secrets visibility, which a
+      fine-grained token may not carry even when it can do everything else
+      `repo setup`/`repo audit` do. Fail closed (report "cannot confirm no
+      org secret is granted") when that read isn't available, rather than
+      silently skipping it. **This is also latent in every
       existing batch credential**, for the identical reason the
       environment branch-policy gap above is: nothing here has ever
       checked for an inherited org secret, for any of them. Worth its own
