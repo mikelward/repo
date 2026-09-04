@@ -126,6 +126,9 @@ class FakeGh:
         self.open_prs = []
         self.closed_prs = []
         self.existing_ruleset_id = None
+        # Set by the migration tests: the id a lookup for a legacy ruleset
+        # name resolves to, or None for "there isn't one".
+        self.legacy_ruleset_id = None
         self._name_lookup_calls = 0
         # Sentinel: unset means "always answer with existing_ruleset_id".
         # Set (with existing_ruleset_id_lookup_threshold below) to model
@@ -392,6 +395,13 @@ class FakeGh:
             return "".join(sha + "\n" for sha in shas)
 
         if _RULESETS_LOOKUP_RE.match(endpoint):
+            # A lookup for a legacy name asks a different question, and
+            # fixtures here model one ruleset -- the standard one. Answer
+            # "no such ruleset" without counting it, so the swap thresholds
+            # below stay about the lookups they were written for.
+            match = re.search(r"select\(\.name == (\".*?\")\)", jq or "")
+            if match and json.loads(match.group(1)) in rules.LEGACY_RULESET_NAMES:
+                return f"{self.legacy_ruleset_id}\n" if self.legacy_ruleset_id else ""
             self._name_lookup_calls += 1
             if (
                 self._name_lookup_calls >= self.existing_ruleset_id_lookup_threshold
@@ -806,7 +816,7 @@ class SetupCmdTest(unittest.TestCase):
         fake.all_ruleset_ids = ["42"]
         fake.ruleset_objects["42"] = {
             "id": 42,
-            "name": "merge gates",
+            "name": "main",
             "target": "branch",
             "enforcement": "active",
             "bypass_actors": [{"actor_id": 1, "actor_type": "Team"}],
@@ -878,7 +888,7 @@ class SetupCmdTest(unittest.TestCase):
         fake.all_ruleset_ids = ["42"]
         fake.ruleset_objects["42"] = {
             "id": 42,
-            "name": "merge gates",
+            "name": "main",
             "enforcement": "active",
             "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
             "rules": [
@@ -920,7 +930,7 @@ class SetupCmdTest(unittest.TestCase):
         fake.all_ruleset_ids = ["7"]
         fake.ruleset_objects["7"] = {
             "id": 7,
-            "name": "merge gates",
+            "name": "main",
             "enforcement": "active",
             "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
             "rules": [
@@ -976,7 +986,7 @@ class SetupCmdTest(unittest.TestCase):
         fake.all_ruleset_ids = ["7"]
         fake.ruleset_objects["7"] = {
             "id": 7,
-            "name": "merge gates",
+            "name": "main",
             "enforcement": "active",
             "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
             "rules": [
@@ -1023,7 +1033,7 @@ class SetupCmdTest(unittest.TestCase):
         fake.existing_ruleset_id_after_second_lookup = None  # swapped away before the real apply starts
         fake.ruleset_objects["7"] = {
             "id": 7,
-            "name": "merge gates",
+            "name": "main",
             "enforcement": "active",
             "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
             "rules": [
@@ -1071,7 +1081,7 @@ class SetupCmdTest(unittest.TestCase):
         fake.existing_ruleset_id_lookup_threshold = 3
         fake.ruleset_objects["7"] = {
             "id": 7,
-            "name": "merge gates",
+            "name": "main",
             "enforcement": "active",
             "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
             "rules": [
@@ -1108,7 +1118,7 @@ class SetupCmdTest(unittest.TestCase):
         fake.all_ruleset_ids = ["7"]
         fake.ruleset_objects["7"] = {
             "id": 7,
-            "name": "merge gates",
+            "name": "main",
             "enforcement": "active",
             "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
             "rules": [
@@ -1152,7 +1162,7 @@ class SetupCmdTest(unittest.TestCase):
         fake.all_ruleset_ids = ["7"]
         fake.ruleset_objects["7"] = {
             "id": 7,
-            "name": "merge gates",
+            "name": "main",
             "enforcement": "active",
             "bypass_actors": [{"actor_id": 1, "actor_type": "Team"}],
             "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
@@ -1294,6 +1304,77 @@ class SetupCmdTest(unittest.TestCase):
         code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
         self.assertEqual(code, 1)
         self.assertIn("targets 'tag'", err)
+        self.assertEqual(fake.puts, [])
+
+    def test_a_legacy_named_ruleset_is_renamed_rather_than_rivalled(self):
+        # The migration's whole point: `repo setup` created 'merge gates'
+        # before the standard name settled. Creating a second ruleset and
+        # leaving that one behind would strand its bypass actors and its
+        # scope behind a ruleset that AND-s with the new one, so it is
+        # adopted and renamed in the same write instead.
+        fake = FakeGh()
+        fake.check_runs = {fake.default_head_sha: ["lanes"]}
+        fake.existing_ruleset_id = None
+        fake.legacy_ruleset_id = "7"
+        fake.all_ruleset_ids = ["7"]
+        fake.ruleset_objects["7"] = {
+            "id": 7,
+            "name": "merge gates",
+            "enforcement": "active",
+            "bypass_actors": [{"actor_id": 5, "actor_type": "Team"}],
+            "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+            "rules": [],
+        }
+        code, out, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(fake.puts), 1)
+        self.assertEqual(fake.puts[0][0][3], f"repos/{REPO}/rulesets/7")
+        self.assertEqual(fake.posts, [])
+        written = fake.puts[0][1]
+        self.assertEqual(written["name"], "main")
+        self.assertEqual(written["bypass_actors"], [{"actor_id": 5, "actor_type": "Team"}])
+        self.assertIn("adopted the ruleset named 'merge gates'", out)
+
+    def test_the_plan_names_the_rename_rather_than_an_update(self):
+        # With only the legacy ruleset present there is no 'main' to
+        # update, so a plan saying so would name something that does not
+        # exist and hide the rename.
+        fake = FakeGh()
+        fake.check_runs = {fake.default_head_sha: ["lanes"]}
+        fake.existing_ruleset_id = None
+        fake.legacy_ruleset_id = "7"
+        fake.all_ruleset_ids = ["7"]
+        fake.ruleset_objects["7"] = {
+            "id": 7,
+            "name": "merge gates",
+            "enforcement": "active",
+            "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+            "rules": [],
+        }
+        code, out, err = _run(fake, ["--dry-run", "--rule", "lanes", REPO])
+        plan = out + err
+        self.assertIn("would adopt ruleset 'merge gates' (id 7) and rename it 'main'", plan)
+        self.assertNotIn("would update ruleset 'main'", plan)
+        self.assertEqual(fake.puts, [])
+
+    def test_a_legacy_ruleset_beside_the_standard_one_is_reported(self):
+        # Not deleted -- deciding one ruleset supersedes another is its own
+        # change (see TODO.md). But leaving it unmentioned would let a
+        # duplicate sit there unnoticed, which is the problem this is for.
+        fake = FakeGh()
+        fake.check_runs = {fake.default_head_sha: ["lanes"]}
+        fake.existing_ruleset_id = "1"
+        fake.legacy_ruleset_id = "9"
+        fake.all_ruleset_ids = ["1"]
+        fake.ruleset_objects["1"] = {
+            "id": 1,
+            "name": "main",
+            "enforcement": "active",
+            "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+            "rules": [],
+        }
+        code, _, err = _run(fake, ["--dry-run", "--rule", "lanes", REPO])
+        self.assertIn("'merge gates' (id 9) is still there beside 'main'", err)
         self.assertEqual(fake.puts, [])
 
     def test_an_inactive_ruleset_is_still_refused(self):
@@ -1587,7 +1668,7 @@ class SetupCmdTest(unittest.TestCase):
         fake.all_ruleset_ids = ["7"]
         fake.ruleset_objects["7"] = {
             "id": 7,
-            "name": "merge gates",
+            "name": "main",
             "enforcement": "active",
             "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
             "rules": [
@@ -1658,7 +1739,7 @@ class SetupCmdTest(unittest.TestCase):
         fake.all_ruleset_ids = ["7"]
         fake.ruleset_objects["7"] = {
             "id": 7,
-            "name": "merge gates",
+            "name": "main",
             "enforcement": "active",
             "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
             "rules": [
@@ -1729,7 +1810,7 @@ class SetupCmdTest(unittest.TestCase):
         fake.ruleset_content_change_threshold = 3
         base_object = {
             "id": 7,
-            "name": "merge gates",
+            "name": "main",
             "enforcement": "active",
             "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
             "rules": [
@@ -3496,7 +3577,7 @@ class BootstrapStepTest(unittest.TestCase):
         fake.ruleset_content_change_threshold = 3
         base_object = {
             "id": 7,
-            "name": "merge gates",
+            "name": "main",
             "enforcement": "active",
             "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
             "rules": [
@@ -3566,7 +3647,7 @@ class BootstrapStepTest(unittest.TestCase):
         fake.all_ruleset_ids = ["7"]
         fake.ruleset_objects["7"] = {
             "id": 7,
-            "name": "merge gates",
+            "name": "main",
             "enforcement": "active",
             "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
             "rules": [
@@ -3615,7 +3696,7 @@ class BootstrapStepTest(unittest.TestCase):
         fake.all_ruleset_ids = ["7"]
         fake.ruleset_objects["7"] = {
             "id": 7,
-            "name": "merge gates",
+            "name": "main",
             "enforcement": "active",
             "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
             "rules": [{"type": "required_linear_history"}, {"type": "non_fast_forward"}],
@@ -3650,7 +3731,7 @@ class BootstrapStepTest(unittest.TestCase):
         fake.ruleset_content_change_threshold = 3
         base_object = {
             "id": 7,
-            "name": "merge gates",
+            "name": "main",
             "enforcement": "active",
             "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
             "rules": [
@@ -3705,7 +3786,7 @@ class BootstrapStepTest(unittest.TestCase):
         fake.ruleset_content_change_threshold = 3
         base_object = {
             "id": 7,
-            "name": "merge gates",
+            "name": "main",
             "enforcement": "active",
             "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
             "rules": [

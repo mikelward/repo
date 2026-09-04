@@ -40,7 +40,12 @@ import urllib.parse
 from repo_lib import gh
 from repo_lib.common import error, error_lines
 
-DEFAULT_RULESET_NAME = "merge gates"
+DEFAULT_RULESET_NAME = "main"
+# Names this tool used before DEFAULT_RULESET_NAME settled. A repository
+# carrying one is mid-migration, not misconfigured: it is adopted and
+# renamed in place rather than left beside a new one, so nothing it holds
+# (bypass actors, a narrowed scope, an extra rule type) is lost.
+LEGACY_RULESET_NAMES = ("merge gates",)
 # This fleet's usual three checks -- the lanes docs-vs-code split, Codex's
 # review verdict, zizmor's workflow-injection scan -- used when --rule was
 # never given, matching repo-rules' own default.
@@ -369,6 +374,57 @@ def _lookup_existing_ruleset(repo, ruleset_name):
     return ids[0] if ids else None
 
 
+def _lookup_legacy_ruleset(repo, ruleset_name):
+    """(name, id) of the first ruleset carrying a name this tool used
+    before `ruleset_name`, or (None, None). Raises on a failed lookup, for
+    the same reason _lookup_existing_ruleset does."""
+    for legacy_name in LEGACY_RULESET_NAMES:
+        if legacy_name == ruleset_name:
+            continue
+        found = _lookup_existing_ruleset(repo, legacy_name)
+        if found:
+            return legacy_name, found
+    return None, None
+
+
+def _resolve_ruleset(repo, ruleset_name):
+    """(id, adopted_legacy_name): the ruleset this run will write.
+
+    Prefers one already carrying the standard name. Failing that, adopts a
+    legacy-named one -- the write renames it in place, which keeps its
+    bypass actors, its scope and any rule type outside MANAGED_RULE_TYPES,
+    all of which a create-a-new-one-and-leave-the-old would have stranded
+    behind a second, aggregating ruleset. (None, None) means create."""
+    existing = _lookup_existing_ruleset(repo, ruleset_name)
+    if existing:
+        return existing, None
+    legacy_name, legacy_id = _lookup_legacy_ruleset(repo, ruleset_name)
+    return legacy_id, legacy_name
+
+
+def _note_legacy_ruleset(repo, ruleset_name, existing, adopted_legacy):
+    """Says so when a legacy-named ruleset sits beside the standard one.
+
+    Read-only on purpose. Removing it is the obvious next step and is not
+    taken here: deciding whether one ruleset is superseded by another means
+    comparing rule types, ref scope, every managed parameter, each required
+    check's App binding, and the bypass actors -- five levels, each found
+    only after the previous was fixed. That belongs in its own change with
+    its own review (see TODO.md), not bolted onto a rename."""
+    if adopted_legacy or not existing:
+        return
+    try:
+        legacy_name, legacy_id = _lookup_legacy_ruleset(repo, ruleset_name)
+    except RulesetError:
+        return
+    if legacy_id:
+        error(
+            f"{repo}: note -- '{legacy_name}' (id {legacy_id}) is still there beside "
+            f"'{ruleset_name}'. Rulesets aggregate, so both apply; delete it by hand "
+            "once you have checked it carries nothing the other does not."
+        )
+
+
 def _check_ruleset_ownership(repo, ruleset_id, ruleset_name):
     """Whether a ruleset found under a name this module writes is one it
     can actually write.
@@ -655,6 +711,9 @@ def _build_update_body(repo, existing_id, checks, ruleset_name):
 
     target = dict(original)
     target["rules"] = new_rules
+    # Adopting a legacy-named ruleset renames it here rather than in a
+    # separate call, so the rename and the rules land in one write.
+    target["name"] = ruleset_name
     return target != original, target, has_pull_request
 
 
@@ -698,9 +757,19 @@ def _bypass_actor_note(bypass_actors):
     )
 
 
-def _describe_plan(repo, existing_id, default_branch, checks, ruleset_name, bypass_actors=()):
+def _describe_plan(
+    repo, existing_id, default_branch, checks, ruleset_name, bypass_actors=(), adopted_legacy=None
+):
     lines = []
-    if existing_id:
+    if existing_id and adopted_legacy:
+        # Saying "update ruleset 'main'" here would name a ruleset that
+        # does not exist yet and hide the rename, which is the change the
+        # reader most needs to see (Codex review, mikelward/repo#30).
+        lines.append(
+            f"{repo}: would adopt ruleset '{adopted_legacy}' (id {existing_id}) and rename "
+            f"it '{ruleset_name}'; scope unchanged"
+        )
+    elif existing_id:
         lines.append(f"{repo}: would update ruleset '{ruleset_name}' (id {existing_id}); scope unchanged")
     else:
         lines.append(f"{repo}: would create ruleset '{ruleset_name}' on {default_branch}, main and master")
@@ -759,7 +828,10 @@ def apply_ruleset(
     failed, 2 for a usage error (an empty or control-character check
     name).
 
-    A "fingerprint" is `(existing_id, needs_write, target_body)`: which
+    A "fingerprint" is `(existing_id, adopted_legacy, needs_write,
+    target_body)`: adopted_legacy distinguishes "this id is the standard
+    ruleset" from "this id is a legacy one about to be renamed into it",
+    which target_body cannot, since a rename makes them identical. Which
     ruleset (or None, meaning create) this call is about to act on,
     whether it would actually write anything, and the exact API body it
     would PUT/POST if so. Computed once per pass (see `_plan_write`),
@@ -888,12 +960,13 @@ def apply_ruleset(
             return 1
 
     try:
-        existing = _lookup_existing_ruleset(repo, ruleset_name)
+        existing, adopted_legacy = _resolve_ruleset(repo, ruleset_name)
     except RulesetError:
         return 1
 
     if report is not None:
         report["existing_id"] = existing
+        report["adopted_legacy"] = adopted_legacy
 
     if existing and not _check_ruleset_ownership(repo, existing, ruleset_name):
         return 1
@@ -910,7 +983,7 @@ def apply_ruleset(
     except RulesetError:
         return 1
 
-    fingerprint = (existing, needs_write, target_body)
+    fingerprint = (existing, adopted_legacy, needs_write, target_body)
     if report is not None:
         report["needs_write"] = needs_write
         report["fingerprint"] = fingerprint
@@ -919,18 +992,26 @@ def apply_ruleset(
     if not needs_write:
         if not quiet:
             print(f"{repo}: ruleset '{ruleset_name}' (id {existing}) {NO_OP_MESSAGE}")
+            _note_legacy_ruleset(repo, ruleset_name, existing, adopted_legacy)
             note = _bypass_actor_note((target_body or {}).get("bypass_actors") or [])
             if note:
                 print(note)
         return 0
 
     plan_lines = _describe_plan(
-        repo, existing, default_branch, checks, ruleset_name, target_body.get("bypass_actors") or []
+        repo,
+        existing,
+        default_branch,
+        checks,
+        ruleset_name,
+        target_body.get("bypass_actors") or [],
+        adopted_legacy,
     )
 
     if dry_run:
         for line in plan_lines:
             print(line)
+        _note_legacy_ruleset(repo, ruleset_name, existing, adopted_legacy)
         return 0
 
     if not (force or skip_confirm) and not _confirm(repo, ruleset_name, plan_lines):
@@ -952,7 +1033,7 @@ def apply_ruleset(
     if not _check_allow_rebase(repo):
         return 1
     try:
-        fresh_existing = _lookup_existing_ruleset(repo, ruleset_name)
+        fresh_existing, fresh_adopted_legacy = _resolve_ruleset(repo, ruleset_name)
     except RulesetError:
         return 1
     if fresh_existing and not _check_ruleset_ownership(repo, fresh_existing, ruleset_name):
@@ -984,7 +1065,12 @@ def apply_ruleset(
             error(problem)
             return 1
 
-    fresh_fingerprint = (fresh_existing, fresh_needs_write, fresh_target_body)
+    fresh_fingerprint = (
+        fresh_existing,
+        fresh_adopted_legacy,
+        fresh_needs_write,
+        fresh_target_body,
+    )
     want = fingerprint if expected_fingerprint is _NO_EXPECTATION else expected_fingerprint
     if fresh_fingerprint != want:
         error(f"ruleset '{ruleset_name}' on {repo} no longer matches what was previewed and")
@@ -1004,10 +1090,17 @@ def apply_ruleset(
         except gh.GhError as e:
             error_lines(f"could not update ruleset '{ruleset_name}' on {repo}:", e.stderr)
             return 1
-        print(
-            f"{repo}: updated ruleset '{ruleset_name}' (its scope is unchanged); "
-            f"required checks: {', '.join(checks)}"
-        )
+        if fresh_adopted_legacy:
+            print(
+                f"{repo}: adopted the ruleset named '{fresh_adopted_legacy}' and renamed "
+                f"it '{ruleset_name}' (its scope, bypass actors and any other rules are "
+                f"unchanged); required checks: {', '.join(checks)}"
+            )
+        else:
+            print(
+                f"{repo}: updated ruleset '{ruleset_name}' (its scope is unchanged); "
+                f"required checks: {', '.join(checks)}"
+            )
     else:
         try:
             gh.run_with_input(

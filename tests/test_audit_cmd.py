@@ -318,7 +318,7 @@ def _run(fake, argv):
     return code, out.getvalue(), err.getvalue()
 
 
-def _covering_ruleset(name="merge gates", include=None, exclude=None, bypass_actors=None):
+def _covering_ruleset(name="main", include=None, exclude=None, bypass_actors=None):
     # Default `include` is the FULL hardened set (all three required
     # refs, literally) rather than just "~DEFAULT_BRANCH" -- so a test
     # focused purely on bypass-actor reporting doesn't also trip the
@@ -523,7 +523,7 @@ class AuditCmdTest(unittest.TestCase):
         code, out, err = _run(fake, [REPO])
         self.assertEqual(code, 1, err)
         self.assertIn("[GAP] bypass actors configured on a ruleset covering main:", out)
-        self.assertIn("merge gates: Team 5 (always)", out)
+        self.assertIn("main: Team 5 (always)", out)
 
     def test_no_bypass_actor_on_any_covering_ruleset_is_ok(self):
         fake = FakeGh()

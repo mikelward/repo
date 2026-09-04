@@ -138,6 +138,25 @@
       a `120000` blob, so `CLAUDE.md -> AGENTS.md` is reachable without a
       clone, and `plan_gaps` already refuses to overwrite one.
 
+- [ ] **The bootstrap failure does not say `--no-bootstrap` unblocks it.**
+      A repository the item below describes fails with GitHub's own
+      rejection relayed verbatim -- "Changes must be made through a pull
+      request" -- which says nothing about what to do next, though
+      `--no-bootstrap` gets the rest of `repo setup` through. The
+      maintainer chose this over building the write path itself
+      (2026-09-04: "branch-and-PR write path is a TODO for later"), so it
+      is the near-term half: name the flag in the error, and say the
+      scaffold still needs adding by hand.
+
+- [ ] **Which `lanes.conf` docs rule `repo setup` should generate is
+      undecided.** The scaffold writes one today, but the fleet is split:
+      eight repositories including `mikelward/lanes` use the shorthand
+      `docs **/*.md`, while `mikelward/lanes`'s own README documents the
+      narrow pair `docs *.md` + `docs docs/**/*.md` as the standard. Put
+      to the maintainer 2026-09-04, unanswered. Whichever wins, the other
+      half of the fleet needs converting, and `mikelward/lanes`'s own
+      `TODO.md` carries the matching entry.
+
 - [ ] **A repository a PRIOR `repo setup` run already protected has no
       path to a scaffold fix here at all.** The ordering fix above only
       covers a ruleset THIS run is the one creating; apply_gaps's direct
@@ -153,6 +172,71 @@
       is adding may be the very thing that makes exist) pass. Until then,
       an already-protected repository missing a scaffold file needs it
       added by hand, through an ordinary PR.
+
+## repo setup: one ruleset per repository
+
+- [x] **Converge on a single branch ruleset named `main`.** The name was
+      `merge gates`, chosen before there was a fleet to be consistent
+      with; half the fleet then had a hand-made ruleset called `main` and
+      the other half gained a second one beside it (maintainer,
+      2026-09-04). Rulesets AGGREGATE -- a pull request must satisfy every
+      one covering the branch -- so a duplicate is not broken, just
+      confusing, except that `allowed_merge_methods` INTERSECTS and a
+      genuine conflict there leaves nothing able to merge at all. Now:
+      `DEFAULT_RULESET_NAME` is `main`, and a ruleset found under a legacy
+      name (`LEGACY_RULESET_NAMES`) is adopted and renamed in the same
+      write, so its bypass actors, scope and any extra rule type survive.
+      `adopted_legacy` joins the fingerprint, since a rename makes the two
+      rulesets identical in `target_body` and nothing else distinguishes
+      "this is the standard one" from "this is about to become it".
+
+- [ ] **Delete a superseded legacy ruleset, rather than only reporting
+      it.** Where both names exist, `repo setup` now says so and leaves
+      both in place. Deleting the redundant one was written and then cut
+      back to this (maintainer, 2026-09-04) after review found the same
+      class of gap five times, each only visible once the previous was
+      fixed:
+
+      1. it holds a rule type outside `MANAGED_RULE_TYPES`;
+      2. it covers a ref the standard ruleset does not -- and an update
+         leaves the standard one's own conditions alone, so a hand-made
+         `main` scoped to `~DEFAULT_BRANCH` beside a legacy one covering
+         `refs/heads/master` is the real case;
+      3. it sets a managed parameter more strictly -- an approval count,
+         code-owner review, strict-up-to-date;
+      4. it binds a required check to a specific App via `integration_id`,
+         which a context-name comparison misses;
+      5. it grants no bypass actor where the standard one does, so
+         deleting it lets that actor past every remaining gate.
+
+      The lesson is the shape, not the list: "is A at least as strict as
+      B" was being reimplemented field by field, which can always be one
+      item short. Whoever picks this up should consider refusing to delete
+      anything whose managed rules, scope and bypass actors are not
+      byte-identical to the target's -- that cannot be one item short,
+      at the cost of keeping duplicates that differ harmlessly. Also
+      needed regardless: the deletion must be a planned mutation (shown in
+      `--dry-run`, covered by the confirmation, and part of the
+      fingerprint), it must run on the no-write path too since an
+      already-correct `main` is the steady state, and where the
+      merge-method conflict scan is told to skip a ruleset on the promise
+      it will go, a failed delete has to fail the step.
+
+- [ ] **`repo audit` does not report a surviving legacy ruleset.** `repo
+      setup` notes one on every run, which is how the fleet finds them,
+      but there is no read-only way to ask "which repositories still have
+      two?" short of running setup against each. A `[FIX]` for a ruleset
+      named in `LEGACY_RULESET_NAMES` would make the existing fleet sweep
+      answer that.
+
+- [ ] **Widening `main`'s own scope to the hardened three refs.** An
+      update leaves an existing ruleset's conditions alone, so a hand-made
+      `main` keeps whatever narrow scope it was given -- while a freshly
+      created one gets `~DEFAULT_BRANCH`, `refs/heads/main` and
+      `refs/heads/master`. Closing that would also make most legacy
+      rulesets genuinely superseded, so it is worth doing before the
+      deletion above. It is the first change here that would rewrite an
+      existing ruleset's conditions, which is why it is its own item.
 
 ## repo cleanup
 
