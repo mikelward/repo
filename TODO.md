@@ -467,6 +467,23 @@ doesn't set today).
       the safe, checkable shape is simply "first in the graph, nothing it
       waits on," which is what the real design's own `init` job already
       is (typelauncher's `ci.yml`: "First in the graph, no `needs:`").
+      **`init` having no `needs:` only makes it ELIGIBLE to run early --
+      nothing about that shape stops `gate` from being scheduled
+      concurrently with it, or finishing first** (Codex review,
+      mikelward/repo#26): GitHub schedules jobs by dependency
+      satisfaction, not by which one was declared "first" in the file, so
+      unless `gate` itself depends -- directly or transitively through the
+      heavy-job graph -- on `init`, a short or cache-warmed job graph can
+      let `gate` complete and publish its terminal status before a
+      delayed `init` (queued behind a concurrency limit, a slow runner
+      allocation) ever posts `pending`. That's the same stale-status
+      problem this whole `init` requirement exists to shrink, just
+      relocated: instead of a stale PREVIOUS run's status sitting there
+      too long, it's this run's own terminal status landing with no
+      `pending` ever having appeared ahead of it. The detected publisher
+      shape needs `gate`'s job to declare `init` in its own `needs:`
+      (directly, or transitively through every path to it), not just
+      `init` declaring no incoming ones.
       **The step's own trigger matters too -- a credentialed `gate` step
       inside a workflow that never runs `pull_request_target` is not a
       working publisher for pull requests either** (Codex review,
@@ -821,12 +838,26 @@ doesn't set today).
       accepting an unprovable filter as compliant, with a footnote, is not
       a safe substitute for that proof. The detector doesn't need to parse
       every filter shape to close this: it needs to require the trigger
-      have NO narrowing filter beyond a safe default (bare
-      `pull_request_target:`, or an explicit `types:` list that still
-      covers every ruleset-relevant event) and fail closed -- report
-      "cannot confirm," `[FIX]` -- on any `branches:`, `paths:`, or
-      narrowed `types:` it finds, rather than accepting the filter's
-      presence as a documented, tolerated gap.
+      have NO narrowing filter beyond a safe default -- and "bare
+      `pull_request_target:`" is NOT that safe default, which the
+      previous revision of this item got backwards** (Codex review,
+      mikelward/repo#26): a trigger with no `types:` at all fires only
+      for GitHub's default activity types -- `opened`, `synchronize`,
+      `reopened` -- which does not include `edited`. This item's own
+      earlier rounds require `edited` to fire: it's the event a title
+      edit or a retarget produces, and `init`/`gate` re-running on it is
+      exactly what shrinks the stale-status window discussed there.
+      `scaffold.py`'s own generated trigger (`scaffold.py:255`) lists
+      `types: [opened, synchronize, reopened, edited]` for precisely this
+      reason. A bare trigger structurally cannot re-run on a title edit or
+      retarget at all, so accepting it as "safe" would silently defeat the
+      init/gate re-run mechanism this section's own earlier items depend
+      on. The detector needs an EXPLICIT `types:` list covering at least
+      `opened`, `synchronize`, `reopened`, and `edited`, and fail closed --
+      report "cannot confirm," `[FIX]` -- on a bare trigger, any
+      `branches:`/`paths:` filter, or a `types:` list missing any of those
+      four, rather than accepting the filter's presence (or absence) as a
+      documented, tolerated gap.
       **This same gap is latent in the existing batch credentials too**
       (`NPM_UPDATE_APP_ID`/`GRADLE_UPDATE_APP_ID`/`RUST_UPDATE_APP_ID` and
       their private keys) -- `_ensure_environment` gives every one of them
@@ -909,18 +940,25 @@ doesn't set today).
       the hardened three-ref set for a freshly created ruleset, or the
       existing ruleset's own conditions when one was already there, per
       `_compute_scope` -- and nothing more; see the branch-policy item's
-      own note on this) AND NO organization-scoped copy of either secret
-      reaching the repository (see the credential-placement item's own
-      note on this -- fail closed, "cannot confirm," when that read isn't
-      available, rather than silently treating it as clean), the lanes App
-      still covering the repository, AND the ruleset's `lanes` entry bound
-      to THAT App's own id specifically (compliant); `pull_request_target`
-      with the secrets missing, repository-scoped, in the wrong
-      environment, OR reachable via an inherited organization secret, the
-      environment's branch policy missing an entry or
-      carrying an extra one, the App no longer covering the repository,
-      OR the ruleset entry unbound or bound to a different App's id
-      (broken, `[FIX]`); and
+      own note on this) AND the environment carries NO other protection
+      (no required reviewers, no wait timer, no custom deployment
+      protection rule -- see the protection-rules item's own note) AND NO
+      organization-scoped copy of either secret reaching the repository
+      (see the credential-placement item's own note on this -- fail
+      closed, "cannot confirm," when that read isn't available, rather
+      than silently treating it as clean), the lanes App still covering
+      the repository AND its installation neither suspended
+      (`suspended_at` null) nor missing the Statuses API write permission
+      (see the installation-health item's own note), AND the ruleset's
+      `lanes` entry bound to THAT App's own id specifically (compliant);
+      `pull_request_target` with the secrets missing, repository-scoped,
+      in the wrong environment, OR reachable via an inherited organization
+      secret, the environment's branch policy missing an entry, carrying
+      an extra one, OR the environment carrying a required-reviewer/
+      wait-timer/custom protection rule, the App no longer covering the
+      repository, its installation suspended, OR its permissions no
+      longer including the Statuses API write, OR the ruleset entry
+      unbound or bound to a different App's id (broken, `[FIX]`); and
       plain `pull_request` with `LANES_APP_ID`/`LANES_APP_PRIVATE_KEY`
       present anywhere -- a dead credential, since a workflow that never
       passes `app-id`/`app-private-key` to `mode: gate` never uses them,
@@ -1186,10 +1224,22 @@ doesn't set today).
       this check). `GET /orgs/{org}/actions/secrets/{secret_name}` reads
       each of those two BY NAME directly -- a 404 means that name isn't
       granted at the org level at all, nothing further to do for it; a
-      200 means paginating its selected-repository grants (only if its
-      visibility is "selected") to check whether this repository is among
-      them. At most two lookups plus pagination for whichever of those
-      two secrets actually exists, not an org-wide sweep. This is a
+      200 means branching on that secret's own `visibility` field, not
+      assuming "selected" (Codex review, mikelward/repo#26: an earlier
+      revision of this fix only handled the "selected" case, silently
+      passing a repository that inherits a secret set to `all` or
+      `private` -- `visibility: all` reaches every repository in the org
+      with no per-repo grant list to check at all, and `visibility:
+      private` reaches every PRIVATE repository in the org the same way,
+      so either would let the check read "not granted" while the
+      repository actually inherits the credential). The three cases: `all`
+      -- reachable, no further read needed, report as a hit; `private` --
+      reachable if and only if the audited repository's own visibility is
+      private (a fact this tool's repository read already carries);
+      `selected` -- paginate the selected-repository grants and check
+      whether this repository is among them, same as before. At most two
+      lookups plus pagination for whichever of those two secrets actually
+      exists and is `selected`, not an org-wide sweep. This is a
       genuinely different permission footprint than anything else this
       tool reads -- every other call here is repository-scoped; this one
       needs organization-level Actions-secrets visibility, which a
@@ -1310,6 +1360,21 @@ doesn't set today).
       check immediately before the ruleset write -- not reuse the
       run-start detection -- and refuse the write if either the branch tip
       or the structural verdict has changed since.
+      **That revalidation only covered the audited branch, but the
+      compliant predicate above requires every ruleset-targeted branch to
+      have a working publisher -- the two items say different things about
+      the same write** (Codex review, mikelward/repo#26): if another
+      targeted branch (not the one named on the command line) loses its
+      publisher during the membership/credential window -- or the ruleset
+      itself gains a new target while that window runs -- the audited
+      branch alone can still read as unchanged, and this revalidation as
+      written would let the write through across a scope that's now wrong
+      or broken elsewhere. The pre-write revalidation needs to re-resolve
+      the ruleset's CURRENT scope (the same `_compute_scope` read, run
+      again, not reused from earlier in the same command) and rerun the
+      full structural check against every branch it now names, not just
+      the audited one -- refusing the write if any of them fails, changed,
+      or the scope itself has changed since the run-start detection.
 - [ ] **Don't default `repo create --scaffold` onto the App design yet --
       that's the owner's call, not autopilot's, once the above exists.**
       `repo_lib/scaffold.py` only ever generates the plain-`pull_request`
