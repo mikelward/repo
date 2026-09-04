@@ -16,6 +16,7 @@ REPO = "owner/repo"
 _DEFAULT_BRANCH_RE = re.compile(r"^repos/([^/]+/[^/]+)$")
 _RULES_RE = re.compile(r"^repos/([^/]+/[^/]+)/rules/branches/(.+)$")
 _RULESETS_ALL_RE = re.compile(r"^repos/([^/]+/[^/]+)/rulesets\?includes_parents=true$")
+_RULESETS_LOOKUP_RE = re.compile(r"^repos/([^/]+/[^/]+)/rulesets\?includes_parents=false$")
 _RULESET_ONE_RE = re.compile(r"^repos/([^/]+/[^/]+)/rulesets/([^/]+)$")
 _MASTER_BRANCH_RE = re.compile(r"^repos/([^/]+/[^/]+)/branches/master$")
 _COMMITS_HEAD_RE = re.compile(r"^repos/([^/]+/[^/]+)/commits\?per_page=1(?:&sha=(.+))?$")
@@ -112,6 +113,7 @@ class FakeGh:
         self.ruleset_objects = {}  # id -> ruleset dict
         self.ruleset_read_fails = set()  # ids whose read fails
         self.rulesets_list_fails = None  # gh stderr text, or None
+        self.rulesets_lookup_fails = None  # the by-name lookup's own failure
         self.master_exists = False
         self.master_error = None  # non-404 stderr text, or None
         self.master_redirect_name = None  # branch a renamed master redirects to
@@ -210,6 +212,19 @@ class FakeGh:
         if m:
             shas = self.open_prs if m.group(2) == "open" else self.closed_prs
             return "".join(sha + "\n" for sha in shas)
+
+        if _RULESETS_LOOKUP_RE.match(endpoint):
+            # rules.find_legacy_rulesets's own by-name lookup, over the
+            # repository's OWN rulesets only.
+            if self.rulesets_lookup_fails is not None:
+                raise gh.GhError(self.rulesets_lookup_fails)
+            match = re.search(r"select\(\.name == (\".*?\")\)", jq or "")
+            wanted = json.loads(match.group(1)) if match else None
+            return "".join(
+                f"{rid}\n"
+                for rid, obj in self.ruleset_objects.items()
+                if obj.get("name") == wanted
+            )
 
         if _RULESETS_ALL_RE.match(endpoint):
             if self.rulesets_list_fails is not None:
@@ -1038,6 +1053,33 @@ class AuditCmdTest(unittest.TestCase):
         code, out, err = _run(fake, [REPO, "lanes"])
         self.assertEqual(code, 0, err)
         self.assertIn("[ok]", out)
+
+
+class LegacyRulesetAuditTest(unittest.TestCase):
+    def test_no_legacy_ruleset_is_ok(self):
+        code, out, err = _run(FakeGh(), [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[ok] no ruleset left under a name this tool used before 'main'", out)
+
+    def test_a_legacy_named_ruleset_is_a_fix_naming_setup(self):
+        # The read-only half of what `repo setup` already reports: asking
+        # "which repositories still have two?" should not mean running a
+        # command that writes against each of them.
+        fake = FakeGh()
+        fake.ruleset_ids = ["9"]
+        fake.ruleset_objects["9"] = _covering_ruleset(name="merge gates")
+        fake.ruleset_objects["9"]["id"] = 9
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[FIX] 'merge gates' (id 9) is a ruleset name this tool used before", out)
+        self.assertIn("`repo setup` adopts it", out)
+
+    def test_a_failed_lookup_exits_1_rather_than_reading_as_none(self):
+        fake = FakeGh()
+        fake.rulesets_lookup_fails = "gh: HTTP 500: boom\n"
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 1)
+        self.assertNotIn("no ruleset left under a name", out)
 
 
 class AutoMergeAuditTest(unittest.TestCase):

@@ -83,11 +83,16 @@
       and keep a Todo to tighten it after the next setup pass"). Once
       every repository has been through `repo setup --credential ...`,
       route them through `gap()` instead of `fix()` in
-      `audit_cmd.audit_secrets`, `audit_auto_merge`, and
-      `audit_delete_branch_on_merge`, and flip the
-      `assertEqual(code, 0, ...)` assertions in `SecretsAuditTest`,
-      `AutoMergeAuditTest`, and `DeleteBranchOnMergeAuditTest` -- they are
-      written to have to change. Until then the hubs and every converted
+      `audit_cmd.audit_secrets`, `audit_auto_merge`,
+      `audit_delete_branch_on_merge`, and `audit_legacy_rulesets`, and
+      flip the `assertEqual(code, 0, ...)` assertions in
+      `SecretsAuditTest`, `AutoMergeAuditTest`,
+      `DeleteBranchOnMergeAuditTest`, and `LegacyRulesetAuditTest` -- they
+      are written to have to change. The legacy-ruleset one has its own
+      condition on top: `repo setup` closes it only when the duplicate is
+      identical to the survivor, so promoting it before the fleet has been
+      swept would fail every repository holding one that genuinely differs
+      and needs a human. Until then the hubs and every converted
       caller read a repository-level credential through `inherit`, so
       nothing is broken by the lax reading, only less isolated than it
       will be.
@@ -215,12 +220,14 @@
       about to go": a deletable ruleset is identical to the target, and
       the target always allows rebase, so the scan can never flag one.
 
-- [ ] **`repo audit` does not report a surviving legacy ruleset.** `repo
-      setup` notes one on every run, which is how the fleet finds them,
-      but there is no read-only way to ask "which repositories still have
-      two?" short of running setup against each. A `[FIX]` for a ruleset
-      named in `LEGACY_RULESET_NAMES` would make the existing fleet sweep
-      answer that.
+- [x] **`repo audit` reports a surviving legacy ruleset.** `repo setup`
+      notes one on every run, which is how the fleet found them, but that
+      meant running a write command against a repository to ask a
+      read-only question. `audit_legacy_rulesets` reports a `[FIX]` for
+      each ruleset named in `LEGACY_RULESET_NAMES`, reusing
+      `rules.find_legacy_rulesets` (repository-owned only -- an org-level
+      ruleset sharing the name is not this tool's to touch) so the two
+      commands cannot come to disagree about which names count.
 
 - [x] **Widening `main`'s own scope to the hardened three refs.** An
       update used to leave an existing ruleset's conditions alone, so a
