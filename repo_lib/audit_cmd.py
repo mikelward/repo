@@ -220,6 +220,31 @@ def _targeting_status(include, exclude):
 # The weekly dependency batches, keyed by the caller workflow file a consumer
 # carries. Each hub's publish job reads its credential from an environment
 # of the same name (see that repository's docs/PAT.md).
+def audit_duplicate_rulesets(repo, ok, note):
+    """Reports a SECOND ruleset carrying the managed name.
+
+    GitHub does not make a ruleset's name unique within a repository, so
+    two can be named `main` and both apply. `repo setup` writes the first
+    and says it is leaving the other alone; nothing fixes it, because what
+    to do when the two disagree is undecided (see TODO.md).
+
+    [CHECK], therefore, not [FIX] or [GAP]: [FIX] would claim `repo setup`
+    closes it, which it does not, and [GAP] would fail the audit over a
+    state no command here can resolve."""
+    try:
+        extras = rules.find_duplicate_standard_rulesets(repo)
+    except rules.RulesetError:
+        raise SystemExit(1)
+    if not extras:
+        ok(f"exactly one ruleset is named '{rules.DEFAULT_RULESET_NAME}'")
+        return
+    note(
+        f"more than one ruleset is named '{rules.DEFAULT_RULESET_NAME}' -- "
+        f"also id(s) {', '.join(extras)}. Rulesets aggregate, so all of them apply, and "
+        "`repo setup` writes only the first. Reconcile them by hand"
+    )
+
+
 def audit_legacy_rulesets(repo, ok, fix):
     """Reports a ruleset still carrying a name this tool used before
     `rules.DEFAULT_RULESET_NAME`.
@@ -546,6 +571,12 @@ def run(args):
         # it.
         print(f"  [FIX] {message}")
 
+    def note(message):
+        # Neither ok nor a gap: something a human has to look at that no
+        # command here resolves, so it neither passes nor fails the audit.
+        # Same tier the unevaluated-ruleset-pattern report already uses.
+        print(f"  [CHECK] {message}")
+
     print(f"{repo} (@{branch})")
 
     # Flagged, not just noted (matching the shell source's own reasoning):
@@ -869,6 +900,7 @@ def run(args):
         error_lines(f"could not check whether {repo} has a branch named 'master':", detail)
         raise SystemExit(1)
 
+    audit_duplicate_rulesets(repo, ok, note)
     audit_legacy_rulesets(repo, ok, fix)
     audit_auto_merge(repo, ok, fix)
     audit_delete_branch_on_merge(repo, ok, fix)

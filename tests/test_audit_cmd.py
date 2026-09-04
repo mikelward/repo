@@ -1055,6 +1055,32 @@ class AuditCmdTest(unittest.TestCase):
         self.assertIn("[ok]", out)
 
 
+class DuplicateRulesetAuditTest(unittest.TestCase):
+    def test_one_ruleset_under_the_managed_name_is_ok(self):
+        fake = FakeGh()
+        fake.ruleset_ids = ["1"]
+        fake.ruleset_objects["1"] = _covering_ruleset(name="main")
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[ok] exactly one ruleset is named 'main'", out)
+
+    def test_a_second_one_under_the_same_name_is_a_check_not_a_gap(self):
+        # Nothing here resolves it -- `repo setup` writes the first and
+        # says it is leaving the other alone, because what to do when the
+        # two disagree is undecided. So it neither passes nor fails the
+        # audit: a [FIX] would claim setup closes it, and a [GAP] would
+        # fail every repository over a state no command can fix.
+        fake = FakeGh()
+        fake.ruleset_ids = ["1", "2"]
+        for rid in ("1", "2"):
+            fake.ruleset_objects[rid] = _covering_ruleset(name="main")
+            fake.ruleset_objects[rid]["id"] = int(rid)
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[CHECK] more than one ruleset is named 'main'", out)
+        self.assertIn("also id(s) 2", out)
+
+
 class LegacyRulesetAuditTest(unittest.TestCase):
     def test_no_legacy_ruleset_is_ok(self):
         code, out, err = _run(FakeGh(), [REPO])
