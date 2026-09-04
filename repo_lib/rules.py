@@ -346,7 +346,7 @@ def describe_missing(items):
     )
 
 
-def _lookup_ruleset_ids(repo, ruleset_name):
+def _lookup_ruleset_ids(repo, ruleset_name, include_parents=False):
     """Every ruleset id on `repo` named `ruleset_name`, oldest first.
 
     A list, not one id: GitHub does not make a ruleset's name unique
@@ -363,7 +363,7 @@ def _lookup_ruleset_ids(repo, ruleset_name):
             [
                 "api",
                 "--paginate",
-                f"repos/{repo}/rulesets?includes_parents=false",
+                f"repos/{repo}/rulesets?includes_parents={'true' if include_parents else 'false'}",
                 "--jq",
                 f".[] | select(.name == {_json_string(ruleset_name)}) | .id",
             ]
@@ -392,8 +392,16 @@ def _lookup_existing_ruleset(repo, ruleset_name):
     return ids[0] if ids else None
 
 
-def find_rulesets_named(repo, ruleset_name=DEFAULT_RULESET_NAME):
+def find_rulesets_named(repo, ruleset_name=DEFAULT_RULESET_NAME, include_parents=False):
     """Every ruleset id on `repo` carrying `ruleset_name`, oldest first.
+
+    include_parents=True counts an org- or enterprise-level ruleset of the
+    same name too. That is the right question for a READ: an inherited one
+    aggregates with the repository's own, so leaving it out reports "just
+    the one" over two that both apply (Codex review, mikelward/repo#33).
+    It is the wrong question for a write, which is why this module's own
+    calls leave it False -- `repo setup` can only ever adopt, update or
+    delete a ruleset the repository owns.
 
     All of them, not just the ones after the first: none and exactly one
     are different answers, and a caller handed only the extras cannot tell
@@ -404,7 +412,7 @@ def find_rulesets_named(repo, ruleset_name=DEFAULT_RULESET_NAME):
     Public for the same reason find_legacy_rulesets is: `repo audit` asks
     the same question read-only, and asking it twice from two definitions
     is how the two come to disagree."""
-    return _lookup_ruleset_ids(repo, ruleset_name)
+    return _lookup_ruleset_ids(repo, ruleset_name, include_parents=include_parents)
 
 
 def find_legacy_rulesets(repo, ruleset_name=DEFAULT_RULESET_NAME):
@@ -1347,10 +1355,15 @@ def apply_ruleset(
         report["introduces_pr_protection"] = introduces_pr_protection
 
     if not needs_write and not deletions:
+        # Outside the quiet guard, like the one on the write path below and
+        # for the same reason: this is the pass that would notice a second
+        # ruleset created since the preview ran, and an already-correct
+        # ruleset is the steady state, so the no-op return is where a real
+        # apply usually ends up (Codex review, mikelward/repo#33).
+        _report_duplicate_standard(repo, ruleset_name, existing, duplicates)
         if not quiet:
             print(f"{repo}: ruleset '{ruleset_name}' (id {existing}) {NO_OP_MESSAGE}")
             _report_excluded_hardened(repo, ruleset_name, target_body, default_branch)
-            _report_duplicate_standard(repo, ruleset_name, existing, duplicates)
             _report_blocked_legacy(repo, ruleset_name, blocked)
             note = _bypass_actor_note((target_body or {}).get("bypass_actors") or [])
             if note:
