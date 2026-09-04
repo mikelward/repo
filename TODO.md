@@ -345,27 +345,65 @@ doesn't set today).
       Four states: plain `pull_request` with no App secrets present (the
       accepted baseline -- not a finding); `pull_request_target` with both
       secrets correctly in the `lanes` environment AND the lanes App still
-      an installed, "selected" member of the repository (compliant);
-      `pull_request_target` with the secrets missing, repository-scoped, or
-      in the wrong environment, OR the App no longer a member (broken,
-      `[FIX]`); and plain `pull_request` with `LANES_APP_ID`/
-      `LANES_APP_PRIVATE_KEY` present anywhere -- a dead credential, since a
-      workflow that never passes `app-id`/`app-private-key` to `mode: gate`
-      never uses them, the same "stale copy for a workflow the repository
-      does not use" treatment `credentials.py` already gives a batch
-      credential. **The App-membership half is required, not optional**
-      (Codex review, mikelward/repo#26): a repository that had the App
-      removed after a compliant `repo setup` run still has correctly-placed
+      covering the repository (compliant); `pull_request_target` with the
+      secrets missing, repository-scoped, or in the wrong environment, OR
+      the App no longer covering the repository (broken, `[FIX]`); and
+      plain `pull_request` with `LANES_APP_ID`/`LANES_APP_PRIVATE_KEY`
+      present anywhere -- a dead credential, since a workflow that never
+      passes `app-id`/`app-private-key` to `mode: gate` never uses them,
+      the same "stale copy for a workflow the repository does not use"
+      treatment `credentials.py` already gives a batch credential.
+      **The App-membership half is required, not optional** (Codex
+      review, mikelward/repo#26): a repository that had the App removed
+      after a compliant `repo setup` run still has correctly-placed
       secrets, but the installation-token exchange those secrets feed can
       no longer succeed, so no legitimate `lanes` status can be published
       at all -- reading the secret placement alone reports it compliant
-      while its publisher is actually dead. `repo_lib/apps.py`'s
-      `resolve_installation` already does the membership check `repo
-      setup --app` uses; `repo audit` needs to run the equivalent read, not
-      infer membership from a past `repo setup` run having succeeded --
-      the ruleset's own `codex`/`lanes` check-history read stays green
-      regardless, since GitHub keeps reporting the LAST status that
-      publisher posted, however long ago.
+      while its publisher is actually dead.
+      **"Covering the repository" is deliberately not "a selected member"
+      -- that was wrong in an earlier revision of this item, and so was
+      the function it cited** (Codex review, mikelward/repo#26, twice, in
+      the same round): `repo_lib/apps.py`'s `resolve_installation`
+      (lines 65-104) only resolves the installation's id and its
+      `repository_selection` ("selected" vs. "all") -- it never checks
+      whether THIS repo is in a selected installation's member list, so
+      citing it as "the membership check" was itself wrong. The actual
+      per-repo check is `plan_app_step` (lines 122-158), which calls
+      `resolve_installation` and then either lists the selected
+      installation's repositories and looks for a match, or -- when the
+      installation covers "all repositories" -- confirms the repo exists
+      and reports `ALREADY_ALL` without needing a membership list at all.
+      That second case is a real, fully-covered outcome, not a narrower
+      one: `apps.apply_step` already treats it as a no-op success, same
+      as `ALREADY_MEMBER`. Requiring "selected" specifically, as an
+      earlier revision of this item did, would report `[FIX]` on a
+      repository an all-repositories install already protects -- a
+      `[FIX]` `repo setup --app` could never clear, since `apply_step`
+      correctly does nothing for `ALREADY_ALL` in the first place.
+      `repo audit` needs `plan_app_step`'s actual verdict (`ALREADY_MEMBER`
+      or `ALREADY_ALL`, not just "selected and present"), not a fresh
+      reimplementation of it and not `resolve_installation` alone -- and
+      not an inference from a past `repo setup` run having succeeded,
+      since the ruleset's own `codex`/`lanes` check-history read stays
+      green regardless of current membership, GitHub keeps reporting the
+      LAST status that publisher posted, however long ago.
+      **Out of scope for this item, on purpose: a repository whose lanes
+      workflow has been removed from the default branch entirely, with no
+      App secrets left either** (Codex review, mikelward/repo#26). None of
+      the four states above name that repository, because it isn't
+      running either design -- it has no lanes gate producing anything at
+      all, which is a general "required check nothing currently produces"
+      problem this tool already has a place for (`rules.never_reported`/
+      `describe_missing`, exercised in `repo audit`'s own required-check
+      section), not something specific to distinguishing the App design
+      from the default one. Worth naming precisely, though, since that
+      existing check's own `_collect_reported` walks the default branch
+      head, then recent open and closed pull requests, for whether a
+      context has EVER reported -- which can find an old success from
+      before the workflow was deleted and read the check as fine, not as
+      currently missing its producer. That is a real, general gap in an
+      existing check, not a new one this item's four states should try to
+      absorb -- its own follow-up, if it turns out to matter in practice.
 - [ ] **`repo setup --credential LANES_APP_ID=... --credential
       LANES_APP_PRIVATE_KEY=...`** should place them like a batch
       credential does today: fan into the `lanes` environment for a repo
