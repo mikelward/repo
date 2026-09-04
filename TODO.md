@@ -143,15 +143,16 @@
       a `120000` blob, so `CLAUDE.md -> AGENTS.md` is reachable without a
       clone, and `plan_gaps` already refuses to overwrite one.
 
-- [ ] **The bootstrap failure does not say `--no-bootstrap` unblocks it.**
-      A repository the item below describes fails with GitHub's own
-      rejection relayed verbatim -- "Changes must be made through a pull
-      request" -- which says nothing about what to do next, though
-      `--no-bootstrap` gets the rest of `repo setup` through. The
-      maintainer chose this over building the write path itself
-      (2026-09-04: "branch-and-PR write path is a TODO for later"), so it
-      is the near-term half: name the flag in the error, and say the
-      scaffold still needs adding by hand.
+- [x] **The bootstrap failure names `--no-bootstrap`.** A repository the
+      item below describes fails with GitHub's own rejection relayed
+      verbatim -- "Changes must be made through a pull request" -- which
+      says nothing about what to do next. `apply_gaps`'s ref-update
+      failure now adds a line naming the way past both of the two causes
+      it cannot tell apart: rerun if the branch simply moved, and
+      `--no-bootstrap` to get the rest of `repo setup` through a branch
+      this step cannot write to at all, with the scaffold left to add by
+      hand. The write path itself is still the item below (maintainer,
+      2026-09-04: "branch-and-PR write path is a TODO for later").
 
 - [ ] **Which `lanes.conf` docs rule `repo setup` should generate is
       undecided.** The scaffold writes one today, but the fleet is split:

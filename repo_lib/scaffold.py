@@ -920,6 +920,20 @@ def apply_gaps(repo, default_branch, plan):
             "(moved since the plan was built, or a ruleset already blocks a direct push):",
             e.stderr,
         )
+        # GitHub's own rejection for the second case reads "Changes must be
+        # made through a pull request", which says nothing about what to do
+        # next. Neither cause is diagnosable from the response, so this
+        # names the way past both rather than picking one: rerunning fixes
+        # a branch that moved, and --no-bootstrap gets the rest of
+        # `repo setup` through on a branch this step cannot write to at all
+        # (there is no branch-and-pull-request write path here yet -- see
+        # TODO.md), leaving the scaffold to be added by hand.
+        error(
+            "Rerun if the branch simply moved. If a ruleset is blocking the push, "
+            "`--no-bootstrap` skips this step so the rest of `repo setup` can finish -- "
+            "the missing scaffold file(s) then need adding by hand, through an ordinary "
+            "pull request."
+        )
         return None
 
     return commit_sha
