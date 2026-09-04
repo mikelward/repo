@@ -346,9 +346,16 @@ def describe_missing(items):
     )
 
 
-def _lookup_existing_ruleset(repo, ruleset_name):
-    """The id of the ruleset named `ruleset_name` on `repo`, or None. A
-    failed lookup must never read as "there is no ruleset": that would
+def _lookup_ruleset_ids(repo, ruleset_name):
+    """Every ruleset id on `repo` named `ruleset_name`, oldest first.
+
+    A list, not one id: GitHub does not make a ruleset's name unique
+    within a repository, so two can carry the same one and both apply
+    (Codex review, mikelward/repo#31). Collapsing them here would let a
+    run report a name handled while a second ruleset under it kept
+    aggregating.
+
+    A failed lookup must never read as "there is no ruleset": that would
     create a duplicate that ANDs with a real one this run simply couldn't
     see -- so it raises RulesetError instead."""
     try:
@@ -370,7 +377,15 @@ def _lookup_existing_ruleset(repo, ruleset_name):
             e.stderr,
         )
         raise RulesetError()
-    ids = [line.strip() for line in out.splitlines() if line.strip()]
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def _lookup_existing_ruleset(repo, ruleset_name):
+    """The id of the ruleset this run will write under `ruleset_name`, or
+    None. The first of several sharing the name -- which is a real
+    possibility, see _lookup_ruleset_ids; the others are not adopted here,
+    and TODO.md tracks reporting them."""
+    ids = _lookup_ruleset_ids(repo, ruleset_name)
     return ids[0] if ids else None
 
 
@@ -390,15 +405,24 @@ def find_legacy_rulesets(repo, ruleset_name=DEFAULT_RULESET_NAME):
     for legacy_name in LEGACY_RULESET_NAMES:
         if legacy_name == ruleset_name:
             continue
-        rid = _lookup_existing_ruleset(repo, legacy_name)
-        if rid:
+        # Every id under the name, not just the first: two rulesets can
+        # share one, and reporting or deleting only one of them would
+        # leave the other applying with nothing to say so (Codex review,
+        # mikelward/repo#31).
+        for rid in _lookup_ruleset_ids(repo, legacy_name):
             found.append((legacy_name, rid))
     return found
 
 
 def _lookup_legacy_ruleset(repo, ruleset_name):
     """(name, id) of the first ruleset carrying a name this tool used
-    before `ruleset_name`, or (None, None)."""
+    before `ruleset_name`, or (None, None) -- what an adoption renames.
+
+    One, deliberately: a rename can only make one of them the standard
+    ruleset. Where two share a legacy name, the second is still a legacy
+    ruleset on the next run -- beside the standard one this run just made
+    -- and the deletion path handles it there. Converging in two runs
+    beats renaming both to the same name in one."""
     for legacy_name, rid in find_legacy_rulesets(repo, ruleset_name):
         return legacy_name, rid
     return None, None
