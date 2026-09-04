@@ -249,18 +249,19 @@
       evaluates the refs the write actually brings into range rather than
       the narrower ones it replaces.
 
-- [ ] **A second ruleset under the STANDARD name is still picked over
-      silently.** GitHub does not make a ruleset's name unique within a
-      repository, and `find_legacy_rulesets` now returns every id sharing
-      a legacy name (Codex review, mikelward/repo#31) -- but
-      `_lookup_existing_ruleset` still answers with the first id under
-      `main`, so a repository holding two of those has one updated and the
-      other left applying with nothing said. Pre-existing, not introduced
-      by the deletion work: the deletion path only ever targets legacy
-      names, so nothing new is deleted on the strength of it. The fix is
-      the same shape as the legacy one -- report every id, adopt the
-      first -- and it wants its own change, since it decides what happens
-      when the survivor and the second copy disagree.
+- [ ] **Two rulesets under the STANDARD name are reported, not
+      reconciled.** GitHub does not make a ruleset's name unique within a
+      repository, and `_lookup_existing_ruleset` writes the first id under
+      `main`. That is no longer silent -- `repo setup` says which one it
+      wrote and which it left alone, and `repo audit` reports a `[CHECK]`
+      (not `[FIX]`: nothing here closes it; not `[GAP]`: it would fail the
+      audit over a state no command can resolve). What is still open is
+      the decision itself: what should happen when the two disagree.
+      Adopting both is not available -- a rename would just produce two
+      rulesets sharing the new name. The candidates are updating every id
+      under the name, or deleting the extras on the same byte-identical
+      test the legacy path uses, and both are writes against a ruleset a
+      human made deliberately.
 
 ## repo cleanup
 

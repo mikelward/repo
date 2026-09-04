@@ -133,6 +133,9 @@ class FakeGh:
         self.open_prs = []
         self.closed_prs = []
         self.existing_ruleset_id = None
+        # Set instead when a test needs more than one ruleset under the
+        # managed name -- GitHub does not make it unique.
+        self.existing_ruleset_ids = None
         # Set by the migration tests: the id a lookup for a legacy ruleset
         # name resolves to, or None for "there isn't one".
         self.legacy_ruleset_id = None
@@ -422,6 +425,8 @@ class FakeGh:
                     return "".join(f"{rid}\n" for rid in self.legacy_ruleset_ids)
                 return f"{self.legacy_ruleset_id}\n" if self.legacy_ruleset_id else ""
             self._name_lookup_calls += 1
+            if self.existing_ruleset_ids is not None:
+                return "".join(f"{rid}\n" for rid in self.existing_ruleset_ids)
             if (
                 self._name_lookup_calls >= self.existing_ruleset_id_lookup_threshold
                 and self.existing_ruleset_id_after_second_lookup != "__unset__"
@@ -1646,6 +1651,25 @@ class SetupCmdTest(unittest.TestCase):
             "conditions": legacy_scope if legacy_scope is not None else scope,
             "rules": legacy_rules if legacy_rules is not None else rules_body,
         }
+
+    def test_a_second_ruleset_under_the_managed_name_is_reported(self):
+        # GitHub does not make the name unique, so this run writes the
+        # first and the other keeps applying -- including whatever
+        # stricter rule or bypass actor it carries. Reported rather than
+        # resolved: deciding between two rulesets that disagree is its own
+        # change (see TODO.md), and picking one silently is the problem.
+        fake = FakeGh()
+        self._ruleset_with_scope(fake, list(_HARDENED_SCOPE))
+        fake.legacy_ruleset_ids = []
+        fake.all_ruleset_ids = ["7", "8"]
+        fake.ruleset_objects["8"] = dict(fake.ruleset_objects["7"], id=8)
+        fake.existing_ruleset_ids = ["7", "8"]
+        code, out, err = _run(fake, ["--force", "-v", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("more than one ruleset is named 'main'", err)
+        self.assertIn("writes id 7 and leaves id 8 alone", err)
+        self.assertEqual(fake.puts, [])
+        self.assertEqual(fake.deleted_rulesets, [])
 
     def test_an_identical_legacy_ruleset_is_deleted(self):
         # Rulesets aggregate, so a duplicate is not broken -- but

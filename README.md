@@ -123,9 +123,10 @@ audit` is the read-only counterpart: it reports whether a branch's rules
 (required checks, conversation resolution, up-to-date merges, force-push
 and deletion protection, bypass actors, and -- when auditing the
 repository's real default branch -- whether every covering ruleset also
-targets `refs/heads/main` and `refs/heads/master`, and whether a ruleset
-under a name this tool used before `main` is still there) already hold,
-without writing anything. It also audits where secrets live. The fleet's shared credentials -- the
+targets `refs/heads/main` and `refs/heads/master`, whether a ruleset under
+a name this tool used before `main` is still there, and whether more than
+one ruleset carries the name `main` at all) already hold, without writing
+anything. It also audits where secrets live. The fleet's shared credentials -- the
 weekly dependency batches' `<HUB>_PAT` (or `<HUB>_APP_ID` +
 `<HUB>_APP_PRIVATE_KEY` pair, for mikelward/npm-update, gradle-update and
 rust-update) and mikelward/ci-commit-artifact's `CI_COMMIT_ARTIFACT_TOKEN`

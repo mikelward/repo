@@ -383,10 +383,23 @@ def _lookup_ruleset_ids(repo, ruleset_name):
 def _lookup_existing_ruleset(repo, ruleset_name):
     """The id of the ruleset this run will write under `ruleset_name`, or
     None. The first of several sharing the name -- which is a real
-    possibility, see _lookup_ruleset_ids; the others are not adopted here,
-    and TODO.md tracks reporting them."""
+    possibility, see _lookup_ruleset_ids. The others are reported by
+    find_duplicate_standard_rulesets rather than silently passed over, but
+    they are not adopted, updated or deleted here: what to do when two
+    rulesets under the managed name disagree is its own decision (see
+    TODO.md), and picking one quietly is what this is fixing."""
     ids = _lookup_ruleset_ids(repo, ruleset_name)
     return ids[0] if ids else None
+
+
+def find_duplicate_standard_rulesets(repo, ruleset_name=DEFAULT_RULESET_NAME):
+    """The ids under `ruleset_name` this run is NOT the one writing --
+    every one after the first. Empty in the ordinary case.
+
+    Public for the same reason find_legacy_rulesets is: `repo audit`
+    reports the same finding read-only, and asking the question twice from
+    two definitions is how the two come to disagree."""
+    return _lookup_ruleset_ids(repo, ruleset_name)[1:]
 
 
 def find_legacy_rulesets(repo, ruleset_name=DEFAULT_RULESET_NAME):
@@ -429,18 +442,24 @@ def _lookup_legacy_ruleset(repo, ruleset_name):
 
 
 def _resolve_ruleset(repo, ruleset_name):
-    """(id, adopted_legacy_name): the ruleset this run will write.
+    """(id, adopted_legacy_name, duplicate_ids): the ruleset this run will
+    write, and any others already carrying the same managed name.
 
     Prefers one already carrying the standard name. Failing that, adopts a
     legacy-named one -- the write renames it in place, which keeps its
     bypass actors, its scope and any rule type outside MANAGED_RULE_TYPES,
     all of which a create-a-new-one-and-leave-the-old would have stranded
-    behind a second, aggregating ruleset. (None, None) means create."""
-    existing = _lookup_existing_ruleset(repo, ruleset_name)
-    if existing:
-        return existing, None
+    behind a second, aggregating ruleset. A falsy id means create.
+
+    duplicate_ids comes out of the same lookup rather than a second one:
+    an extra by-name lookup here was a real race once (see setup_cmd.py's
+    own docstring on the fingerprint), and a report is no reason to
+    reintroduce the shape of it."""
+    ids = _lookup_ruleset_ids(repo, ruleset_name)
+    if ids:
+        return ids[0], None, ids[1:]
     legacy_name, legacy_id = _lookup_legacy_ruleset(repo, ruleset_name)
-    return legacy_id, legacy_name
+    return legacy_id, legacy_name, []
 
 
 def _comparable_ruleset(body):
@@ -545,6 +564,23 @@ def _still_superseded(repo, ruleset_name, survivor_id, legacy_name, legacy_id):
     if survivor.get("name") != ruleset_name or candidate.get("name") != legacy_name:
         return False
     return _comparable_ruleset(candidate) == _comparable_ruleset(survivor)
+
+
+def _report_duplicate_standard(repo, ruleset_name, existing, extras):
+    """Says so when more than one ruleset carries the managed name.
+
+    Rulesets aggregate, so the others apply too -- and this run writes
+    only the first, so a second one keeps whatever it says, including a
+    stricter rule nobody asked for or a bypass actor nobody sees.
+    Reported, not resolved: silently picking the first was the problem,
+    and deciding what happens when the two disagree is its own change
+    (see TODO.md)."""
+    for rid in extras:
+        error(
+            f"{repo}: note -- more than one ruleset is named '{ruleset_name}'; this run "
+            f"writes id {existing} and leaves id {rid} alone. Rulesets aggregate, so both "
+            "apply. Check what the other one says, then reconcile them by hand."
+        )
 
 
 def _report_blocked_legacy(repo, ruleset_name, blocked):
@@ -1268,7 +1304,7 @@ def apply_ruleset(
             return 1
 
     try:
-        existing, adopted_legacy = _resolve_ruleset(repo, ruleset_name)
+        existing, adopted_legacy, duplicates = _resolve_ruleset(repo, ruleset_name)
     except RulesetError:
         return 1
 
@@ -1309,6 +1345,7 @@ def apply_ruleset(
         if not quiet:
             print(f"{repo}: ruleset '{ruleset_name}' (id {existing}) {NO_OP_MESSAGE}")
             _report_excluded_hardened(repo, ruleset_name, target_body, default_branch)
+            _report_duplicate_standard(repo, ruleset_name, existing, duplicates)
             _report_blocked_legacy(repo, ruleset_name, blocked)
             note = _bypass_actor_note((target_body or {}).get("bypass_actors") or [])
             if note:
@@ -1333,6 +1370,7 @@ def apply_ruleset(
         for line in plan_lines:
             print(line)
         _report_excluded_hardened(repo, ruleset_name, target_body, default_branch)
+        _report_duplicate_standard(repo, ruleset_name, existing, duplicates)
         _report_blocked_legacy(repo, ruleset_name, blocked)
         return 0
 
@@ -1355,7 +1393,9 @@ def apply_ruleset(
     if not _check_allow_rebase(repo):
         return 1
     try:
-        fresh_existing, fresh_adopted_legacy = _resolve_ruleset(repo, ruleset_name)
+        fresh_existing, fresh_adopted_legacy, fresh_duplicates = _resolve_ruleset(
+            repo, ruleset_name
+        )
     except RulesetError:
         return 1
     if fresh_existing and not _check_ruleset_ownership(repo, fresh_existing, ruleset_name):
@@ -1491,6 +1531,7 @@ def apply_ruleset(
             f"it was identical to '{ruleset_name}'"
         )
     if not quiet:
+        _report_duplicate_standard(repo, ruleset_name, fresh_existing, fresh_duplicates)
         _report_blocked_legacy(repo, ruleset_name, fresh_blocked)
     if delete_failed:
         return 1
