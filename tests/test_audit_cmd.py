@@ -1064,6 +1064,19 @@ class DuplicateRulesetAuditTest(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertIn("[ok] exactly one ruleset is named 'main'", out)
 
+    def test_no_ruleset_of_that_name_is_not_reported_as_exactly_one(self):
+        # None and exactly one are different answers, and the version that
+        # only saw the extras could not tell them apart -- so a repository
+        # protected solely by an inherited or differently-named ruleset
+        # got a false "exactly one ruleset is named 'main'" (Codex review,
+        # mikelward/repo#33).
+        fake = FakeGh()
+        fake.ruleset_ids = []
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[ok] no repository ruleset is named 'main'", out)
+        self.assertNotIn("exactly one ruleset", out)
+
     def test_a_second_one_under_the_same_name_is_a_check_not_a_gap(self):
         # Nothing here resolves it -- `repo setup` writes the first and
         # says it is leaving the other alone, because what to do when the

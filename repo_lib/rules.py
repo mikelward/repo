@@ -392,14 +392,19 @@ def _lookup_existing_ruleset(repo, ruleset_name):
     return ids[0] if ids else None
 
 
-def find_duplicate_standard_rulesets(repo, ruleset_name=DEFAULT_RULESET_NAME):
-    """The ids under `ruleset_name` this run is NOT the one writing --
-    every one after the first. Empty in the ordinary case.
+def find_rulesets_named(repo, ruleset_name=DEFAULT_RULESET_NAME):
+    """Every ruleset id on `repo` carrying `ruleset_name`, oldest first.
 
-    Public for the same reason find_legacy_rulesets is: `repo audit`
-    reports the same finding read-only, and asking the question twice from
-    two definitions is how the two come to disagree."""
-    return _lookup_ruleset_ids(repo, ruleset_name)[1:]
+    All of them, not just the ones after the first: none and exactly one
+    are different answers, and a caller handed only the extras cannot tell
+    them apart -- which is how "exactly one ruleset is named 'main'" got
+    printed for a repository that has none (Codex review,
+    mikelward/repo#33).
+
+    Public for the same reason find_legacy_rulesets is: `repo audit` asks
+    the same question read-only, and asking it twice from two definitions
+    is how the two come to disagree."""
+    return _lookup_ruleset_ids(repo, ruleset_name)
 
 
 def find_legacy_rulesets(repo, ruleset_name=DEFAULT_RULESET_NAME):
@@ -1530,8 +1535,17 @@ def apply_ruleset(
             f"{repo}: deleted the superseded ruleset '{legacy_name}' (id {legacy_id}) -- "
             f"it was identical to '{ruleset_name}'"
         )
+    # NOT gated on quiet, unlike the two around it. quiet means "the
+    # preview already said this about state that has not changed" -- but
+    # this list comes from the fresh lookup, and a second ruleset created
+    # since the preview ran is exactly what the preview could not have
+    # named. Since setup_cmd's real apply runs quiet unless --verbose,
+    # gating it here would suppress the only warning there is (Codex
+    # review, mikelward/repo#33). The cost is saying it twice on a
+    # repository that already had one, which is a repository that needs
+    # the reminder anyway.
+    _report_duplicate_standard(repo, ruleset_name, fresh_existing, fresh_duplicates)
     if not quiet:
-        _report_duplicate_standard(repo, ruleset_name, fresh_existing, fresh_duplicates)
         _report_blocked_legacy(repo, ruleset_name, fresh_blocked)
     if delete_failed:
         return 1
