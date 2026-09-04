@@ -45,11 +45,12 @@ DEFAULT_RULESET_NAME = "merge gates"
 # review verdict, zizmor's workflow-injection scan -- used when --rule was
 # never given, matching repo-rules' own default.
 DEFAULT_CHECKS = ["lanes", "codex", "zizmor"]
-# The rule types this module manages. A ruleset holding any other type is
-# not ours to overwrite -- see _check_ruleset_ownership. required_linear_history
-# and non_fast_forward take no parameters, unlike the other two: managing them
-# is purely a presence check (see _build_update_body).
-_MANAGED_RULE_TYPES = {
+# The rule types this module manages. Everything else in a ruleset it
+# updates is carried through untouched (see _build_update_body), so this
+# set says what gets written, not what may be present.
+# required_linear_history and non_fast_forward take no parameters, unlike
+# the other two: managing them is purely a presence check.
+MANAGED_RULE_TYPES = {
     "required_status_checks",
     "pull_request",
     "required_linear_history",
@@ -369,13 +370,20 @@ def _lookup_existing_ruleset(repo, ruleset_name):
 
 
 def _check_ruleset_ownership(repo, ruleset_id, ruleset_name):
-    """A name match is not ownership. If a ruleset carries a rule type this
-    module doesn't manage, or isn't actively enforced, refuses to touch it
-    -- overwriting it would silently delete protections or report a gate
-    that doesn't gate."""
+    """Whether a ruleset found under a name this module writes is one it
+    can actually write.
+
+    Two ways it isn't. One GitHub does not actively enforce would report a
+    gate that does not gate. A tag-targeted one would take the branch
+    rules added here and be rejected on PUT -- after the dry run promised
+    the update, and after earlier `repo setup` steps have written (Codex
+    review, mikelward/repo#29).
+
+    Rule types outside MANAGED_RULE_TYPES are not one of those ways: an
+    update edits only those four and copies the rest through untouched."""
     try:
         out = gh.run(
-            ["api", f"repos/{repo}/rulesets/{ruleset_id}", "--jq", ".enforcement, (.rules[].type)"]
+            ["api", f"repos/{repo}/rulesets/{ruleset_id}", "--jq", ".enforcement, .target"]
         )
     except gh.GhError as e:
         error_lines(
@@ -385,24 +393,21 @@ def _check_ruleset_ownership(repo, ruleset_id, ruleset_name):
         )
         return False
     lines = out.splitlines()
-    if not lines:
+    if len(lines) < 2:
         error(f"could not read ruleset '{ruleset_name}' (id {ruleset_id}): empty response")
         return False
-    enforcement, types = lines[0], [t for t in lines[1:] if t]
+    enforcement, target = lines[0].strip(), lines[1].strip()
+    if target != "branch":
+        error(f"ruleset '{ruleset_name}' (id {ruleset_id}) on {repo} targets '{target}',")
+        error("not 'branch'. The rules this writes are branch rules; GitHub would")
+        error("reject them on a ruleset of that target. Rename it, or point this run")
+        error("at a different one.")
+        return False
     if enforcement != "active":
         error(f"ruleset '{ruleset_name}' (id {ruleset_id}) on {repo} is '{enforcement}', not")
         error("'active', so its rules block nothing. Setting a check list on it")
         error("would report a gate that does not gate. Activate it, or point this")
         error("run at a different ruleset.")
-        return False
-    unmanaged = [t for t in types if t not in _MANAGED_RULE_TYPES]
-    if unmanaged:
-        error(f"ruleset '{ruleset_name}' (id {ruleset_id}) on {repo} holds rules this")
-        error("module does not manage:")
-        for t in unmanaged:
-            error(f"  {t}")
-        error("Overwriting it would delete them. Rename that ruleset, or point")
-        error("this run at a different one.")
         return False
     return True
 
