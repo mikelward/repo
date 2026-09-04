@@ -221,6 +221,13 @@
       happens AFTER the write, because what makes the duplicate safe to
       delete is that the survivor holds everything it held -- true only
       once the write has landed -- and a failed delete fails the step.
+      Immediately before each delete, `_still_superseded` re-reads BOTH
+      rulesets and compares them as they now are (Codex review,
+      mikelward/repo#31): the plan's own reading is a network round trip
+      old by then, since the survivor's write sits between, and it
+      compares against the body this run meant to write rather than the
+      one GitHub actually stored. A read it cannot make keeps the
+      duplicate rather than counting as "unchanged".
       The merge-method conflict scan needed no "skip the one that is
       about to go": a deletable ruleset is identical to the target, and
       the target always allows rebase, so the scan can never flag one.

@@ -174,6 +174,9 @@ class FakeGh:
         self._ruleset_object_reads = {}
         self.ruleset_objects_after_change = {}  # rid -> replacement object
         self.ruleset_content_change_threshold = 1
+        # rid -> read count after which reads of that id fail, for the
+        # "could not tell" half of a recheck (as distinct from "changed").
+        self.ruleset_read_fails_after = {}
         self.master_exists = False
         self.master_error = None
         self.master_redirect_name = None  # branch a renamed master redirects to
@@ -439,6 +442,8 @@ class FakeGh:
         if m:
             rid = m.group(2)
             self._ruleset_object_reads[rid] = self._ruleset_object_reads.get(rid, 0) + 1
+            if self._ruleset_object_reads[rid] > self.ruleset_read_fails_after.get(rid, 1 << 30):
+                raise gh.GhError("gh: HTTP 500: Internal Server Error\n")
             if (
                 self._ruleset_object_reads[rid] > self.ruleset_content_change_threshold
                 and rid in self.ruleset_objects_after_change
@@ -706,6 +711,17 @@ class FakeGh:
         body = json.loads(input_bytes.decode())
         if method == "PUT":
             self.puts.append((args, body))
+            m = _RULESET_ONE_RE.match(endpoint)
+            if m:
+                # A successful PUT replaces the stored ruleset, so a later
+                # read sees what was written -- which is what a re-read
+                # right before deleting a duplicate is asking about
+                # (Codex review, mikelward/repo#31). Modeling the write as
+                # invisible would make that check compare the survivor's
+                # PRE-write body and never delete anything.
+                stored = dict(body)
+                stored.setdefault("id", int(m.group(2)) if m.group(2).isdigit() else m.group(2))
+                self.ruleset_objects[m.group(2)] = stored
             if _SCAFFOLD_CONTENTS_PUT_RE.match(endpoint):
                 # push_initial_commit's own bootstrap write, for a
                 # repository whose branch has no commits yet -- the one
@@ -1025,6 +1041,27 @@ class SetupCmdTest(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertEqual(len(fake.puts), 1)
         self.assertEqual((out + err).count("excludes refs/heads/master"), 1)
+
+    def test_the_default_branch_token_in_the_exclusions_is_recognized(self):
+        # An exclusion may itself be written ~DEFAULT_BRANCH, and
+        # comparing that token against the resolved refs/heads/<default>
+        # would miss a ruleset excluding the very branch this protects
+        # (Codex review, mikelward/repo#31).
+        fake = FakeGh()
+        self._ruleset_with_scope(fake, list(_HARDENED_SCOPE), exclude=["~DEFAULT_BRANCH"])
+        code, out, err = _run(fake, ["--force", "-v", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("already matches; nothing to do", out)
+        # Named as written, not as resolved, so the ref reported is the
+        # one to go looking for in the ruleset.
+        self.assertIn("excludes ~DEFAULT_BRANCH", err)
+
+    def test_excluding_all_branches_is_recognized_too(self):
+        fake = FakeGh()
+        self._ruleset_with_scope(fake, list(_HARDENED_SCOPE), exclude=["~ALL"])
+        code, out, err = _run(fake, ["--force", "-v", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("excludes ~ALL", err)
 
     def test_a_pattern_in_the_exclusions_is_reported_as_unevaluated(self):
         # Literal matching only, here as everywhere else in this module:
@@ -1695,6 +1732,45 @@ class SetupCmdTest(unittest.TestCase):
             i for i, c in enumerate(fake.calls) if "DELETE" in c and c[-1].endswith("/rulesets/9")
         )
         self.assertLess(put_index, delete_index)
+
+    def test_a_duplicate_edited_during_the_write_is_not_deleted(self):
+        # The plan reads the duplicate before the survivor's own write, so
+        # the window between that read and the delete is a network round
+        # trip wide -- an administrator editing the duplicate inside it
+        # would otherwise have it deleted on a reading that no longer
+        # holds (Codex review, mikelward/repo#31). Simulated by swapping
+        # the duplicate's content in after its first read.
+        fake = FakeGh()
+        self._matching_pair(fake)
+        fake.ruleset_objects["1"]["rules"] = [
+            r for r in fake.ruleset_objects["1"]["rules"] if r["type"] != "non_fast_forward"
+        ]
+        changed = dict(fake.ruleset_objects["9"])
+        changed["rules"] = [*changed["rules"], {"type": "required_signatures"}]
+        fake.ruleset_objects_after_change["9"] = changed
+        # The seventh read of the duplicate is the one _still_superseded
+        # makes, right before the delete; everything before it -- the
+        # plan, the merge-method scans, the fingerprint recompute -- sees
+        # the unchanged object, so this lands in exactly the window the
+        # earlier checks cannot cover.
+        fake.ruleset_content_change_threshold = 6
+        code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 1)
+        self.assertEqual(fake.deleted_rulesets, [])
+        self.assertIn("no longer identical", err)
+        # The survivor's own write still happened -- the duplicate going
+        # is the part that was unsafe, not the protection being written.
+        self.assertEqual(len(fake.puts), 1)
+
+    def test_a_failed_re_read_before_the_delete_keeps_the_duplicate(self):
+        # "Could not tell" is not "unchanged": a read this cannot make
+        # must never be the reason a ruleset is deleted.
+        fake = FakeGh()
+        self._matching_pair(fake)
+        fake.ruleset_read_fails_after["9"] = 6
+        code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 1)
+        self.assertEqual(fake.deleted_rulesets, [])
 
     def test_a_failed_deletion_fails_the_step(self):
         fake = FakeGh()
