@@ -4337,6 +4337,13 @@ class BootstrapStepTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("could not update main to the scaffold gap-fill's commit", err)
         self.assertIn("moved since the plan was built, or a ruleset already blocks a direct push", err)
+        # Neither cause is diagnosable from GitHub's own response, so the
+        # error names the way past both -- including the flag that gets
+        # the rest of `repo setup` through a branch this step cannot write
+        # to at all, which its rejection ("Changes must be made through a
+        # pull request") says nothing about.
+        self.assertIn("`--no-bootstrap` skips this step", err)
+        self.assertIn("adding by hand", err)
         self.assertIn("failed on: bootstrap", err)
 
     def test_a_branch_reset_backward_is_refused_rather_than_silently_restored(self):
