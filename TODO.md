@@ -335,9 +335,30 @@ doesn't set today).
       whole time, letting `repo setup` bind `lanes` to an App with no
       currently-working publisher. Closing this needs resolving the
       referenced ref to a concrete revision and checking it against a
-      documented minimum compatible revision (a tag or SHA, sourced from
+      documented compatible revision (a tag or SHA, sourced from
       `mikelward/lanes`' own TODO.md/CHANGELOG stating when App-publishing
-      actually landed), failing closed below that revision.
+      actually landed), failing closed outside that revision.
+      **"A minimum compatible revision" -- as first stated -- only
+      protects against too OLD; it assumes every later commit stays
+      compatible forever, which nothing guarantees** (Codex review,
+      mikelward/repo#26, P1): a minimum-revision check accepts `@main`,
+      any later tag, or any descendant commit as long as it's newer than
+      the known-good floor -- but a REGRESSION in `mikelward/lanes` itself
+      (a bug that breaks status publication, or a deliberate change that
+      removes it) would still be newer than that floor and would still
+      pass. This item has spent many rounds establishing that a
+      structurally-correct-looking publisher that can't actually publish
+      is exactly the failure to close, and a monotonic minimum check
+      reopens that same hole one level up, at the dependency itself
+      rather than at the calling workflow. Closing it for real needs an
+      explicit ALLOWLIST of specifically reviewed-good revisions (not an
+      open-ended "at or above X" comparison) -- or, short of maintaining
+      one, some other mechanism that actually confirms the referenced
+      implementation still publishes, which this tool has no way to do
+      without executing it. An allowlist means every `mikelward/lanes`
+      release this rollout wants to support has to be added deliberately,
+      which is real ongoing maintenance -- state that cost plainly rather
+      than assuming a minimum-version check was the cheaper equivalent.
       **Reading the referenced revision's own `action.yml` -- floated as
       an equal alternative directly above -- does not actually establish
       the thing that matters, and isn't a substitute for the
@@ -1035,7 +1056,23 @@ doesn't set today).
       earlier framing of this estimate had it. Its latency, rate-limit
       usage, and failure behavior belong alongside the other four variable-
       cost operations, not folded into "a handful" the way it was.
-      All five belong in this estimate together, and all fail
+      **A sixth operation belongs here too, and it can be the largest of
+      the six on a ruleset with multiple targets: the publisher detector's
+      own reads, repeated per target branch, plus the revalidation right
+      before binding** (Codex review, mikelward/repo#26, P2): fetching and
+      parsing each target branch's workflow text, resolving the referenced
+      `mikelward/lanes` ref for each `classify`/`init`/`gate` step found,
+      and checking it against the compatible-revision allowlist all scale
+      with however many branches the ruleset's hardened scope covers and
+      however many distinct workflow/action references appear across
+      them -- and the "bind last" ordering item's own re-read-and-rerun
+      requirement means a chunk of this happens TWICE in one `repo setup`
+      run, once to detect and once to revalidate immediately before the
+      write. Declaring five operations "the complete estimate" left out
+      what could be the dominant share of the interactive latency,
+      rate-limit usage, and failure surface a multi-target repository
+      actually pays.
+      All six belong in this estimate together, and all fail
       closed the same way: an unavailable or incomplete read refuses the
       step rather than reporting a clean sweep it couldn't actually
       confirm. Interactive, not scheduled either way,
@@ -1080,6 +1117,26 @@ doesn't set today).
       passes `app-id`/`app-private-key` to `mode: gate` never uses them,
       the same "stale copy for a workflow the repository does not use"
       treatment `credentials.py` already gives a batch credential.
+      **The compliant/broken split above starts from "`pull_request_target`
+      present" and checks infrastructure from there, but never actually
+      requires the publisher-detector's own full verdict -- the
+      structurally valid, unique `init`/`gate` pair every earlier
+      correction in this item built up** (Codex review, mikelward/repo#26,
+      P1): a repository with the right trigger, correctly-placed secrets,
+      the right environment, App membership, and a bound ruleset entry --
+      every infrastructure check above -- but no `gate` step at all, or one
+      that fails any of the earlier structural requirements (wrong `pr:`,
+      results: not corresponding to a real `classify`, wrong mode, missing
+      environment selection, an unpinned or too-old `lanes` revision) would
+      still satisfy this predicate as written, since none of that is
+      actually checked here. That is precisely the "correctly-shaped
+      infrastructure, no working publisher" failure this whole item exists
+      to catch, just relocated into the one place that was supposed to be
+      the summary of it. Both compliant and broken need to incorporate the
+      publisher detector's own verdict directly -- compliant requires it
+      positively confirmed a valid publisher, broken (or a state distinct
+      from both, if the trigger's present but the detector can't confirm a
+      publisher at all) covers everything else.
       **"Reachable via an inherited organization secret" cannot be
       `[FIX]` across the board -- for two of the three visibility modes,
       nothing this tool (or any per-repository action) can do actually
