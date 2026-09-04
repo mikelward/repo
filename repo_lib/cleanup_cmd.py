@@ -32,8 +32,18 @@ which is the safe direction: they are offered, never swept.
 
 Deleting a branch is not quite reversible from here, so:
 
-- **Merged branches are the only thing deleted without asking per branch**,
-  and only after the plan is written and confirmed (or --force given).
+- **Nothing is deleted without being chosen.** The run asks in two stages,
+  each over its own list: the merged branches first, then the unmerged ones
+  worth offering. Each stage takes all of them, none of them, or a walk
+  through one at a time, and everything starts selected -- the common case
+  is "yes, all of these". Two stages rather than one because the questions
+  differ in kind: a merged branch is provably redundant and the only
+  question is whether you want it gone, while an unmerged one is a judgment
+  call per branch. One combined list would put those one keystroke apart.
+- **Where prompt_toolkit is installed the stages are checkbox lists**, and
+  where it is not they are the same question in plain text. It is imported
+  lazily and its absence is not an error: `repo` runs from a checkout with
+  no install step, and that stays true.
 - **The plan prints; the deletion stream after it does not.** The plan is
   what the confirmation is about. The two lines each deletion writes are
   not, and hundreds of them scrolled past are not a record either, so they
@@ -42,8 +52,9 @@ Deleting a branch is not quite reversible from here, so:
   anything is deleted, and each branch's restore command is flushed
   before its own delete request -- sweeping with nowhere to write the way
   back is sweeping with no way back.
-- **Unmerged branches are never swept.** With --include-unmerged, each is
-  offered individually, with its age, how many commits would be lost, and
+- **Unmerged branches are never swept.** They are offered -- on a terminal,
+  and never under --force, whose whole meaning is "do not ask" -- with
+  their age, how many commits would be lost, and
   whether its pull request was closed without merging. Which ones get
   offered turns on that last point: a branch whose pull request was CLOSED
   without merging AGAINST THE DEFAULT BRANCH is offered whatever its age,
@@ -53,8 +64,7 @@ Deleting a branch is not quite reversible from here, so:
   nobody deciding anything, and this command can cause that itself by
   sweeping the merged lower branch. A branch with NO pull request is
   offered only once its last commit is --older-than days old, since a date
-  is the only evidence there is and recent work should not be asked about. That flag
-  refuses --force: a per-branch judgment cannot be made unattended.
+  is the only evidence there is and recent work should not be asked about.
 - **Every deletion prints the full SHA it deleted**, with the `gh api`
   call that recreates the ref from it -- the form that works from
   anywhere, since a `git push` needs a clone that already has the object
@@ -136,7 +146,7 @@ def add_arguments(parser):
         metavar="DAYS",
         help=(
             "how old an unmerged branch's last commit must be before "
-            f"--include-unmerged offers it (default {DEFAULT_OLDER_THAN_DAYS}). "
+            f"the unmerged stage offers it (default {DEFAULT_OLDER_THAN_DAYS}). "
             "Not applied to a branch whose pull request was closed "
             "without merging against the default branch: that is somebody "
             "saying it is abandoned, rather than a guess from a date. A "
@@ -150,8 +160,8 @@ def add_arguments(parser):
         "--include-unmerged",
         action="store_true",
         help=(
-            "also offer each unmerged branch older than --older-than, one at "
-            "a time. Cannot be combined with --force"
+            "accepted and ignored -- offering unmerged branches is now what "
+            "an interactive run does, so this no longer has to be asked for"
         ),
     )
     parser.add_argument(
@@ -578,7 +588,7 @@ def _grouped_lines(entries, indent="  "):
     return lines
 
 
-def _describe_plan(repo, plan, default_branch, older_than, include_unmerged):
+def _describe_plan(repo, plan, default_branch, older_than, offer_unmerged):
     deletable, offerable, kept, skipped, failed = plan
     lines = []
 
@@ -590,15 +600,15 @@ def _describe_plan(repo, plan, default_branch, older_than, include_unmerged):
 
     if offerable:
         lines.append("")
-        verb = "to offer one at a time" if include_unmerged else "NOT deleted"
+        verb = "to ask about" if offer_unmerged else "NOT deleted"
         lines.append(
             f"Unmerged -- pull request closed against {default_branch}, or "
             f"last commit at least {older_than}d ago -- "
             f"{verb} ({len(offerable)}):"
         )
         lines.extend(_grouped_lines(offerable))
-        if not include_unmerged:
-            lines.append("  (pass --include-unmerged to be asked about each of these)")
+        if not offer_unmerged:
+            lines.append("  (these are only offered on a terminal, and never under --force)")
 
     if kept:
         lines.append("")
@@ -623,45 +633,122 @@ def _describe_plan(repo, plan, default_branch, older_than, include_unmerged):
     return lines
 
 
-def _confirm(count):
-    """True if the user confirmed deleting the merged branches. False means
-    "stop, nothing was deleted" -- the caller has already had the plan
-    printed."""
-    if not sys.stdin.isatty():
-        error("stdin is not a terminal and --force was not given, so no branches")
-        error("were deleted rather than either blocking on a question nobody can")
-        error("answer or silently deleting unconfirmed. Pass --force to delete")
-        error("non-interactively, or run this from a terminal.")
-        return False
-    print(
-        f"Delete the {count} merged branch{'es' if count != 1 else ''} above? [y/N] ",
-        file=sys.stderr,
-        end="",
-    )
-    try:
-        answer = input()
-    except EOFError:
-        answer = ""
-    if answer.strip().lower() not in ("y", "yes"):
-        error("not confirmed; no branches were deleted.")
-        return False
-    return True
+# `_select` could not build a picker at all -- the library is absent, or the
+# terminal cannot host one. Distinct from None, which is the user saying no.
+_NO_PICKER = object()
 
 
-def _offer(entry):
-    """Ask about one unmerged branch. True to delete it."""
-    print(
-        f"Delete {entry['name']}? ({entry['why']}) [y/N] ",
-        file=sys.stderr,
-        end="",
-    )
+def _label(entry):
+    """One branch as a picker line: the name, then why it is on offer."""
+    return f"{entry['name']} -- {entry['why']}"
+
+
+def _select_widgets(entries, title):
+    """A checkbox list, everything ticked, via prompt_toolkit.
+
+    Imported here rather than at module scope, and its absence is not an
+    error: `repo` runs from a checkout with no install step, and that has to
+    keep being true. Installed, you get widgets; not installed, the caller
+    falls back to the prompt below and nothing is lost but the scrolling.
+
+    Returns the chosen entries, None if the user canceled, or _NO_PICKER
+    when no dialog could be shown -- which is also what a non-terminal gets,
+    since a full-screen dialog needs a real one at every end.
+
+    All THREE streams are checked, stdout included, because that is where
+    prompt_toolkit draws by default. Checking only the two this command
+    talks on would enable the dialog under `repo cleanup owner/repo >out`
+    and paint it into the file, leaving the command waiting on input to a
+    dialog nobody can see (Codex review, mikelward/repo#27).
+    """
+    if not (sys.stdin.isatty() and sys.stdout.isatty() and sys.stderr.isatty()):
+        return _NO_PICKER
     try:
-        answer = input()
-    except EOFError:
-        # No more input: treat the rest as declined rather than as blanket
-        # agreement, and stop asking questions nobody is there to answer.
+        from prompt_toolkit.shortcuts import checkboxlist_dialog
+    except ImportError:
+        return _NO_PICKER
+    by_name = {e["name"]: e for e in entries}
+    try:
+        chosen = checkboxlist_dialog(
+            title=title,
+            text="space toggles, tab moves to the buttons, enter confirms.",
+            values=[(e["name"], _label(e)) for e in entries],
+            default_values=[e["name"] for e in entries],
+        ).run()
+    except Exception as e:
+        # A dialog that cannot draw must not take the command down: fall
+        # back to asking in plain text rather than dying between the plan
+        # and the deletions. Broad on purpose -- prompt_toolkit raises its
+        # own types for an unsupported terminal, and an older release may
+        # not accept default_values at all (TypeError).
+        error(f"could not show the selection dialog ({e}); asking in plain text.")
+        return _NO_PICKER
+    if chosen is None:
         return None
-    return answer.strip().lower() in ("y", "yes")
+    return [by_name[name] for name in chosen]
+
+
+def _can_ask():
+    """Whether a question can actually be put to someone.
+
+    Both halves matter, and stderr is the half that is easy to miss: every
+    question here is written to stderr, so `repo cleanup owner/repo
+    2>cleanup.log` with a terminal stdin would print an invisible prompt
+    into the file and then block on input the user has no idea is wanted
+    -- indistinguishable from a hang (Codex review, mikelward/repo#27).
+    Asking needs a stream to ask on as much as it needs one to answer
+    from."""
+    return sys.stdin.isatty() and sys.stderr.isatty()
+
+
+def _ask(prompt):
+    """One line of input, or None at end of input."""
+    print(prompt, file=sys.stderr, end="")
+    try:
+        return input().strip().lower()
+    except EOFError:
+        return None
+
+
+def _select_prompts(entries, title):
+    """The no-dependency fallback: all, none, or one at a time.
+
+    This is the path the tests drive, so the two-stage behavior is covered
+    whether or not prompt_toolkit is installed anywhere.
+    """
+    error(title)
+    for line in _grouped_lines(entries):
+        error(line)
+    answer = _ask(f"Delete [A]ll {len(entries)}, [s]elect one by one, or [n]one? ")
+    if answer is None:
+        return None
+    if answer in ("", "a", "all"):
+        return list(entries)
+    if answer in ("n", "no", "none"):
+        return []
+    if answer not in ("s", "select"):
+        error(f"'{answer}' is not one of a, s or n; nothing selected.")
+        return []
+    chosen = []
+    for entry in entries:
+        reply = _ask(f"Delete {entry['name']}? ({entry['why']}) [y/N] ")
+        if reply is None:
+            # No more input: keep what was already chosen and stop asking
+            # questions nobody is there to answer.
+            error("no more input; leaving the remaining branches alone.")
+            break
+        if reply in ("y", "yes"):
+            chosen.append(entry)
+    return chosen
+
+
+def _select(entries, title):
+    """Which of `entries` to delete: the widget picker where one can be
+    shown, the plain prompt otherwise. None means the user canceled."""
+    chosen = _select_widgets(entries, title)
+    if chosen is not _NO_PICKER:
+        return chosen
+    return _select_prompts(entries, title)
 
 
 def _read_branch_state(repo, name):
@@ -965,20 +1052,9 @@ def run(args):
     if args.older_than < 0:
         error("--older-than cannot be negative")
         raise SystemExit(2)
-    if args.include_unmerged and args.force:
-        # --force means "do not ask", and --include-unmerged is nothing but
-        # asking. Silently dropping either one would be the dangerous
-        # reading (sweeping unmerged work unattended), so refuse instead.
-        error("--include-unmerged asks about each branch individually and --force")
-        error("suppresses the asking, so the two cannot be combined. Drop --force")
-        error("to be asked, or drop --include-unmerged to sweep merged branches")
-        error("only.")
-        raise SystemExit(2)
-    if args.include_unmerged and not args.dry_run and not sys.stdin.isatty():
-        error("--include-unmerged needs a terminal to ask on; stdin is not one.")
-        error("Run it from a terminal, or drop the flag to sweep merged branches")
-        error("only.")
-        raise SystemExit(2)
+    if args.include_unmerged:
+        error("--include-unmerged is accepted but no longer needed: an interactive")
+        error("run asks about unmerged branches anyway. It will be removed later.")
 
     gh.require_gh()
 
@@ -1008,9 +1084,13 @@ def run(args):
     )
     deletable, offerable, _kept, _skipped, failed = plan
 
-    lines = _describe_plan(
-        repo, plan, default_branch, args.older_than, args.include_unmerged
-    )
+    # Stage two asks per branch, so it needs someone to ask: a terminal, and
+    # not --force, whose whole meaning is "do not ask". Unmerged work is
+    # still never swept unattended -- what changed is that a plain
+    # interactive run now offers it, instead of waiting to be asked with a
+    # flag nobody remembered.
+    offer_unmerged = not args.force and _can_ask()
+    lines = _describe_plan(repo, plan, default_branch, args.older_than, offer_unmerged)
 
     def report_classification_failures():
         # The plan names an unclassifiable branch but not WHY, so this says
@@ -1118,11 +1198,6 @@ def run(args):
         unrecorded = []
         deleted = []
 
-        if deletable:
-            if not args.force and not _confirm(len(deletable)):
-                log_best_effort("not confirmed; no branches were deleted.")
-                raise SystemExit(1)
-
         def delete_checked(entry):
             reason = _why_no_longer_safe(repo, entry)
             if reason is not None:
@@ -1136,26 +1211,68 @@ def run(args):
             elif err is not None:
                 errors.append((entry["name"], err))
 
+        # Two stages, each choosing from its own list, because the two
+        # answer different questions: the merged ones are safe and the only
+        # question is whether you want them gone, while an unmerged one is
+        # a judgment call per branch. Running them together would put a
+        # branch carrying unmerged commits one keystroke from a branch that
+        # is provably redundant.
+        chosen = []
+
         if deletable:
-            for i, entry in enumerate(deletable, 1):
-                _progress(i, len(deletable))
+            if args.force:
+                chosen.extend(deletable)
+            elif not _can_ask():
+                error("this is not an interactive terminal (stdin and stderr both have")
+                error("to be one, since the question is written to stderr) and --force")
+                error("was not given, so no branches were deleted rather than either")
+                error("blocking on a question nobody can answer or silently deleting")
+                error("unconfirmed. Pass --force to delete non-interactively, or run")
+                error("this from a terminal.")
+                log_best_effort("not confirmed; no branches were deleted.")
+                raise SystemExit(1)
+            else:
+                picked = _select(
+                    deletable, f"Merged branches on {repo}, safe to delete"
+                )
+                if picked is None:
+                    both("canceled; no branches were deleted.")
+                    raise SystemExit(1)
+                # The plan already listed every one of these as "to delete",
+                # so a branch that then goes unpicked needs its own line:
+                # without it the record cannot tell a deliberate deselection
+                # from a deletion that was skipped with no outcome written
+                # (Codex review, mikelward/repo#27).
+                for entry in deletable:
+                    if entry not in picked:
+                        log_best_effort(f"declined {entry['name']}")
+                chosen.extend(picked)
+
+        if offer_unmerged and offerable:
+            print("", file=sys.stderr)
+            picked = _select(
+                offerable,
+                f"Unmerged on {repo} -- closed pull request, or old with none",
+            )
+            if picked is None:
+                # Canceling the second stage abandons only the second: the
+                # first was already answered, and throwing that answer away
+                # would make the user give it twice.
+                both("canceled at the unmerged branches; keeping all of them.")
+                picked = []
+            for entry in offerable:
+                if entry not in picked:
+                    log_best_effort(f"declined {entry['name']}")
+            chosen.extend(picked)
+
+        if chosen:
+            error("")
+            error("Each deletion writes the full SHA and the command that recreates")
+            error(f"the branch from it to {log_path}.")
+            for i, entry in enumerate(chosen, 1):
+                _progress(i, len(chosen))
                 delete_checked(entry)
             _clear_progress()
-
-        if args.include_unmerged and offerable:
-            print("", file=sys.stderr)
-            error("Now asking about each unmerged branch. Each deletion writes the")
-            error("full SHA and the command that recreates the branch from it to")
-            error(f"{log_path}.")
-            for entry in offerable:
-                answer = _offer(entry)
-                if answer is None:
-                    both("no more input; leaving the remaining branches alone.")
-                    break
-                if not answer:
-                    log_best_effort(f"declined {entry['name']}")
-                    continue
-                delete_checked(entry)
 
         for name, reason in refused:
             both(f"{name} was NOT deleted -- {reason}")

@@ -50,7 +50,7 @@ repo setup [--dry-run] [--force] [-v|--verbose] [--no-rules] [--no-bootstrap]
            [--rule CHECK]... [--secret NAME[@ENV]=PATH]...
            [--credential NAME=PATH]... [--app SLUG]... OWNER/REPO
 repo audit [--branch NAME] OWNER/REPO [CHECK...]
-repo cleanup [--dry-run] [--force] [--older-than DAYS] [--include-unmerged]
+repo cleanup [--dry-run] [--force] [--older-than DAYS]
              [--log FILE] OWNER/REPO
 ```
 
@@ -193,9 +193,11 @@ never truncated, so pointing `--log` at an earlier run's file -- or two
 default-path runs starting inside the same second -- cannot destroy that run's
 restore commands. `--dry-run` writes no log: it changes
 nothing, a file appearing where none was asked for is a change, and its plan is
-the whole of its output. Unmerged branches are never swept: with
-`--include-unmerged` each is offered individually, showing its age, how many
-commits would be lost, and whether its own pull request was closed without
+the whole of its output. Unmerged branches are never swept: they are
+offered, on a terminal -- stdin and stderr both, since that is where the
+question is asked and answered, so `2>file` gets the plan and no prompt rather
+than an invisible one -- and never under `--force`, showing their age, how many
+commits would be lost, and whether their own pull request was closed without
 merging. Which ones are offered turns on that last point. A branch whose pull
 request was **closed without merging against the default branch** is offered
 whatever its age -- somebody has already said it is finished with, and age is
@@ -206,8 +208,10 @@ nothing about whether the work is live. Nobody deletes the default branch, so a
 closure against it was a person's decision.
 A branch with **no pull request** is offered once its last commit is
 `--older-than` days old (7 by default), since a date is the only evidence there
-is and recent work should not be asked about. That flag refuses `--force`,
-because a per-branch judgment cannot be made unattended, and every deletion
+is and recent work should not be asked about. `--older-than` itself is just a
+threshold and combines with anything; it is the unmerged *stage* that never
+runs under `--force`, because a per-branch judgment cannot be made
+unattended. Every deletion
 logs the full SHA it removed alongside the `gh api` call that recreates the
 ref from it -- shell-quoted, since a branch name may legally contain `$(...)`
 and the line is meant to be pasted, and in the API form because a `git push`
