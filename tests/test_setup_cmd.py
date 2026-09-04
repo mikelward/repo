@@ -1796,6 +1796,22 @@ class SetupCmdTest(unittest.TestCase):
         # is the part that was unsafe, not the protection being written.
         self.assertEqual(len(fake.puts), 1)
 
+    def test_a_rename_in_that_window_keeps_the_duplicate_too(self):
+        # Content equality deliberately ignores the name -- that is what
+        # lets a duplicate be recognized as identical to a survivor called
+        # something else -- so it says nothing about WHICH of the two is
+        # the standard ruleset. An administrator renaming the duplicate to
+        # 'main' in this window would otherwise have the newly canonical
+        # one deleted (Codex review, mikelward/repo#31).
+        fake = FakeGh()
+        self._matching_pair(fake)
+        fake.ruleset_objects_after_change["9"] = dict(fake.ruleset_objects["9"], name="main")
+        fake.ruleset_content_change_threshold = 6
+        code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 1)
+        self.assertEqual(fake.deleted_rulesets, [])
+        self.assertIn("renamed", err)
+
     def test_a_failed_re_read_before_the_delete_keeps_the_duplicate(self):
         # "Could not tell" is not "unchanged": a read this cannot make
         # must never be the reason a ruleset is deleted.

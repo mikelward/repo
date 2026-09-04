@@ -227,7 +227,11 @@
       old by then, since the survivor's write sits between, and it
       compares against the body this run meant to write rather than the
       one GitHub actually stored. A read it cannot make keeps the
-      duplicate rather than counting as "unchanged".
+      duplicate rather than counting as "unchanged", and both names are
+      checked alongside the content: equality deliberately ignores the
+      name, so it says nothing about which of the two is the standard
+      ruleset, and a rename landing in that window would otherwise delete
+      whichever one had just become canonical.
       The merge-method conflict scan needed no "skip the one that is
       about to go": a deletable ruleset is identical to the target, and
       the target always allows rebase, so the scan can never flag one.
