@@ -104,7 +104,7 @@ import sys
 from urllib.parse import quote
 
 from repo_lib import gh
-from repo_lib.common import error, error_lines
+from repo_lib.common import error, error_lines, status
 
 # The lookaheads reject `.` and `..` components: made of allowed
 # characters, but as path segments spliced into `repos/{repo}/...` they
@@ -981,6 +981,14 @@ def run(args):
         raise SystemExit(2)
 
     gh.require_gh()
+
+    # Several seconds pass between here and the plan -- the repository, its
+    # branches, both pages of pull requests, then a compare per branch --
+    # with nothing on the terminal to say the command is doing anything.
+    # Printed BEFORE the first call rather than after it, so it appears at
+    # once; the caller's spelling is used for the same reason, since the
+    # canonical name is what the first call is still fetching.
+    status(f"Checking {repo}...")
 
     # Every later call uses the canonical name, not the caller's spelling:
     # pull requests report canonically, so a renamed repository invoked by
