@@ -520,10 +520,20 @@ def _still_superseded(repo, ruleset_name, survivor_id, legacy_name, legacy_id):
     So both sides are re-read and compared as they now are. A failed read
     is not "unchanged": it returns False, and the caller reports the
     duplicate as kept rather than deleting on an answer it could not
-    get."""
+    get.
+
+    Their NAMES are checked separately, because _comparable_ruleset
+    deliberately drops the name -- that is what lets a duplicate be
+    recognized as identical to a survivor called something else. Content
+    equality therefore says nothing about which of the two is the standard
+    ruleset, so a rename landing in this window would otherwise go
+    unnoticed: an administrator renaming the duplicate to `ruleset_name`
+    (and the survivor away from it) would have the newly canonical one
+    deleted and the repository left with no ruleset under that name at all
+    (Codex review, mikelward/repo#31)."""
     try:
-        survivor = gh.run(["api", f"repos/{repo}/rulesets/{survivor_id}"])
-        candidate = gh.run(["api", f"repos/{repo}/rulesets/{legacy_id}"])
+        survivor = json.loads(gh.run(["api", f"repos/{repo}/rulesets/{survivor_id}"]))
+        candidate = json.loads(gh.run(["api", f"repos/{repo}/rulesets/{legacy_id}"]))
     except gh.GhError as e:
         error_lines(
             f"could not re-read '{ruleset_name}' (id {survivor_id}) and '{legacy_name}' "
@@ -532,7 +542,9 @@ def _still_superseded(repo, ruleset_name, survivor_id, legacy_name, legacy_id):
             e.stderr,
         )
         return False
-    return _comparable_ruleset(json.loads(candidate)) == _comparable_ruleset(json.loads(survivor))
+    if survivor.get("name") != ruleset_name or candidate.get("name") != legacy_name:
+        return False
+    return _comparable_ruleset(candidate) == _comparable_ruleset(survivor)
 
 
 def _report_blocked_legacy(repo, ruleset_name, blocked):
@@ -1457,9 +1469,9 @@ def apply_ruleset(
         if not _still_superseded(repo, ruleset_name, fresh_existing, legacy_name, legacy_id):
             error(
                 f"{repo}: not deleting '{legacy_name}' (id {legacy_id}) -- it is no longer "
-                f"identical to '{ruleset_name}' (id {fresh_existing}). One of them changed "
-                "since this run planned the deletion. Nothing is unprotected; rerun to "
-                "re-check."
+                f"identical to '{ruleset_name}' (id {fresh_existing}), or one of the two has "
+                "been renamed since this run planned the deletion. Nothing is unprotected; "
+                "rerun to re-check."
             )
             delete_failed = True
             continue
