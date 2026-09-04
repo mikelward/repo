@@ -316,6 +316,44 @@ doesn't set today).
       reusable-workflow call it can't parse) on any shape it doesn't
       recognize, rather than treating an unparseable shape as "not
       present."
+      **OPEN DECISION -- this detector, and every structural requirement
+      layered onto it below (mode, `pr:` resolution, `results:`/
+      `classify-result:`/`base-sha:` correspondence to `classify`'s real
+      outputs, credential-expression resolution, environment selection,
+      trigger `types:`, condition survival, isolation, concurrency
+      grouping, the classify-producer check above), assumes a level of
+      structural YAML parsing this repository does not have and the
+      standard library does not provide** (Codex review, mikelward/repo#26,
+      P1, citing `AGENTS.md`'s "no third-party dependencies... a
+      conversation about the tradeoff, not a quiet `pip install`" --
+      confirmed: `credentials.py` (`import re`, line 24) does its existing
+      workflow-text checks by regex/substring matching, not structural
+      parsing, and nothing in this repository parses YAML today).
+      Recognizing a step's `uses:`/`mode:`/`with:` shape, an enclosing
+      job's `environment:`, a trigger's `types:` list, or an expression's
+      exact reference target correctly -- across every valid YAML
+      encoding of those constructs (anchors, flow mappings, multiline
+      scalars, quoting variants) -- is a real parsing problem regex
+      cannot safely solve; a regex confident enough to report "recognized"
+      on a shape it actually mis-parsed is worse than the fail-closed
+      posture this whole item otherwise insists on, since a false
+      structural match is exactly what lets `repo setup` bind `lanes` to
+      an unsafe or non-existent publisher. This needs a decision before
+      any of the above is buildable, not an assumption that "parse the
+      YAML" is a detail to fill in later: either (a) a genuinely minimal,
+      deliberately-limited grammar covering only the shapes `scaffold.py`
+      itself generates and this rollout's own detector needs to recognize
+      -- built and tested to the same fail-closed discipline as everything
+      else here, explicitly rejecting (not silently mis-parsing) anything
+      outside that narrow grammar -- or (b) accepting a real third-party
+      YAML dependency as the AGENTS.md-sanctioned exception, weighed
+      against what it costs. `mikelward/yaml-lite` is not a drop-in answer
+      to either option: it's a separate repository's CI-test tool, tracked
+      via a git checkout at test time, not a runtime dependency a shipped
+      CLI vendors -- reusing its parsing logic here would still be a
+      choice between (a) reimplementing/porting it as this repository's
+      own stdlib-only code, or (b) importing it as a real dependency, not
+      a third option that avoids the decision.
       **The `gate` step also has to target the RIGHT pull request, and
       mode plus credentials alone say nothing about that** (Codex review,
       mikelward/repo#26): lanes takes which PR to publish against as its
@@ -983,6 +1021,29 @@ doesn't set today).
       passes `app-id`/`app-private-key` to `mode: gate` never uses them,
       the same "stale copy for a workflow the repository does not use"
       treatment `credentials.py` already gives a batch credential.
+      **"Reachable via an inherited organization secret" cannot be
+      `[FIX]` across the board -- for two of the three visibility modes,
+      nothing this tool (or any per-repository action) can do actually
+      closes it** (Codex review, mikelward/repo#26, P2): the
+      credential-placement item's own fix only ever describes DETECTING
+      an inherited org secret (read the two names, fail closed if
+      unreadable) -- it never defined a remediation, and one doesn't
+      exist for every case. `visibility: selected` has a real, repo-scoped
+      fix: `DELETE
+      /orgs/{org}/actions/secrets/{secret_name}/repositories/{repository_id}`
+      removes just this repository from the grant, affecting nothing else
+      -- that case stays `[FIX]`. `visibility: all` and `visibility:
+      private` have no per-repository exclusion mechanism at all (the org
+      secret reaches every repository, or every private repository,
+      org-wide, with no selected-repository list to remove an entry
+      from), so the only ways to close it are deleting or renaming the
+      org-level secret -- actions this tool has no business taking
+      unilaterally on a per-repo `setup` run, since they'd affect every
+      OTHER repository that legitimately depends on that org secret too.
+      Those two visibilities need their own reported state -- "reachable,
+      no repo-scoped remedy available" -- distinct from `[FIX]`, with the
+      actual fix (an org-level secret decision) left to a human, not
+      promised as something `repo setup` converges on.
       **The App-membership half is required, not optional** (Codex
       review, mikelward/repo#26): a repository that had the App removed
       after a compliant `repo setup` run still has correctly-placed
