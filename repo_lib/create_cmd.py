@@ -164,8 +164,8 @@ def run(args):
 
     print(f"{args.repo}: pushed the CI scaffold ({len(files)} files) to {default_branch}")
     print("lanes and zizmor will report on this push; ci.yml's placeholder job stands")
-    print("in for this project's real jobs until you replace it (see the TODO.md this")
-    print("pushed). codex needs a pull request -- its status-writing sweep only")
+    print("in for this project's real jobs until you replace it (see the TODO comment")
+    print("in ci.yml). codex needs a pull request -- its status-writing sweep only")
     print("triggers on pull-request activity, not a bare push (Codex review,")
     print("mikelward/repo#14). Once something has reported, run:")
     print(f"  repo setup {args.repo} --force")

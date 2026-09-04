@@ -25,8 +25,8 @@ FAKE_TEMPLATE_CONTENT = {
 FAKE_ZIZMOR_WORKFLOW = "name: zizmor\non:\n  push:\n    branches: [main]\n"
 
 # codex-review's three templates + zizmor.yml + the two generated policy
-# files + ci.yml + TODO.md -- see scaffold.build_scaffold_files.
-EXPECTED_SCAFFOLD_FILE_COUNT = len(scaffold.TEMPLATE_FILES) + 5
+# files + ci.yml -- see scaffold.build_scaffold_files.
+EXPECTED_SCAFFOLD_FILE_COUNT = len(scaffold.TEMPLATE_FILES) + 4
 
 
 class FakeGh:
@@ -371,7 +371,6 @@ class ScaffoldFlagTest(unittest.TestCase):
                 ".github/zizmor.yml",
                 ".github/lanes.conf",
                 ".github/workflows/ci.yml",
-                "TODO.md",
             },
         )
         # The real commit is parented on the bootstrap commit, and the

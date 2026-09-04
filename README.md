@@ -70,10 +70,10 @@ at all, so a genuinely empty repository can't take this as one write; see
 files (fetched live from `mikelward/codex-review`,
 always current rather than a vendored copy going stale), `zizmor.yml`
 (from `mikelward/lanes`, its self-identified pilot), the `.github/zizmor.yml`
-exceptions policy and `.github/lanes.conf` docs/code split those imply, a
+exceptions policy and `.github/lanes.conf` docs/code split those imply, and a
 `ci.yml` wiring `mikelward/lanes`'s classify+gate job pair with a trivial
-placeholder standing in for the project's real jobs, and a `TODO.md`
-pointing at replacing it. `lanes` and `zizmor` report from the scaffold's
+placeholder standing in for the project's real jobs, carrying the comment
+that says how to replace it. `lanes` and `zizmor` report from the scaffold's
 own CI run; `codex` needs a pull request first, since its status-writing
 sweep triggers on pull-request activity, not a bare push (Codex review,
 mikelward/repo#14). Only the placeholder's replacement with real project
