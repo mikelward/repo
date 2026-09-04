@@ -350,6 +350,25 @@ doesn't set today).
       `classify`'s own outputs rather than a literal or an unrelated
       expression, failing closed on a `results:` expression or dependency
       graph it can't fully resolve rather than assuming correspondence.
+      **Confirming `gate`'s inputs come from `needs.classify.*` syntactically
+      still says nothing about whether `classify` ITSELF is a real
+      classifier -- only that gate is wired to whatever job happens to be
+      named `classify`** (Codex review, mikelward/repo#26, P1): a stub
+      `classify` job that hard-codes its own `classify-result`/`base-sha`
+      outputs (skipping the actual diff classification) satisfies every
+      check above, because `gate`'s `results:`/`classify-result:`/
+      `base-sha:` expressions are syntactically `needs.classify.outputs.*`
+      either way -- the detector as scoped so far validates the reference,
+      not what's on the other end of it. Such a stub could mark every
+      heavy job docs-only so they all skip, after which `gate` still
+      publishes a clean success, having never actually classified the PR.
+      The detector needs to also confirm the `classify` job is a
+      recognized `mikelward/lanes` classify invocation (the same
+      structural-match discipline as everything above -- a real `uses:`
+      reference and `mode: classify`, not merely a job named `classify`),
+      and that the outputs `gate` consumes are the ones THAT step
+      produces, failing closed on a `classify` job it doesn't recognize
+      rather than trusting the reference alone.
       **Setting `app-id:`/`app-private-key:` at all is not the same as
       setting them FROM `LANES_APP_ID`/`LANES_APP_PRIVATE_KEY`
       specifically** (Codex review, mikelward/repo#26): a `gate` step
@@ -1039,11 +1058,25 @@ doesn't set today).
       currently means "no opinion, leave whatever's there alone," not
       "make sure this is unbound." (Codex review, mikelward/repo#26.) The
       `integration_id` item's `--rule NAME@APP_ID`-shaped surface needs an
-      explicit unbind form too -- `--rule NAME` alone changing meaning to
-      "ensure unbound," or a distinct `--rule NAME@` / `--unbind NAME`
-      shape -- and `rules.py`'s writer needs to actually drop a
+      explicit unbind form too, and it has to be a DISTINCT shape --
+      `--rule NAME@` or `--unbind NAME` -- not a repurposing of the bare
+      `--rule NAME` form, and `rules.py`'s writer needs to actually drop a
       pre-existing `integration_id` for that request rather than
       preserving it by default.
+      **Repurposing bare `--rule NAME` to mean "ensure unbound" -- floated
+      as one of the two options directly above -- would silently break
+      every ORDINARY no-argument `repo setup` run, not just an explicit
+      `--rule lanes` invocation** (Codex review, mikelward/repo#26, P1,
+      confirmed against `setup_cmd.py:689` directly): a run with no
+      `--rule` at all expands `checks = args.rule if args.rule else
+      list(rules.DEFAULT_CHECKS)`, and `DEFAULT_CHECKS` (`rules.py:52`) is
+      `["lanes", "codex", "zizmor"]` -- bare names. If bare `--rule NAME`
+      meant "ensure unbound," every plain `repo setup OWNER/REPO` call
+      with no flags would silently strip `lanes`' (and `codex`'s) valid
+      App binding on a repo that already has one, on every single run.
+      The preserve-existing-binding behavior for bare names has to stay
+      exactly as it is today; only the new, syntactically distinct form
+      may unbind.
       **Fixing that `[FIX]` has its own ordering requirement, and it runs
       OPPOSITE to the migration direction the binding item below settles
       on** (Codex review, mikelward/repo#26): repairing a rollback means
@@ -1222,9 +1255,8 @@ doesn't set today).
       could be thousands of unrelated paginated calls in a large org, when
       only `LANES_APP_ID` and `LANES_APP_PRIVATE_KEY` can possibly affect
       this check). `GET /orgs/{org}/actions/secrets/{secret_name}` reads
-      each of those two BY NAME directly -- a 404 means that name isn't
-      granted at the org level at all, nothing further to do for it; a
-      200 means branching on that secret's own `visibility` field, not
+      each of those two BY NAME directly; a 200 means branching on that
+      secret's own `visibility` field, not
       assuming "selected" (Codex review, mikelward/repo#26: an earlier
       revision of this fix only handled the "selected" case, silently
       passing a repository that inherits a secret set to `all` or
@@ -1246,7 +1278,33 @@ doesn't set today).
       fine-grained token may not carry even when it can do everything else
       `repo setup`/`repo audit` do. Fail closed (report "cannot confirm no
       org secret is granted") when that read isn't available, rather than
-      silently skipping it. **This is also latent in every
+      silently skipping it.
+      **A 404 from that read is not proof of absence -- GitHub can, and
+      routinely does, use the same 404 to conceal a resource from a
+      caller that lacks the permission to see it, exactly the pattern
+      this repository's own `credentials.workflow_entries()` already has
+      to work around for `.github/workflows` contents** (Codex review,
+      mikelward/repo#26, P1): a fine-grained token without organization
+      Actions-secrets read access is the common case for this call
+      specifically (the paragraph above already says so), and treating
+      every 404 as "not granted" -- as an earlier revision of this fix
+      did -- means that exact common case reports "no org secret found"
+      when the real answer is "cannot tell." A repository that actually
+      inherits `LANES_APP_PRIVATE_KEY` from an org-level `all`/`private`
+      grant would then be reported compliant, leaving any untrusted
+      same-repo workflow able to read the inherited copy and forge the
+      bound status -- silently defeating the fail-closed posture the
+      paragraph above just established for the read failing outright.
+      `workflow_entries` disambiguates its own 404 by making a second,
+      broader read (the repository root) and checking whether THAT also
+      404s before concluding "genuinely absent" rather than "unreadable."
+      The org-secret read needs the equivalent: confirm the permission
+      itself before trusting a 404 as absence -- e.g. a successful call
+      to the org secrets list/visibility endpoint that the token CAN
+      reach, or another read that only a token with organization
+      Actions-secrets access could make -- and fail closed on "cannot
+      confirm" rather than reporting "not granted" whenever that
+      permission can't first be established. **This is also latent in every
       existing batch credential**, for the identical reason the
       environment branch-policy gap above is: nothing here has ever
       checked for an inherited org secret, for any of them. Worth its own
@@ -1337,11 +1395,31 @@ doesn't set today).
       active with no working publisher at all, blocking every merge
       until a second run fixes it. The binding step needs the App
       confirmed a member, the environment's branch policy confirmed, and
-      the credential confirmed placed (or already correct from an
-      earlier run) as its own preconditions, checked immediately before
-      the write -- which likely means moving it to run after the
-      App-membership and credential steps, not merely adding it to the
-      existing ruleset call.
+      the credential confirmed placed as its own preconditions, checked
+      immediately before the write -- which likely means moving it to run
+      after the App-membership and credential steps, not merely adding it
+      to the existing ruleset call.
+      **"Or already correct from an earlier run" -- the parenthetical
+      directly above -- is not a precondition this tool can actually
+      check, and treating it as satisfying the same bar as a fresh
+      placement is a real gap, not a shortcut** (Codex review,
+      mikelward/repo#26, P1): GitHub's secrets API never returns a
+      stored value, and this plan defines no durable attestation that a
+      previously-placed credential was ever validated, let alone still
+      is. A key that was correct when placed and has since been revoked,
+      rotated, or replaced by a different App's credentials under the
+      same names is indistinguishable, from the outside, from one that's
+      still good -- `repo setup` run without `--credential` sees only
+      "the two secret names are present," identical in both cases. Binding
+      on that basis can activate an App-restricted required check for an
+      App that can no longer publish anything, blocking every merge with
+      no signal pointing at the actual cause. The precondition has to be
+      a successful token exchange performed IN THE CURRENT INVOCATION
+      whenever an unbound `lanes` entry is about to be bound for the
+      first time -- which means `repo setup` binding `lanes` on a repo
+      that doesn't already hold a validated-this-run credential has to
+      require `--credential` be supplied (and pass validation) in that
+      same run, not accept a credential it only confirmed is *present*.
       **"Bind last" fixes the ordering WITHIN one `repo setup` run, but the
       detector's own read can still be stale by the time the write
       actually happens -- the audited branch is live, and nothing stops it
