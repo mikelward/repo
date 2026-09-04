@@ -293,6 +293,20 @@ doesn't set today).
       reusable-workflow call it can't parse) on any shape it doesn't
       recognize, rather than treating an unparseable shape as "not
       present."
+      **Setting `app-id:`/`app-private-key:` at all is not the same as
+      setting them FROM `LANES_APP_ID`/`LANES_APP_PRIVATE_KEY`
+      specifically** (Codex review, mikelward/repo#26): a `gate` step
+      could set those two keys from a literal, a different variable, or a
+      differently-named secret, and the structural match above -- key
+      presence only -- would still call it a consumer of THESE two
+      credentials. That would move or delete `LANES_APP_ID`/
+      `LANES_APP_PRIVATE_KEY` for a publisher that never reads them, and
+      bind the ruleset with no real publisher for the App it names. The
+      detector needs the two input EXPRESSIONS themselves to resolve to
+      `secrets.LANES_APP_ID`/`secrets.LANES_APP_PRIVATE_KEY`, not just
+      the two keys to be present, and to fail closed on an expression it
+      can't resolve -- an indirection through a job-level `env:`, a
+      workflow input, or similar.
       **The mode matters, not just the two inputs' presence** (Codex
       review, mikelward/repo#26): `classify` mode never publishes
       anything -- only `init` (posts `pending`) and `gate` (posts the
@@ -407,6 +421,20 @@ doesn't set today).
       same `default_branch(repo)` lookup this codebase already has)
       plus the literal names `main` and `master` -- not the ruleset's own
       encoding of those three targets.
+      **Covering those three is necessary but not sufficient -- the
+      policy also has to contain NOTHING else, and "compliant" has to
+      check that, not just that the three are present** (Codex review,
+      mikelward/repo#26): a `lanes` environment whose policy is the
+      correct three names PLUS a leftover `*` or some other extra entry
+      still lets an untrusted branch select the environment and read the
+      App private key, which is exactly what this whole branch-policy
+      requirement exists to prevent -- three correct entries do not
+      un-do a fourth permissive one. `repo audit`'s compliant state
+      (below) needs to check the policy is EXACTLY that three-name set,
+      not merely a superset of it, and `repo setup` needs to remove any
+      entry outside it before -- or as part of -- placing the credential,
+      the same direction as deleting a stray copy from the wrong
+      environment.
       **Widening the branch policy to all three targets does not by
       itself make all three branches' WORKFLOWS App publishers, and this
       item can't fix that -- it's a general limit of how this tool audits,
@@ -483,13 +511,16 @@ doesn't set today).
       Four states: plain `pull_request` with no App secrets present AND
       the ruleset's `lanes` entry unbound (no `integration_id`) -- the
       accepted baseline, not a finding; `pull_request_target` with both
-      secrets correctly in the `lanes` environment, the lanes App still
+      secrets correctly in the `lanes` environment (whose branch policy is
+      EXACTLY the three hardened-target names, nothing more -- see the
+      branch-policy item's own note on this), the lanes App still
       covering the repository, AND the ruleset's `lanes` entry bound to
       THAT App's own id specifically (compliant); `pull_request_target`
       with the secrets missing, repository-scoped, or in the wrong
-      environment, the App no longer covering the repository, OR the
-      ruleset entry unbound or bound to a different App's id (broken,
-      `[FIX]`); and
+      environment, the environment's branch policy missing an entry or
+      carrying an extra one, the App no longer covering the repository,
+      OR the ruleset entry unbound or bound to a different App's id
+      (broken, `[FIX]`); and
       plain `pull_request` with `LANES_APP_ID`/`LANES_APP_PRIVATE_KEY`
       present anywhere -- a dead credential, since a workflow that never
       passes `app-id`/`app-private-key` to `mode: gate` never uses them,
@@ -512,9 +543,23 @@ doesn't set today).
       genuinely satisfied, recreating the exact forged-publisher gap this
       whole design exists to close, just moved from "no App" to "the
       wrong App." `repo audit` needs to resolve the lanes App's own
-      numeric id (the same lookup the App-membership check already needs)
-      and compare the ruleset entry's `integration_id` against that
-      specific value, not just check that one is present.
+      numeric id and compare the ruleset entry's `integration_id` against
+      that specific value, not just check that one is present.
+      **That id is NOT what the App-membership lookup returns, and
+      reusing it as if it were would compare the wrong number** (Codex
+      review, mikelward/repo#26): `apps.resolve_installation` resolves
+      `.installations[].id` -- the INSTALLATION's own id, which is what
+      `apps.py`'s existing membership machinery needs and calls
+      `install_id` throughout. A ruleset's `integration_id` identifies
+      the App itself, a different number in a different namespace.
+      Comparing an installation id against an `integration_id` would make
+      every correctly bound repository read as broken (the numbers never
+      match), and using the installation id to WRITE the binding would
+      activate a required check restricted to an id nothing can ever
+      satisfy. The same installations listing `resolve_installation`
+      already queries carries the App's own id too, on the installation
+      object's `app_id` field -- retain that field alongside `install_id`
+      rather than reusing `install_id` for both purposes.
       **The plain-`pull_request` baseline needs the inverse check too, for
       a repository ROLLED BACK off the App design** (Codex review,
       mikelward/repo#26): remove the App secrets without also unbinding
