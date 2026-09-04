@@ -229,14 +229,20 @@
       named in `LEGACY_RULESET_NAMES` would make the existing fleet sweep
       answer that.
 
-- [ ] **Widening `main`'s own scope to the hardened three refs.** An
-      update leaves an existing ruleset's conditions alone, so a hand-made
-      `main` keeps whatever narrow scope it was given -- while a freshly
-      created one gets `~DEFAULT_BRANCH`, `refs/heads/main` and
-      `refs/heads/master`. Closing that would also make most legacy
-      rulesets genuinely superseded, so it is worth doing before the
-      deletion above. It is the first change here that would rewrite an
-      existing ruleset's conditions, which is why it is its own item.
+- [x] **Widening `main`'s own scope to the hardened three refs.** An
+      update used to leave an existing ruleset's conditions alone, so a
+      hand-made `main` kept whatever narrow scope it was given -- while a
+      freshly created one got `~DEFAULT_BRANCH`, `refs/heads/main` and
+      `refs/heads/master`. Now `_widen_include` appends whichever of the
+      three the ruleset does not already name, and it only ever widens:
+      existing entries stay (a ruleset also covering a release branch
+      keeps covering it), `~ALL` is left alone since it already subsumes
+      all three, and exclusions are never edited -- the plan names one
+      instead, since a ruleset excluding `refs/heads/master` still
+      excludes it after the include list gains it. `_compute_scope` now
+      returns the POST-widening scope, so the merge-method conflict scan
+      evaluates the refs the write actually brings into range rather than
+      the narrower ones it replaces.
 
 ## repo cleanup
 

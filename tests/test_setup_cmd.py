@@ -15,6 +15,12 @@ from repo_lib.cli import main
 
 REPO = "owner/repo"
 
+# The three refs a ruleset this tool writes always targets. A fixture
+# using it is one whose scope is ALREADY hardened, so the run under test
+# has no widening to do -- which is what makes "already matches; nothing
+# to do" a real no-op rather than a scope rewrite waiting to happen.
+_HARDENED_SCOPE = ("~DEFAULT_BRANCH", "refs/heads/main", "refs/heads/master")
+
 _DEFAULT_BRANCH_RE = re.compile(r"^repos/([^/]+/[^/]+)$")
 _BRANCH_COUNT_RE = re.compile(r"^repos/([^/]+/[^/]+)/branches\?per_page=1$")
 _COMMITS_HEAD_RE = re.compile(r"^repos/([^/]+/[^/]+)/commits\?per_page=1$")
@@ -809,7 +815,7 @@ class SetupCmdTest(unittest.TestCase):
         ]
         self.assertEqual(contexts, ["lanes", "codex", "zizmor"])
 
-    def test_update_leaves_existing_scope_and_unmanaged_fields_alone(self):
+    def test_update_widens_the_scope_and_leaves_unmanaged_fields_alone(self):
         fake = FakeGh()
         fake.check_runs = {fake.default_head_sha: ["lanes"]}
         fake.existing_ruleset_id = "42"
@@ -848,9 +854,19 @@ class SetupCmdTest(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertEqual(len(fake.puts), 1)
         body = fake.puts[0][1]
-        # Scope, target, and bypass_actors are all untouched -- an UPDATE
-        # only ever edits the managed rules.
-        self.assertEqual(body["conditions"]["ref_name"]["include"], ["refs/heads/release"])
+        # The scope is WIDENED, never replaced: whatever the ruleset
+        # already covered it still covers, plus the hardened three. A
+        # ruleset named 'main' that covers only some release branch is
+        # not protecting the default branch at all, which is the whole
+        # thing this step exists to do.
+        self.assertEqual(
+            body["conditions"]["ref_name"]["include"],
+            ["refs/heads/release", *_HARDENED_SCOPE],
+        )
+        self.assertEqual(body["conditions"]["ref_name"]["exclude"], [])
+        # target and bypass_actors are still untouched -- widening the
+        # include list is the ONE thing an update rewrites outside `rules`.
+        self.assertEqual(body["target"], "branch")
         self.assertEqual(body["bypass_actors"], [{"actor_id": 1, "actor_type": "Team"}])
         checks_rule = next(r for r in body["rules"] if r["type"] == "required_status_checks")
         self.assertEqual(
@@ -862,7 +878,8 @@ class SetupCmdTest(unittest.TestCase):
         types = [rule["type"] for rule in body["rules"]]
         self.assertEqual(types.count("required_linear_history"), 1)
         self.assertEqual(types.count("non_fast_forward"), 1)
-        self.assertIn("scope is unchanged", out)
+        self.assertIn("now also targeting ~DEFAULT_BRANCH, refs/heads/main, refs/heads/master", out)
+        self.assertIn("scope: also targeting ~DEFAULT_BRANCH", err)
         # A preserved bypass actor overrides every rule above, old and new
         # alike -- the plan says so rather than reading as an unqualified
         # guarantee. repo audit is what actually reports who they are. The
@@ -870,6 +887,111 @@ class SetupCmdTest(unittest.TestCase):
         # (the dry-run preview pass), not the real apply's own stdout.
         self.assertIn("1 bypass actor(s)", err)
         self.assertIn("repo audit", err)
+
+    def _ruleset_with_scope(self, fake, include, exclude=()):
+        """A minimal already-compliant ruleset differing only in scope, so
+        a test asserting what the widening does isn't also asserting what
+        the rule edits do."""
+        fake.check_runs = {fake.default_head_sha: ["lanes"]}
+        fake.existing_ruleset_id = "7"
+        fake.all_ruleset_ids = ["7"]
+        fake.ruleset_objects["7"] = {
+            "id": 7,
+            "name": "main",
+            "target": "branch",
+            "enforcement": "active",
+            "conditions": {"ref_name": {"include": list(include), "exclude": list(exclude)}},
+            "rules": [
+                {
+                    "type": "required_status_checks",
+                    "parameters": {
+                        "strict_required_status_checks_policy": True,
+                        "required_status_checks": [{"context": "lanes"}],
+                    },
+                },
+                {
+                    "type": "pull_request",
+                    "parameters": {
+                        "required_review_thread_resolution": True,
+                        "allowed_merge_methods": ["rebase"],
+                        "required_approving_review_count": 0,
+                        "dismiss_stale_reviews_on_push": False,
+                        "require_code_owner_review": False,
+                        "require_last_push_approval": False,
+                    },
+                },
+                {"type": "required_linear_history"},
+                {"type": "non_fast_forward"},
+            ],
+        }
+
+    def test_a_partly_hardened_scope_gains_only_the_refs_it_lacks(self):
+        # The common shape across the fleet: a hand-made ruleset naming
+        # the literal default branch and nothing else, so refs/heads/
+        # master -- the backdoor the wider targeting exists to close --
+        # was never covered.
+        fake = FakeGh()
+        self._ruleset_with_scope(fake, ["refs/heads/main"])
+        code, out, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(fake.puts), 1)
+        self.assertEqual(
+            fake.puts[0][1]["conditions"]["ref_name"]["include"],
+            ["refs/heads/main", "~DEFAULT_BRANCH", "refs/heads/master"],
+        )
+        self.assertIn("now also targeting ~DEFAULT_BRANCH, refs/heads/master", out)
+
+    def test_a_scope_of_all_branches_is_left_exactly_as_it_is(self):
+        # ~ALL already covers every branch these three name, so appending
+        # them would be noise -- and noise that rewrites somebody else's
+        # ruleset for no gain. Nothing else about the fixture needs a
+        # write, so this stays a genuine no-op.
+        fake = FakeGh()
+        self._ruleset_with_scope(fake, ["~ALL"])
+        code, out, err = _run(fake, ["--force", "-v", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.puts, [])
+        self.assertIn("already matches; nothing to do", out)
+
+    def test_an_exclusion_is_left_alone_and_the_plan_says_it_may_narrow_this(self):
+        # This module never edits an exclusion -- deleting one somebody
+        # wrote is a different decision from adding a ref to an include
+        # list. So a ruleset excluding the very ref just added still
+        # excludes it, and a plan that just said "also targeting
+        # refs/heads/master" would promise coverage the write does not
+        # deliver.
+        fake = FakeGh()
+        self._ruleset_with_scope(fake, ["~DEFAULT_BRANCH"], exclude=["refs/heads/master"])
+        code, out, err = _run(fake, ["--dry-run", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        plan = out + err
+        self.assertIn("scope: also targeting refs/heads/main, refs/heads/master", plan)
+        self.assertIn("exclusions are left alone", plan)
+        self.assertEqual(fake.puts, [])
+
+    def test_widening_is_checked_against_the_merge_methods_on_the_refs_it_adds(self):
+        # The scan that stops two rulesets from intersecting to no
+        # permitted merge method has to see the scope the write will
+        # PRODUCE, not the narrower one it is replacing: this widening is
+        # exactly what brings refs/heads/master into range of the other
+        # ruleset below, and evaluating the as-found scope would wave it
+        # through and leave master unable to merge anything.
+        fake = FakeGh()
+        self._ruleset_with_scope(fake, ["refs/heads/main"])
+        fake.all_ruleset_ids = ["7", "8"]
+        fake.ruleset_objects["8"] = {
+            "id": 8,
+            "name": "no rebase on master",
+            "enforcement": "active",
+            "conditions": {"ref_name": {"include": ["refs/heads/master"], "exclude": []}},
+            "rules": [
+                {"type": "pull_request", "parameters": {"allowed_merge_methods": ["squash"]}}
+            ],
+        }
+        code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("no rebase on master", err)
+        self.assertEqual(fake.puts, [])
 
     def test_no_bypass_actor_note_when_the_ruleset_has_none(self):
         fake = FakeGh()
@@ -1120,7 +1242,7 @@ class SetupCmdTest(unittest.TestCase):
             "id": 7,
             "name": "main",
             "enforcement": "active",
-            "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+            "conditions": {"ref_name": {"include": list(_HARDENED_SCOPE), "exclude": []}},
             "rules": [
                 {
                     "type": "required_status_checks",
@@ -1165,7 +1287,7 @@ class SetupCmdTest(unittest.TestCase):
             "name": "main",
             "enforcement": "active",
             "bypass_actors": [{"actor_id": 1, "actor_type": "Team"}],
-            "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+            "conditions": {"ref_name": {"include": list(_HARDENED_SCOPE), "exclude": []}},
             "rules": [
                 {
                     "type": "required_status_checks",
@@ -1670,7 +1792,7 @@ class SetupCmdTest(unittest.TestCase):
             "id": 7,
             "name": "main",
             "enforcement": "active",
-            "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+            "conditions": {"ref_name": {"include": list(_HARDENED_SCOPE), "exclude": []}},
             "rules": [
                 {
                     "type": "required_status_checks",
@@ -1741,7 +1863,7 @@ class SetupCmdTest(unittest.TestCase):
             "id": 7,
             "name": "main",
             "enforcement": "active",
-            "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+            "conditions": {"ref_name": {"include": list(_HARDENED_SCOPE), "exclude": []}},
             "rules": [
                 {
                     "type": "required_status_checks",
@@ -3649,7 +3771,7 @@ class BootstrapStepTest(unittest.TestCase):
             "id": 7,
             "name": "main",
             "enforcement": "active",
-            "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+            "conditions": {"ref_name": {"include": list(_HARDENED_SCOPE), "exclude": []}},
             "rules": [
                 {
                     "type": "required_status_checks",

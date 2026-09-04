@@ -468,10 +468,35 @@ def _check_ruleset_ownership(repo, ruleset_id, ruleset_name):
     return True
 
 
+def _widen_include(include):
+    """(include, added): the ref_name include list a write will carry --
+    whatever the ruleset already names, plus any of the hardened three it
+    does not.
+
+    Existing entries are kept rather than replaced, so a ruleset also
+    covering some release branch keeps covering it: this only ever widens.
+    A ruleset carrying ~ALL is left alone -- it already covers every
+    branch, and appending three refs it subsumes would be noise.
+
+    Exclusions are NOT touched. One naming a ref this adds would defeat
+    the widening, which is why _describe_plan says so rather than this
+    quietly deleting an exclusion somebody meant."""
+    include = list(include)
+    if "~ALL" in include:
+        return include, []
+    added = [ref for ref in _HARDENED_INCLUDE if ref not in include]
+    return include + added, added
+
+
 def _compute_scope(repo, existing_id):
-    """The branch conditions the write will target: the existing ruleset's
-    own conditions on update (unchanged), or the hardened three-ref set on
-    create."""
+    """The branch conditions the write will target: the hardened three-ref
+    set on create, and on update the existing ruleset's own conditions
+    WIDENED to include them (see _widen_include).
+
+    Post-widening, not as-found, because this is what the merge-method
+    conflict scan evaluates: a write that newly brings refs/heads/master
+    into scope has to be checked against the other rulesets covering
+    master, not against the narrower scope it is replacing."""
     if not existing_id:
         return {"include": list(_HARDENED_INCLUDE), "exclude": []}
     try:
@@ -491,7 +516,9 @@ def _compute_scope(repo, existing_id):
             e.stderr,
         )
         raise RulesetError()
-    return json.loads(out)
+    scope = json.loads(out)
+    scope["include"], _ = _widen_include(scope.get("include") or [])
+    return scope
 
 
 def _normalize_refs(refs, default_branch):
@@ -630,16 +657,27 @@ _VOLATILE_FIELDS = (
 
 def _build_update_body(repo, existing_id, checks, ruleset_name):
     """UPDATE does not build a body from scratch: it fetches the existing
-    ruleset and edits only the two managed rules inside it, since a PUT
-    replaces the whole object and this module does not know every field
-    GitHub puts there (conditions, enforcement, bypass_actors, and so on
-    all stay exactly as they were). An entry's integration_id -- which
-    binds a required check to a specific GitHub App -- is preserved by
-    reusing the existing entry for any context that already has one,
-    rather than rebuilding from names alone.
+    ruleset and edits only the managed rules inside it (plus the ref_name
+    include list, see below), since a PUT replaces the whole object and
+    this module does not know every field GitHub puts there (enforcement,
+    bypass_actors, and so on all stay exactly as they were). An entry's
+    integration_id -- which binds a required check to a specific GitHub
+    App -- is preserved by reusing the existing entry for any context that
+    already has one, rather than rebuilding from names alone.
 
-    Returns (changed, target) -- target is the full object to PUT,
-    `changed` is whether it differs from what's there now."""
+    The one thing an update does rewrite outside `rules` is the ref_name
+    include list, widened to carry the hardened three refs (see
+    _widen_include). Leaving it alone -- as this did until now -- meant a
+    hand-made ruleset kept whatever narrow scope it was given while a
+    freshly created one got all three, so the master backdoor this module
+    exists to close stayed open on exactly the repositories that already
+    had a ruleset. Widening only ever adds: an entry the ruleset already
+    names, an exclusion, and every other condition key (repository
+    properties, say) are untouched.
+
+    Returns (changed, target, had_pull_request, scope_added) -- target is
+    the full object to PUT, `changed` is whether it differs from what's
+    there now, and scope_added lists the refs the widening appended."""
     try:
         raw = gh.run(["api", f"repos/{repo}/rulesets/{existing_id}"])
     except gh.GhError as e:
@@ -709,16 +747,25 @@ def _build_update_body(repo, existing_id, checks, ruleset_name):
     if not has_non_fast_forward:
         new_rules.append({"type": "non_fast_forward"})
 
+    conditions = dict(original.get("conditions") or {})
+    ref_name = dict(conditions.get("ref_name") or {})
+    widened, scope_added = _widen_include(ref_name.get("include") or [])
+
     target = dict(original)
     target["rules"] = new_rules
+    if scope_added:
+        ref_name["include"] = widened
+        conditions["ref_name"] = ref_name
+        target["conditions"] = conditions
     # Adopting a legacy-named ruleset renames it here rather than in a
     # separate call, so the rename and the rules land in one write.
     target["name"] = ruleset_name
-    return target != original, target, has_pull_request
+    return target != original, target, has_pull_request, scope_added
 
 
 def _plan_write(repo, existing_id, checks, ruleset_name):
-    """Returns (needs_write, target_body, introduces_pr_protection): the
+    """Returns (needs_write, target_body, introduces_pr_protection,
+    scope_added): the
     full API body this step would PUT to `existing_id` (or POST as a new
     ruleset, when `existing_id` is falsy) to reach `checks`, whether that
     differs from what's there now, and whether writing it would be what
@@ -730,11 +777,16 @@ def _plan_write(repo, existing_id, checks, ruleset_name):
     (Codex review, mikelward/repo#14). needs_write and target_body feed
     apply_ruleset's fingerprint; introduces_pr_protection rides along in
     `report` only, since it describes the ruleset's PRIOR state rather
-    than what this call is about to write."""
+    than what this call is about to write. scope_added -- the refs the
+    update widens the ruleset's scope by -- rides along the same way: it
+    is already inside target_body, and travels separately only so the
+    plan can name what changed."""
     if existing_id:
-        changed, target, had_pull_request = _build_update_body(repo, existing_id, checks, ruleset_name)
-        return changed, target, not had_pull_request
-    return True, _create_body(ruleset_name, checks), True
+        changed, target, had_pull_request, scope_added = _build_update_body(
+            repo, existing_id, checks, ruleset_name
+        )
+        return changed, target, not had_pull_request, scope_added
+    return True, _create_body(ruleset_name, checks), True, []
 
 
 def _bypass_actor_note(bypass_actors):
@@ -757,8 +809,42 @@ def _bypass_actor_note(bypass_actors):
     )
 
 
+def _scope_line(scope_added, target_body):
+    """The one line saying what an update does to the ruleset's targeting
+    -- widened by the refs _widen_include appended, or unchanged.
+
+    An exclusion is named alongside, because this module never edits one:
+    a ruleset excluding refs/heads/master still excludes it after a
+    widening that just added it to the include list, and a plan reading
+    "also targeting refs/heads/master" with no caveat would promise
+    coverage the write does not deliver."""
+    if not scope_added:
+        return "  scope unchanged"
+    line = "  scope: also targeting " + ", ".join(scope_added)
+    excluded = ((target_body or {}).get("conditions") or {}).get("ref_name") or {}
+    if excluded.get("exclude"):
+        line += " (this ruleset's own exclusions are left alone and may narrow that)"
+    return line
+
+
+def _scope_result(scope_added):
+    """How a completed write describes what it did to the targeting --
+    past tense, for the success line."""
+    if not scope_added:
+        return "its scope is unchanged"
+    return "now also targeting " + ", ".join(scope_added)
+
+
 def _describe_plan(
-    repo, existing_id, default_branch, checks, ruleset_name, bypass_actors=(), adopted_legacy=None
+    repo,
+    existing_id,
+    default_branch,
+    checks,
+    ruleset_name,
+    bypass_actors=(),
+    adopted_legacy=None,
+    scope_added=(),
+    target_body=None,
 ):
     lines = []
     if existing_id and adopted_legacy:
@@ -767,10 +853,12 @@ def _describe_plan(
         # reader most needs to see (Codex review, mikelward/repo#30).
         lines.append(
             f"{repo}: would adopt ruleset '{adopted_legacy}' (id {existing_id}) and rename "
-            f"it '{ruleset_name}'; scope unchanged"
+            f"it '{ruleset_name}'"
         )
+        lines.append(_scope_line(scope_added, target_body))
     elif existing_id:
-        lines.append(f"{repo}: would update ruleset '{ruleset_name}' (id {existing_id}); scope unchanged")
+        lines.append(f"{repo}: would update ruleset '{ruleset_name}' (id {existing_id})")
+        lines.append(_scope_line(scope_added, target_body))
     else:
         lines.append(f"{repo}: would create ruleset '{ruleset_name}' on {default_branch}, main and master")
     lines.append("  required checks: " + ", ".join(checks))
@@ -977,7 +1065,7 @@ def apply_ruleset(
         return 1
 
     try:
-        needs_write, target_body, introduces_pr_protection = _plan_write(
+        needs_write, target_body, introduces_pr_protection, scope_added = _plan_write(
             repo, existing, checks, ruleset_name
         )
     except RulesetError:
@@ -1006,6 +1094,8 @@ def apply_ruleset(
         ruleset_name,
         target_body.get("bypass_actors") or [],
         adopted_legacy,
+        scope_added,
+        target_body,
     )
 
     if dry_run:
@@ -1044,9 +1134,12 @@ def apply_ruleset(
         return 1
 
     try:
-        fresh_needs_write, fresh_target_body, fresh_introduces_pr_protection = _plan_write(
-            repo, fresh_existing, checks, ruleset_name
-        )
+        (
+            fresh_needs_write,
+            fresh_target_body,
+            fresh_introduces_pr_protection,
+            fresh_scope_added,
+        ) = _plan_write(repo, fresh_existing, checks, ruleset_name)
     except RulesetError:
         error(f"could not re-read ruleset '{ruleset_name}' to write it")
         return 1
@@ -1093,12 +1186,13 @@ def apply_ruleset(
         if fresh_adopted_legacy:
             print(
                 f"{repo}: adopted the ruleset named '{fresh_adopted_legacy}' and renamed "
-                f"it '{ruleset_name}' (its scope, bypass actors and any other rules are "
-                f"unchanged); required checks: {', '.join(checks)}"
+                f"it '{ruleset_name}' ({_scope_result(fresh_scope_added)}; its bypass actors "
+                f"and any other rules are unchanged); "
+                f"required checks: {', '.join(checks)}"
             )
         else:
             print(
-                f"{repo}: updated ruleset '{ruleset_name}' (its scope is unchanged); "
+                f"{repo}: updated ruleset '{ruleset_name}' ({_scope_result(fresh_scope_added)}); "
                 f"required checks: {', '.join(checks)}"
             )
     else:
