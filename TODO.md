@@ -318,6 +318,26 @@ doesn't set today).
       additional evidence when present (the real design normally has
       both, per the initializer/finalizer split), never a substitute for
       it.
+      **The step's own trigger matters too -- a credentialed `gate` step
+      inside a workflow that never runs `pull_request_target` is not a
+      working publisher for pull requests either** (Codex review,
+      mikelward/repo#26): the whole reason this design needs the App at
+      all is that `pull_request_target` is the trigger whose ambient
+      check-run can't land on the PR head, so the App posts a status
+      instead. A workflow triggered on `push` (or on `pull_request_target`
+      for some unrelated job only) could still contain a syntactically
+      matching, credentialed `gate` step -- producing real App-attributed
+      history on pushes to the default branch, enough to clear
+      `never_reported`'s preflight -- while actual pull requests keep
+      running whatever the old plain check was, since nothing in a
+      `push`-triggered run ever executes for a PR event at all. `repo
+      setup` would then bind `lanes` to the App on the strength of history
+      that has nothing to do with pull requests, and every PR merge blocks
+      the moment the ruleset requires a status nothing posts for it. The
+      detector needs to also confirm the credentialed `gate` step's
+      workflow is triggered by `pull_request_target`, and fail closed on
+      a trigger shape it can't parse (a matrix, an external reusable-
+      workflow indirection, or similar) rather than assume coverage.
       **The step alone is not enough -- the ENCLOSING JOB has to select
       the `lanes` environment too, or the move this detector triggers
       breaks the very thing it's meant to protect** (Codex review,
@@ -406,19 +426,28 @@ doesn't set today).
       assuming it's fine because nothing has exploited it yet.
       **Cost and reliability of everything in this section** (Codex
       review, mikelward/repo#26, citing AGENTS.md's cost-and-reliability
-      rule): free, on the same GitHub REST API and the same
+      rule; revised once more below after the credential-placement item
+      turned out to need a full environment sweep, not a fixed handful of
+      calls): free, on the same GitHub REST API and the same
       5,000-authenticated-requests-an-hour limit `rules.py` and
-      `apps.py`'s own module docstrings already budget against -- this
-      adds a handful of calls per repository (a branch-policy read and,
-      when missing, a write; the App-membership read item below already
-      needs) on top of what `repo setup`/`repo audit` already make, not a
-      new dependency. Interactive, not scheduled, so a slow or failed
-      call is a visible error for the person running the command, not a
-      silent gap -- and per this section's own fail-closed posture
-      throughout, a failed branch-policy or membership read must refuse
-      the affected step (report `[FIX]`/error, same as a failed ruleset
-      or credential read does today) rather than proceed as if the
-      policy or membership were confirmed.
+      `apps.py`'s own module docstrings already budget against. Most of
+      this section adds only a handful of calls per repository (a
+      branch-policy read and, when missing, a write; the App-membership
+      read) on top of what `repo setup`/`repo audit` already make --
+      except the credential-placement item's environment sweep, which is
+      one secrets-list call per environment the repository has, not a
+      fixed count; still free and still well inside the rate limit for
+      any repository with a realistic number of environments, but worth
+      stating as "scales with environment count" rather than "a handful,"
+      since a repository with an unusual number of environments is where
+      that stops being negligible. Interactive, not scheduled either way,
+      so a slow or failed call is a visible error for the person running
+      the command, not a silent gap -- and per this section's own
+      fail-closed posture throughout, a failed branch-policy, membership,
+      or environment-sweep read must refuse the affected step (report
+      `[FIX]`/error, same as a failed ruleset or credential read does
+      today) rather than proceed as if the policy, membership, or sweep
+      were confirmed clean.
 - [ ] **`repo audit` should report which design a repo is actually wired
       for, and flag drift the same way it flags a stray batch credential.**
       Four states: plain `pull_request` with no App secrets present AND
@@ -538,6 +567,30 @@ doesn't set today).
       item above has to run first (or be folded into the same step) so
       the environment this writes into is actually restricted before the
       secret lands in it.
+      **"Like a batch credential does today" undersells what this
+      actually needs -- the batch pattern doesn't clean up a copy sitting
+      in some OTHER, wrong environment, and the audit item above already
+      promises to catch exactly that** (Codex review, mikelward/repo#26):
+      `setup_cmd._plan_credentials` (`setup_cmd.py:317-`) only ever reads
+      `repository_secrets` and `environment_secrets` for each credential's
+      OWN designated environment (`npm-update`, `gradle-update`,
+      `rust-update`, `ci-commit-artifact`) -- it has never scanned every
+      environment on the repo for a stray copy elsewhere, because no
+      batch credential's audit state names "wrong environment" as
+      something it detects. This item's audit state does. So placing
+      `LANES_APP_ID`/`LANES_APP_PRIVATE_KEY` needs new work the batch
+      pattern doesn't already do: enumerate every environment on the
+      repo (`credentials.environments`), and once the correct, policy-
+      protected `lanes` environment holds a usable credential, delete any
+      copy found in a DIFFERENT environment too, not just a repository-
+      level one -- otherwise a stale private key keeps sitting under
+      whatever (possibly unrestricted) environment it was in, and the
+      `[FIX]` the audit reports for it can never actually clear. That
+      also changes the cost estimate below: a full environment sweep is
+      one secrets-list call per environment on the repo, not the fixed
+      handful this section currently budgets, so update that note too
+      rather than leaving it describing only the narrower batch-style
+      check.
 - [ ] **Wire the lanes App's slug into `repo_lib/apps.py`'s `--app` step**
       so a repo migrating onto the App design gets installation membership
       fixed by the same `repo setup` run that places its credential,
