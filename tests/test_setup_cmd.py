@@ -135,6 +135,9 @@ class FakeGh:
         # Set by the migration tests: the id a lookup for a legacy ruleset
         # name resolves to, or None for "there isn't one".
         self.legacy_ruleset_id = None
+        # Set instead when a test needs more than one ruleset sharing a
+        # legacy name -- GitHub does not make the name unique.
+        self.legacy_ruleset_ids = None
         self.deleted_rulesets = []
         self.ruleset_delete_fails = set()
         self._name_lookup_calls = 0
@@ -412,6 +415,8 @@ class FakeGh:
             # below stay about the lookups they were written for.
             match = re.search(r"select\(\.name == (\".*?\")\)", jq or "")
             if match and json.loads(match.group(1)) in rules.LEGACY_RULESET_NAMES:
+                if self.legacy_ruleset_ids is not None:
+                    return "".join(f"{rid}\n" for rid in self.legacy_ruleset_ids)
                 return f"{self.legacy_ruleset_id}\n" if self.legacy_ruleset_id else ""
             self._name_lookup_calls += 1
             if (
@@ -1667,6 +1672,35 @@ class SetupCmdTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("stdin is not a terminal", err)
         self.assertEqual(fake.deleted_rulesets, [])
+
+    def test_two_rulesets_sharing_a_legacy_name_are_both_handled(self):
+        # GitHub does not make a ruleset's name unique within a
+        # repository, so two can carry the same one and both apply.
+        # Handling only the first would let a run report the name dealt
+        # with while the second kept aggregating (Codex review,
+        # mikelward/repo#31).
+        fake = FakeGh()
+        self._matching_pair(fake)
+        fake.legacy_ruleset_ids = ["9", "10"]
+        fake.all_ruleset_ids = ["1", "9", "10"]
+        fake.ruleset_objects["10"] = dict(fake.ruleset_objects["9"], id=10)
+        code, out, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(sorted(fake.deleted_rulesets), ["10", "9"])
+
+    def test_a_second_ruleset_sharing_a_legacy_name_is_still_reported(self):
+        # The kept half of the same case: neither is deleted, and both
+        # are named rather than one standing in for the pair.
+        fake = FakeGh()
+        self._matching_pair(fake, legacy_rules=[{"type": "required_signatures"}])
+        fake.legacy_ruleset_ids = ["9", "10"]
+        fake.all_ruleset_ids = ["1", "9", "10"]
+        fake.ruleset_objects["10"] = dict(fake.ruleset_objects["9"], id=10)
+        code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.deleted_rulesets, [])
+        self.assertIn("(id 9) is still there", err)
+        self.assertIn("(id 10) is still there", err)
 
     def test_a_legacy_ruleset_that_differs_is_reported_not_deleted(self):
         # The whole reason this is an equality test and not a

@@ -1074,6 +1074,21 @@ class LegacyRulesetAuditTest(unittest.TestCase):
         self.assertIn("[FIX] 'merge gates' (id 9) is a ruleset name this tool used before", out)
         self.assertIn("`repo setup` adopts it", out)
 
+    def test_every_ruleset_sharing_a_legacy_name_is_reported(self):
+        # A ruleset's name is not unique within a repository, so reporting
+        # only the first would answer "which repositories still have a
+        # duplicate?" with a number that is too low (Codex review,
+        # mikelward/repo#31).
+        fake = FakeGh()
+        fake.ruleset_ids = ["9", "10"]
+        for rid in ("9", "10"):
+            fake.ruleset_objects[rid] = _covering_ruleset(name="merge gates")
+            fake.ruleset_objects[rid]["id"] = int(rid)
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[FIX] 'merge gates' (id 9)", out)
+        self.assertIn("[FIX] 'merge gates' (id 10)", out)
+
     def test_a_failed_lookup_exits_1_rather_than_reading_as_none(self):
         fake = FakeGh()
         fake.rulesets_lookup_fails = "gh: HTTP 500: boom\n"

@@ -256,6 +256,19 @@
       evaluates the refs the write actually brings into range rather than
       the narrower ones it replaces.
 
+- [ ] **A second ruleset under the STANDARD name is still picked over
+      silently.** GitHub does not make a ruleset's name unique within a
+      repository, and `find_legacy_rulesets` now returns every id sharing
+      a legacy name (Codex review, mikelward/repo#31) -- but
+      `_lookup_existing_ruleset` still answers with the first id under
+      `main`, so a repository holding two of those has one updated and the
+      other left applying with nothing said. Pre-existing, not introduced
+      by the deletion work: the deletion path only ever targets legacy
+      names, so nothing new is deleted on the strength of it. The fix is
+      the same shape as the legacy one -- report every id, adopt the
+      first -- and it wants its own change, since it decides what happens
+      when the survivor and the second copy disagree.
+
 ## repo cleanup
 
 - [ ] **Patch-equivalence is invisible to `repo cleanup`, so those branches
