@@ -24,9 +24,12 @@ FAKE_TEMPLATE_CONTENT = {
 # filter (and the only one _branches_line is ever applied to).
 FAKE_ZIZMOR_WORKFLOW = "name: zizmor\non:\n  push:\n    branches: [main]\n"
 
+FAKE_CONVENTIONS = "# Coding\n\n- Fake shared conventions.\n"
+
 # codex-review's three templates + zizmor.yml + the two generated policy
-# files + ci.yml -- see scaffold.build_scaffold_files.
-EXPECTED_SCAFFOLD_FILE_COUNT = len(scaffold.TEMPLATE_FILES) + 4
+# files + ci.yml + AGENTS.md and CLAUDE.md -- see
+# scaffold.build_scaffold_files.
+EXPECTED_SCAFFOLD_FILE_COUNT = len(scaffold.TEMPLATE_FILES) + 6
 
 
 class FakeGh:
@@ -145,6 +148,12 @@ class FakeGh:
             if self.template_fetch_fails == name:
                 raise gh.GhError(f"gh: HTTP 404: Not Found (fake, {name})\n")
             return base64.b64encode(FAKE_TEMPLATE_CONTENT[name].encode()).decode() + "\n"
+        if args[0] == "api" and args[1].startswith(
+            f"repos/{scaffold.CONVENTIONS_REPO}/contents/{scaffold.CONVENTIONS_PATH}"
+        ):
+            if self.template_fetch_fails == scaffold.CONVENTIONS_PATH:
+                raise gh.GhError("gh: HTTP 404: Not Found (fake, conventions)\n")
+            return base64.b64encode(FAKE_CONVENTIONS.encode()).decode() + "\n"
         if args[0] == "api" and args[1].startswith(
             f"repos/{scaffold.ZIZMOR_SOURCE_REPO}/contents/.github/workflows/zizmor.yml"
         ):
@@ -371,6 +380,8 @@ class ScaffoldFlagTest(unittest.TestCase):
                 ".github/zizmor.yml",
                 ".github/lanes.conf",
                 ".github/workflows/ci.yml",
+                "AGENTS.md",
+                "CLAUDE.md",
             },
         )
         # The real commit is parented on the bootstrap commit, and the
