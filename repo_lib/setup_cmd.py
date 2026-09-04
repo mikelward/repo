@@ -1,5 +1,5 @@
 """`repo setup` -- compose rules, secrets, App membership, fleet credentials,
-auto-merge, and the fleet CI scaffold's gaps.
+auto-merge, delete-branch-on-merge, and the fleet CI scaffold's gaps.
 
 Port of mikelward/scripts's repo-setup (see its own header comment for the
 full reasoning; repeated here only where the port changes something). A
@@ -611,6 +611,27 @@ def _plan_auto_merge(repo):
     return "enable", ["enable auto-merge on the repository (the weekly batches arm it on their pull requests)"]
 
 
+def _plan_delete_branch_on_merge(repo):
+    """Whether the repository deletes a pull request's head branch once it
+    merges: ("allowed" | "enable" | "error", the plan lines). Same shape as
+    _plan_auto_merge, and for the same reason -- there is nothing to
+    request, only a setting with one right value. This is GitHub's own
+    sweep, so it fires from the merge event itself: unlike an ancestry
+    check, it is unaffected by this fleet rebase-merging (which rewrites a
+    branch's commits, so the branch is never an ancestor of the default
+    branch after merge -- see mikelward/repo's own `repo cleanup`, written
+    to sweep up everything this setting being off left behind)."""
+    try:
+        value = gh.run(["api", f"repos/{repo}", "--jq", ".delete_branch_on_merge"]).strip()
+    except gh.GhError as e:
+        lines = [f"could not read whether {repo} deletes branches on merge:"]
+        lines += [f"  {line}" for line in (e.stderr or "").splitlines()]
+        return "error", lines
+    if value == "true":
+        return "allowed", ["already allowed"]
+    return "enable", ["delete a pull request's head branch automatically once it merges"]
+
+
 def _reject_fleet_credentials_under_secret(secret_specs):
     """A fleet credential has one place, and --credential is the flag that
     puts it there; a --secret naming one is refused whatever scope it
@@ -682,6 +703,8 @@ def run(args):
     credentials_idle = not (credentials_plan.moves or credentials_plan.unfixed or credentials_plan.failed)
     _progress(args, f"{repo}: checking auto-merge")
     auto_merge_state, auto_merge_lines = _plan_auto_merge(repo)
+    _progress(args, f"{repo}: checking delete-branch-on-merge")
+    delete_branch_state, delete_branch_lines = _plan_delete_branch_on_merge(repo)
 
     # Always on, like credentials and auto-merge: there is nothing to
     # request here either, only one right state (the fleet's scaffold
@@ -711,6 +734,7 @@ def run(args):
         and not credential_specs
         and credentials_idle
         and auto_merge_state == "allowed"
+        and delete_branch_state == "allowed"
         and bootstrap_idle
     )
     if would_skip_everything and bootstrap_plan is not None and not bootstrap_plan.error:
@@ -880,6 +904,8 @@ def run(args):
             lines.append("    nothing to do")
         lines.append("  auto-merge:")
         lines += [f"    {line}" for line in auto_merge_lines]
+        lines.append("  delete-branch-on-merge:")
+        lines += [f"    {line}" for line in delete_branch_lines]
         if not args.no_bootstrap:
             lines.append("  bootstrap (fleet CI scaffold):")
             lines += [f"    {line}" for line in scaffold.describe_gap_plan(bootstrap_plan)]
@@ -898,6 +924,7 @@ def run(args):
             or credentials_plan.failed
             or credentials_plan.unfixed
             or auto_merge_state == "error"
+            or delete_branch_state == "error"
             or (bootstrap_plan is not None and bootstrap_plan.error)
             or (bootstrap_plan is not None and bootstrap_plan.missing_workflow_scope)
             or empty_branch_would_strand_ruleset
@@ -950,6 +977,7 @@ def run(args):
         or apps_need_mutation
         or bool(credentials_plan.moves)
         or auto_merge_state == "enable"
+        or delete_branch_state == "enable"
         or (
             bootstrap_plan is not None
             and not bootstrap_plan.error
@@ -1351,6 +1379,23 @@ def run(args):
             for line in auto_merge_lines:
                 error(line)
         failed.append("auto-merge")
+
+    if delete_branch_state == "enable":
+        try:
+            gh.run_with_input(
+                ["api", "--method", "PATCH", f"repos/{repo}", "--input", "-"],
+                json.dumps({"delete_branch_on_merge": True}).encode(),
+            )
+        except gh.GhError as e:
+            error_lines(f"could not enable delete-branch-on-merge on {repo}:", e.stderr)
+            failed.append("delete-branch-on-merge")
+        else:
+            print(f"{repo}: enabled delete-branch-on-merge")
+    elif delete_branch_state == "error":
+        if not show_plan:
+            for line in delete_branch_lines:
+                error(line)
+        failed.append("delete-branch-on-merge")
 
     if failed:
         error("failed on: " + " ".join(failed))

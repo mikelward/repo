@@ -1,9 +1,14 @@
 """`repo cleanup` -- delete the branches a fleet accumulates.
 
 No shell-script counterpart; new here. It exists because GitHub's
-"automatically delete head branches" setting is off across this fleet and
-nothing else sweeps up: mikelward/simmo reached 192 branches, 184 of them
-dead, before anybody counted.
+"automatically delete head branches" setting used to be off across this
+fleet with nothing else sweeping up: mikelward/simmo reached 192 branches,
+184 of them dead, before anybody counted. `repo setup`/`repo audit` now
+enable and check that setting on every repository, which handles a branch
+from the moment its pull request merges -- no invocation of this command
+needed. This command remains for the backlog every repository already had
+before that, and for what the setting cannot see at all: a branch merged
+with no pull request, or one still unmerged and worth judging by hand.
 
 The one thing that makes this non-trivial is that **this fleet
 rebase-merges**. A rebase-merged branch's commits are rewritten, so its tip

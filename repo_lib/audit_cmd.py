@@ -240,6 +240,28 @@ def audit_auto_merge(repo, ok, fix):
         )
 
 
+def audit_delete_branch_on_merge(repo, ok, fix):
+    """Whether the repository deletes a pull request's head branch once it
+    merges. Off, nothing sweeps the branches a merged pull request leaves
+    behind -- this is the setting `repo cleanup`'s own docstring names as
+    the reason that command has to exist at all. GitHub applies it from
+    the merge event itself, so it fires correctly on a rebase-merged
+    branch too, unlike an ancestry check. A setup pass enables it, so this
+    is a [FIX] like the auto-merge finding above."""
+    try:
+        value = gh.run(["api", f"repos/{repo}", "--jq", ".delete_branch_on_merge"]).strip()
+    except gh.GhError as e:
+        error_lines(f"could not read whether {repo} deletes branches on merge:", e.stderr)
+        raise SystemExit(1)
+    if value == "true":
+        ok("a merged pull request's head branch is deleted automatically")
+    else:
+        fix(
+            f"{repo} does not delete a merged pull request's head branch automatically -- "
+            f"branches accumulate until `repo cleanup` sweeps them; `repo setup {repo}` enables it"
+        )
+
+
 def audit_secrets(repo, ok, fix):
     """Reports where the fleet credentials live, and names every other
     repository-level secret. See the module docstring for the reasoning.
@@ -815,6 +837,7 @@ def run(args):
         raise SystemExit(1)
 
     audit_auto_merge(repo, ok, fix)
+    audit_delete_branch_on_merge(repo, ok, fix)
     audit_secrets(repo, ok, fix)
 
     if gap_found[0]:

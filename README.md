@@ -128,12 +128,14 @@ tell"), and a credential left behind by a workflow nothing here calls --
 for the batches and the commit-back workflow alike -- are each reported as
 `[FIX]` -- a finding `repo setup` closes, named with the command -- and
 every other repository-level secret is listed by name for review. A repository that does not allow auto-merge is a `[FIX]` too: the weekly
-batches arm it on their pull requests. `[FIX]` findings do not fail the audit
-batches arm it on their pull requests. `[FIX]` findings do not fail the audit
-yet (see `TODO.md`): the layout is being rolled out through `repo setup`.
+batches arm it on their pull requests. So is one that does not delete a merged
+pull request's head branch automatically -- without it nothing sweeps the
+branches a merge leaves behind (see `repo cleanup` below). `[FIX]` findings do
+not fail the audit yet (see `TODO.md`): the layout is being rolled out through
+`repo setup`.
 
-`repo setup` makes the move, and enables auto-merge on the repository where it
-is off. Its fleet-credentials step is always on: for
+`repo setup` makes the move, and enables auto-merge and delete-branch-on-merge
+on the repository where either is off. Its fleet-credentials step is always on: for
 each batch the repository runs (by whichever workflows call it from a job,
 whatever they are named, on any branch) and for the
 commit-back workflow (by a job calling it), a value passed as
@@ -151,9 +153,14 @@ environment holds nothing and no value was given (GitHub never returns a
 secret's value, so a move needs it handed in). Across a fleet:
 `repo list | xargs -n1 repo setup --force --credential NPM_UPDATE_PAT=pat.txt --credential GRADLE_UPDATE_PAT=pat.txt --credential RUST_UPDATE_PAT=pat.txt --credential CI_COMMIT_ARTIFACT_TOKEN=token.txt`.
 `repo cleanup` deletes the branches a repository has finished with. It exists
-because this fleet leaves GitHub's "automatically delete head branches" off and
-nothing else sweeps up -- mikelward/simmo reached 192 branches, 184 of them
-dead. The hard part is that the fleet **rebase-merges**, so a merged branch's
+because this fleet used to leave GitHub's "automatically delete head branches"
+off with nothing else sweeping up -- mikelward/simmo reached 192 branches, 184
+of them dead. `repo setup`/`repo audit` now enable and check that setting (see
+above), which handles a branch going forward, from the moment its pull request
+merges, with no per-repository invocation needed; `repo cleanup` remains for
+the backlog a repository already accumulated before that, and for what the
+setting cannot see at all -- an unmerged branch, or a merge with no pull
+request. The hard part is that the fleet **rebase-merges**, so a merged branch's
 commits are rewritten and every ancestry test calls it unmerged; judged that
 way almost nothing here is ever deletable. So a branch counts as merged when a
 pull request whose head it was has `merged_at` set **and targeted the default
