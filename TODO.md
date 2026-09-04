@@ -118,31 +118,20 @@
       so the scaffold was writing a second copy of a single instruction
       into a second file, where the two could drift and where a project
       that keeps its own TODO.md would find the path taken. Removed;
-      `build_scaffold_files` now produces seven files, and the instruction
+      `build_scaffold_files` now produces nine files, and the instruction
       lives only where the work is. Bring it back only with something to
       say that ci.yml cannot say in place -- a fleet-wide checklist a new
       repository should work through, say -- not as a restatement of the
       placeholder comment.
 
-- [ ] **Populate `CLAUDE.md` and `AGENTS.md` from a template**
-      (maintainer, 2026-09-04). Every repository in the fleet carries an
-      `AGENTS.md` with `CLAUDE.md` a symlink to it, and the scaffold
-      writes neither -- so a freshly created repository is the one place
-      in the fleet an agent works with no conventions loaded at all, which
-      is exactly when it is most likely to invent some. The template
-      should live somewhere shared rather than inline in this repo:
-      `mikelward/conf`'s `templates/` (installed as `~/.templates`) is the
-      candidate the maintainer named, and `scaffold.py` already knows how
-      to fetch a file from another repository over the API
-      (`_fetch_file`), so reading it from there is the same shape as the
-      codex-review templates it already pins. Three things to settle
-      first: what the template holds (the rules every repo's copy shares
-      -- talking to the user, asking questions, git workflow, privacy,
-      reviews -- against a near-empty stub the project fills in), whether
-      it is pinned to a sha the way `TEMPLATE_FILES` are or tracked at
-      `main`, and how the symlink gets made -- the Git Data API can write
-      a `120000` blob, so `CLAUDE.md -> AGENTS.md` is reachable without a
-      clone, and `plan_gaps` already refuses to overwrite one.
+- [x] **Populate `CLAUDE.md` and `AGENTS.md` from a template**
+      (maintainer, 2026-09-04). A freshly created repository was the one
+      place in the fleet an agent worked with no conventions loaded at
+      all, which is exactly when it is most likely to invent some. The
+      scaffold now writes both. See *Decisions needing review* for the
+      four calls this took -- where the template lives, what it holds, how
+      `CLAUDE.md` gets made, and what happens where one already exists as
+      a symlink.
 
 - [x] **The bootstrap failure names `--no-bootstrap`.** A repository the
       item below describes fails with GitHub's own rejection relayed
@@ -331,6 +320,49 @@
       repository and reading past the merged section each time.
 
 ## Decisions needing review
+
+- **The scaffolded `AGENTS.md` is `mikelward/conf`'s own
+  `agents/AGENTS.md`, under a generated header** (autopilot, 2026-09-04).
+  Four calls, none of them settled beforehand:
+  - **Where the template lives.** `mikelward/conf@main:agents/AGENTS.md`,
+    the fleet's shared conventions, rather than a new
+    `conf/templates/AGENTS.md` the maintainer had named as the candidate:
+    that would be a second copy of a file that already exists, kept in
+    step by hand, which is the arrangement this repository exists to
+    replace. Tracked at `main` like `zizmor.yml`, not pinned to a resolved
+    sha like `TEMPLATE_FILES` -- those are pinned because they are a set
+    that has to come from one revision, and this is a single file. The
+    cost is a sixth external read on every `repo setup`, and a scaffold
+    that fails when `conf` cannot be read (fail-closed, like every other
+    template source).
+  - **What it holds.** The shared rules, not a near-empty stub. A stub
+    deferring to the user-level conventions assumes those load, and a
+    remote session does not necessarily load them -- this session's own
+    context carried each repository's `CLAUDE.md` and no user-level file
+    at all. The generated header on top carries the two things no template
+    can know (what the project is, what a contributor runs) as explicit
+    TODOs. The cost: the fetched text is written in the first person to
+    the maintainer ("Talking to me"), which reads oddly in a repository
+    file and would be worth rewording if this stays.
+  - **How `CLAUDE.md` gets made.** A one-line `@AGENTS.md` import, which
+    is what `mikelward/conf`'s own `CLAUDE.md` does, rather than the
+    `120000` symlink blob most of the fleet uses. The Git Data API can
+    write one, but `push_initial_commit`'s bootstrap goes through the
+    Contents API, which cannot -- so a symlink would work for a gap-fill
+    and fail for a brand-new repository, which is the case this is most
+    for.
+  - **A symlink at `CLAUDE.md` counts as present.** `plan_gaps` treats any
+    non-regular file at a scaffold path as occupied and fails the whole
+    step, so without this every fleet repository whose `CLAUDE.md` is a
+    symlink would have its bootstrap fail over a file that is already
+    exactly right. Narrow on purpose: one named path
+    (`SYMLINK_IS_PRESENT_PATHS`), because a symlink at `ci.yml` could point
+    anywhere and refusing is right there. The item this closes said
+    "`plan_gaps` already refuses to overwrite one" as though that settled
+    it -- refusing means erroring the whole repository, not skipping.
+
+  All four are reversible: the source is two constants, the header one
+  string, and the symlink exemption one frozenset.
 
 - **A ruleset exclusion that keeps a hardened ref out is reported, not
   failed and not deleted** (autopilot, 2026-09-04, answering Codex's P1 on

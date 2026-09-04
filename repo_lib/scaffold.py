@@ -28,6 +28,22 @@ project knowledge, and only ever does the former:
   files are present (codex-review's pair legitimately use
   `pull_request_target`; the docs-lane split is the same in every consumer
   that hasn't customized it).
+- `AGENTS.md` is the fleet's shared agent conventions, fetched from
+  `mikelward/conf`'s `agents/AGENTS.md` -- the one maintained copy, rather
+  than a second one here kept in step by hand, which is the arrangement
+  this whole repository exists to replace. A generated header goes on top
+  carrying the two things no template can know (what the project is, and
+  what a contributor runs) as explicit TODOs. It carries the shared rules
+  rather than deferring to a user-level file, because a freshly created
+  repository is otherwise the one place in this fleet an agent works with
+  no conventions loaded at all -- and a remote session does not
+  necessarily load the user-level copy.
+- `CLAUDE.md` is generated: a one-line `@AGENTS.md` import, which is what
+  `mikelward/conf`'s own CLAUDE.md does. Not a symlink, though most of the
+  fleet uses one there: the whole file map here is plain blobs, and
+  push_initial_commit's bootstrap goes through the Contents API, which
+  cannot write a symlink at all. A repository that already has the symlink
+  keeps it -- see SYMLINK_IS_PRESENT_PATHS.
 - `ci.yml` is generated too, but only the classify+gate wiring
   `mikelward/lanes`'s own README documents verbatim -- the actual project
   jobs (tests, a build) are NOT something this can know, so a trivial
@@ -38,9 +54,10 @@ project knowledge, and only ever does the former:
   check that turns out not to work is exactly the trap `lanes` exists to
   prevent. Delete the placeholder once a real job exists.
 
-Cost and reliability: five `gh api` reads against mikelward/codex-review
-and mikelward/lanes -- both this account's own public repos -- to build
-the scaffold's file set, on EVERY call (one of the five resolves
+Cost and reliability: six `gh api` reads against mikelward/codex-review,
+mikelward/lanes and mikelward/conf -- all three this account's own public
+repos -- to build the scaffold's file set, on EVERY call (one of the six
+resolves
 codex-review's `main` to a single commit sha so its three template files
 come from one revision rather than each independently resolving a `main`
 that could move between them -- see _resolve_commit_sha): `repo create
@@ -110,6 +127,22 @@ def _missing_workflow_scope(missing_paths):
 TEMPLATE_REPO = "mikelward/codex-review"
 TEMPLATE_FILES = ("codex-review.yml", "codex-review-check.yml", "codex-review-listener.yml")
 ZIZMOR_SOURCE_REPO = "mikelward/lanes"
+# The fleet's shared agent conventions, and where a scaffolded repository
+# gets its own copy from. One maintained file rather than a second copy
+# kept in step by hand -- which is the arrangement this whole repository
+# exists to replace. Tracked at `main` like zizmor.yml, not pinned to a
+# resolved sha like TEMPLATE_FILES: those are pinned because they are a
+# SET that has to come from one revision, and this is a single file with
+# nothing to be consistent with.
+CONVENTIONS_REPO = "mikelward/conf"
+CONVENTIONS_PATH = "agents/AGENTS.md"
+# Paths where a symlink counts as the scaffold content already being
+# present, rather than as something a new blob would silently replace.
+# Only CLAUDE.md: pointing it at AGENTS.md is what most of this fleet
+# already does, and it is the same content by another route. Everywhere
+# else a symlink stays an occupied path -- a symlink at ci.yml could point
+# anywhere, and refusing is right there.
+SYMLINK_IS_PRESENT_PATHS = frozenset({"CLAUDE.md"})
 
 # A `branches: [main]` YAML mapping entry as a whole line -- not a
 # commented-out one, since `#` would sit in the leading-whitespace-only
@@ -190,6 +223,56 @@ def _ref_missing_commits(ref_raw):
     (Codex review, mikelward/repo#14)."""
     return "HTTP 404" in ref_raw or ("HTTP 409" in ref_raw and "Git Repository is empty" in ref_raw)
 
+
+# Prepended to the fetched conventions. Everything a scaffolded repository
+# has to say for itself is a TODO here, because none of it is derivable:
+# what the project is, and what a contributor actually runs. The shared
+# conventions follow, so a repository nobody has written a word about yet
+# still gives an agent the rules the rest of the fleet works under.
+_AGENTS_HEADER = """\
+# AGENTS.md
+
+Conventions for AI agents working in this repository.
+
+`CLAUDE.md` imports this file, so every agent reads the same conventions.
+Edit `AGENTS.md`.
+
+## What this repository is
+
+TODO: one paragraph -- what it does, what it is built with, and what a
+reader has to know before changing anything. Name the normative documents
+(`SPEC.md`, `TODO.md`, `README.md`) if there are any.
+
+## Building and testing
+
+TODO: the commands a contributor actually runs, and which one of them to
+run before every commit. `.github/workflows/ci.yml` ships with a
+placeholder job standing in for this project's real ones -- replacing it
+and describing it here are the same task.
+
+## Everything below
+
+The rest of this file was copied from this account's shared conventions
+(`mikelward/conf`, `agents/AGENTS.md`) when the repository was scaffolded,
+so it says what the rest of the fleet already does. It is this
+repository's copy now: edit it where this project genuinely differs,
+rather than treating it as something that syncs.
+
+Keep the whole file as short as it can be and still work. Every session
+loads it whole, so each rule costs context on every turn: add one the
+first time something bites, say it once in the fewest words that carry the
+*why*, rewrite or trim an existing rule rather than appending beside it,
+and delete one that has stopped biting.
+
+"""
+
+# Claude Code reads CLAUDE.md, not AGENTS.md, so a scaffolded repository
+# needs both. An import rather than a symlink: it is what mikelward/conf's
+# own CLAUDE.md does, and the scaffold's file map is plain blobs
+# throughout -- push_initial_commit's bootstrap goes through the Contents
+# API, which cannot write a symlink at all. A repository that already has
+# the symlink keeps it (see SYMLINK_IS_PRESENT_PATHS).
+_CLAUDE_MD = "@AGENTS.md\n"
 
 _ZIZMOR_POLICY = """\
 # Policy for zizmor; the workflow beside this file runs it.
@@ -434,6 +517,12 @@ def build_scaffold_files(default_branch):
     if zizmor_rewritten is None:
         return None
     files[".github/workflows/zizmor.yml"] = zizmor_rewritten
+
+    conventions = _fetch_file(CONVENTIONS_REPO, CONVENTIONS_PATH)
+    if conventions is None:
+        return None
+    files["AGENTS.md"] = _AGENTS_HEADER + conventions
+    files["CLAUDE.md"] = _CLAUDE_MD
 
     files[".github/zizmor.yml"] = _ZIZMOR_POLICY
     files[".github/lanes.conf"] = _LANES_CONF
@@ -685,7 +774,16 @@ def plan_gaps(repo, default_branch):
 
     def is_regular_file(path):
         kind, mode = existing.get(path, (None, None))
-        return kind == "blob" and mode in ("100644", "100755")
+        if kind != "blob":
+            return False
+        if mode == "120000" and path in SYMLINK_IS_PRESENT_PATHS:
+            # Most of this fleet points CLAUDE.md at AGENTS.md with a
+            # symlink, which is the scaffold's content by another route.
+            # Counting it as occupied instead would fail the whole
+            # bootstrap step on every one of those repositories, over a
+            # file that is already exactly right.
+            return True
+        return mode in ("100644", "100755")
 
     def occupied_reason(path):
         """None if `path` is safe to add as a new blob under base_tree

@@ -57,6 +57,7 @@ _INSTALL_OWNER_JQ_RE = re.compile(r'== \("([^"]*)" \| ascii_downcase\)')
 _SCAFFOLD_TEMPLATE_COMMIT_RE = re.compile(r"^repos/mikelward/codex-review/commits/main$")
 _SCAFFOLD_TEMPLATE_RE = re.compile(r"^repos/mikelward/codex-review/contents/templates/([^/?]+)\?ref=(.+)$")
 _SCAFFOLD_ZIZMOR_RE = re.compile(r"^repos/mikelward/lanes/contents/\.github/workflows/zizmor\.yml\?ref=main$")
+_SCAFFOLD_CONVENTIONS_RE = re.compile(r"^repos/mikelward/conf/contents/agents/AGENTS\.md\?ref=main$")
 # Singular git/ref/... is the read (GET) route; plural git/refs/... is
 # create/update/delete only and has no GET at all -- two regexes, not one,
 # so the fixture can only answer a read on the route real GitHub actually
@@ -240,6 +241,8 @@ class FakeGh:
         # of zizmor.yml is always a no-op here regardless of content.
         self.template_contents = {name: f"# fake {name}\n" for name in scaffold.TEMPLATE_FILES}
         self.zizmor_workflow_content = "# fake zizmor.yml\n"
+        self.conventions_content = "# Coding\n\n- Fake shared conventions.\n"
+        self.conventions_fetch_fails = False
         self.template_fetch_fails = set()  # TEMPLATE_FILES names whose fetch 404s
         self.template_resolve_fails = False  # codex-review main->sha resolve fails
         # The fixed sha every template fetch must be pinned to once
@@ -613,6 +616,11 @@ class FakeGh:
                 raise gh.GhError(f"gh: HTTP 404: Not Found (.../{endpoint})\n")
             return base64.encodebytes(self.template_contents.get(name, "").encode()).decode()
 
+        if _SCAFFOLD_CONVENTIONS_RE.match(endpoint) and jq == ".content":
+            if self.conventions_fetch_fails:
+                raise gh.GhError("gh: HTTP 404: Not Found (.../repos/mikelward/conf)\n")
+            return base64.encodebytes(self.conventions_content.encode()).decode()
+
         if _SCAFFOLD_ZIZMOR_RE.match(endpoint) and jq == ".content":
             if self.zizmor_fetch_fails:
                 raise gh.GhError("gh: HTTP 404: Not Found (.../repos/mikelward/lanes)\n")
@@ -684,6 +692,8 @@ class FakeGh:
             ".github/zizmor.yml",
             ".github/lanes.conf",
             ".github/workflows/ci.yml",
+            "AGENTS.md",
+            "CLAUDE.md",
         }
 
     def _text(self, name, ref):
@@ -3876,11 +3886,11 @@ class BootstrapStepTest(unittest.TestCase):
 
         code, out, err = _run(fake, ["--force", "--no-rules", REPO])
         self.assertEqual(code, 0, err)
-        self.assertIn(f"{REPO}: added 5 fleet CI scaffold file(s)", out)
+        self.assertIn(f"{REPO}: added 7 fleet CI scaffold file(s)", out)
         blob_paths = {body["encoding"] for _args, body in fake.posts if "encoding" in body}
         self.assertEqual(blob_paths, {"utf-8"})
         blob_posts = [body for _args, body in fake.posts if "encoding" in body]
-        self.assertEqual(len(blob_posts), 5)  # one blob per missing file, none for the two present
+        self.assertEqual(len(blob_posts), 7)  # one blob per missing file, none for the two present
         tree_posts = [body for _args, body in fake.posts if "base_tree" in body]
         self.assertEqual(len(tree_posts), 1)
         self.assertEqual(tree_posts[0]["base_tree"], fake.bootstrap_tree_sha)
@@ -3892,6 +3902,8 @@ class BootstrapStepTest(unittest.TestCase):
                 ".github/workflows/zizmor.yml",
                 ".github/zizmor.yml",
                 ".github/workflows/ci.yml",
+                "AGENTS.md",
+                "CLAUDE.md",
             },
         )
         commit_posts = [body for _args, body in fake.posts if "parents" in body]
@@ -3899,6 +3911,65 @@ class BootstrapStepTest(unittest.TestCase):
         self.assertEqual(commit_posts[0]["parents"], [fake.bootstrap_commit_sha])
         self.assertEqual(len(fake.patches), 1)
         self.assertEqual(fake.patches[0][1], {"sha": "newscaffoldcommitsha", "force": False})
+
+    def test_a_symlinked_claude_md_counts_as_present_not_occupied(self):
+        # Most of this fleet points CLAUDE.md at AGENTS.md with a symlink,
+        # which is the scaffold's content by another route. Treating it as
+        # an occupied path -- the rule for every other non-regular file --
+        # would fail the whole bootstrap step on those repositories over a
+        # file that is already exactly right.
+        fake = FakeGh()
+        fake.bootstrap_occupied_entries = {"CLAUDE.md": ("blob", "120000")}
+        code, out, err = _run(fake, ["--dry-run", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("cannot add CLAUDE.md", err)
+        self.assertNotIn("add CLAUDE.md", out)
+
+    def test_a_symlink_anywhere_else_is_still_an_occupied_path(self):
+        # The exemption is one named path, not "a symlink is fine": one at
+        # ci.yml could point anywhere, and silently replacing it is what
+        # this step promises never to do.
+        fake = FakeGh()
+        fake.bootstrap_occupied_entries = {".github/workflows/ci.yml": ("blob", "120000")}
+        code, out, err = _run(fake, ["--dry-run", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("cannot add .github/workflows/ci.yml", err)
+
+    def test_the_scaffolded_conventions_carry_the_shared_ones_and_the_placeholders(self):
+        # A freshly created repository is the one place in the fleet an
+        # agent works with no conventions loaded at all, which is exactly
+        # when it is most likely to invent some. So the file carries the
+        # shared rules rather than deferring to a user-level file that a
+        # remote session may not load, with the repository-specific parts
+        # left as explicit TODOs.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        blobs = {}
+        tree_posts = [body for _args, body in fake.posts if "base_tree" in body]
+        blob_posts = [body for _args, body in fake.posts if "encoding" in body]
+        for entry, body in zip(tree_posts[0]["tree"], blob_posts):
+            blobs[entry["path"]] = body["content"]
+        # The fake answers blobs in the order they were created, which is
+        # sorted by path -- assert that rather than trusting it.
+        self.assertEqual(
+            [e["path"] for e in tree_posts[0]["tree"]], sorted(blobs), "blob order assumption"
+        )
+        agents = blobs["AGENTS.md"]
+        self.assertIn("TODO: one paragraph", agents)
+        self.assertIn("Fake shared conventions", agents)
+        self.assertEqual(blobs["CLAUDE.md"], "@AGENTS.md\n")
+
+    def test_an_unreadable_conventions_source_fails_the_scaffold(self):
+        # Fail-closed like every other template source: a scaffold missing
+        # its conventions is not a scaffold this tool wrote.
+        fake = FakeGh()
+        fake.conventions_fetch_fails = True
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("mikelward/conf", err)
+        self.assertIn("failed on: bootstrap", err)
 
     def test_bootstrap_applies_before_the_ruleset_step(self):
         # A ruleset requiring pull requests blocks apply_gaps's own direct
@@ -4407,7 +4478,7 @@ class BootstrapStepTest(unittest.TestCase):
         fake.bootstrap_ref_missing = True
         code, out, err = _run(fake, ["--force", "--no-rules", REPO])
         self.assertEqual(code, 0, err)
-        self.assertIn(f"{REPO}: added 7 fleet CI scaffold file(s)", out)
+        self.assertIn(f"{REPO}: added 9 fleet CI scaffold file(s)", out)
         self.assertEqual(len(fake.puts), 1)  # the Contents-API bootstrap write
         self.assertEqual(fake.puts[0][1]["branch"], "main")
 
@@ -4424,7 +4495,7 @@ class BootstrapStepTest(unittest.TestCase):
         fake.bootstrap_ref_empty_409 = True
         code, out, err = _run(fake, ["--force", "--no-rules", REPO])
         self.assertEqual(code, 0, err)
-        self.assertIn(f"{REPO}: added 7 fleet CI scaffold file(s)", out)
+        self.assertIn(f"{REPO}: added 9 fleet CI scaffold file(s)", out)
         self.assertEqual(len(fake.puts), 1)  # the Contents-API bootstrap write
         self.assertEqual(fake.puts[0][1]["branch"], "main")
 
