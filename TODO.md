@@ -316,6 +316,33 @@ doesn't set today).
       reusable-workflow call it can't parse) on any shape it doesn't
       recognize, rather than treating an unparseable shape as "not
       present."
+      **Matching `uses: mikelward/lanes@...` accepts ANY revision --
+      structurally correct today says nothing about whether the ACTUAL
+      code at that ref supports the modes and inputs this design
+      depends on** (Codex review, mikelward/repo#26, P1): `scaffold.py`
+      itself generates an unpinned `@main` (`scaffold.py:272,302`), but
+      the detector's own wording ("`uses: mikelward/lanes@...`") accepts
+      any ref -- a SHA, a tag, a branch -- with no check that the
+      revision it points at actually implements `mode: init`/`gate` with
+      `app-id:`/`app-private-key:`/`pr:` inputs. A workflow pinned to a
+      `mikelward/lanes` revision that predates those inputs would still
+      structurally match every check above (the calling side's syntax is
+      what's being parsed, not the callee's capability), while at run
+      time the action either errors or silently ignores inputs it
+      doesn't recognize and never actually publishes -- and an OLD status
+      from before the pin was set (or from when it still tracked `@main`)
+      can sit there satisfying the ruleset's history-based preflight the
+      whole time, letting `repo setup` bind `lanes` to an App with no
+      currently-working publisher. Closing this needs resolving the
+      referenced ref to a concrete revision and confirming THAT
+      revision's own `action.yml` declares the required inputs/modes --
+      which means a read against `mikelward/lanes` itself, not just the
+      calling repository's workflow text -- or, short of that, a
+      documented minimum compatible revision (a tag or SHA, sourced from
+      `mikelward/lanes`' own TODO.md/CHANGELOG stating when App-publishing
+      landed) the detector can compare against and fail closed below.
+      Confirm which approach lanes' own TODO.md already supports before
+      building either.
       **OPEN DECISION -- this detector, and every structural requirement
       layered onto it below (mode, `pr:` resolution, `results:`/
       `classify-result:`/`base-sha:` correspondence to `classify`'s real
