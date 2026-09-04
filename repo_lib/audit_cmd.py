@@ -225,19 +225,25 @@ def audit_duplicate_rulesets(repo, ok, note):
 
     GitHub does not make a ruleset's name unique within a repository, so
     two can be named `main` and both apply. `repo setup` writes the first
-    and says it is leaving the other alone; nothing fixes it, because what
-    to do when the two disagree is undecided (see TODO.md).
+    the repository OWNS and says it is leaving the others alone; nothing
+    fixes it, because what to do when the two disagree is undecided (see
+    TODO.md).
 
     [CHECK], therefore, not [FIX] or [GAP]: [FIX] would claim `repo setup`
     closes it, which it does not, and [GAP] would fail the audit over a
-    state no command here can resolve."""
+    state no command here can resolve.
+
+    Two lookups, on purpose. With parents included -- an org- or
+    enterprise-level ruleset of the same name aggregates with the
+    repository's own, so counting only what the repository owns would
+    report "just the one" over two that both apply. And without -- because
+    that is the list `repo setup` acts on, and the first id WITH parents
+    is the inherited one whenever the organization's predates the
+    repository's, so naming it as setup's target would point at the wrong
+    ruleset (Codex review, mikelward/repo#33)."""
     try:
-        # include_parents: an org- or enterprise-level ruleset of the same
-        # name aggregates with the repository's own, so counting only what
-        # the repository owns would report "just the one" over two that
-        # both apply. `repo setup` is the opposite case and asks without
-        # parents -- it can only write a ruleset the repository owns.
         ids = rules.find_rulesets_named(repo, include_parents=True)
+        owned = rules.find_rulesets_named(repo)
     except rules.RulesetError:
         raise SystemExit(1)
     if not ids:
@@ -247,14 +253,26 @@ def audit_duplicate_rulesets(repo, ok, note):
         # all-clear for a repository that has none.
         ok(f"no ruleset is named '{rules.DEFAULT_RULESET_NAME}'")
         return
-    extras = ids[1:]
-    if not extras:
+    if len(ids) == 1:
         ok(f"exactly one ruleset is named '{rules.DEFAULT_RULESET_NAME}'")
         return
+    inherited = [rid for rid in ids if rid not in owned]
+    parts = [f"ids {', '.join(ids)}"]
+    if inherited:
+        parts.append(
+            f"inherited from the organization and not changeable here: {', '.join(inherited)}"
+        )
+    if owned:
+        parts.append(f"`repo setup` writes {owned[0]} and leaves the rest alone")
+    else:
+        parts.append(
+            "`repo setup` writes none of them -- it only ever writes a ruleset the "
+            "repository owns"
+        )
     note(
-        f"more than one ruleset is named '{rules.DEFAULT_RULESET_NAME}' -- "
-        f"also id(s) {', '.join(extras)}. Rulesets aggregate, so all of them apply, and "
-        "`repo setup` writes only the first. Reconcile them by hand"
+        f"more than one ruleset is named '{rules.DEFAULT_RULESET_NAME}': "
+        + "; ".join(parts)
+        + ". Rulesets aggregate, so all of them apply. Reconcile them by hand"
     )
 
 
