@@ -349,6 +349,29 @@ doesn't set today).
       additional evidence when present (the real design normally has
       both, per the initializer/finalizer split), never a substitute for
       it.
+      **`init` is not merely "additional evidence when present" -- without
+      it, a re-run that doesn't change the head SHA leaves the OLD
+      terminal status covering the whole re-run window, and that was
+      wrong to accept as optional** (Codex review, mikelward/repo#26):
+      GitHub evaluates a required status check against whatever the
+      latest posted status for that `(context, sha)` pair is, and a
+      re-run triggered by something other than a new commit -- a title
+      edit, a retarget, a `synchronize` that lanes' own trigger filters
+      still accept -- doesn't clear the previous run's status first. A
+      `gate`-only publisher leaves the PREVIOUS success sitting there,
+      green, for the entire time the new run takes to reach its own
+      `gate` step -- during which the check reads "satisfied" even though
+      the diff being re-evaluated might turn out to fail. `init`'s whole
+      job is to post `pending` immediately so that window doesn't exist;
+      that's a correctness property, not extra credit. `repo`'s own
+      generated `classify` step already sets `mode: classify` early for
+      a different reason (docs-lane skip), but nothing there posts
+      `pending` for `lanes` itself the way `init` does. The detector
+      needs to require BOTH a credentialed `init` step early in the
+      trigger's run AND a credentialed `gate` step as the terminal one --
+      `init` is no longer "additional evidence when present," it's a
+      second required element, and the compliant predicate below needs
+      to check for it the same way.
       **The step's own trigger matters too -- a credentialed `gate` step
       inside a workflow that never runs `pull_request_target` is not a
       working publisher for pull requests either** (Codex review,
@@ -400,6 +423,35 @@ doesn't set today).
       The detector needs to check the `gate` STEP's own condition (not
       just its job's), unless it is the only step in the job -- and fail
       closed the same way on a step-level condition it can't analyze.
+      **A correct `if:` on the `gate` step protects against a SKIPPED
+      step, not a TAMPERED one -- a preceding step in the same job that
+      executes PR-controlled content can compromise the runner itself,
+      and `gate`'s credentials ride on the same compromised runner
+      whatever its own `if:` says** (Codex review, mikelward/repo#26):
+      every step in a job shares one runner and one filesystem, so a
+      step that runs untrusted code before `gate` -- a build, a test
+      suite, anything that executes rather than merely fetches PR
+      content -- can tamper with the toolcache, `PATH`, a downloaded
+      action's cached files, or other runner state in a way that
+      compromises `gate`'s own execution and lets it exfiltrate
+      `app-id`/`app-private-key` without ever touching `secrets.*`
+      directly itself. This is a different threat from every check above:
+      it doesn't care whether `gate`'s own `if:`, mode, or trigger are
+      correct, because the compromise happens before `gate` runs at all.
+      The real design's own `finalize` job (typelauncher's `ci.yml`) is
+      the safe shape already: its only step before `gate` is
+      `actions/checkout` with `persist-credentials: false` -- fetching PR
+      content as data, never executing it -- and every job that DOES
+      execute PR content (`build`, `connected-tests`) is a separate job
+      with no credentials in it at all. The detector needs to require
+      that shape: the credentialed `gate` step runs in a job whose only
+      other steps fetch content rather than execute it (a checkout is
+      fine; a build/test/lint step is not), and fail closed on a job
+      whose other steps it can't classify either way. Full verification
+      -- proving a "safe" step like `checkout` itself wasn't compromised
+      further upstream -- is out of scope for a static check; this item
+      only closes the same-job, executes-before-`gate` case, which is the
+      one a migrated `ci.yml` could introduce by accident.
       **A credentialed, correctly-triggered `gate` step still isn't a safe
       publisher without a PR-scoped, cancel-in-progress `concurrency:`
       group on its workflow -- and this section's own closing note below
@@ -415,10 +467,29 @@ doesn't set today).
       such `concurrency:` group is not a safe publisher yet, so it isn't
       enough to fix lanes' own README template and leave every consumer's
       own workflow file unchecked. The detector needs to also confirm the
-      workflow declares a `concurrency:` group scoped to the PR (by
-      number or ref, the way both real consumers already do) with
+      workflow declares a `concurrency:` group scoped to the PR with
       `cancel-in-progress: true`, and the compliant predicate below needs
       to require it the same way it requires the trigger and the mode.
+      **"Scoped to the PR" has to mean `github.event.pull_request.number`
+      specifically -- `github.ref` alone is not PR-unique under
+      `pull_request_target` and accepting it was a real gap in the
+      paragraph above, not just an imprecise gloss on it** (Codex review,
+      mikelward/repo#26): `pull_request_target` runs against the BASE
+      branch's context, so `github.ref` there resolves to something like
+      `refs/heads/main` -- identical across every open PR targeting that
+      branch. A concurrency group keyed on `github.ref` alone would put
+      every PR targeting `main` in the SAME group, so starting one PR's
+      run cancels another PR's already-running publisher, leaving that
+      other PR's `lanes` status stuck `pending` indefinitely -- the exact
+      failure mode this whole item exists to prevent, just caused by the
+      fix meant to prevent it. `github.ref` is a safe fallback only for a
+      non-PR trigger this workflow might also run under (a `push`, which
+      is genuinely one ref at a time) -- exactly how yaml-lite's own
+      `github.event.pull_request.number || github.ref` pattern (quoted in
+      this section's closing note) uses it: PR number first, ref only
+      when there is no PR. The detector needs to confirm the group key
+      resolves to the PR number for every `pull_request_target` run, not
+      merely that SOME expression involving `ref` appears in it.
       **The step alone is not enough -- the ENCLOSING JOB has to select
       the `lanes` environment too, or the move this detector triggers
       breaks the very thing it's meant to protect** (Codex review,
