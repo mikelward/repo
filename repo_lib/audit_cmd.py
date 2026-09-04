@@ -220,6 +220,39 @@ def _targeting_status(include, exclude):
 # The weekly dependency batches, keyed by the caller workflow file a consumer
 # carries. Each hub's publish job reads its credential from an environment
 # of the same name (see that repository's docs/PAT.md).
+def audit_legacy_rulesets(repo, ok, fix):
+    """Reports a ruleset still carrying a name this tool used before
+    `rules.DEFAULT_RULESET_NAME`.
+
+    `repo setup` says so on every run, which is how the fleet finds them
+    -- but that means running a write command against a repository just to
+    ask a read-only question, so there was no way to sweep the fleet for
+    "which of these still have two?". rules.find_legacy_rulesets is
+    reused rather than reimplemented, so the two commands cannot come to
+    disagree about which names count.
+
+    [FIX] rather than [GAP]: `repo setup` closes it, either by adopting
+    the ruleset (when there is no standard-named one) or by deleting it
+    (when it is identical to the one that survives). One that is neither
+    still needs a human, and setup says which."""
+    try:
+        legacy = rules.find_legacy_rulesets(repo)
+    except rules.RulesetError:
+        # find_legacy_rulesets has already reported the failed call. Fail
+        # closed, like every other ruleset read here: "could not tell"
+        # must never print as "there is none".
+        raise SystemExit(1)
+    if not legacy:
+        ok(f"no ruleset left under a name this tool used before '{rules.DEFAULT_RULESET_NAME}'")
+        return
+    for name, rid in legacy:
+        fix(
+            f"'{name}' (id {rid}) is a ruleset name this tool used before "
+            f"'{rules.DEFAULT_RULESET_NAME}' -- rulesets aggregate, so it applies too. "
+            "`repo setup` adopts it, or deletes it when it duplicates the one that stays"
+        )
+
+
 def audit_auto_merge(repo, ok, fix):
     """Whether the repository allows auto-merge. The weekly batches arm
     auto-merge on the pull requests they open, and a repository with the
@@ -836,6 +869,7 @@ def run(args):
         error_lines(f"could not check whether {repo} has a branch named 'master':", detail)
         raise SystemExit(1)
 
+    audit_legacy_rulesets(repo, ok, fix)
     audit_auto_merge(repo, ok, fix)
     audit_delete_branch_on_merge(repo, ok, fix)
     audit_secrets(repo, ok, fix)
