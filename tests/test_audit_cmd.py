@@ -100,6 +100,8 @@ class FakeGh:
         self.branch_workflows = {}
         self.allow_auto_merge = "true"
         self.auto_merge_fails = None  # gh stderr text, or None
+        self.delete_branch_on_merge = "true"
+        self.delete_branch_on_merge_fails = None  # gh stderr text, or None
         self.effective_rules = list(DEFAULT_EFFECTIVE_RULES)
         self.effective_rules_fails = None  # gh stderr text, or None
         # None means "one page" (self.effective_rules as a whole). Set to a
@@ -155,6 +157,10 @@ class FakeGh:
             if self.auto_merge_fails is not None:
                 raise gh.GhError(self.auto_merge_fails)
             return self.allow_auto_merge + "\n"
+        if m and jq == ".delete_branch_on_merge":
+            if self.delete_branch_on_merge_fails is not None:
+                raise gh.GhError(self.delete_branch_on_merge_fails)
+            return self.delete_branch_on_merge + "\n"
 
         m = _RULES_RE.match(endpoint)
         if m:
@@ -1058,6 +1064,34 @@ class AutoMergeAuditTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn(f"could not read whether {REPO} allows auto-merge:", err)
         self.assertNotIn("auto-merge is", out)
+
+
+class DeleteBranchOnMergeAuditTest(unittest.TestCase):
+    def test_delete_branch_on_merge_allowed_is_ok(self):
+        code, out, err = _run(FakeGh(), [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "[ok] a merged pull request's head branch is deleted automatically", out
+        )
+
+    def test_delete_branch_on_merge_off_is_a_fix_naming_setup(self):
+        fake = FakeGh()
+        fake.delete_branch_on_merge = "false"
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            f"[FIX] {REPO} does not delete a merged pull request's head branch automatically -- "
+            f"branches accumulate until `repo cleanup` sweeps them; `repo setup {REPO}` enables it",
+            out,
+        )
+
+    def test_a_failed_delete_branch_on_merge_read_exits_1(self):
+        fake = FakeGh()
+        fake.delete_branch_on_merge_fails = "gh: HTTP 500: boom\n"
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(f"could not read whether {REPO} deletes branches on merge:", err)
+        self.assertNotIn("deletes branches on merge", out)
 
 
 class SecretsAuditTest(unittest.TestCase):

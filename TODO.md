@@ -64,17 +64,31 @@
       off as a `[FIX]` in `repo audit` (maintainer, 2026-09-01: it was off on
       readmo and "probably is for a few repos"; the weekly batches arm it on
       their pull requests).
+- [x] Enable GitHub's "automatically delete head branches" setting
+      (`delete_branch_on_merge`) from `repo setup`, and report it off as a
+      `[FIX]` in `repo audit` (maintainer, 2026-09-04: the user asked how to
+      stop having to run `repo cleanup` by hand after every merge). This is
+      the setting `repo cleanup`'s own docstring already named as the reason
+      it has to exist; the fleet never turned it on, so branches kept
+      accumulating until someone ran the sweep. Fires from the merge event
+      itself, so it is unaffected by this fleet rebase-merging (unlike an
+      ancestry check). `repo cleanup` still owns the backlog every repository
+      already has, plus what this setting can't see: a merge with no pull
+      request, or a branch still unmerged.
 - [ ] **Promote `[FIX]` to `[GAP]` after the next setup pass.** `[FIX]`
       findings are reported but do not fail `repo audit` (maintainer,
       2026-09-01: "keep it lax enough to accept the current standard ...
       and keep a Todo to tighten it after the next setup pass"). Once
       every repository has been through `repo setup --credential ...`,
       route them through `gap()` instead of `fix()` in
-      `audit_cmd.audit_secrets` and `audit_auto_merge`, and flip the
-      `assertEqual(code, 0, ...)` assertions in `SecretsAuditTest` and
-      `AutoMergeAuditTest` -- they are written to have to change. Until then the hubs and every converted caller read a
-      repository-level credential through `inherit`, so nothing is
-      broken by the lax reading, only less isolated than it will be.
+      `audit_cmd.audit_secrets`, `audit_auto_merge`, and
+      `audit_delete_branch_on_merge`, and flip the
+      `assertEqual(code, 0, ...)` assertions in `SecretsAuditTest`,
+      `AutoMergeAuditTest`, and `DeleteBranchOnMergeAuditTest` -- they are
+      written to have to change. Until then the hubs and every converted
+      caller read a repository-level credential through `inherit`, so
+      nothing is broken by the lax reading, only less isolated than it
+      will be.
 
 ## repo setup: fleet CI scaffold
 

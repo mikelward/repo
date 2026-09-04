@@ -114,6 +114,8 @@ class FakeGh:
         self.allow_rebase = "true"
         self.allow_auto_merge = "true"
         self.fail_allow_auto_merge = False
+        self.delete_branch_on_merge = "true"
+        self.fail_delete_branch_on_merge = False
         self.patches = []
         self.patch_fails = False
         self.branch_count = "1"
@@ -349,6 +351,10 @@ class FakeGh:
             if self.fail_allow_auto_merge or self.repo_missing:
                 raise gh.GhError("gh: HTTP 404: Not Found\n")
             return self.allow_auto_merge + "\n"
+        if m and jq == ".delete_branch_on_merge":
+            if self.fail_delete_branch_on_merge or self.repo_missing:
+                raise gh.GhError("gh: HTTP 404: Not Found\n")
+            return self.delete_branch_on_merge + "\n"
         if m and jq == ".allow_rebase_merge":
             if self.fail_allow_rebase:
                 raise gh.GhError("gh: HTTP 500: Internal Server Error\n")
@@ -702,6 +708,9 @@ class FakeGh:
                 self._scaffold_ref_current_sha = body["sha"]
                 self._scaffold_ref_patched = True
             self.allow_auto_merge = "true" if body.get("allow_auto_merge") else self.allow_auto_merge
+            self.delete_branch_on_merge = (
+                "true" if body.get("delete_branch_on_merge") else self.delete_branch_on_merge
+            )
         else:
             raise AssertionError(f"unexpected method: {method}")
         return b""
@@ -3121,6 +3130,80 @@ class AutoMergeStepTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn(f"could not read whether {REPO} allows auto-merge:", err)
         self.assertIn("failed on: auto-merge", err)
+        self.assertEqual(fake.patches, [])
+        self.assertEqual(fake.written_secrets, [("TOKEN", REPO, "lanes", b"sekrit")])
+
+
+class DeleteBranchOnMergeStepTest(unittest.TestCase):
+    """Always on, like the auto-merge step above and for the same reason:
+    the setting has one right value, and it's what `repo cleanup` exists
+    to make unnecessary going forward."""
+
+    def test_an_allowed_repository_needs_nothing(self):
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        code, out, err = _run(fake, ["--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(err, "")
+        self.assertEqual(fake.patches, [])
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+        code, out, err = _run(fake, ["--dry-run", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("  delete-branch-on-merge:\n    already allowed\n", out)
+
+    def test_delete_branch_on_merge_is_enabled_after_confirmation(self):
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        fake.delete_branch_on_merge = "false"
+        # A repository setting change, so it is a mutation the gate asks about.
+        code, out, err = _run(fake, ["--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("stdin is not a terminal", err)
+        self.assertEqual(fake.patches, [])
+        code, out, err = _run(fake, ["--force", "-v", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "delete a pull request's head branch automatically once it merges",
+            err,
+        )
+        self.assertEqual(len(fake.patches), 1)
+        args, body = fake.patches[0]
+        self.assertEqual(args[:4], ["api", "--method", "PATCH", f"repos/{REPO}"])
+        self.assertEqual(body, {"delete_branch_on_merge": True})
+        self.assertIn(f"{REPO}: enabled delete-branch-on-merge", out)
+
+    def test_a_dry_run_reports_without_enabling(self):
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        fake.delete_branch_on_merge = "false"
+        code, out, err = _run(fake, ["--dry-run", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "  delete-branch-on-merge:\n    delete a pull request's head branch automatically",
+            out,
+        )
+        self.assertEqual(fake.patches, [])
+
+    def test_a_failed_enable_fails_the_step(self):
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        fake.delete_branch_on_merge = "false"
+        fake.patch_fails = True
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(f"could not enable delete-branch-on-merge on {REPO}:", err)
+        self.assertIn("failed on: delete-branch-on-merge", err)
+
+    def test_a_failed_read_fails_this_step_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _secret_file(tmp, "value.txt")
+            fake = FakeGh()
+            fake.workflow_files = ["ci.yml"]
+            fake.fail_delete_branch_on_merge = True
+            code, out, err = _run(fake, ["--force", "--no-rules", "--secret", f"TOKEN@lanes={path}", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(f"could not read whether {REPO} deletes branches on merge:", err)
+        self.assertIn("failed on: delete-branch-on-merge", err)
         self.assertEqual(fake.patches, [])
         self.assertEqual(fake.written_secrets, [("TOKEN", REPO, "lanes", b"sekrit")])
 
