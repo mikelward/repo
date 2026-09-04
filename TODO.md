@@ -352,6 +352,23 @@ doesn't set today).
       workflow is triggered by `pull_request_target`, and fail closed on
       a trigger shape it can't parse (a matrix, an external reusable-
       workflow indirection, or similar) rather than assume coverage.
+      **A credentialed `gate` step also has to actually RUN when one of
+      its own job's dependencies fails, or it never publishes anything at
+      all -- not even a failure** (Codex review, mikelward/repo#26): a
+      `needs:`-dependent job is skipped by GitHub the instant a dependency
+      fails or is cancelled, unless the job's own `if:` overrides that
+      default -- which is exactly why lanes' README template puts
+      `if: ${{ !cancelled() }}` on the finalizer (see this section's
+      closing note on the missing `concurrency:` block, which quotes the
+      same line). A `gate` job with `needs:` and no such condition still
+      matches every structural check above -- credentials, mode,
+      environment, trigger -- while a single upstream failure silently
+      skips it, leaving the required check with no producer at all rather
+      than a failing one. The detector needs to also confirm the `gate`
+      job's own condition keeps it running after a dependency failure
+      (`if: ${{ !cancelled() }}` or an equivalent that isn't strictly
+      narrower), and fail closed on a condition expression it can't
+      analyze.
       **The step alone is not enough -- the ENCLOSING JOB has to select
       the `lanes` environment too, or the move this detector triggers
       breaks the very thing it's meant to protect** (Codex review,
@@ -435,6 +452,28 @@ doesn't set today).
       entry outside it before -- or as part of -- placing the credential,
       the same direction as deleting a stray copy from the wrong
       environment.
+      **The branch policy is not the only protection an environment can
+      carry, and the others can block a publisher just as completely as a
+      missing branch policy would** (Codex review, mikelward/repo#26): a
+      `lanes` environment can also have required reviewers, a wait timer,
+      or a custom deployment-protection rule (a separate GitHub Apps
+      surface from the branch-policy endpoint this item has been about).
+      Any of those can satisfy the exact three-name branch-policy check
+      above while every `init`/`gate` run against it stalls waiting for an
+      approval or an external decision that never comes -- a different
+      failure mode than the forgery this section exists to close, but one
+      that leaves the same symptom (pull requests waiting on a `lanes`
+      status nothing posts), and a history-based preflight can look
+      green in the meantime on the strength of an old status from before
+      the protection was added. `repo audit`'s compliant predicate needs
+      to also read the environment's protection rules (the same
+      `GET /repos/{owner}/{repo}/environments/{env}` response already
+      being read for the branch policy carries them) and treat required
+      reviewers, a wait timer, or a custom rule as `[FIX]`, not just an
+      exact-or-not branch-policy set; `repo setup` needs to remove or
+      explicitly refuse to touch an incompatible one before placing the
+      credential, the same posture as the extra-branch-policy-entry case
+      just above.
       **Widening the branch policy to all three targets does not by
       itself make all three branches' WORKFLOWS App publishers, and this
       item can't fix that -- it's a general limit of how this tool audits,
@@ -589,6 +628,24 @@ doesn't set today).
       shape -- and `rules.py`'s writer needs to actually drop a
       pre-existing `integration_id` for that request rather than
       preserving it by default.
+      **Fixing that `[FIX]` has its own ordering requirement, and it runs
+      OPPOSITE to the migration direction the binding item below settles
+      on** (Codex review, mikelward/repo#26): repairing a rollback means
+      the credential-placement step deletes the now-unused App secrets
+      (per its "delete a stray/repository-level copy" behavior) while the
+      ruleset item unbinds `lanes`. If the unbind write fails after the
+      secrets are already gone, or simply runs second and its own failure
+      is swallowed the way every `setup_cmd.run` step's failure already
+      is, the repository is left with an App-bound required check and no
+      credential anywhere that could ever satisfy it -- blocking every
+      merge until a second run fixes it, which is worse than the drifted
+      state being repaired. So for a rollback repair specifically, the
+      unbind has to succeed BEFORE the App credential is removed -- the
+      reverse of the "bind last, after the credential and membership are
+      confirmed" ordering the binding item below requires for a
+      migration. `repo setup` needs to tell the two directions apart (is
+      this run adding a binding or removing one) and sequence its ruleset
+      and credential steps accordingly, not apply one fixed order to both.
       **"Covering the repository" is deliberately not "a selected member"
       -- that was wrong in an earlier revision of this item, and so was
       the function it cited** (Codex review, mikelward/repo#26, twice, in
@@ -616,6 +673,29 @@ doesn't set today).
       since the ruleset's own `codex`/`lanes` check-history read stays
       green regardless of current membership, GitHub keeps reporting the
       LAST status that publisher posted, however long ago.
+      **None of the above actually confirms the private key WORKS -- only
+      that something with the right name sits in the right place** (Codex
+      review, mikelward/repo#26): a `LANES_APP_PRIVATE_KEY` that has been
+      revoked, rotated on GitHub's side without updating the secret, or
+      paired with the wrong `LANES_APP_ID`, still reads as "present, in
+      the right environment, right shape" to every check above -- and a
+      stale App-attributed status from before the key broke can still
+      clear the history-based preflight, so `repo audit` would report
+      compliant right up until a real pull request needs a fresh
+      installation-token exchange that can no longer succeed. Confirming
+      the credential actually authenticates needs a live token exchange
+      -- signing a JWT with the private key and calling GitHub's
+      installation-token endpoint -- which this tool doesn't do anywhere
+      today; `apps.py`'s existing membership machinery reads installation
+      listings, it doesn't mint a token from a private key. That's real
+      build work, not a detector tweak, so it's named here as a boundary
+      rather than folded into the compliant predicate: "compliant" means
+      the credential is correctly placed and shaped, not that it has been
+      verified to still authenticate, and `repo setup` should not treat
+      an already-present credential as "already correct" under a
+      stronger check until that token-exchange verification exists to
+      back it -- until then, this is a known gap the section names rather
+      than silently claims to close.
       **Out of scope for this item, on purpose: a repository whose lanes
       workflow has been removed from the default branch entirely, with no
       App secrets left either** (Codex review, mikelward/repo#26). None of
