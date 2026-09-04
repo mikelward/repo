@@ -32,10 +32,12 @@
       together (`repo_lib/rules.py`, exercised via `repo setup`), and
       `check_master_branch` warns on stderr — without failing the run —
       when the repo has an actual `master` branch. Ported: create vs.
-      update, the ownership check (refuses to overwrite a same-named
-      ruleset holding an unmanaged rule type), the never-reported-check
-      guard, the merge-method conflict scan against a repo's other active
-      rulesets, and the confirm/re-validate-before-write flow.
+      update, the ownership check (refuses a same-named ruleset GitHub
+      does not actively enforce; it also refused one holding an unmanaged
+      rule type until that was found to be guarding against a write this
+      module never makes), the never-reported-check guard, the
+      merge-method conflict scan against a repo's other active rulesets,
+      and the confirm/re-validate-before-write flow.
 
 - [x] Port repo-setup's other two steps: fanning a secret out (reusing
       `secrets_cmd.py`'s own plan/write functions directly, not

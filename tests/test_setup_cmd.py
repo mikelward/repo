@@ -64,7 +64,7 @@ _SCAFFOLD_TREE_CREATE_RE = re.compile(r"^repos/([^/]+/[^/]+)/git/trees$")
 _SCAFFOLD_COMMIT_CREATE_RE = re.compile(r"^repos/([^/]+/[^/]+)/git/commits$")
 _SCAFFOLD_CONTENTS_PUT_RE = re.compile(r"^repos/([^/]+/[^/]+)/contents/(.+)$")
 
-_OWNERSHIP_JQ = ".enforcement, (.rules[].type)"
+_OWNERSHIP_JQ = ".enforcement, .target"
 
 
 def _parse_api_args(rest):
@@ -100,9 +100,9 @@ class FakeGh:
     run_with_input, closely enough to exercise repo_lib.rules, apps, and
     the secrets_cmd functions setup_cmd reuses -- without a fake `gh`
     binary on PATH. Only the two --jq forms rules.py actually sends to a
-    single ruleset id are distinguished (the ownership check vs. the scope
-    fetch) -- there is no third, so matching on the ownership JQ string and
-    falling back to "scope fetch" for any other is safe.
+    single ruleset id are distinguished (the enforcement check vs. the
+    scope fetch) -- there is no third, so matching on the enforcement JQ
+    string and falling back to "scope fetch" for any other is safe.
     """
 
     def __init__(self):
@@ -417,8 +417,9 @@ class FakeGh:
             else:
                 obj = self.ruleset_objects[rid]
             if jq == _OWNERSHIP_JQ:
-                lines = [obj.get("enforcement", "")] + [r["type"] for r in obj.get("rules", [])]
-                return "\n".join(lines) + "\n"
+                # Fixtures predate the target check and are all branch
+                # rulesets; default rather than making every one restate it.
+                return obj.get("enforcement", "") + "\n" + obj.get("target", "branch") + "\n"
             if jq:
                 ref_name = obj.get("conditions", {}).get("ref_name", {})
                 return json.dumps(
@@ -1227,22 +1228,92 @@ class SetupCmdTest(unittest.TestCase):
         self.assertIn("rebase merging disabled", err)
         self.assertEqual(fake.posts, [])
 
-    def test_ruleset_with_unmanaged_rule_type_is_refused(self):
+    def test_an_unmanaged_rule_type_is_adopted_and_survives(self):
+        # This used to be refused, on the reasoning that overwriting the
+        # ruleset would delete the rule. An update never rebuilds the body
+        # -- every existing rule is copied through and only the four
+        # managed types are edited -- so refusing was guarding against a
+        # write this module does not make, and it left exactly the
+        # hand-made ruleset `repo setup` most needs to adopt sitting beside
+        # a second one it created instead.
         fake = FakeGh()
         fake.check_runs = {fake.default_head_sha: ["lanes"]}
         fake.existing_ruleset_id = "3"
         fake.all_ruleset_ids = ["3"]
         fake.ruleset_objects["3"] = {
             "id": 3,
-            "name": "merge gates",
+            "name": "main",
             "enforcement": "active",
             "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
-            "rules": [{"type": "commit_message_pattern", "parameters": {}}],
+            "rules": [
+                {"type": "commit_message_pattern", "parameters": {"pattern": "^x"}},
+                {"type": "required_signatures"},
+            ],
+        }
+        code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(fake.puts), 1)
+        written = fake.puts[0][1]
+        by_type = {r["type"]: r for r in written["rules"]}
+        # The unmanaged rules are still there, parameters and all.
+        self.assertEqual(by_type["commit_message_pattern"]["parameters"], {"pattern": "^x"})
+        self.assertIn("required_signatures", by_type)
+        # ...and the fleet's four gates were added alongside them.
+        for managed in rules.MANAGED_RULE_TYPES:
+            self.assertIn(managed, by_type)
+
+    def test_the_managed_set_matches_what_a_create_actually_writes(self):
+        # MANAGED_RULE_TYPES is the module's stated contract -- the types it
+        # writes, and by omission the ones it carries through untouched. It
+        # is written down in one place and enforced in another (the if/elif
+        # chain in _build_update_body), so pin them together: adding a rule
+        # to the create body without adding it here would silently widen
+        # what an update overwrites.
+        created = {rule["type"] for rule in rules._create_body("main", ["lanes"])["rules"]}
+        self.assertEqual(created, rules.MANAGED_RULE_TYPES)
+
+    def test_a_tag_targeted_ruleset_of_the_same_name_is_refused(self):
+        # Accepting extra rule types opened this: a tag ruleset holding
+        # only required_signatures now passes the rule-type test, and
+        # _build_update_body would preserve target "tag" while adding
+        # branch-only rules -- so the dry run promises an update GitHub
+        # rejects on PUT, after earlier steps have already written (Codex
+        # review, mikelward/repo#29).
+        fake = FakeGh()
+        fake.check_runs = {fake.default_head_sha: ["lanes"]}
+        fake.existing_ruleset_id = "3"
+        fake.all_ruleset_ids = ["3"]
+        fake.ruleset_objects["3"] = {
+            "id": 3,
+            "name": "main",
+            "target": "tag",
+            "enforcement": "active",
+            "conditions": {"ref_name": {"include": ["~ALL"], "exclude": []}},
+            "rules": [{"type": "required_signatures"}],
         }
         code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
         self.assertEqual(code, 1)
-        self.assertIn("does not manage", err)
-        self.assertIn("commit_message_pattern", err)
+        self.assertIn("targets 'tag'", err)
+        self.assertEqual(fake.puts, [])
+
+    def test_an_inactive_ruleset_is_still_refused(self):
+        # The other half of the check, and the half that stays: a ruleset
+        # GitHub does not enforce would report a gate that does not gate.
+        fake = FakeGh()
+        fake.check_runs = {fake.default_head_sha: ["lanes"]}
+        fake.existing_ruleset_id = "3"
+        fake.all_ruleset_ids = ["3"]
+        fake.ruleset_objects["3"] = {
+            "id": 3,
+            "name": "main",
+            "enforcement": "evaluate",
+            "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+            "rules": [],
+        }
+        code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("not", err)
+        self.assertIn("'active'", err)
         self.assertEqual(fake.puts, [])
 
     def test_conflicting_ruleset_blocks_the_write(self):
