@@ -1671,6 +1671,22 @@ class SetupCmdTest(unittest.TestCase):
         self.assertEqual(fake.puts, [])
         self.assertEqual(fake.deleted_rulesets, [])
 
+    def test_a_duplicate_appearing_before_the_write_is_reported_even_when_quiet(self):
+        # setup_cmd's real apply runs quiet unless --verbose, so gating
+        # this report on quiet -- as the reports around it are -- would
+        # suppress the only warning there is for a second ruleset created
+        # since the preview ran, which is precisely the silence this is
+        # for (Codex review, mikelward/repo#33).
+        fake = FakeGh()
+        self._ruleset_with_scope(fake, list(_HARDENED_SCOPE))
+        fake.all_ruleset_ids = ["7", "8"]
+        fake.ruleset_objects["8"] = dict(fake.ruleset_objects["7"], id=8)
+        fake.existing_ruleset_ids = ["7", "8"]
+        # No -v: the real apply is quiet, and the note still has to appear.
+        code, out, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("more than one ruleset is named 'main'", err)
+
     def test_an_identical_legacy_ruleset_is_deleted(self):
         # Rulesets aggregate, so a duplicate is not broken -- but
         # allowed_merge_methods INTERSECTS, so a pair that ever drifts

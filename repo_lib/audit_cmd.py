@@ -232,9 +232,17 @@ def audit_duplicate_rulesets(repo, ok, note):
     closes it, which it does not, and [GAP] would fail the audit over a
     state no command here can resolve."""
     try:
-        extras = rules.find_duplicate_standard_rulesets(repo)
+        ids = rules.find_rulesets_named(repo)
     except rules.RulesetError:
         raise SystemExit(1)
+    if not ids:
+        # Not a gap on its own: the branch's own rules are checked above
+        # from the effective-rules API, which covers an inherited or
+        # differently-named ruleset too. Saying "exactly one" here would
+        # be a false all-clear for a repository that has none of its own.
+        ok(f"no repository ruleset is named '{rules.DEFAULT_RULESET_NAME}'")
+        return
+    extras = ids[1:]
     if not extras:
         ok(f"exactly one ruleset is named '{rules.DEFAULT_RULESET_NAME}'")
         return
