@@ -261,8 +261,12 @@ since a `pull_request_target` run's ambient check-run attributes to the
 base tip, never the PR head.
 
 This is shaped like the fleet-credentials work above, and should mostly
-reuse it, but it is not a drop-in extension of `credentials.py` as it
-stands -- see item 1.
+reuse it, but it is not a drop-in extension of `credentials.py`/
+`secrets_cmd.py` as they stand -- see items 1 and 2 below (Codex review,
+mikelward/repo#26, caught both: the detector needs to parse a real
+workflow step rather than grep for the secret names, and the environment
+this credential lands in needs a branch policy `_ensure_environment`
+doesn't set today).
 
 - [ ] **Extend the fleet-credential machinery to `LANES_APP_ID`/
       `LANES_APP_PRIVATE_KEY`, with a detector of its own.** The naming
@@ -274,12 +278,53 @@ stands -- see item 1.
       their own `with:` block. `credentials.py`'s `callers()`/
       `caller_inherits()` look for a job-level `uses: mikelward/<hub>/...`
       reusable-workflow call and an `inherit`; neither matches this shape.
-      "Does this repo use the App design" needs a new detector -- a step
-      with `uses: mikelward/lanes@` whose `with:` sets `app-id:`/
-      `app-private-key:` (or just the presence of both secret references
-      in the workflow text) -- that plugs into the same environment-fanout
-      logic `repo setup --credential`/`repo audit` already use, once it
-      exists.
+      "Does this repo use the App design" needs a new detector -- and a
+      raw text-presence check for `LANES_APP_ID`/`LANES_APP_PRIVATE_KEY`
+      is not enough (Codex review, mikelward/repo#26): both names could
+      appear in a comment, or in a step that isn't a live `lanes`
+      invocation at all, and a false match would then move or delete a
+      credential the repository doesn't actually use lanes' publisher
+      with -- `repo audit` reporting it compliant while the publisher is
+      actually unusable. The detector needs to parse a structurally
+      recognized step -- `uses: mikelward/lanes@...` with a `with:` block
+      that sets both `app-id:` and `app-private-key:` -- and fail closed
+      (report "cannot tell", the same posture `credentials.py`'s
+      `unread_mentions` already takes for a reusable-workflow call it
+      can't parse) on any shape it doesn't recognize, rather than treating
+      an unparseable shape as "not present."
+- [ ] **The `lanes` environment needs a deployment-branch policy BEFORE
+      the credential is placed in it, and today's environment creation
+      doesn't set one** (Codex review, mikelward/repo#26). Lanes' own
+      TODO.md is explicit that this credential's safety depends on it
+      living in "a GitHub Environment with a deployment branch/ref policy
+      restricted to the trusted base ref" -- without that, any workflow in
+      the repository that can declare `environment: lanes`, including one
+      a same-repo pull request adds on its own branch, reads the same
+      secret the legitimate `init`/`finalize` jobs do, and can mint its
+      own installation token and forge the status. `secrets_cmd.py`'s
+      `_ensure_environment` (`secrets_cmd.py:218`) is a bare
+      `PUT repos/{repo}/environments/{env}` with no body -- GitHub's
+      default for a newly created environment has no branch restriction
+      at all, and the function's own docstring already warns that PUTting
+      an EXISTING environment silently resets whatever policy it had back
+      to that default. So placing `LANES_APP_ID`/`LANES_APP_PRIVATE_KEY`
+      cannot reuse `_ensure_environment` unmodified the way a batch
+      credential's environment does today -- it needs an explicit branch-
+      policy write (the `deployment-branch-policies` endpoint, restricted
+      to the repository's default branch) as part of creating or
+      confirming the `lanes` environment, checked BEFORE the secret is
+      written, not assumed from the environment merely existing. This is
+      the environment-side counterpart of the "confirm against a real
+      ruleset" item below on `integration_id`, and it blocks the
+      credential-placement item below, not just the detector above.
+      **This same gap is latent in the existing batch credentials too**
+      (`NPM_UPDATE_APP_ID`/`GRADLE_UPDATE_APP_ID`/`RUST_UPDATE_APP_ID` and
+      their private keys) -- `_ensure_environment` gives every one of them
+      the same unrestricted-by-default environment. Lower severity there
+      today (those Apps' installation tokens gate a reusable workflow
+      whose own definition is pinned at `@main`, not read from the
+      calling repo's branch), but worth its own follow-up rather than
+      assuming it's fine because nothing has exploited it yet.
 - [ ] **`repo audit` should report which design a repo is actually wired
       for, and flag drift the same way it flags a stray batch credential.**
       Four states: plain `pull_request` with no App secrets present (the
@@ -293,12 +338,14 @@ stands -- see item 1.
       copy for a workflow the repository does not use" treatment
       `credentials.py` already gives a batch credential.
 - [ ] **`repo setup --credential LANES_APP_ID=... --credential
-      LANES_APP_PRIVATE_KEY=...`** should place them exactly like a batch
+      LANES_APP_PRIVATE_KEY=...`** should place them like a batch
       credential does today: fan into the `lanes` environment for a repo
       whose workflow already references them (per the detector above),
-      delete a repository-level copy, leave an unaffected repo alone. This
-      part is mechanically identical to the existing fleet-credentials
-      step once the detector exists -- no new placement logic.
+      delete a repository-level copy, leave an unaffected repo alone --
+      but NOT via `_ensure_environment` unmodified; the branch-policy
+      item above has to run first (or be folded into the same step) so
+      the environment this writes into is actually restricted before the
+      secret lands in it.
 - [ ] **Wire the lanes App's slug into `repo_lib/apps.py`'s `--app` step**
       so a repo migrating onto the App design gets installation membership
       fixed by the same `repo setup` run that places its credential,
