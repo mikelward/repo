@@ -325,18 +325,47 @@ doesn't set today).
       whose own definition is pinned at `@main`, not read from the
       calling repo's branch), but worth its own follow-up rather than
       assuming it's fine because nothing has exploited it yet.
+      **Cost and reliability of everything in this section** (Codex
+      review, mikelward/repo#26, citing AGENTS.md's cost-and-reliability
+      rule): free, on the same GitHub REST API and the same
+      5,000-authenticated-requests-an-hour limit `rules.py` and
+      `apps.py`'s own module docstrings already budget against -- this
+      adds a handful of calls per repository (a branch-policy read and,
+      when missing, a write; the App-membership read item below already
+      needs) on top of what `repo setup`/`repo audit` already make, not a
+      new dependency. Interactive, not scheduled, so a slow or failed
+      call is a visible error for the person running the command, not a
+      silent gap -- and per this section's own fail-closed posture
+      throughout, a failed branch-policy or membership read must refuse
+      the affected step (report `[FIX]`/error, same as a failed ruleset
+      or credential read does today) rather than proceed as if the
+      policy or membership were confirmed.
 - [ ] **`repo audit` should report which design a repo is actually wired
       for, and flag drift the same way it flags a stray batch credential.**
       Four states: plain `pull_request` with no App secrets present (the
       accepted baseline -- not a finding); `pull_request_target` with both
-      secrets correctly in the `lanes` environment (compliant); `pull_request_target`
-      with the secrets missing, repository-scoped, or in the wrong
-      environment (broken, `[FIX]`); and plain `pull_request` with
-      `LANES_APP_ID`/`LANES_APP_PRIVATE_KEY` present anywhere -- a dead
-      credential, since a workflow that never passes `app-id`/
-      `app-private-key` to `mode: gate` never uses them, the same "stale
-      copy for a workflow the repository does not use" treatment
-      `credentials.py` already gives a batch credential.
+      secrets correctly in the `lanes` environment AND the lanes App still
+      an installed, "selected" member of the repository (compliant);
+      `pull_request_target` with the secrets missing, repository-scoped, or
+      in the wrong environment, OR the App no longer a member (broken,
+      `[FIX]`); and plain `pull_request` with `LANES_APP_ID`/
+      `LANES_APP_PRIVATE_KEY` present anywhere -- a dead credential, since a
+      workflow that never passes `app-id`/`app-private-key` to `mode: gate`
+      never uses them, the same "stale copy for a workflow the repository
+      does not use" treatment `credentials.py` already gives a batch
+      credential. **The App-membership half is required, not optional**
+      (Codex review, mikelward/repo#26): a repository that had the App
+      removed after a compliant `repo setup` run still has correctly-placed
+      secrets, but the installation-token exchange those secrets feed can
+      no longer succeed, so no legitimate `lanes` status can be published
+      at all -- reading the secret placement alone reports it compliant
+      while its publisher is actually dead. `repo_lib/apps.py`'s
+      `resolve_installation` already does the membership check `repo
+      setup --app` uses; `repo audit` needs to run the equivalent read, not
+      infer membership from a past `repo setup` run having succeeded --
+      the ruleset's own `codex`/`lanes` check-history read stays green
+      regardless, since GitHub keeps reporting the LAST status that
+      publisher posted, however long ago.
 - [ ] **`repo setup --credential LANES_APP_ID=... --credential
       LANES_APP_PRIVATE_KEY=...`** should place them like a batch
       credential does today: fan into the `lanes` environment for a repo
@@ -382,6 +411,28 @@ doesn't set today).
       identity on this account's plan") -- this tool already round-trips
       ruleset JSON, so it's a reasonable place to do that confirmation
       rather than lanes itself.
+      **This has to bind LAST, after every publisher prerequisite is
+      confirmed in place -- not reuse `setup_cmd.run`'s current step
+      order** (Codex review, mikelward/repo#26, real and worth catching
+      before implementation rather than after: `rules.apply_ruleset`
+      runs at `setup_cmd.py:1220`, before the `--secret`/environment loop,
+      the App-membership step (`apps.apply_step`, `:1288`), and the
+      fleet-credential moves (`:1292`) -- and every step still runs
+      regardless of an earlier one's failure, by this module's own
+      design. Binding `integration_id` at the ruleset step's current
+      position, unchanged, means a single `repo setup` run that both
+      migrates a repo onto the App design AND flips the binding on could
+      activate an App-restricted required check before that run's own
+      later steps have placed the credential or confirmed App membership
+      -- or, if either of those later steps fails, leave the binding
+      active with no working publisher at all, blocking every merge
+      until a second run fixes it. The binding step needs the App
+      confirmed a member, the environment's branch policy confirmed, and
+      the credential confirmed placed (or already correct from an
+      earlier run) as its own preconditions, checked immediately before
+      the write -- which likely means moving it to run after the
+      App-membership and credential steps, not merely adding it to the
+      existing ruleset call.
 - [ ] **Don't default `repo create --scaffold` onto the App design yet --
       that's the owner's call, not autopilot's, once the above exists.**
       `repo_lib/scaffold.py` only ever generates the plain-`pull_request`
