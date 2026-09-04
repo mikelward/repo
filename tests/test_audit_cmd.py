@@ -1109,7 +1109,38 @@ class DuplicateRulesetAuditTest(unittest.TestCase):
         code, out, err = _run(fake, [REPO])
         self.assertEqual(code, 0, err)
         self.assertIn("[CHECK] more than one ruleset is named 'main'", out)
-        self.assertIn("also id(s) 77", out)
+        self.assertIn("ids 1, 77", out)
+        self.assertIn("inherited from the organization and not changeable here: 77", out)
+        self.assertIn("`repo setup` writes 1", out)
+
+    def test_an_inherited_ruleset_that_sorts_first_is_not_named_as_setups_target(self):
+        # With parents included the inherited ruleset comes FIRST whenever
+        # the organization's predates the repository's, which is the
+        # common case -- so "setup writes the first" would name the one
+        # setup never touches. Setup's target is the first the repository
+        # OWNS, read from its own lookup (Codex review, mikelward/repo#33).
+        fake = FakeGh()
+        fake.ruleset_ids = ["3", "9"]
+        for rid in ("3", "9"):
+            fake.ruleset_objects[rid] = _covering_ruleset(name="main")
+            fake.ruleset_objects[rid]["id"] = int(rid)
+        fake.repo_owned_ruleset_ids = ["9"]
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("inherited from the organization and not changeable here: 3", out)
+        self.assertIn("`repo setup` writes 9", out)
+        self.assertNotIn("writes 3", out)
+
+    def test_only_inherited_rulesets_say_setup_writes_none(self):
+        fake = FakeGh()
+        fake.ruleset_ids = ["3", "4"]
+        for rid in ("3", "4"):
+            fake.ruleset_objects[rid] = _covering_ruleset(name="main")
+            fake.ruleset_objects[rid]["id"] = int(rid)
+        fake.repo_owned_ruleset_ids = []
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("`repo setup` writes none of them", out)
 
     def test_a_second_one_under_the_same_name_is_a_check_not_a_gap(self):
         # Nothing here resolves it -- `repo setup` writes the first and
@@ -1125,7 +1156,9 @@ class DuplicateRulesetAuditTest(unittest.TestCase):
         code, out, err = _run(fake, [REPO])
         self.assertEqual(code, 0, err)
         self.assertIn("[CHECK] more than one ruleset is named 'main'", out)
-        self.assertIn("also id(s) 2", out)
+        self.assertIn("ids 1, 2", out)
+        self.assertIn("`repo setup` writes 1 and leaves the rest alone", out)
+        self.assertNotIn("inherited", out)
 
 
 class LegacyRulesetAuditTest(unittest.TestCase):
