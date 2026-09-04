@@ -286,12 +286,24 @@ doesn't set today).
       credential the repository doesn't actually use lanes' publisher
       with -- `repo audit` reporting it compliant while the publisher is
       actually unusable. The detector needs to parse a structurally
-      recognized step -- `uses: mikelward/lanes@...` with a `with:` block
-      that sets both `app-id:` and `app-private-key:` -- and fail closed
-      (report "cannot tell", the same posture `credentials.py`'s
-      `unread_mentions` already takes for a reusable-workflow call it
-      can't parse) on any shape it doesn't recognize, rather than treating
-      an unparseable shape as "not present."
+      recognized step -- `uses: mikelward/lanes@...` with `mode: init` or
+      `mode: gate` AND a `with:` block that sets both `app-id:` and
+      `app-private-key:` -- and fail closed (report "cannot tell", the
+      same posture `credentials.py`'s `unread_mentions` already takes for
+      a reusable-workflow call it can't parse) on any shape it doesn't
+      recognize, rather than treating an unparseable shape as "not
+      present."
+      **The mode matters, not just the two inputs' presence** (Codex
+      review, mikelward/repo#26): `classify` mode never publishes
+      anything -- only `init` (posts `pending`) and `gate` (posts the
+      terminal result) do, per lanes' own README. A `classify` step that
+      happens to carry `app-id:`/`app-private-key:` inputs too (a
+      copy-paste, most likely, since they do nothing there) is not a
+      publisher, and matching on the two inputs alone would still call it
+      one -- moving the credential and binding the ruleset with no
+      `init`/`gate` step anywhere actually reading it. The detector's
+      structural match has to include the mode, not stop at `uses:` plus
+      the two `with:` keys.
       **The step alone is not enough -- the ENCLOSING JOB has to select
       the `lanes` environment too, or the move this detector triggers
       breaks the very thing it's meant to protect** (Codex review,
@@ -328,13 +340,28 @@ doesn't set today).
       to that default. So placing `LANES_APP_ID`/`LANES_APP_PRIVATE_KEY`
       cannot reuse `_ensure_environment` unmodified the way a batch
       credential's environment does today -- it needs an explicit branch-
-      policy write (the `deployment-branch-policies` endpoint, restricted
-      to the repository's default branch) as part of creating or
-      confirming the `lanes` environment, checked BEFORE the secret is
-      written, not assumed from the environment merely existing. This is
-      the environment-side counterpart of the "confirm against a real
-      ruleset" item below on `integration_id`, and it blocks the
-      credential-placement item below, not just the detector above.
+      policy write (the `deployment-branch-policies` endpoint) as part of
+      creating or confirming the `lanes` environment, checked BEFORE the
+      secret is written, not assumed from the environment merely
+      existing. This is the environment-side counterpart of the "confirm
+      against a real ruleset" item below on `integration_id`, and it
+      blocks the credential-placement item below, not just the detector
+      above.
+      **"Restricted to the repository's default branch" is too narrow --
+      it has to match every ref the `lanes` RULESET actually protects,
+      not just the one branch** (Codex review, mikelward/repo#26):
+      `rules.py`'s own hardened targeting (`_HARDENED_INCLUDE`,
+      `rules.py:66`) covers `~DEFAULT_BRANCH`, `refs/heads/main`, AND
+      `refs/heads/master` together, precisely so a leftover or
+      accidentally-recreated `master` stays covered too. If the
+      environment's branch policy names only the resolved default branch,
+      a `pull_request_target` run whose base is `main` or `master` -- one
+      of the OTHER two hardened targets, on a repo whose actual default
+      is neither -- cannot read the credential and can never publish
+      `lanes` there, permanently blocking merges to a branch the ruleset
+      itself requires the check on. The branch policy needs the same
+      three-name set the ruleset targets, not a narrower one independently
+      derived from "the default branch."
       **This same gap is latent in the existing batch credentials too**
       (`NPM_UPDATE_APP_ID`/`GRADLE_UPDATE_APP_ID`/`RUST_UPDATE_APP_ID` and
       their private keys) -- `_ensure_environment` gives every one of them
@@ -394,8 +421,20 @@ doesn't set today).
       `pull_request` with no App secrets is therefore only the accepted
       baseline when the ruleset entry is ALSO unbound; plain
       `pull_request` with a still-bound entry (secrets present or not) is
-      broken, `[FIX]`, and its fix is the unbind half of the
-      `integration_id` item below, applied in reverse.
+      broken, `[FIX]`, and its fix needs an unbind operation the
+      `integration_id` item below does not actually define yet -- "applied
+      in reverse" was hand-waved in an earlier revision of this item, and
+      there is no such reverse today: `_build_update_body`'s merge keeps
+      an EXISTING entry's `integration_id` exactly as it was for any
+      context it already recognizes by name, and a bare `--rule lanes`
+      currently means "no opinion, leave whatever's there alone," not
+      "make sure this is unbound." (Codex review, mikelward/repo#26.) The
+      `integration_id` item's `--rule NAME@APP_ID`-shaped surface needs an
+      explicit unbind form too -- `--rule NAME` alone changing meaning to
+      "ensure unbound," or a distinct `--rule NAME@` / `--unbind NAME`
+      shape -- and `rules.py`'s writer needs to actually drop a
+      pre-existing `integration_id` for that request rather than
+      preserving it by default.
       **"Covering the repository" is deliberately not "a selected member"
       -- that was wrong in an earlier revision of this item, and so was
       the function it cited** (Codex review, mikelward/repo#26, twice, in
