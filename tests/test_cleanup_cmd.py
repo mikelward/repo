@@ -295,6 +295,32 @@ class CleanupTestCase(unittest.TestCase):
         return code
 
 
+class StatusLineTest(CleanupTestCase):
+    def test_the_repo_being_checked_is_announced_before_the_work(self):
+        # Several seconds of API calls separate the command starting from
+        # its plan. Without this the terminal shows nothing at all in that
+        # window, which is indistinguishable from a hang.
+        fake = FakeGh(
+            branches=[("main", "aaa", True), ("claude/done", "bbb", False)],
+            closed_pulls=[{"number": 7, "head_ref": "claude/done", "merged_at": "x"}],
+        )
+        code, out, err, _log = self.invoke(fake, [REPO, "--force"])
+        self.assertEqual(code, 0)
+        self.assertIn(f"Checking {REPO}", err)
+
+    def test_the_status_line_stays_out_of_the_plan_on_stdout(self):
+        # stderr, so `repo cleanup --dry-run owner/repo > plan` still gets
+        # exactly the plan, and the wait is still visible on the terminal.
+        fake = FakeGh(
+            branches=[("main", "aaa", True), ("claude/done", "bbb", False)],
+            closed_pulls=[{"number": 7, "head_ref": "claude/done", "merged_at": "x"}],
+        )
+        code, out, err, _log = self.invoke(fake, [REPO, "--dry-run"])
+        self.assertEqual(code, 0)
+        self.assertIn(f"Checking {REPO}", err)
+        self.assertNotIn("Checking", out)
+
+
 class ClassificationTest(CleanupTestCase):
     def test_a_rebase_merged_branch_is_deletable_via_its_merged_pull_request(self):
         # The case that motivates the whole command: the fleet rebase-merges,
