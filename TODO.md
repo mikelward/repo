@@ -286,11 +286,11 @@ doesn't set today).
       credential the repository doesn't actually use lanes' publisher
       with -- `repo audit` reporting it compliant while the publisher is
       actually unusable. The detector needs to parse a structurally
-      recognized step -- `uses: mikelward/lanes@...` with `mode: init` or
-      `mode: gate` AND a `with:` block that sets both `app-id:` and
-      `app-private-key:` -- and fail closed (report "cannot tell", the
-      same posture `credentials.py`'s `unread_mentions` already takes for
-      a reusable-workflow call it can't parse) on any shape it doesn't
+      recognized step -- `uses: mikelward/lanes@...` with `mode: gate` AND
+      a `with:` block that sets both `app-id:` and `app-private-key:` --
+      and fail closed (report "cannot tell", the same posture
+      `credentials.py`'s `unread_mentions` already takes for a
+      reusable-workflow call it can't parse) on any shape it doesn't
       recognize, rather than treating an unparseable shape as "not
       present."
       **The mode matters, not just the two inputs' presence** (Codex
@@ -304,6 +304,20 @@ doesn't set today).
       `init`/`gate` step anywhere actually reading it. The detector's
       structural match has to include the mode, not stop at `uses:` plus
       the two `with:` keys.
+      **A credentialed `init` step alone is not a publisher either --
+      only `gate` posts a terminal result, so `gate` is the one that has
+      to be there** (Codex review, mikelward/repo#26, catching a real gap
+      in the fix right above: an earlier revision of this item accepted
+      `mode: init` OR `mode: gate` as equally sufficient). `init` only
+      ever posts `pending`, which never satisfies a required check by
+      itself; a repository with a credentialed `init` step and no
+      credentialed `gate` step anywhere would be recognized as an App
+      design consumer and have its ruleset bound, with no step that could
+      ever post the success that unblocks a merge. The detector requires
+      a credentialed `mode: gate` step; a credentialed `init` step is
+      additional evidence when present (the real design normally has
+      both, per the initializer/finalizer split), never a substitute for
+      it.
       **The step alone is not enough -- the ENCLOSING JOB has to select
       the `lanes` environment too, or the move this detector triggers
       breaks the very thing it's meant to protect** (Codex review,
@@ -362,6 +376,26 @@ doesn't set today).
       itself requires the check on. The branch policy needs the same
       three-name set the ruleset targets, not a narrower one independently
       derived from "the default branch."
+      **Widening the branch policy to all three targets does not by
+      itself make all three branches' WORKFLOWS App publishers, and this
+      item can't fix that -- it's a general limit of how this tool audits,
+      not a new gap this rollout introduces** (Codex review,
+      mikelward/repo#26): a repository could genuinely have migrated only
+      one of the ruleset's targeted branches (typically the default one)
+      while another -- a real leftover `master`, say -- still carries the
+      old plain-`pull_request` workflow. The credential being *readable*
+      from all three refs says nothing about whether all three branches'
+      `ci.yml` actually calls `mode: gate` with it; a single ruleset
+      binding still applies uniformly across every branch it targets, so
+      the unmigrated one's ordinary Actions check-run can never satisfy
+      it either. But `repo audit`/`repo setup` already inspect one branch
+      at a time (`repo audit [--branch NAME]`), not every ruleset-covered
+      branch's workflow content in a single pass -- so detecting this
+      fully needs auditing each hardened target's own branch, which is a
+      characteristic of the whole tool's model, not something to design a
+      fix for inside this one item. Worth naming as a real edge case a
+      partial migration can hit, not something the `--branch` default
+      already covers.
       **This same gap is latent in the existing batch credentials too**
       (`NPM_UPDATE_APP_ID`/`GRADLE_UPDATE_APP_ID`/`RUST_UPDATE_APP_ID` and
       their private keys) -- `_ensure_environment` gives every one of them
@@ -390,10 +424,13 @@ doesn't set today).
       Four states: plain `pull_request` with no App secrets present AND
       the ruleset's `lanes` entry unbound (no `integration_id`) -- the
       accepted baseline, not a finding; `pull_request_target` with both
-      secrets correctly in the `lanes` environment AND the lanes App still
-      covering the repository (compliant); `pull_request_target` with the
-      secrets missing, repository-scoped, or in the wrong environment, OR
-      the App no longer covering the repository (broken, `[FIX]`); and
+      secrets correctly in the `lanes` environment, the lanes App still
+      covering the repository, AND the ruleset's `lanes` entry bound to
+      THAT App's own id specifically (compliant); `pull_request_target`
+      with the secrets missing, repository-scoped, or in the wrong
+      environment, the App no longer covering the repository, OR the
+      ruleset entry unbound or bound to a different App's id (broken,
+      `[FIX]`); and
       plain `pull_request` with `LANES_APP_ID`/`LANES_APP_PRIVATE_KEY`
       present anywhere -- a dead credential, since a workflow that never
       passes `app-id`/`app-private-key` to `mode: gate` never uses them,
@@ -406,6 +443,19 @@ doesn't set today).
       no longer succeed, so no legitimate `lanes` status can be published
       at all -- reading the secret placement alone reports it compliant
       while its publisher is actually dead.
+      **"Bound" isn't enough either -- it has to be bound to THE LANES
+      APP specifically, not merely bound to something** (Codex review,
+      mikelward/repo#26): an earlier revision of this item's compliant
+      state only checked that the ruleset entry had a non-null
+      `integration_id` at all, which a `lanes` entry bound to an unrelated
+      App would also satisfy -- and if that other App had ever posted a
+      `lanes` status too, the generic history read would pass it as
+      genuinely satisfied, recreating the exact forged-publisher gap this
+      whole design exists to close, just moved from "no App" to "the
+      wrong App." `repo audit` needs to resolve the lanes App's own
+      numeric id (the same lookup the App-membership check already needs)
+      and compare the ruleset entry's `integration_id` against that
+      specific value, not just check that one is present.
       **The plain-`pull_request` baseline needs the inverse check too, for
       a repository ROLLED BACK off the App design** (Codex review,
       mikelward/repo#26): remove the App secrets without also unbinding
@@ -504,9 +554,9 @@ doesn't set today).
       `(context, integration_id)` pairs, `bound_to_another_app`, the
       whole `never_reported`/`describe_missing` App-aware plumbing --
       already understands a bound check and is exercised today (for
-      `codex`, which GitHub may already report as App-bound on the read
-      side without this tool ever having asked for it). Without a write
-      path, a repo running the App design still has a ruleset that
+      `codex`, which is App-published via a Checks-API check run, and
+      whose App attribution the read side already resolves). Without a
+      write path, a repo running the App design still has a ruleset that
       accepts a `lanes` context from ANY source -- including a forged one
       from an unrelated `push`-triggered workflow a same-repo PR could
       add, which is exactly the threat lanes' own TODO.md (its "round
@@ -524,6 +574,38 @@ doesn't set today).
       identity on this account's plan") -- this tool already round-trips
       ruleset JSON, so it's a reasonable place to do that confirmation
       rather than lanes itself.
+      **The read side does NOT already understand lanes' actual
+      publishing mechanism, and this is the most consequential correction
+      in this whole item -- everything above assumed the wrong thing about
+      it** (Codex review, mikelward/repo#26, P1): `codex`'s App attribution
+      works because Codex publishes via a Checks-API check run, and
+      `_collect_reported` (`rules.py:186-278`) only ever populates
+      `app_pairs` -- the set `_entry_satisfied` checks a bound entry
+      against -- from check runs' `.app.id` field (`rules.py:207-222`).
+      Its commit-status scan, right below that in the same function
+      (`rules.py:224-239`), reads ONLY `.statuses[].context` and drops
+      everything else, `creator` included. Lanes does not publish a check
+      run at all -- per its own TODO.md ("round eight"), `mode: gate`'s
+      publishing half calls `repos.createCommitStatus` directly, the
+      legacy Statuses API. So the instant `lanes` is bound to an
+      `integration_id`, `_entry_satisfied` can NEVER find a
+      `(context, integration_id)` pair for it, no matter how many times
+      the real App posts the real status -- `never_reported` reports it
+      as never having reported from the right App even on a repository
+      that is working exactly as designed, which fails `apply_ruleset`'s
+      own preflight (a check it refuses to require until proven it can
+      report) and would make `repo audit`'s new compliant state
+      (immediately above) unreachable by construction. Closing this needs
+      `_collect_reported`'s status scan extended to also populate
+      `app_pairs` from something on each status entry that identifies its
+      App -- and that "something" is itself unconfirmed, not a trivial
+      swap: a commit status's `creator` is a bot-user-shaped object
+      (`login`, `id`, `type`), and whether that `id` equals the App's own
+      `integration_id` the way a check run's `.app.id` does, or names a
+      different numbering GitHub uses for the App's bot identity, has to
+      be confirmed against a real status GitHub App has actually posted
+      before this is built, not assumed from the check-run shape working
+      that way.
       **This has to bind LAST, after every publisher prerequisite is
       confirmed in place -- not reuse `setup_cmd.run`'s current step
       order** (Codex review, mikelward/repo#26, real and worth catching
