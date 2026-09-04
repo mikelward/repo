@@ -832,7 +832,21 @@ doesn't set today).
       above needs is one more fixed call per repository (not variable,
       unlike the other two), alongside the environment response already
       read for the branch policy and the built-in reviewer/wait-timer
-      checks. All three belong in this estimate together, and all fail
+      checks.
+      **A fourth operation scales too, and it's the one this section is
+      most directly about: reconciling the branch policy to EXACTLY the
+      resolved set is a list, then one delete per stale entry and one
+      create per missing entry, not the single read-and-write this
+      estimate implied** (Codex review, mikelward/repo#26): the
+      `deployment-branch-policies` API has no bulk "set this exact list"
+      call, so making a drifted policy match -- removing a leftover `*`,
+      adding a missing branch name -- means a list call plus one API call
+      per entry that has to change. That scales with the ruleset's own
+      scope and however much the existing policy has drifted from it, the
+      same shape of cost as the environment sweep and the org-secret
+      check, for the same reason: a per-item reconciliation this codebase
+      hasn't needed before.
+      All four belong in this estimate together, and all fail
       closed the same way: an unavailable or incomplete read refuses the
       step rather than reporting a clean sweep it couldn't actually
       confirm. Interactive, not scheduled either way,
@@ -1018,6 +1032,24 @@ doesn't set today).
       stronger check until that token-exchange verification exists to
       back it -- until then, this is a known gap the section names rather
       than silently claims to close.
+      **Signing that JWT has no supported path under this repository's own
+      no-third-party-dependencies rule, and "build work, not a detector
+      tweak" glossed over that this item genuinely can't specify a plan
+      without resolving it** (Codex review, mikelward/repo#26): RS256
+      signing needs an RSA private-key operation, and Python's standard
+      library has nothing that does it -- `hashlib`/`hmac` cover hashing
+      and symmetric MACs, not asymmetric signing. That leaves two real
+      options, both a genuine tradeoff this item can't wave past: shell out
+      to `openssl` (a new external-binary dependency, needing this repo's
+      own cost-and-reliability note the same as any other new dependency),
+      or add a third-party crypto package (a policy exception AGENTS.md
+      says is "a conversation about the tradeoff, not a quiet `pip
+      install`," and explicitly not something to resolve by adding one
+      quietly). This item should stop describing token-exchange
+      verification as future work with an implied implementation and
+      instead name it as an open decision -- which of the two paths, with
+      its cost/reliability note -- that has to be made before any of it is
+      buildable, not merely before it's built.
       **Out of scope for this item, on purpose: a repository whose lanes
       workflow has been removed from the default branch entirely, with no
       App secrets left either** (Codex review, mikelward/repo#26). None of
