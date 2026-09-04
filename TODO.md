@@ -334,15 +334,27 @@ doesn't set today).
       can sit there satisfying the ruleset's history-based preflight the
       whole time, letting `repo setup` bind `lanes` to an App with no
       currently-working publisher. Closing this needs resolving the
-      referenced ref to a concrete revision and confirming THAT
-      revision's own `action.yml` declares the required inputs/modes --
-      which means a read against `mikelward/lanes` itself, not just the
-      calling repository's workflow text -- or, short of that, a
+      referenced ref to a concrete revision and checking it against a
       documented minimum compatible revision (a tag or SHA, sourced from
       `mikelward/lanes`' own TODO.md/CHANGELOG stating when App-publishing
-      landed) the detector can compare against and fail closed below.
-      Confirm which approach lanes' own TODO.md already supports before
-      building either.
+      actually landed), failing closed below that revision.
+      **Reading the referenced revision's own `action.yml` -- floated as
+      an equal alternative directly above -- does not actually establish
+      the thing that matters, and isn't a substitute for the
+      documented-revision approach** (Codex review, mikelward/repo#26,
+      P1): `action.yml` declaring an input named `mode` proves only that
+      the interface shape exists, not which VALUES it accepts, and
+      nothing at all about whether `init`/`gate` still perform status
+      publication when invoked -- a broken or reverted revision can keep
+      its input declarations completely unchanged while the logic behind
+      them stops publishing. Metadata is a schema, not a behavioral
+      guarantee, so passing this check would still let `repo setup` bind
+      `lanes` to a revision with the right-looking inputs and no working
+      publish path. The only approach that actually resolves this is the
+      documented-minimum-compatible-revision one: comparing against a
+      specific, known-working revision from `mikelward/lanes`' own
+      history, not inspecting what the referenced revision merely
+      declares about itself.
       **OPEN DECISION -- this detector, and every structural requirement
       layered onto it below (mode, `pr:` resolution, `results:`/
       `classify-result:`/`base-sha:` correspondence to `classify`'s real
@@ -843,6 +855,26 @@ doesn't set today).
       entry outside it before -- or as part of -- placing the credential,
       the same direction as deleting a stray copy from the wrong
       environment.
+      **"Three-name set" is the wrong unit -- a deployment branch policy
+      entry is a `(type, name)` pair, not a bare name, and matching on
+      name alone lets a same-named TAG policy pass as if it were the
+      branch policy this design actually needs** (Codex review,
+      mikelward/repo#26, P1): the deployment-branch-policies endpoint
+      returns each entry with its own `type` (`branch` or `tag`)
+      alongside `name`. A `type: tag` entry named `main` satisfies a
+      name-only comparison against the expected set, but
+      `pull_request_target` runs against the `main` BRANCH, which a tag
+      policy does nothing to admit -- so a repository could read as
+      exactly-the-right-three-names and still have no working branch
+      access to the environment. Worse, if the set is deduplicated by
+      name before comparing, a genuine extra `type: tag` entry sharing a
+      name with one of the three expected branch entries disappears from
+      the check entirely, silently defeating the "nothing else" rule the
+      paragraph above just established. The comparison needs to be exact
+      `(type, name)` pairs -- every expected entry present with
+      `type: branch` specifically, and any `type: tag` entry rejected
+      outright, never treated as interchangeable with its same-named
+      branch counterpart.
       **The branch policy is not the only protection an environment can
       carry, and the others can block a publisher just as completely as a
       missing branch policy would** (Codex review, mikelward/repo#26): a
