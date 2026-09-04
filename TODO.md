@@ -109,9 +109,10 @@
       the ruleset step in the same run, since a ruleset requiring pull
       requests blocks the direct ref update this uses (Codex review,
       mikelward/repo#14).
-- [ ] **The scaffold no longer writes a `TODO.md`, and whether it should
-      ever have is open** (maintainer, 2026-09-04: "i'm not sure if we
-      need that"). The file carried exactly one item -- replace ci.yml's
+- [x] **The scaffold no longer writes a `TODO.md`, and that stands**
+      (maintainer, 2026-09-04: "i'm not sure if we need that"; kept
+      removed under autopilot, 2026-09-04 -- see *Decisions needing
+      review*). The file carried exactly one item -- replace ci.yml's
       placeholder job with the project's real jobs -- and ci.yml already
       states the same thing in a comment directly above that placeholder,
       so the scaffold was writing a second copy of a single instruction
@@ -154,14 +155,17 @@
       hand. The write path itself is still the item below (maintainer,
       2026-09-04: "branch-and-PR write path is a TODO for later").
 
-- [ ] **Which `lanes.conf` docs rule `repo setup` should generate is
-      undecided.** The scaffold writes one today, but the fleet is split:
-      eight repositories including `mikelward/lanes` use the shorthand
-      `docs **/*.md`, while `mikelward/lanes`'s own README documents the
-      narrow pair `docs *.md` + `docs docs/**/*.md` as the standard. Put
-      to the maintainer 2026-09-04, unanswered. Whichever wins, the other
-      half of the fleet needs converting, and `mikelward/lanes`'s own
-      `TODO.md` carries the matching entry.
+- [ ] **Which `lanes.conf` docs rule `repo setup` generates: guessed,
+      not settled.** The fleet is split: eight repositories including
+      `mikelward/lanes` use the shorthand `docs **/*.md`, while
+      `mikelward/lanes`'s own README documents the narrow pair
+      `docs *.md` + `docs docs/**/*.md` as the standard. Put to the
+      maintainer 2026-09-04, unanswered; autopilot kept the narrow pair
+      the scaffold already writes (see *Decisions needing review*). What
+      is still open is the fleet: whichever form wins, the other half
+      needs converting, and `mikelward/lanes`'s own `TODO.md` carries the
+      matching entry. Nothing in this repository changes either way --
+      `_LANES_CONF` in `scaffold.py` is one string.
 
 - [ ] **A repository a PRIOR `repo setup` run already protected has no
       path to a scaffold fix here at all.** The ordering fix above only
@@ -303,6 +307,36 @@
       repository and reading past the merged section each time.
 
 ## Decisions needing review
+
+- **The scaffold's `lanes.conf` keeps the narrow docs pair
+  (`docs *.md` + `docs docs/**/*.md`), not the shorthand `docs **/*.md`**
+  (autopilot, 2026-09-04; the question had been put to the maintainer and
+  was unanswered). Two reasons. It is what `mikelward/lanes`'s own README
+  documents as the standard, so a repository this creates matches the
+  documentation a reader will find. And it is the safer of the two to
+  apply to a repository nobody has looked at yet: `**/*.md` routes
+  markdown at any depth down the docs lane, including a README sitting
+  beside code the full CI validates -- readmo's own guide says markdown
+  outside the root and `docs/` is code for exactly that reason -- so the
+  shorthand can skip a code lane on a diff that needed it, while the
+  narrow pair only ever costs a docs-only change a full CI run. The
+  alternative was matching the eight repositories using the shorthand.
+  Reversible: `_LANES_CONF` in `scaffold.py` is one string, and it only
+  affects repositories scaffolded after the change -- an existing
+  `lanes.conf` is never overwritten.
+
+- **The scaffold does not write a `TODO.md`, and autopilot left it that
+  way** (2026-09-04; the maintainer's own note was "i'm not sure if we
+  need that"). The file it used to write carried one item -- replace
+  `ci.yml`'s placeholder job with the project's real jobs -- which
+  `ci.yml` already says in a comment directly above that placeholder, so
+  the scaffold was writing a second copy of a single instruction into a
+  second file, where the two could drift and where a project that keeps
+  its own `TODO.md` would find the path taken. The alternative was
+  bringing it back with something to say that `ci.yml` cannot say in
+  place, such as a fleet-wide checklist for a new repository; nobody has
+  written one. Reversible: `build_scaffold_files` gains an eighth entry,
+  and `plan_gaps` already refuses to overwrite a path that exists.
 
 - **`repo setup` fails (exit 1) on a fleet credential it cannot move,
   rather than reporting it and exiting 0.** "Fixes everything" was the
