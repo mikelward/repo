@@ -308,18 +308,6 @@ jobs:
           results: placeholder=${{{{ needs.placeholder.result }}}}
 """
 
-_TODO_MD = """\
-# TODO
-
-## Set up
-
-- [ ] Replace the placeholder job in `.github/workflows/ci.yml` with this
-      project's real jobs (tests, a build, lint -- whatever applies), each
-      carrying `needs: classify` and
-      `if: needs.classify.outputs.docs_only != 'true'`. Add each job's
-      name to the `lanes` job's own `needs:` and `results:`, then delete
-      the placeholder.
-"""
 
 _INITIAL_COMMIT_MESSAGE = """\
 Add the fleet's standard CI scaffold
@@ -453,7 +441,6 @@ def build_scaffold_files(default_branch):
     # replacement: a default branch name can contain YAML flow-syntax
     # characters a bare scalar would misparse.
     files[".github/workflows/ci.yml"] = _CI_YML.format(default_branch=json.dumps(default_branch))
-    files["TODO.md"] = _TODO_MD
     return files
 
 
@@ -713,9 +700,10 @@ def plan_gaps(repo, default_branch):
         ANCESTOR directory component of it is itself a blob (a file
         sitting where a directory needs to be, so nothing under it can
         exist at all). All three are real if unlikely -- a repository
-        with a directory named `TODO.md` is strange, but "never overwrites
-        what's already there" (this module's own promise) has to hold
-        even then (Codex review, mikelward/repo#14)."""
+        with a directory named `.github/lanes.conf` is strange, but
+        "never overwrites what's already there" (this module's own
+        promise) has to hold even then (Codex review,
+        mikelward/repo#14)."""
         kind, mode = existing.get(path, (None, None))
         if kind is not None and not is_regular_file(path):
             detail = kind if mode is None else f"{kind}, mode {mode}"

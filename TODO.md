@@ -102,6 +102,20 @@
       the ruleset step in the same run, since a ruleset requiring pull
       requests blocks the direct ref update this uses (Codex review,
       mikelward/repo#14).
+- [ ] **The scaffold no longer writes a `TODO.md`, and whether it should
+      ever have is open** (maintainer, 2026-09-04: "i'm not sure if we
+      need that"). The file carried exactly one item -- replace ci.yml's
+      placeholder job with the project's real jobs -- and ci.yml already
+      states the same thing in a comment directly above that placeholder,
+      so the scaffold was writing a second copy of a single instruction
+      into a second file, where the two could drift and where a project
+      that keeps its own TODO.md would find the path taken. Removed;
+      `build_scaffold_files` now produces seven files, and the instruction
+      lives only where the work is. Bring it back only with something to
+      say that ci.yml cannot say in place -- a fleet-wide checklist a new
+      repository should work through, say -- not as a restatement of the
+      placeholder comment.
+
 - [ ] **A repository a PRIOR `repo setup` run already protected has no
       path to a scaffold fix here at all.** The ordering fix above only
       covers a ruleset THIS run is the one creating; apply_gaps's direct

@@ -617,9 +617,9 @@ class FakeGh:
             # bootstrap_occupied_entries lets a test plant a non-regular-
             # file (or an ancestor-of-a-scaffold-path) entry instead of /
             # alongside the blob one -- a bare kind string (e.g.
-            # {"TODO.md": "tree"}, a directory sitting where the scaffold
+            # {".github/zizmor.yml": "tree"}, a directory sitting where the scaffold
             # file would go) or a (kind, mode) pair (e.g.
-            # {"TODO.md": ("blob", "120000")}, a symlink).
+            # {".github/zizmor.yml": ("blob", "120000")}, a symlink).
             for path, kind in self.bootstrap_occupied_entries.items():
                 kind, mode = kind if isinstance(kind, tuple) else (kind, None)
                 entries = [e for e in entries if e["path"] != path]
@@ -641,7 +641,6 @@ class FakeGh:
             ".github/zizmor.yml",
             ".github/lanes.conf",
             ".github/workflows/ci.yml",
-            "TODO.md",
         }
 
     def _text(self, name, ref):
@@ -3231,7 +3230,7 @@ class BootstrapStepTest(unittest.TestCase):
         # against every populated branch and made plan_gaps/apply_gaps
         # misclassify it as empty (Codex review, mikelward/repo#14).
         fake = FakeGh()
-        fake.bootstrap_existing_paths = {"TODO.md"}
+        fake.bootstrap_existing_paths = {".github/zizmor.yml"}
         code, out, err = _run(fake, ["--force", "--no-rules", REPO])
         self.assertEqual(code, 0, err)
         ref_reads = [c[1] for c in fake.calls if c[0] == "api" and "/git/ref" in c[1]]
@@ -3247,7 +3246,10 @@ class BootstrapStepTest(unittest.TestCase):
 
     def test_a_partially_scaffolded_repository_adds_only_what_is_missing(self):
         fake = FakeGh()
-        fake.bootstrap_existing_paths = {"TODO.md", ".github/lanes.conf"}
+        fake.bootstrap_existing_paths = {
+            ".github/workflows/codex-review-listener.yml",
+            ".github/lanes.conf",
+        }
         code, out, err = _run(fake, ["--dry-run", "--no-rules", REPO])
         self.assertEqual(code, 0, err)
         self.assertIn("  bootstrap (fleet CI scaffold):", out)
@@ -3255,17 +3257,17 @@ class BootstrapStepTest(unittest.TestCase):
         self.assertIn("add .github/workflows/zizmor.yml", out)
         self.assertIn("add .github/zizmor.yml", out)
         self.assertIn("add .github/workflows/ci.yml", out)
-        self.assertNotIn("add TODO.md", out)
+        self.assertNotIn("add .github/workflows/codex-review-listener.yml", out)
         self.assertNotIn("add .github/lanes.conf", out)
         self.assertIn("already present, untouched: 2 file(s)", out)
 
         code, out, err = _run(fake, ["--force", "--no-rules", REPO])
         self.assertEqual(code, 0, err)
-        self.assertIn(f"{REPO}: added 6 fleet CI scaffold file(s)", out)
+        self.assertIn(f"{REPO}: added 5 fleet CI scaffold file(s)", out)
         blob_paths = {body["encoding"] for _args, body in fake.posts if "encoding" in body}
         self.assertEqual(blob_paths, {"utf-8"})
         blob_posts = [body for _args, body in fake.posts if "encoding" in body]
-        self.assertEqual(len(blob_posts), 6)  # one blob per missing file, none for the two present
+        self.assertEqual(len(blob_posts), 5)  # one blob per missing file, none for the two present
         tree_posts = [body for _args, body in fake.posts if "base_tree" in body]
         self.assertEqual(len(tree_posts), 1)
         self.assertEqual(tree_posts[0]["base_tree"], fake.bootstrap_tree_sha)
@@ -3274,7 +3276,6 @@ class BootstrapStepTest(unittest.TestCase):
             {
                 ".github/workflows/codex-review.yml",
                 ".github/workflows/codex-review-check.yml",
-                ".github/workflows/codex-review-listener.yml",
                 ".github/workflows/zizmor.yml",
                 ".github/zizmor.yml",
                 ".github/workflows/ci.yml",
@@ -3318,7 +3319,7 @@ class BootstrapStepTest(unittest.TestCase):
         # its own. Now it applies everything it safely can (bootstrap) and
         # skips only the ruleset step, saying what unblocks it.
         fake = FakeGh()
-        fake.bootstrap_existing_paths = {"TODO.md"}  # real gaps to fill
+        fake.bootstrap_existing_paths = {".github/zizmor.yml"}  # real gaps to fill
         # fake.check_runs defaults to {} -- nothing has ever reported.
         with patch("builtins.input", return_value="y"):
             code, out, err = _run(fake, [REPO], isatty=True)
@@ -3346,7 +3347,7 @@ class BootstrapStepTest(unittest.TestCase):
         # .github/workflows/ -- checked up front now, before any write is
         # attempted, rather than discovered as an opaque, unretryable 404.
         fake = FakeGh()
-        fake.bootstrap_existing_paths = {"TODO.md"}  # real gaps to fill
+        fake.bootstrap_existing_paths = {".github/zizmor.yml"}  # real gaps to fill
         fake.token_scopes = ("gist", "read:org", "repo")
         code, out, err = _run(fake, ["--no-rules", "--force", REPO])
         self.assertEqual(code, 1)
@@ -3365,7 +3366,7 @@ class BootstrapStepTest(unittest.TestCase):
         # scaffold's five workflow files) it overstated how many files the
         # missing scope actually blocks.
         fake = FakeGh()
-        fake.bootstrap_existing_paths = {"TODO.md"}  # only TODO.md already present
+        fake.bootstrap_existing_paths = {".github/zizmor.yml"}  # only .github/zizmor.yml already present
         fake.token_scopes = ("gist", "read:org", "repo")
         code, out, err = _run(fake, ["--no-rules", "--force", REPO])
         self.assertEqual(code, 1)
@@ -3377,7 +3378,7 @@ class BootstrapStepTest(unittest.TestCase):
         # at all -- "can't tell" must not read as "missing", or every
         # such token would be refused a gap-fill it could actually write.
         fake = FakeGh()
-        fake.bootstrap_existing_paths = {"TODO.md"}  # real gaps to fill
+        fake.bootstrap_existing_paths = {".github/zizmor.yml"}  # real gaps to fill
         fake.token_scopes = None
         code, out, err = _run(fake, ["--no-rules", "--force", REPO])
         self.assertEqual(code, 0, err)
@@ -3729,7 +3730,7 @@ class BootstrapStepTest(unittest.TestCase):
         # SKIPPED verdict and exit status the real run would, not report
         # the ruleset as creatable when the real run would skip it.
         fake = FakeGh()
-        fake.bootstrap_existing_paths = {"TODO.md"}
+        fake.bootstrap_existing_paths = {".github/zizmor.yml"}
         # fake.check_runs defaults to {} -- nothing has ever reported.
         code, out, err = _run(fake, ["--dry-run", REPO])
         self.assertEqual(code, 1)
@@ -3793,7 +3794,7 @@ class BootstrapStepTest(unittest.TestCase):
         fake.bootstrap_ref_missing = True
         code, out, err = _run(fake, ["--force", "--no-rules", REPO])
         self.assertEqual(code, 0, err)
-        self.assertIn(f"{REPO}: added 8 fleet CI scaffold file(s)", out)
+        self.assertIn(f"{REPO}: added 7 fleet CI scaffold file(s)", out)
         self.assertEqual(len(fake.puts), 1)  # the Contents-API bootstrap write
         self.assertEqual(fake.puts[0][1]["branch"], "main")
 
@@ -3810,20 +3811,20 @@ class BootstrapStepTest(unittest.TestCase):
         fake.bootstrap_ref_empty_409 = True
         code, out, err = _run(fake, ["--force", "--no-rules", REPO])
         self.assertEqual(code, 0, err)
-        self.assertIn(f"{REPO}: added 8 fleet CI scaffold file(s)", out)
+        self.assertIn(f"{REPO}: added 7 fleet CI scaffold file(s)", out)
         self.assertEqual(len(fake.puts), 1)  # the Contents-API bootstrap write
         self.assertEqual(fake.puts[0][1]["branch"], "main")
 
     def test_a_directory_occupying_a_scaffold_path_is_refused_not_replaced(self):
-        # A "tree" entry at TODO.md -- a directory, not a file -- must
+        # A "tree" entry at .github/zizmor.yml -- a directory, not a file -- must
         # never be silently replaced by our blob (Codex review,
         # mikelward/repo#14).
         fake = FakeGh()
         fake.bootstrap_existing_paths = set()  # everything else genuinely missing
-        fake.bootstrap_occupied_entries = {"TODO.md": "tree"}
+        fake.bootstrap_occupied_entries = {".github/zizmor.yml": "tree"}
         code, out, err = _run(fake, ["--force", "--no-rules", REPO])
         self.assertEqual(code, 1)
-        self.assertIn("cannot add TODO.md to the scaffold: TODO.md already exists and is not a "
+        self.assertIn("cannot add .github/zizmor.yml to the scaffold: .github/zizmor.yml already exists and is not a "
                        "regular file (tree); add it by hand", err)
         self.assertIn("failed on: bootstrap", err)
         self.assertEqual(fake.posts, [])
@@ -3836,10 +3837,10 @@ class BootstrapStepTest(unittest.TestCase):
         # entry says "blob" (Codex review, mikelward/repo#14).
         fake = FakeGh()
         fake.bootstrap_existing_paths = set()  # everything else genuinely missing
-        fake.bootstrap_occupied_entries = {"TODO.md": ("blob", "120000")}
+        fake.bootstrap_occupied_entries = {".github/zizmor.yml": ("blob", "120000")}
         code, out, err = _run(fake, ["--force", "--no-rules", REPO])
         self.assertEqual(code, 1)
-        self.assertIn("cannot add TODO.md to the scaffold: TODO.md already exists and is not a "
+        self.assertIn("cannot add .github/zizmor.yml to the scaffold: .github/zizmor.yml already exists and is not a "
                        "regular file (blob, mode 120000); add it by hand", err)
         self.assertIn("failed on: bootstrap", err)
         self.assertEqual(fake.posts, [])
@@ -3986,7 +3987,7 @@ class BootstrapStepTest(unittest.TestCase):
         code, out, err = _run(fake, ["--dry-run", "--no-rules", REPO])
         self.assertEqual(code, 0, err)
         self.assertIn("  bootstrap (fleet CI scaffold):", out)
-        self.assertIn("add TODO.md", out)
+        self.assertIn("add .github/zizmor.yml", out)
         self.assertEqual(fake.posts, [])
         self.assertEqual(fake.patches, [])
 
