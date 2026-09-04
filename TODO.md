@@ -293,6 +293,23 @@ doesn't set today).
       reusable-workflow call it can't parse) on any shape it doesn't
       recognize, rather than treating an unparseable shape as "not
       present."
+      **The `gate` step also has to target the RIGHT pull request, and
+      mode plus credentials alone say nothing about that** (Codex review,
+      mikelward/repo#26): lanes takes which PR to publish against as its
+      own `pr:` input rather than inferring it, and `scaffold.py`'s
+      generated `gate` step sets it to
+      `${{ github.event.pull_request.number }}` (`scaffold.py:305`) for
+      exactly that reason -- under `pull_request_target` that resolves to
+      the triggering PR. A structural match on `mode: gate` plus the two
+      credential inputs still accepts a step with `pr:` omitted, set to a
+      literal, hard-coded to a different PR number, or built from an
+      unrelated expression -- any of which either misdirects the
+      published status or leaves the step unable to publish at all, while
+      still reading as a fully credentialed publisher. The detector needs
+      to also confirm the `pr:` input resolves to
+      `github.event.pull_request.number` (or a proven equivalent under an
+      indirection it can actually follow), failing closed on an
+      expression it can't resolve.
       **Setting `app-id:`/`app-private-key:` at all is not the same as
       setting them FROM `LANES_APP_ID`/`LANES_APP_PRIVATE_KEY`
       specifically** (Codex review, mikelward/repo#26): a `gate` step
@@ -383,6 +400,25 @@ doesn't set today).
       The detector needs to check the `gate` STEP's own condition (not
       just its job's), unless it is the only step in the job -- and fail
       closed the same way on a step-level condition it can't analyze.
+      **A credentialed, correctly-triggered `gate` step still isn't a safe
+      publisher without a PR-scoped, cancel-in-progress `concurrency:`
+      group on its workflow -- and this section's own closing note below
+      was wrong to treat that as ONLY an independent README fix, separate
+      from what the detector checks** (Codex review, mikelward/repo#26):
+      without one, a run superseded by a retarget, a title edit, or a
+      fresh push can keep executing instead of being canceled, and if it
+      finishes after the newer run does, its stale terminal status can
+      overwrite the newer, correct one on the same PR -- the newly
+      App-bound required check would then read "satisfied" on the strength
+      of a superseded run's verdict, not the current head's. A repository
+      whose workflow otherwise matches every check above but carries no
+      such `concurrency:` group is not a safe publisher yet, so it isn't
+      enough to fix lanes' own README template and leave every consumer's
+      own workflow file unchecked. The detector needs to also confirm the
+      workflow declares a `concurrency:` group scoped to the PR (by
+      number or ref, the way both real consumers already do) with
+      `cancel-in-progress: true`, and the compliant predicate below needs
+      to require it the same way it requires the trigger and the mode.
       **The step alone is not enough -- the ENCLOSING JOB has to select
       the `lanes` environment too, or the move this detector triggers
       breaks the very thing it's meant to protect** (Codex review,
@@ -586,8 +622,11 @@ doesn't set today).
       the ruleset's `lanes` entry unbound (no `integration_id`) -- the
       accepted baseline, not a finding; `pull_request_target` with both
       secrets correctly in the `lanes` environment (whose branch policy is
-      EXACTLY the three hardened-target names, nothing more -- see the
-      branch-policy item's own note on this), the lanes App still
+      EXACTLY the set the repository's actual ruleset scope resolves to --
+      the hardened three-ref set for a freshly created ruleset, or the
+      existing ruleset's own conditions when one was already there, per
+      `_compute_scope` -- and nothing more; see the branch-policy item's
+      own note on this), the lanes App still
       covering the repository, AND the ruleset's `lanes` entry bound to
       THAT App's own id specifically (compliant); `pull_request_target`
       with the secrets missing, repository-scoped, or in the wrong
