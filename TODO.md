@@ -393,9 +393,20 @@ doesn't set today).
       of the OTHER two hardened targets, on a repo whose actual default
       is neither -- cannot read the credential and can never publish
       `lanes` there, permanently blocking merges to a branch the ruleset
-      itself requires the check on. The branch policy needs the same
-      three-name set the ruleset targets, not a narrower one independently
-      derived from "the default branch."
+      itself requires the check on. The branch policy needs to cover the
+      same three targets the ruleset does -- but not by copying
+      `_HARDENED_INCLUDE`'s three strings into the branch-policy API
+      call verbatim, which was implied above and is wrong (Codex review,
+      mikelward/repo#26): `~DEFAULT_BRANCH` and `refs/heads/main`/
+      `refs/heads/master` are ruleset ref-CONDITION syntax, not the plain
+      branch-name patterns the `deployment-branch-policies` endpoint
+      matches against. Creating a literal policy entry for the string
+      `~DEFAULT_BRANCH`, say, would not resolve to anything a real
+      `pull_request_target` run's branch ever equals. The three policy
+      entries have to be the resolved default branch's actual name (the
+      same `default_branch(repo)` lookup this codebase already has)
+      plus the literal names `main` and `master` -- not the ruleset's own
+      encoding of those three targets.
       **Widening the branch policy to all three targets does not by
       itself make all three branches' WORKFLOWS App publishers, and this
       item can't fix that -- it's a general limit of how this tool audits,
@@ -416,6 +427,25 @@ doesn't set today).
       fix for inside this one item. Worth naming as a real edge case a
       partial migration can hit, not something the `--branch` default
       already covers.
+      **The same "not every covered PR necessarily gets a publisher" gap
+      also shows up through the trigger's OWN filters, not just a
+      per-branch workflow difference -- confirming the event name is
+      `pull_request_target` is not confirming it fires for every PR the
+      ruleset protects** (Codex review, mikelward/repo#26): a `branches:`,
+      `paths:`, or narrowed `types:` filter on that trigger can exclude a
+      protected PR the same way an unmigrated branch does, and a filter
+      that DID match once is enough to satisfy the history-based preflight
+      even though a differently-shaped PR then waits forever. Parsing
+      every GitHub Actions filter shape correctly (branch globs, path
+      globs, `branches-ignore`, the interaction between them) is real
+      static-analysis work, not a detector tweak, and it is the same
+      category of gap as the per-branch one just above -- so this item
+      draws the same boundary around it: name the trigger's event
+      filters as an additional way the "confirmed as App-published" read
+      can be wrong, without promising a filter parser here. Whoever
+      builds the detector should decide then whether to fail closed on
+      any filtered trigger (safe, but any repository) or leave this as a
+      documented residual gap alongside the per-branch one.
       **This same gap is latent in the existing batch credentials too**
       (`NPM_UPDATE_APP_ID`/`GRADLE_UPDATE_APP_ID`/`RUST_UPDATE_APP_ID` and
       their private keys) -- `_ensure_environment` gives every one of them
@@ -591,6 +621,29 @@ doesn't set today).
       handful this section currently budgets, so update that note too
       rather than leaving it describing only the narrower batch-style
       check.
+      **The sweep above still can't see an ORGANIZATION-level secret
+      granted to the repository, and that's a real hole on an org-owned
+      repo, not just an unlikely corner** (Codex review, mikelward/repo#26):
+      an org Actions secret named `LANES_APP_ID`/`LANES_APP_PRIVATE_KEY`
+      and shared with the repository is invisible to
+      `repository_secrets`/`environment_secrets` alike, so a same-repo PR
+      could add an ordinary job -- no `environment: lanes` needed -- that
+      reads the inherited copy and forges the status, while this item's
+      own audit reports the repository compliant the whole time. Closing
+      it needs reading the org's secret grants (`GET
+      /orgs/{org}/actions/secrets` and which repos each is shared with),
+      which is a genuinely different permission footprint than anything
+      else this tool reads -- every other call here is repository-scoped;
+      this one needs organization-level Actions-secrets visibility, which
+      a fine-grained token may not carry even when it can do everything
+      else `repo setup`/`repo audit` do. Fail closed (report "cannot
+      confirm no org secret is granted") when that read isn't available,
+      rather than silently skipping it. **This is also latent in every
+      existing batch credential**, for the identical reason the
+      environment branch-policy gap above is: nothing here has ever
+      checked for an inherited org secret, for any of them. Worth its own
+      follow-up across the whole tool rather than a one-off built only for
+      lanes.
 - [ ] **Wire the lanes App's slug into `repo_lib/apps.py`'s `--app` step**
       so a repo migrating onto the App design gets installation membership
       fixed by the same `repo setup` run that places its credential,
