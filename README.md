@@ -88,7 +88,10 @@ rather than gaining a second one beside it, since rulesets aggregate and
 two of them are only ever confusing, and where both names exist the older
 one is deleted when its content is identical to what the surviving one
 will hold, and reported when it is not; an existing ruleset's own scope is
-widened to cover all three refs, never narrowed or replaced),
+widened to cover all three refs, never narrowed or replaced -- and an
+exclusion that carves one of them back out is reported rather than
+deleted, since removing one somebody wrote is a narrowing decision this
+does not make),
 fanning a secret out via the same logic `repo secrets`
 uses, ensuring GitHub App installation membership, and (always on, like
 the fleet-credentials and auto-merge steps below; `--no-bootstrap` skips

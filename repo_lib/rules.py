@@ -548,13 +548,61 @@ def _widen_include(include):
     branch, and appending three refs it subsumes would be noise.
 
     Exclusions are NOT touched. One naming a ref this adds would defeat
-    the widening, which is why _describe_plan says so rather than this
-    quietly deleting an exclusion somebody meant."""
+    the widening, which is why _excluded_hardened_refs reports it rather
+    than this quietly deleting an exclusion somebody meant."""
     include = list(include)
     if "~ALL" in include:
         return include, []
     added = [ref for ref in _HARDENED_INCLUDE if ref not in include]
     return include + added, added
+
+
+def _excluded_hardened_refs(exclude, default_branch):
+    """(named, unevaluated): which of the hardened refs a ruleset's own
+    exclusions carve back out of the scope a write leaves it with, and
+    whether a glob exclusion makes that unanswerable.
+
+    Widening the include list is not the whole answer to "does this
+    ruleset cover all three?" -- an exclusion outranks an include, so a
+    ruleset including ~ALL (or all three literally) while excluding
+    refs/heads/master leaves master exactly as unprotected as before,
+    and nothing about the include list says so (Codex review,
+    mikelward/repo#31). ~DEFAULT_BRANCH is resolved against the real
+    default branch first, since an exclusion names a ref, not a token.
+
+    Literal matching only, and a glob is reported as unevaluated rather
+    than guessed at -- the same discipline as _find_merge_method_conflicts,
+    for the same reason: this module does not reimplement GitHub's ref
+    matching."""
+    exclude = list(exclude or [])
+    wanted = set(_normalize_refs(_HARDENED_INCLUDE, default_branch))
+    named = [ref for ref in exclude if ref in wanted]
+    return named, _has_glob(exclude)
+
+
+def _report_excluded_hardened(repo, ruleset_name, target_body, default_branch):
+    """Says so when a ruleset's exclusions still keep one of the hardened
+    refs out. Reported, never fixed: deleting an exclusion somebody wrote
+    is a narrowing decision this module does not make, and `repo audit`
+    already counts the same state as a [GAP] (see
+    audit_cmd._targeting_status). Silence was the real problem -- an
+    already-matching ruleset excluding refs/heads/master reported
+    "nothing to do" while master stayed open."""
+    ref_name = ((target_body or {}).get("conditions") or {}).get("ref_name") or {}
+    named, unevaluated = _excluded_hardened_refs(ref_name.get("exclude"), default_branch)
+    if named:
+        error(
+            f"{repo}: ruleset '{ruleset_name}' excludes {', '.join(named)}, so it does not "
+            "protect that branch whatever its include list says. An exclusion is never edited "
+            "here -- remove it by hand, or delete the branch it names. `repo audit` reports "
+            "this as a gap."
+        )
+    if unevaluated:
+        error(
+            f"{repo}: ruleset '{ruleset_name}' has a pattern in its exclusions, so whether it "
+            "still covers the default branch, refs/heads/main and refs/heads/master cannot be "
+            "checked here without reimplementing GitHub's ref matching. Check it by hand."
+        )
 
 
 def _compute_scope(repo, existing_id):
@@ -878,22 +926,15 @@ def _bypass_actor_note(bypass_actors):
     )
 
 
-def _scope_line(scope_added, target_body):
+def _scope_line(scope_added):
     """The one line saying what an update does to the ruleset's targeting
-    -- widened by the refs _widen_include appended, or unchanged.
-
-    An exclusion is named alongside, because this module never edits one:
-    a ruleset excluding refs/heads/master still excludes it after a
-    widening that just added it to the include list, and a plan reading
-    "also targeting refs/heads/master" with no caveat would promise
-    coverage the write does not deliver."""
+    -- widened by the refs _widen_include appended, or unchanged. What an
+    exclusion still keeps out is _report_excluded_hardened's job: it is
+    true on every path, including the ones with no scope change to
+    describe."""
     if not scope_added:
         return "  scope unchanged"
-    line = "  scope: also targeting " + ", ".join(scope_added)
-    excluded = ((target_body or {}).get("conditions") or {}).get("ref_name") or {}
-    if excluded.get("exclude"):
-        line += " (this ruleset's own exclusions are left alone and may narrow that)"
-    return line
+    return "  scope: also targeting " + ", ".join(scope_added)
 
 
 def _scope_result(scope_added):
@@ -933,10 +974,10 @@ def _describe_plan(
             f"{repo}: would adopt ruleset '{adopted_legacy}' (id {existing_id}) and rename "
             f"it '{ruleset_name}'"
         )
-        lines.append(_scope_line(scope_added, target_body))
+        lines.append(_scope_line(scope_added))
     elif existing_id:
         lines.append(f"{repo}: would update ruleset '{ruleset_name}' (id {existing_id})")
-        lines.append(_scope_line(scope_added, target_body))
+        lines.append(_scope_line(scope_added))
     else:
         lines.append(f"{repo}: would create ruleset '{ruleset_name}' on {default_branch}, main and master")
     if needs_write:
@@ -1183,6 +1224,7 @@ def apply_ruleset(
     if not needs_write and not deletions:
         if not quiet:
             print(f"{repo}: ruleset '{ruleset_name}' (id {existing}) {NO_OP_MESSAGE}")
+            _report_excluded_hardened(repo, ruleset_name, target_body, default_branch)
             _report_blocked_legacy(repo, ruleset_name, blocked)
             note = _bypass_actor_note((target_body or {}).get("bypass_actors") or [])
             if note:
@@ -1206,6 +1248,7 @@ def apply_ruleset(
     if dry_run:
         for line in plan_lines:
             print(line)
+        _report_excluded_hardened(repo, ruleset_name, target_body, default_branch)
         _report_blocked_legacy(repo, ruleset_name, blocked)
         return 0
 
@@ -1331,6 +1374,12 @@ def apply_ruleset(
     # the write lands that is only true of the target body. Deleting first
     # and then failing the write would leave the repository protected by
     # neither.
+    # quiet here for the same reason the no-op report has it: setup_cmd's
+    # preview pass has already printed both of these from its own dry run,
+    # and the real apply repeating them is noise, not a second finding.
+    if not quiet:
+        _report_excluded_hardened(repo, ruleset_name, fresh_target_body, default_branch)
+
     delete_failed = False
     for legacy_name, legacy_id in fresh_deletions:
         try:
@@ -1348,7 +1397,8 @@ def apply_ruleset(
             f"{repo}: deleted the superseded ruleset '{legacy_name}' (id {legacy_id}) -- "
             f"it was identical to '{ruleset_name}'"
         )
-    _report_blocked_legacy(repo, ruleset_name, fresh_blocked)
+    if not quiet:
+        _report_blocked_legacy(repo, ruleset_name, fresh_blocked)
     if delete_failed:
         return 1
     return 0
