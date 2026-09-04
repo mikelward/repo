@@ -479,6 +479,38 @@ def _plan_legacy_deletion(repo, ruleset_name, existing, adopted_legacy, target_b
     return deletable, blocked
 
 
+def _still_superseded(repo, ruleset_name, survivor_id, legacy_name, legacy_id):
+    """Whether deleting `legacy_id` is STILL safe, asked immediately
+    before the delete rather than from the plan's own snapshot.
+
+    Two things the earlier answer cannot cover. An administrator editing
+    the duplicate between the plan and the delete -- a window that spans
+    the survivor's own write, so it is a network round trip wide, not an
+    instant (Codex review, mikelward/repo#31) -- would otherwise have it
+    deleted on a reading that no longer holds. And the plan compares
+    against the body this run MEANT to write, where what matters is the
+    body GitHub actually stored: a field it normalized or defaulted on the
+    way in would make the survivor differ from the target, and the
+    duplicate is only redundant against what is really there.
+
+    So both sides are re-read and compared as they now are. A failed read
+    is not "unchanged": it returns False, and the caller reports the
+    duplicate as kept rather than deleting on an answer it could not
+    get."""
+    try:
+        survivor = gh.run(["api", f"repos/{repo}/rulesets/{survivor_id}"])
+        candidate = gh.run(["api", f"repos/{repo}/rulesets/{legacy_id}"])
+    except gh.GhError as e:
+        error_lines(
+            f"could not re-read '{ruleset_name}' (id {survivor_id}) and '{legacy_name}' "
+            f"(id {legacy_id}) on {repo} to confirm the duplicate is still redundant. "
+            "Not deleting it.",
+            e.stderr,
+        )
+        return False
+    return _comparable_ruleset(json.loads(candidate)) == _comparable_ruleset(json.loads(survivor))
+
+
 def _report_blocked_legacy(repo, ruleset_name, blocked):
     """Says so for each legacy-named ruleset left in place. Rulesets
     aggregate, so one sitting beside the standard one is not broken --
@@ -570,13 +602,29 @@ def _excluded_hardened_refs(exclude, default_branch):
     mikelward/repo#31). ~DEFAULT_BRANCH is resolved against the real
     default branch first, since an exclusion names a ref, not a token.
 
-    Literal matching only, and a glob is reported as unevaluated rather
-    than guessed at -- the same discipline as _find_merge_method_conflicts,
-    for the same reason: this module does not reimplement GitHub's ref
-    matching."""
+    Both sides are normalized, not just the wanted one: an exclusion may
+    itself be written `~DEFAULT_BRANCH`, and comparing that token against
+    the resolved `refs/heads/<default>` would miss a ruleset excluding the
+    very branch this protects. `~ALL` on the exclusion side carves out
+    every branch, these three included. audit_cmd._branch_coverage_verdict
+    already treats both tokens as effective in `exclude`, so recognizing
+    them here keeps the two commands answering the same question (Codex
+    review, mikelward/repo#31).
+
+    Reported by the entry as written, not as normalized, so the ref named
+    is the one to go looking for in the ruleset.
+
+    Literal matching otherwise, and a glob is reported as unevaluated
+    rather than guessed at -- the same discipline as
+    _find_merge_method_conflicts, for the same reason: this module does not
+    reimplement GitHub's ref matching."""
     exclude = list(exclude or [])
     wanted = set(_normalize_refs(_HARDENED_INCLUDE, default_branch))
-    named = [ref for ref in exclude if ref in wanted]
+    named = [
+        ref
+        for ref in exclude
+        if ref == "~ALL" or _normalize_refs([ref], default_branch)[0] in wanted
+    ]
     return named, _has_glob(exclude)
 
 
@@ -1382,6 +1430,15 @@ def apply_ruleset(
 
     delete_failed = False
     for legacy_name, legacy_id in fresh_deletions:
+        if not _still_superseded(repo, ruleset_name, fresh_existing, legacy_name, legacy_id):
+            error(
+                f"{repo}: not deleting '{legacy_name}' (id {legacy_id}) -- it is no longer "
+                f"identical to '{ruleset_name}' (id {fresh_existing}). One of them changed "
+                "since this run planned the deletion. Nothing is unprotected; rerun to "
+                "re-check."
+            )
+            delete_failed = True
+            continue
         try:
             gh.run(["api", "--method", "DELETE", f"repos/{repo}/rulesets/{legacy_id}"])
         except gh.GhError as e:
