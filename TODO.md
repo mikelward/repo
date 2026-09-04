@@ -238,6 +238,151 @@
       deletion above. It is the first change here that would rewrite an
       existing ruleset's conditions, which is why it is its own item.
 
+## repo setup and repo audit: lanes' trusted-verdicts design
+
+Two designs for the required `lanes` check coexist in the fleet today, and
+`repo setup`/`repo audit` only know about one of them. The default -- every
+repo except typelauncher and yaml-lite -- runs `classify`/`lanes` on plain
+`pull_request` with no credential at all: `mode: gate`'s own Actions
+check-run IS the required check, `permissions: contents: read,
+pull-requests: read` is enough, and `repo_lib/scaffold.py` generates exactly
+this for `repo create --scaffold`. typelauncher and yaml-lite instead run
+under `pull_request_target` and authenticate as a dedicated GitHub App
+(`LANES_APP_ID`/`LANES_APP_PRIVATE_KEY` secrets in a `lanes` environment
+scoped to the base ref), which `mode: init`/`gate` use to post the `lanes`
+commit status directly via API rather than relying on the ambient
+check-run. yaml-lite's own comment calls itself the fleet's pilot for this
+"trusted-verdicts design" -- it exists to close a real hole in the default:
+under plain `pull_request`, a PR can rewrite its own `ci.yml` to make the
+`lanes` job `exit 0` and forge a green required check, something
+`pull_request_target` (which always loads job definitions from the base
+branch) closes on its own, at the cost of needing an explicit publisher
+since a `pull_request_target` run's ambient check-run attributes to the
+base tip, never the PR head.
+
+This is shaped like the fleet-credentials work above, and should mostly
+reuse it, but it is not a drop-in extension of `credentials.py` as it
+stands -- see item 1.
+
+- [ ] **Extend the fleet-credential machinery to `LANES_APP_ID`/
+      `LANES_APP_PRIVATE_KEY`, with a detector of its own.** The naming
+      already fits `batch_credentials(hub)`'s convention, but `lanes` is
+      not a `workflow_call` reusable workflow invoked at job level with
+      `secrets: inherit` -- it's a composite Action invoked at step level
+      (`uses: mikelward/lanes@main`), and its `init`/`gate` steps reference
+      `secrets.LANES_APP_ID`/`secrets.LANES_APP_PRIVATE_KEY` directly in
+      their own `with:` block. `credentials.py`'s `callers()`/
+      `caller_inherits()` look for a job-level `uses: mikelward/<hub>/...`
+      reusable-workflow call and an `inherit`; neither matches this shape.
+      "Does this repo use the App design" needs a new detector -- a step
+      with `uses: mikelward/lanes@` whose `with:` sets `app-id:`/
+      `app-private-key:` (or just the presence of both secret references
+      in the workflow text) -- that plugs into the same environment-fanout
+      logic `repo setup --credential`/`repo audit` already use, once it
+      exists.
+- [ ] **`repo audit` should report which design a repo is actually wired
+      for, and flag drift the same way it flags a stray batch credential.**
+      Four states: plain `pull_request` with no App secrets present (the
+      accepted baseline -- not a finding); `pull_request_target` with both
+      secrets correctly in the `lanes` environment (compliant); `pull_request_target`
+      with the secrets missing, repository-scoped, or in the wrong
+      environment (broken, `[FIX]`); and plain `pull_request` with
+      `LANES_APP_ID`/`LANES_APP_PRIVATE_KEY` present anywhere -- a dead
+      credential, since a workflow that never passes `app-id`/
+      `app-private-key` to `mode: gate` never uses them, the same "stale
+      copy for a workflow the repository does not use" treatment
+      `credentials.py` already gives a batch credential.
+- [ ] **`repo setup --credential LANES_APP_ID=... --credential
+      LANES_APP_PRIVATE_KEY=...`** should place them exactly like a batch
+      credential does today: fan into the `lanes` environment for a repo
+      whose workflow already references them (per the detector above),
+      delete a repository-level copy, leave an unaffected repo alone. This
+      part is mechanically identical to the existing fleet-credentials
+      step once the detector exists -- no new placement logic.
+- [ ] **Wire the lanes App's slug into `repo_lib/apps.py`'s `--app` step**
+      so a repo migrating onto the App design gets installation membership
+      fixed by the same `repo setup` run that places its credential,
+      rather than a separate manual step. Confirm the slug first --
+      nothing in this repo currently records it.
+- [ ] **The required `lanes` check is unbound for every repo `repo setup`
+      has ever created, and that is the actual gap the App design exists
+      to close -- closing it is `repo`'s work, not lanes'.**
+      `rules.py:859`'s own comment says so: "Names off the command line
+      carry no App binding, so every entry is unbound: any producer of
+      that context counts." Both `_build_update_body` (`rules.py:591`) and
+      the ruleset-create path (`rules.py:538`) compose `{"context": c}`
+      with no `integration_id`, even though the READ side -- the
+      `(context, integration_id)` pairs, `bound_to_another_app`, the
+      whole `never_reported`/`describe_missing` App-aware plumbing --
+      already understands a bound check and is exercised today (for
+      `codex`, which GitHub may already report as App-bound on the read
+      side without this tool ever having asked for it). Without a write
+      path, a repo running the App design still has a ruleset that
+      accepts a `lanes` context from ANY source -- including a forged one
+      from an unrelated `push`-triggered workflow a same-repo PR could
+      add, which is exactly the threat lanes' own TODO.md (its "round
+      seven") names as still unclosed and calls "real infrastructure...
+      not a consumer-template detail." Closing this needs: a
+      `--rule NAME@APP_ID`-shaped CLI surface, `rules.py` writing
+      `integration_id` into the entries it composes, and `repo audit`
+      reporting an unbound `lanes` check as a `[FIX]` specifically on a
+      repo that ALSO holds the App credential (that pairing is the tell
+      that the repo believes it's protected and isn't). Confirm against a
+      real ruleset, before relying on it, that this account's GitHub plan
+      actually enforces `required_status_checks[].integration_id` the way
+      lanes' TODO.md still marks unverified ("whether GitHub's
+      required-check 'expected source' feature actually restricts by app
+      identity on this account's plan") -- this tool already round-trips
+      ruleset JSON, so it's a reasonable place to do that confirmation
+      rather than lanes itself.
+- [ ] **Don't default `repo create --scaffold` onto the App design yet --
+      that's the owner's call, not autopilot's, once the above exists.**
+      `repo_lib/scaffold.py` only ever generates the plain-`pull_request`
+      wiring today. Lanes' own TODO.md still lists two gaps in the App
+      design as open, not this rollout's to close: an `actions/cache`
+      poisoning path in a `pull_request_target` heavy job with no answer
+      yet, and the same unverified `integration_id`/ruleset-restriction
+      question item 5 above depends on. Scaffolding every new repo onto a
+      design with a documented, unclosed gap baked in from day one is a
+      worse default than the current one; revisit once those two close.
+- [ ] **Migrating an EXISTING repo's `ci.yml` is not scaffold-fill work and
+      doesn't belong in `repo setup` as a mechanical step.** Unlike a
+      missing file, each repo's heavy-job graph (`build`, `check`, `msrv`,
+      `connected-tests`, ...) is bespoke, and the migration has to move
+      each one to `pull_request_target`, switch its checkout to the merge
+      snapshot, and verify it references no `secrets.*` -- exactly the
+      per-repo work lanes' own TODO.md defers to "whichever pull request
+      actually pilots a consumer onto this." `repo setup`/`repo audit`
+      carry the credential/App-membership/ruleset-binding side (the items
+      above) and can flag which repos are wired for which design; the
+      workflow-file rewrite itself stays a human-or-agent-authored PR per
+      repo, built from typelauncher's or yaml-lite's actual `ci.yml` --
+      not the README's abbreviated template alone (see below). Once the
+      items above land here, pilot exactly one more repo (neither
+      typelauncher nor yaml-lite, which are already done) before treating
+      this as a routine fleet-wide pass, per lanes' own AGENTS.md: "a
+      change that touches consumers goes through ONE of them first."
+
+**What this does NOT need from `mikelward/lanes` itself:** the
+App-publishing mechanism (`mode: init`/`gate` with `app-id`/
+`app-private-key`, JWT signing, the installation-token exchange) is
+already built and tested, per lanes' own TODO.md ("round eight"). Every
+item above is `repo`-side tooling or per-consumer workflow-file work.
+
+One real gap in lanes IS worth a small fix, independent of anything above:
+its README's copy-paste template for the trusted-publishing design (the
+`init`/`finalize` example) shows `environment: lanes` and the finalizer's
+`if: ${{ !cancelled() }}`, but never shows the `concurrency:`/
+`cancel-in-progress` group its own TODO.md ("round six") says the design
+needs -- without one, an in-flight run superseded by a retarget or title
+edit can still land its stale terminal write after the newer run's. Both
+real consumers carry one (yaml-lite's is the simpler of the two:
+`concurrency: {group: ci-${{ github.event.pull_request.number ||
+github.ref }}, cancel-in-progress: true}`); the README template doesn't,
+so a reader following it literally reconstructs that piece from prose
+scattered across TODO.md instead of copying working code. Worth a small
+PR against `mikelward/lanes` on its own, ahead of anything above.
+
 ## repo cleanup
 
 - [ ] **Patch-equivalence is invisible to `repo cleanup`, so those branches
