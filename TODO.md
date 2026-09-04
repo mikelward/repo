@@ -278,6 +278,29 @@ doesn't set today).
       their own `with:` block. `credentials.py`'s `callers()`/
       `caller_inherits()` look for a job-level `uses: mikelward/<hub>/...`
       reusable-workflow call and an `inherit`; neither matches this shape.
+      **Feeding this detector `credentials.workflow_texts()` would be
+      wrong in a way none of the batch credentials' own use of it is --
+      that function deliberately reads EVERY branch, and a
+      `pull_request_target` publisher's existence is a property of ONE
+      branch specifically** (Codex review, mikelward/repo#26):
+      `workflow_texts` (`credentials.py:322-344`) aggregates a workflow's
+      text from every branch where it differs from the default branch's
+      copy, by design -- its own docstring explains why: a push-triggered
+      batch-credential caller runs from whatever branch it lives on, so a
+      caller that exists only on a feature branch still needs its
+      credential, and reading the default branch alone would delete it as
+      unused. That reasoning does not transfer here. A `lanes` `gate`
+      step's *existence on some branch* says nothing about whether the
+      branch this rollout is actually auditing -- `--branch NAME` or the
+      resolved default -- has a working publisher: a migration attempt
+      left on an unmerged feature branch would still make this detector
+      report "App design consumer" for the repository, and `repo setup`
+      run against `main` could then move the credentials and bind `lanes`
+      while `main` itself has no publisher at all, blocking every merge
+      there. This detector needs to read only the workflow text of the
+      branch actually being audited, not `workflow_texts()`'s all-branches
+      aggregation -- a narrower read than the batch-credential callers use,
+      for a narrower question than theirs.
       "Does this repo use the App design" needs a new detector -- and a
       raw text-presence check for `LANES_APP_ID`/`LANES_APP_PRIVATE_KEY`
       is not enough (Codex review, mikelward/repo#26): both names could
@@ -530,6 +553,26 @@ doesn't set today).
       when there is no PR. The detector needs to confirm the group key
       resolves to the PR number for every `pull_request_target` run, not
       merely that SOME expression involving `ref` appears in it.
+      **A correct concurrency group only protects against a SECOND RUN OF
+      THE SAME workflow -- it does nothing if a repository has TWO
+      independently triggered publisher pairs, each internally correct
+      and each in its own group** (Codex review, mikelward/repo#26): if
+      two workflow files each contain a recognized, credentialed
+      `init`/`gate` pair -- a leftover from a previous migration attempt
+      alongside a new one, say -- GitHub's `concurrency:` cancellation
+      only applies within one group, so a group keyed
+      `ci-${{ ...number }}` in one file and `lanes-${{ ...number }}` in
+      the other never interact: both can run for the same PR at once, and
+      whichever finishes last wins the required check's latest status
+      regardless of which one is actually current. Every check this item
+      has added so far -- mode, credentials, `pr:`, environment, trigger,
+      isolation, the group key itself -- can pass independently for BOTH
+      publishers while this failure mode still exists. The detector needs
+      to also confirm there is exactly one qualifying publisher pair on
+      the audited branch (per the branch-scoping note above), or -- if a
+      repository genuinely has more than one for some reason -- that every
+      one of them shares the SAME concurrency group, and fail closed on
+      more than one pair it can't prove share a group.
       **The step alone is not enough -- the ENCLOSING JOB has to select
       the `lanes` environment too, or the move this detector triggers
       breaks the very thing it's meant to protect** (Codex review,
@@ -573,6 +616,26 @@ doesn't set today).
       against a real ruleset" item below on `integration_id`, and it
       blocks the credential-placement item below, not just the detector
       above.
+      **Writing entries via `deployment-branch-policies` doesn't work on
+      an environment created by the bare PUT above -- that endpoint
+      requires the environment's OWN `deployment_branch_policy` mode to
+      already be `custom_branch_policies: true` first, a second write
+      this item hadn't named** (Codex review, mikelward/repo#26): GitHub's
+      environment object carries a `deployment_branch_policy` field of its
+      own (`{protected_branches, custom_branch_policies}`, mutually
+      exclusive), and the `deployment-branch-policies` sub-resource only
+      accepts entries when that field is set to `custom_branch_policies:
+      true` -- the bodyless PUT `_ensure_environment` issues leaves it
+      `null` (GitHub's default, meaning "no branch restriction," which is
+      consistent with "no restriction at all" above but is a DIFFERENT
+      fact from "custom policies enabled"). Attempting the branch-policy
+      write this item requires against a freshly created or still-default
+      environment would fail outright rather than silently doing nothing.
+      Creating or confirming the `lanes` environment needs to set
+      `deployment_branch_policy: {custom_branch_policies: true,
+      protected_branches: false}` on the environment itself FIRST, then
+      write the three (or ruleset-derived) branch-policy entries -- two
+      writes in sequence, not one, both still before the credential lands.
       **"Restricted to the repository's default branch" is too narrow --
       it has to match every ref the `lanes` RULESET actually protects,
       not just the one branch** (Codex review, mikelward/repo#26):
