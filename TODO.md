@@ -268,6 +268,34 @@ workflow step rather than grep for the secret names, and the environment
 this credential lands in needs a branch policy `_ensure_environment`
 doesn't set today).
 
+**OPEN QUESTION -- treating this as a "fleet credential" at all may be the
+wrong model, and every per-repository check this item builds inherits the
+same blind spot if it is** (Codex review, mikelward/repo#26, P1): every
+existing batch credential this tool manages is the SAME secret value
+deliberately shared across every consumer repository -- that's the whole
+point of "fleet." A single GitHub App identity/private key distributed
+that way means compromising ANY ONE consumer's copy lets an attacker
+authenticate as the App and mint an installation token covering every
+repository the installation reaches -- and `apps.py` (`resolve_installation`/
+`plan_app_step`) already confirms one installation can legitimately cover
+multiple repositories, or all of them (`ALREADY_ALL`). The resulting
+forged status carries the App's real `integration_id`, so none of the
+per-repository checks this item builds -- secret placement, publisher
+structure, the ruleset binding itself -- can tell it apart from a
+legitimate one; every one of them verifies "does THIS repository's
+workflow look like a valid publisher," never "was THIS repository's own
+credential the one that actually signed this token." Binding `lanes` to a
+fleet-shared App and calling the result a repository-level trust boundary
+is not true under this model: it is a FLEET-level trust boundary, and a
+single compromised consumer degrades every other repository sharing that
+installation, silently. Closing this for real needs either a separate App
+identity and key per repository (real ongoing maintenance cost, and a
+question of whether GitHub Apps are cheap enough to provision one per
+repo) or an explicit acceptance that this is fleet-level trust, stated
+plainly rather than assumed away by the per-repository language the rest
+of this item uses. This is the maintainer's call, not autopilot's --
+record it, don't resolve it by picking a direction silently.
+
 - [ ] **Extend the fleet-credential machinery to `LANES_APP_ID`/
       `LANES_APP_PRIVATE_KEY`, with a detector of its own.** The naming
       already fits `batch_credentials(hub)`'s convention, but `lanes` is
@@ -490,6 +518,25 @@ doesn't set today).
       EVERY one of them is both a `gate` prerequisite and has a
       corresponding `results:` entry, not merely that whatever already
       appears in both places agrees with itself.
+      **Being present in both `needs:` and `results:` is not the same as
+      being able to FAIL `gate` -- a job with `continue-on-error: true`
+      reports `success` to `needs.<job>.result` even when it actually
+      failed** (Codex review, mikelward/repo#26, P1): GitHub Actions
+      exposes a job's outcome to downstream jobs through
+      `needs.<job>.result`, and `continue-on-error: true` on a job masks
+      that outcome as `success` for anything reading it, regardless of
+      whether the job's own steps actually failed -- that's the whole
+      point of the setting. The completeness check just added (every job
+      present in both `needs:` and `results:`) is satisfied by such a job
+      exactly the same as by one that genuinely passed, so a heavy job
+      quietly marked `continue-on-error: true` -- accidentally or
+      deliberately -- lets `gate` publish success on a real failure while
+      passing every check this item has built so far. Closing this needs
+      the detector to also reject `continue-on-error: true` on any job in
+      the required gated set (or, if a legitimate use case needs it,
+      confirm the workflow validates the job's real outcome some other
+      way before folding it into `results:` -- but the default posture is
+      to fail closed on the setting's presence, not assume it's benign).
       **Confirming `gate`'s inputs come from `needs.classify.*` syntactically
       still says nothing about whether `classify` ITSELF is a real
       classifier -- only that gate is wired to whatever job happens to be
@@ -811,8 +858,23 @@ doesn't set today).
       consumer of the same environment. The detector needs to scan every
       job in every workflow on the audited branch and fail closed unless
       every reference to either secret name, and every `environment:
-      lanes` selection, occurs only inside the one recognized, isolated
-      publisher job -- not just check that no SECOND publisher exists.
+      lanes` selection, occurs only inside the recognized `init` job and
+      the recognized `gate` job -- not just check that no SECOND publisher
+      exists.
+      **"The one recognized, isolated publisher job" -- as first
+      stated directly above -- was wrong and would have flagged every
+      valid `init`/`gate` pair as `[FIX]`: this item requires them to be
+      TWO separate jobs, and both legitimately need the credentials**
+      (Codex review, mikelward/repo#26, P2): earlier corrections in this
+      same item establish that `gate` must depend on `init` (so they
+      can't be the same job) and that BOTH need `app-id:`/
+      `app-private-key:` -- `init` to post `pending`, `gate` to post the
+      terminal result. A rule requiring every secret reference confined
+      to a single job contradicts the two-job shape this item itself
+      requires elsewhere, and would mark the only correct design as
+      non-compliant. Corrected above: exactly the recognized `init` job
+      and the recognized `gate` job may reference the secrets or select
+      the environment; anything beyond those two is still `[FIX]`.
       **The step alone is not enough -- the ENCLOSING JOB has to select
       the `lanes` environment too, or the move this detector triggers
       breaks the very thing it's meant to protect** (Codex review,
