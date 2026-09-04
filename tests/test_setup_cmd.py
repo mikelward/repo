@@ -430,7 +430,12 @@ class FakeGh:
                 return f"{self.legacy_ruleset_id}\n" if self.legacy_ruleset_id else ""
             self._name_lookup_calls += 1
             if self.existing_ruleset_ids is not None:
-                self._name_lookup_calls += 1
+                # Counted once by the line above, like every other by-name
+                # lookup. Counting it twice here put the threshold behind
+                # the FIRST lookup, so a test meaning "the duplicate
+                # appears on the real apply's own lookup" got it from the
+                # preview instead and passed without exercising the
+                # transition at all (Codex review, mikelward/repo#33).
                 if (
                     self._name_lookup_calls >= self.existing_ruleset_id_lookup_threshold
                     and self.existing_ruleset_ids_later is not None
