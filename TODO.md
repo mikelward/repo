@@ -333,6 +333,23 @@ doesn't set today).
       `github.event.pull_request.number` (or a proven equivalent under an
       indirection it can actually follow), failing closed on an
       expression it can't resolve.
+      **A correctly-shaped `gate` step can still be a rubber stamp -- none
+      of the checks above confirm its VERDICT inputs actually reflect the
+      jobs it's supposed to be protecting** (Codex review, mikelward/repo#26):
+      `gate` computes its terminal status from `classify-result:`,
+      `base-sha:`, and `results:`, and the generated scaffold wires every
+      heavy job through both `needs:` and `results:` for exactly that
+      reason (`scaffold.py:278-308`). A `gate` step matching every
+      structural check so far -- mode, credentials, `pr:`, environment,
+      trigger, isolation, condition -- can still omit a failing heavy job
+      from `results:`, or supply a literal or stale value for any of the
+      three inputs, and publish a clean verdict regardless of what actually
+      happened. The detector needs to also confirm `results:` corresponds
+      to the job's own `needs:` dependency graph -- every heavy job present,
+      none missing -- and that `classify-result:`/`base-sha:` come from
+      `classify`'s own outputs rather than a literal or an unrelated
+      expression, failing closed on a `results:` expression or dependency
+      graph it can't fully resolve rather than assuming correspondence.
       **Setting `app-id:`/`app-private-key:` at all is not the same as
       setting them FROM `LANES_APP_ID`/`LANES_APP_PRIVATE_KEY`
       specifically** (Codex review, mikelward/repo#26): a `gate` step
@@ -1213,6 +1230,24 @@ doesn't set today).
       the write -- which likely means moving it to run after the
       App-membership and credential steps, not merely adding it to the
       existing ruleset call.
+      **"Bind last" fixes the ordering WITHIN one `repo setup` run, but the
+      detector's own read can still be stale by the time the write
+      actually happens -- the audited branch is live, and nothing stops it
+      changing during the membership/credential steps this ordering now
+      runs first** (Codex review, mikelward/repo#26): the detector reads
+      the workflow once, at the start of the run; the App-membership and
+      credential-placement steps that now run before the binding write can
+      each take real time (an API round trip, in the worst case a retry).
+      If a push to the audited branch removes or breaks `init`/`gate`
+      during that window, the binding step still proceeds on the strength
+      of a detection that's no longer true, activating an App-restricted
+      required check with no current publisher -- the exact failure mode
+      "bind last" was meant to prevent, just moved from a same-run ordering
+      bug to a cross-run race. The binding step needs to re-read the
+      audited branch's current tip and rerun the full structural publisher
+      check immediately before the ruleset write -- not reuse the
+      run-start detection -- and refuse the write if either the branch tip
+      or the structural verdict has changed since.
 - [ ] **Don't default `repo create --scaffold` onto the App design yet --
       that's the owner's call, not autopilot's, once the above exists.**
       `repo_lib/scaffold.py` only ever generates the plain-`pull_request`
