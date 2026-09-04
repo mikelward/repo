@@ -114,6 +114,9 @@ class FakeGh:
         self.ruleset_read_fails = set()  # ids whose read fails
         self.rulesets_list_fails = None  # gh stderr text, or None
         self.rulesets_lookup_fails = None  # the by-name lookup's own failure
+        # Which ids the repository itself owns; None means all of them.
+        # Only consulted for an includes_parents=false lookup.
+        self.repo_owned_ruleset_ids = None
         self.master_exists = False
         self.master_error = None  # non-404 stderr text, or None
         self.master_redirect_name = None  # branch a renamed master redirects to
@@ -213,17 +216,26 @@ class FakeGh:
             shas = self.open_prs if m.group(2) == "open" else self.closed_prs
             return "".join(sha + "\n" for sha in shas)
 
-        if _RULESETS_LOOKUP_RE.match(endpoint):
+        if _RULESETS_LOOKUP_RE.match(endpoint) or (
+            _RULESETS_ALL_RE.match(endpoint) and jq and "select(.name ==" in jq
+        ):
             # rules.find_legacy_rulesets's own by-name lookup, over the
             # repository's OWN rulesets only.
             if self.rulesets_lookup_fails is not None:
                 raise gh.GhError(self.rulesets_lookup_fails)
             match = re.search(r"select\(\.name == (\".*?\")\)", jq or "")
             wanted = json.loads(match.group(1)) if match else None
+            # includes_parents decides whether an org- or enterprise-level
+            # ruleset is in the answer. Honored rather than ignored, so a
+            # test asserting the audit counts an inherited one is actually
+            # exercising that and not passing because the fake returns
+            # everything either way.
+            owned_only = "includes_parents=false" in endpoint
             return "".join(
                 f"{rid}\n"
                 for rid, obj in self.ruleset_objects.items()
                 if obj.get("name") == wanted
+                and not (owned_only and rid not in self._repo_owned_ids())
             )
 
         if _RULESETS_ALL_RE.match(endpoint):
@@ -269,6 +281,11 @@ class FakeGh:
             return "".join(name + "\n" for name in self.environments[env])
 
         raise AssertionError(f"unexpected endpoint: {endpoint} (method={method} jq={jq})")
+
+    def _repo_owned_ids(self):
+        if self.repo_owned_ruleset_ids is None:
+            return set(self.ruleset_objects)
+        return set(self.repo_owned_ruleset_ids)
 
     def _text(self, name, ref):
         """A workflow's text on `ref` (None: the default branch); a file
@@ -1074,8 +1091,25 @@ class DuplicateRulesetAuditTest(unittest.TestCase):
         fake.ruleset_ids = []
         code, out, err = _run(fake, [REPO])
         self.assertEqual(code, 0, err)
-        self.assertIn("[ok] no repository ruleset is named 'main'", out)
+        self.assertIn("[ok] no ruleset is named 'main'", out)
         self.assertNotIn("exactly one ruleset", out)
+
+    def test_an_inherited_ruleset_of_the_same_name_counts_too(self):
+        # An org- or enterprise-level ruleset named `main` aggregates with
+        # the repository's own, so counting only what the repository owns
+        # would report "just the one" over two that both apply (Codex
+        # review, mikelward/repo#33). `repo setup` asks the opposite
+        # question -- it can only write a ruleset the repository owns.
+        fake = FakeGh()
+        fake.ruleset_ids = ["1", "77"]
+        for rid in ("1", "77"):
+            fake.ruleset_objects[rid] = _covering_ruleset(name="main")
+            fake.ruleset_objects[rid]["id"] = int(rid)
+        fake.repo_owned_ruleset_ids = ["1"]
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[CHECK] more than one ruleset is named 'main'", out)
+        self.assertIn("also id(s) 77", out)
 
     def test_a_second_one_under_the_same_name_is_a_check_not_a_gap(self):
         # Nothing here resolves it -- `repo setup` writes the first and

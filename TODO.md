@@ -253,7 +253,10 @@
       reconciled.** GitHub does not make a ruleset's name unique within a
       repository, and `_lookup_existing_ruleset` writes the first id under
       `main`. That is no longer silent -- `repo setup` says which one it
-      wrote and which it left alone, and `repo audit` reports a `[CHECK]`
+      wrote and which it left alone, and `repo audit` counts an inherited
+      org-level ruleset of the same name too (it aggregates the same way;
+      setup asks without parents, since it can only write what the
+      repository owns) and reports a `[CHECK]`
       (not `[FIX]`: nothing here closes it; not `[GAP]`: it would fail the
       audit over a state no command can resolve). What is still open is
       the decision itself: what should happen when the two disagree.

@@ -136,6 +136,10 @@ class FakeGh:
         # Set instead when a test needs more than one ruleset under the
         # managed name -- GitHub does not make it unique.
         self.existing_ruleset_ids = None
+        # What a by-name lookup answers from existing_ruleset_id_lookup_
+        # threshold on, modeling a second ruleset created under the name
+        # part-way through a run.
+        self.existing_ruleset_ids_later = None
         # Set by the migration tests: the id a lookup for a legacy ruleset
         # name resolves to, or None for "there isn't one".
         self.legacy_ruleset_id = None
@@ -426,6 +430,12 @@ class FakeGh:
                 return f"{self.legacy_ruleset_id}\n" if self.legacy_ruleset_id else ""
             self._name_lookup_calls += 1
             if self.existing_ruleset_ids is not None:
+                self._name_lookup_calls += 1
+                if (
+                    self._name_lookup_calls >= self.existing_ruleset_id_lookup_threshold
+                    and self.existing_ruleset_ids_later is not None
+                ):
+                    return "".join(f"{rid}\n" for rid in self.existing_ruleset_ids_later)
                 return "".join(f"{rid}\n" for rid in self.existing_ruleset_ids)
             if (
                 self._name_lookup_calls >= self.existing_ruleset_id_lookup_threshold
@@ -1686,6 +1696,25 @@ class SetupCmdTest(unittest.TestCase):
         code, out, err = _run(fake, ["--force", "--rule", "lanes", REPO])
         self.assertEqual(code, 0, err)
         self.assertIn("more than one ruleset is named 'main'", err)
+
+    def test_a_duplicate_created_between_the_passes_is_reported_on_the_no_op_path(self):
+        # The case the previous test could not reach: it supplied both ids
+        # from the first lookup, so the preview named the duplicate. Here
+        # the second ruleset appears only from the real apply's own lookup
+        # (threshold 2), and that apply computes needs_write=False and
+        # returns down the no-op path -- which, gated on quiet, said
+        # nothing at all (Codex review, mikelward/repo#33).
+        fake = FakeGh()
+        self._ruleset_with_scope(fake, list(_HARDENED_SCOPE))
+        fake.existing_ruleset_ids = ["7"]
+        fake.existing_ruleset_ids_later = ["7", "8"]
+        fake.existing_ruleset_id_lookup_threshold = 2
+        fake.all_ruleset_ids = ["7", "8"]
+        fake.ruleset_objects["8"] = dict(fake.ruleset_objects["7"], id=8)
+        code, out, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("more than one ruleset is named 'main'", err)
+        self.assertEqual(fake.puts, [])
 
     def test_an_identical_legacy_ruleset_is_deleted(self):
         # Rulesets aggregate, so a duplicate is not broken -- but
