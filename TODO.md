@@ -752,6 +752,25 @@ doesn't set today).
       in for uniqueness. The detector's requirement is simply exactly one
       qualifying pair; more than one is `[FIX]` regardless of whether they
       share a group.
+      **"Exactly one qualifying pair" only counts jobs that structurally
+      MATCH the recognized publisher shape -- it says nothing about a
+      job that never tries to match it but can still reach the same
+      secrets** (Codex review, mikelward/repo#26, P1): any job that
+      declares `environment: lanes` gets `LANES_APP_ID`/
+      `LANES_APP_PRIVATE_KEY` in its `secrets` context whether or not it's
+      the recognized `init`/`gate` step this detector was built to find --
+      a second job in the same workflow, or a job in an entirely different
+      workflow file on the same branch, that selects the `lanes`
+      environment for an unrelated reason (or references either secret
+      name directly without matching the publisher shape at all) can read
+      and exfiltrate the App private key, and the "exactly one pair" check
+      as scoped so far would still pass, since it only ever looks for
+      OTHER publisher-shaped candidates, never for a non-publisher
+      consumer of the same environment. The detector needs to scan every
+      job in every workflow on the audited branch and fail closed unless
+      every reference to either secret name, and every `environment:
+      lanes` selection, occurs only inside the one recognized, isolated
+      publisher job -- not just check that no SECOND publisher exists.
       **The step alone is not enough -- the ENCLOSING JOB has to select
       the `lanes` environment too, or the move this detector triggers
       breaks the very thing it's meant to protect** (Codex review,
@@ -1630,6 +1649,33 @@ doesn't set today).
       full structural check against every branch it now names, not just
       the audited one -- refusing the write if any of them fails, changed,
       or the scope itself has changed since the run-start detection.
+      **Every check above validates that the WORKFLOW can publish -- none
+      of them checks whether the pull requests ALREADY OPEN against this
+      branch actually have a satisfying status on their current head, and
+      binding does nothing to give them one** (Codex review,
+      mikelward/repo#26, P1): `_collect_reported`'s own docstring says it
+      walks the default branch head, then open PRs, then closed ones,
+      "stopping as soon as every entry in `wanted` is satisfied"
+      (`rules.py:192-197`, confirmed against the loop at `:266-285`) --
+      it is a repository-wide "has this ever been reported by the right
+      App" check, not a per-PR one. An App-attributed status on ONE open
+      PR (or the default branch head) satisfies the whole preflight, so
+      the binding write can go through while OTHER open PRs targeting the
+      same branch carry only the legacy unbound status, or none, on their
+      current head -- and nothing about placing the credential or writing
+      `integration_id` triggers a fresh `pull_request_target` run on an
+      existing PR. Those other PRs are immediately blocked by the newly
+      App-restricted required check the moment the write lands, with no
+      way to clear it until someone pushes a new commit or edits the PR
+      (either of which lanes' own trigger `types:` accepts as a retrigger,
+      per this item's earlier trigger-types correction). Closing this
+      needs the binding step to also enumerate every currently OPEN pull
+      request targeting the branch being bound and either confirm each
+      one's head already carries a satisfying App-attributed status, or
+      report which ones will go stuck so the operator can decide --
+      binding silently and leaving open PRs stranded is not an acceptable
+      side effect of a `repo setup` run whose job is supposed to be
+      protective.
 - [ ] **Don't default `repo create --scaffold` onto the App design yet --
       that's the owner's call, not autopilot's, once the above exists.**
       `repo_lib/scaffold.py` only ever generates the plain-`pull_request`
