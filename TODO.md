@@ -116,6 +116,26 @@
       repository should work through, say -- not as a restatement of the
       placeholder comment.
 
+- [ ] **Populate `CLAUDE.md` and `AGENTS.md` from a template**
+      (maintainer, 2026-09-04). Every repository in the fleet carries an
+      `AGENTS.md` with `CLAUDE.md` a symlink to it, and the scaffold
+      writes neither -- so a freshly created repository is the one place
+      in the fleet an agent works with no conventions loaded at all, which
+      is exactly when it is most likely to invent some. The template
+      should live somewhere shared rather than inline in this repo:
+      `mikelward/conf`'s `templates/` (installed as `~/.templates`) is the
+      candidate the maintainer named, and `scaffold.py` already knows how
+      to fetch a file from another repository over the API
+      (`_fetch_file`), so reading it from there is the same shape as the
+      codex-review templates it already pins. Three things to settle
+      first: what the template holds (the rules every repo's copy shares
+      -- talking to the user, asking questions, git workflow, privacy,
+      reviews -- against a near-empty stub the project fills in), whether
+      it is pinned to a sha the way `TEMPLATE_FILES` are or tracked at
+      `main`, and how the symlink gets made -- the Git Data API can write
+      a `120000` blob, so `CLAUDE.md -> AGENTS.md` is reachable without a
+      clone, and `plan_gaps` already refuses to overwrite one.
+
 - [ ] **A repository a PRIOR `repo setup` run already protected has no
       path to a scaffold fix here at all.** The ordering fix above only
       covers a ruleset THIS run is the one creating; apply_gaps's direct
