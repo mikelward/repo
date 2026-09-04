@@ -40,7 +40,13 @@ import urllib.parse
 from repo_lib import gh
 from repo_lib.common import error, error_lines
 
-DEFAULT_RULESET_NAME = "merge gates"
+DEFAULT_RULESET_NAME = "main"
+# Names this tool used before DEFAULT_RULESET_NAME settled. A repository
+# carrying one is mid-migration, not misconfigured: the ruleset is adopted
+# and renamed in place rather than left beside a new one, so nothing it
+# holds (bypass actors, a narrowed scope, an extra rule type) is lost to a
+# create-and-abandon.
+LEGACY_RULESET_NAMES = ("merge gates",)
 # This fleet's usual three checks -- the lanes docs-vs-code split, Codex's
 # review verdict, zizmor's workflow-injection scan -- used when --rule was
 # never given, matching repo-rules' own default.
@@ -369,6 +375,255 @@ def _lookup_existing_ruleset(repo, ruleset_name):
     return ids[0] if ids else None
 
 
+def _lookup_legacy_ruleset(repo, ruleset_name):
+    """(name, id) of the first ruleset on `repo` carrying a name this tool
+    used before `ruleset_name`, or (None, None).
+
+    A failed lookup raises, for the same reason _lookup_existing_ruleset
+    does: reading "cannot tell" as "there is none" would leave the legacy
+    ruleset in place beside the standard one, and rulesets AND together."""
+    for legacy_name in LEGACY_RULESET_NAMES:
+        if legacy_name == ruleset_name:
+            continue
+        found = _lookup_existing_ruleset(repo, legacy_name)
+        if found:
+            return legacy_name, found
+    return None, None
+
+
+def _resolve_ruleset(repo, ruleset_name):
+    """(id, adopted_legacy_name): the ruleset this run will write.
+
+    Prefers one already carrying the standard name. Failing that, adopts a
+    legacy-named one -- the write renames it in place, which keeps its
+    bypass actors, its scope and any rule type outside MANAGED_RULE_TYPES,
+    all of which a create-a-new-one-and-leave-the-old would have stranded
+    behind a second, aggregating ruleset. (None, None) means create."""
+    existing = _lookup_existing_ruleset(repo, ruleset_name)
+    if existing:
+        return existing, None
+    legacy_name, legacy_id = _lookup_legacy_ruleset(repo, ruleset_name)
+    return legacy_id, legacy_name
+
+
+_PR_FLAGS = (
+    ("required_approving_review_count", "approving reviews"),
+    ("dismiss_stale_reviews_on_push", "stale reviews dismissed on push"),
+    ("require_code_owner_review", "code-owner review"),
+    ("require_last_push_approval", "approval of the last push"),
+    ("required_review_thread_resolution", "review threads resolved"),
+)
+
+
+def _protection_gaps(legacy_rules, target_rules):
+    """What the legacy ruleset enforces that the standard one, as this run
+    would leave it, would not.
+
+    Holding only managed rule TYPES is not the same as being superseded:
+    the standard ruleset writes `required_approving_review_count: 0` and
+    the three review flags off, so a legacy ruleset asking for an approval,
+    code-owner review, or a check outside this run's list is strictly
+    stricter, and deleting it would lower the bar (Codex review,
+    mikelward/repo#30). Compares against the body about to be written
+    rather than the fleet defaults, so a `--rule` list widened for one
+    repository counts."""
+    gaps = []
+    legacy = {r.get("type"): (r.get("parameters") or {}) for r in legacy_rules}
+    target = {r.get("type"): (r.get("parameters") or {}) for r in target_rules}
+
+    for rule_type in ("required_linear_history", "non_fast_forward"):
+        if rule_type in legacy and rule_type not in target:
+            gaps.append(f"it enforces '{rule_type}' and the standard ruleset would not")
+
+    if "required_status_checks" in legacy:
+        theirs = legacy["required_status_checks"]
+        ours = target.get("required_status_checks", {})
+        # An entry's integration_id binds the check to one GitHub App, so
+        # it is part of what the requirement means: a legacy entry bound to
+        # an App is only covered by the identical binding, since dropping
+        # to an unbound one would let a different producer of the same
+        # context satisfy the gate (Codex review, mikelward/repo#30). An
+        # unbound legacy entry is covered by any entry for that context --
+        # binding it is stricter, not weaker.
+        ours_bound = {
+            (c.get("context"), c.get("integration_id"))
+            for c in ours.get("required_status_checks") or []
+        }
+        ours_contexts = {context for context, _ in ours_bound}
+        for entry in theirs.get("required_status_checks") or []:
+            context, app = entry.get("context"), entry.get("integration_id")
+            if context is None:
+                continue
+            if app is None:
+                if context not in ours_contexts:
+                    gaps.append(
+                        f"it requires the check {context!r}, which the standard "
+                        "ruleset would not"
+                    )
+            elif (context, app) not in ours_bound:
+                gaps.append(
+                    f"it requires the check {context!r} from one specific app "
+                    f"(integration_id={app!r}), which the standard ruleset would not"
+                )
+        if theirs.get("strict_required_status_checks_policy") and not ours.get(
+            "strict_required_status_checks_policy"
+        ):
+            gaps.append(
+                "it requires the branch to be up to date before merging and the "
+                "standard ruleset would not"
+            )
+
+    if "pull_request" in legacy:
+        theirs = legacy["pull_request"]
+        ours = target.get("pull_request", {})
+        for key, description in _PR_FLAGS:
+            mine, yours = theirs.get(key), ours.get(key)
+            # Counts compare numerically, flags as booleans; in both cases
+            # "legacy asks for more" is the gap.
+            if isinstance(mine, bool) or isinstance(yours, bool):
+                stricter = bool(mine) and not bool(yours)
+            else:
+                stricter = (mine or 0) > (yours or 0)
+            if stricter:
+                gaps.append(
+                    f"it requires {description} ({key}={mine!r}) and the standard "
+                    f"ruleset would not ({key}={yours!r})"
+                )
+    return gaps
+
+
+def _legacy_is_safe_to_delete(repo, ruleset_id, legacy_name, ours_scope, default_branch, target_rules):
+    """Whether deleting the legacy ruleset would remove protection nothing
+    else provides. Returns (safe, blockers) -- blockers being the reasons
+    it would, each already phrased for a report.
+
+    Two questions, and both have to answer yes. WHAT it enforces: the
+    standard ruleset carries everything in MANAGED_RULE_TYPES, so a legacy
+    one holding only those is superseded, and one holding anything else is
+    not. And WHERE: superseding is per-branch, so a legacy ruleset covering
+    a ref the standard one does not is still the only thing protecting that
+    ref -- a hand-made `main` scoped to ~DEFAULT_BRANCH beside a legacy one
+    that also covers refs/heads/master is the real case, since an update
+    leaves the standard ruleset's own conditions alone rather than widening
+    them to the hardened three (Codex review, mikelward/repo#30).
+
+    Ref matching is literal, as in _find_merge_method_conflicts: a pattern
+    or an exclusion on either side is "cannot tell", which counts as a
+    blocker rather than resolving toward deleting. A read failure raises,
+    since guessing "safe" deletes protection."""
+    try:
+        raw = gh.run(["api", f"repos/{repo}/rulesets/{ruleset_id}"])
+    except gh.GhError as e:
+        error_lines(
+            f"could not read the legacy ruleset '{legacy_name}' (id {ruleset_id}) on "
+            f"{repo} to check whether deleting it would remove protection. Refusing "
+            "to delete a ruleset that cannot be inspected.",
+            e.stderr,
+        )
+        raise RulesetError()
+    ruleset = json.loads(raw)
+
+    blockers = []
+    legacy_rules = ruleset.get("rules") or []
+    extra = sorted(
+        {
+            rule.get("type")
+            for rule in legacy_rules
+            if rule.get("type") not in MANAGED_RULE_TYPES
+        }
+    )
+    for t in extra:
+        blockers.append(f"it holds '{t}', which the standard ruleset does not")
+    blockers.extend(_protection_gaps(legacy_rules, target_rules))
+
+    conditions = (ruleset.get("conditions") or {}).get("ref_name") or {}
+    theirs_include = _normalize_refs(conditions.get("include") or [], default_branch)
+    theirs_exclude = conditions.get("exclude") or []
+    ours_include = _normalize_refs(ours_scope.get("include") or [], default_branch)
+    ours_exclude = ours_scope.get("exclude") or []
+
+    if _has_glob(ours_include + theirs_include) or ours_exclude or theirs_exclude:
+        blockers.append(
+            "its scope, or the standard ruleset's, uses a pattern or an exclusion "
+            "this cannot evaluate, so whether it covers a ref the standard one "
+            "misses is unknown"
+        )
+    elif "~ALL" not in ours_include:
+        uncovered = sorted(set(theirs_include) - set(ours_include))
+        if uncovered:
+            blockers.append(
+                "it covers " + ", ".join(uncovered) + ", which the standard ruleset "
+                "does not, so those refs would be left unprotected"
+            )
+    excludes_rebase = any(
+        rule.get("type") == "pull_request"
+        and (rule.get("parameters") or {}).get("allowed_merge_methods")
+        and "rebase" not in rule["parameters"]["allowed_merge_methods"]
+        for rule in ruleset.get("rules") or []
+    )
+    return (not blockers), blockers, excludes_rebase
+
+
+def _plan_legacy_cleanup(
+    repo, ruleset_name, existing, adopted_legacy, default_branch, target_rules
+):
+    """(id, name, safe, blockers, excludes_rebase) for a legacy-named
+    ruleset sitting beside the standard one, or all-empty when there is
+    none.
+
+    Nothing to plan when this run adopted the legacy ruleset itself -- the
+    write renames it, so it *is* the standard one and there is no second
+    ruleset left. Computed before the merge-method conflict scan, because
+    that scan needs to know which ruleset is about to be removed."""
+    if adopted_legacy or not existing:
+        return None, None, False, [], False
+    legacy_name, legacy_id = _lookup_legacy_ruleset(repo, ruleset_name)
+    if not legacy_id:
+        return None, None, False, [], False
+    safe, blockers, excludes_rebase = _legacy_is_safe_to_delete(
+        repo,
+        legacy_id,
+        legacy_name,
+        _compute_scope(repo, existing),
+        default_branch,
+        target_rules,
+    )
+    return legacy_id, legacy_name, safe, blockers, excludes_rebase
+
+
+def _report_legacy_blockers(repo, ruleset_name, legacy_name, legacy_id, blockers):
+    error(
+        f"{repo}: the ruleset '{legacy_name}' (id {legacy_id}) overlaps "
+        f"'{ruleset_name}', but is not superseded by it:"
+    )
+    for reason in blockers:
+        error(f"  {reason}")
+    error(
+        "Deleting it would remove protection, so it is left in place. Move what "
+        f"it still carries into '{ruleset_name}', then delete it by hand."
+    )
+
+
+def _delete_legacy_ruleset(repo, ruleset_id, legacy_name):
+    """Deletes the superseded ruleset. Returns True on success; a failure
+    is reported and returns False -- the standard ruleset is already
+    written by this point, so the repository is protected either way and a
+    failed cleanup must not fail the whole step."""
+    try:
+        gh.run(["api", "--method", "DELETE", f"repos/{repo}/rulesets/{ruleset_id}"])
+    except gh.GhError as e:
+        error_lines(
+            f"{repo}: wrote the ruleset, but could not delete the superseded "
+            f"'{legacy_name}' (id {ruleset_id}). Both are now active and rulesets "
+            "aggregate, so the repository is protected -- just by two rulesets "
+            "where one would do. Delete it by hand, or rerun.",
+            e.stderr,
+        )
+        return False
+    print(f"{repo}: deleted the superseded ruleset '{legacy_name}' (id {ruleset_id})")
+    return True
+
+
 def _check_ruleset_ownership(repo, ruleset_id, ruleset_name):
     """Whether a ruleset found under a name this module writes is one it
     can actually write.
@@ -446,7 +701,7 @@ def _has_glob(refs):
     return any(_GLOB_CHARS_RE.search(r) for r in refs)
 
 
-def _find_merge_method_conflicts(repo, scope, existing_id, default_branch):
+def _find_merge_method_conflicts(repo, scope, existing_id, default_branch, ignore_ids=()):
     """Rulesets AGGREGATE: a pull request must satisfy every one that
     applies to the branch, and allowed_merge_methods INTERSECTS across
     them. Returns (definite, undecidable) -- ruleset names that plainly
@@ -475,7 +730,7 @@ def _find_merge_method_conflicts(repo, scope, existing_id, default_branch):
 
     definite, undecidable = [], []
     for rid in ids:
-        if not rid or rid == existing_id:
+        if not rid or rid == existing_id or rid in ignore_ids:
             continue
         try:
             ruleset = json.loads(gh.run(["api", f"repos/{repo}/rulesets/{rid}"]))
@@ -506,9 +761,19 @@ def _find_merge_method_conflicts(repo, scope, existing_id, default_branch):
     return definite, undecidable
 
 
-def _validate_merge_method_scope(repo, existing_id, default_branch):
+def _validate_merge_method_scope(repo, existing_id, default_branch, ignore_ids=()):
+    """`ignore_ids` is for a legacy ruleset this run has already confirmed
+    it can delete. Without it, a legacy ruleset that allows only squash --
+    exactly the duplicate this migration exists to end -- reads as an
+    ordinary conflict and aborts the run before the cleanup that would
+    remove it, so no number of `repo setup` runs could ever repair the
+    repository (Codex review, mikelward/repo#30). Excluding it is only
+    sound because its deletion is then mandatory: see `cleanup_required`
+    in apply_ruleset."""
     scope = _compute_scope(repo, existing_id)
-    definite, undecidable = _find_merge_method_conflicts(repo, scope, existing_id, default_branch)
+    definite, undecidable = _find_merge_method_conflicts(
+        repo, scope, existing_id, default_branch, ignore_ids
+    )
     if definite:
         error(f"another active ruleset on {repo} excludes rebase from its allowed")
         error("merge methods, and covers the same branches as this one:")
@@ -655,6 +920,9 @@ def _build_update_body(repo, existing_id, checks, ruleset_name):
 
     target = dict(original)
     target["rules"] = new_rules
+    # Adopting a legacy-named ruleset renames it here rather than in a
+    # separate call, so the rename and the rules land in one write.
+    target["name"] = ruleset_name
     return target != original, target, has_pull_request
 
 
@@ -759,15 +1027,23 @@ def apply_ruleset(
     failed, 2 for a usage error (an empty or control-character check
     name).
 
-    A "fingerprint" is `(existing_id, needs_write, target_body)`: which
-    ruleset (or None, meaning create) this call is about to act on,
-    whether it would actually write anything, and the exact API body it
-    would PUT/POST if so. Computed once per pass (see `_plan_write`),
-    exposed via report["fingerprint"], and what expected_fingerprint
-    compares against. All three parts matter -- target_body alone can
-    coincidentally match an earlier no-op's even when a write is newly
-    needed (content removed, then re-added identically), so needs_write
-    has to travel with it rather than being inferred from it.
+    A "fingerprint" is `(existing_id, adopted_legacy, needs_write,
+    target_body, legacy_disposition)`: which ruleset (or None, meaning
+    create) this call is
+    about to act on, whether that ruleset was found under a legacy name
+    and is being renamed rather than found under the standard one,
+    whether the call would actually write anything, and the exact API
+    body it would PUT/POST if so. Computed once per pass (see
+    `_plan_write`), exposed via report["fingerprint"], and what
+    expected_fingerprint compares against. Every part matters --
+    target_body alone can coincidentally match an earlier no-op's even
+    when a write is newly needed (content removed, then re-added
+    identically), so needs_write has to travel with it rather than being
+    inferred from it; adopted_legacy distinguishes "this id is the
+    standard ruleset" from "this id is a legacy one about to be renamed
+    into it", which target_body cannot, since a rename makes them
+    identical; and legacy_disposition carries the pending deletion, which
+    nothing else in the tuple describes at all.
 
     expected_fingerprint: when given (not the _NO_EXPECTATION default),
     the fresh fingerprint computed immediately before the real write must
@@ -888,21 +1164,20 @@ def apply_ruleset(
             return 1
 
     try:
-        existing = _lookup_existing_ruleset(repo, ruleset_name)
+        existing, adopted_legacy = _resolve_ruleset(repo, ruleset_name)
     except RulesetError:
         return 1
 
     if report is not None:
         report["existing_id"] = existing
+        report["adopted_legacy"] = adopted_legacy
 
     if existing and not _check_ruleset_ownership(repo, existing, ruleset_name):
         return 1
 
-    try:
-        _validate_merge_method_scope(repo, existing, default_branch)
-    except RulesetError:
-        return 1
-
+    # The write is planned before the cleanup, because whether the legacy
+    # ruleset is superseded is a question about the body this run would
+    # leave behind -- not about the fleet defaults.
     try:
         needs_write, target_body, introduces_pr_protection = _plan_write(
             repo, existing, checks, ruleset_name
@@ -910,11 +1185,61 @@ def apply_ruleset(
     except RulesetError:
         return 1
 
-    fingerprint = (existing, needs_write, target_body)
+    try:
+        (
+            legacy_id,
+            legacy_name,
+            legacy_safe,
+            legacy_blockers,
+            legacy_excludes_rebase,
+        ) = _plan_legacy_cleanup(
+            repo,
+            ruleset_name,
+            existing,
+            adopted_legacy,
+            default_branch,
+            (target_body or {}).get("rules") or [],
+        )
+    except RulesetError:
+        return 1
+    # Only skip the conflict scan over a legacy ruleset that would actually
+    # trip it -- and then its deletion is load-bearing rather than tidying,
+    # so a failure to delete has to fail the step. Where it conflicts with
+    # nothing, the scan sees it and passes either way, and the cleanup goes
+    # back to being the kind whose failure is not the step's problem.
+    cleanup_required = bool(legacy_id and legacy_safe and legacy_excludes_rebase)
+    deletes_legacy = bool(legacy_id and legacy_safe)
+
+    try:
+        _validate_merge_method_scope(
+            repo, existing, default_branch, (legacy_id,) if cleanup_required else ()
+        )
+    except RulesetError:
+        return 1
+
+    # The cleanup's identity and disposition travel with the fingerprint
+    # for the same reason the write's body does: a legacy ruleset that
+    # appears, vanishes, or becomes deletable while the confirmation is
+    # waiting would otherwise let the real apply delete something the plan
+    # never showed, with the fingerprint matching throughout (Codex review,
+    # mikelward/repo#30).
+    legacy_disposition = (legacy_id, legacy_name, legacy_safe)
+    fingerprint = (existing, adopted_legacy, needs_write, target_body, legacy_disposition)
     if report is not None:
         report["needs_write"] = needs_write
         report["fingerprint"] = fingerprint
         report["introduces_pr_protection"] = introduces_pr_protection
+        # A pending deletion is a mutation in its own right: without this,
+        # a run whose ruleset already matches reports "nothing to confirm"
+        # and then deletes a ruleset anyway (Codex review,
+        # mikelward/repo#30).
+        report["legacy_cleanup"] = (legacy_name, legacy_id) if deletes_legacy else None
+
+    cleanup_line = (
+        f"{repo}: delete the superseded ruleset '{legacy_name}' (id {legacy_id})"
+        if deletes_legacy
+        else None
+    )
 
     if not needs_write:
         if not quiet:
@@ -922,11 +1247,53 @@ def apply_ruleset(
             note = _bypass_actor_note((target_body or {}).get("bypass_actors") or [])
             if note:
                 print(note)
-        return 0
+        # The standard ruleset already says what it should, which is
+        # exactly the precondition the cleanup needs -- and this is the
+        # path a repository whose `main` was already correct takes every
+        # single run, so gating the cleanup on a write would leave the
+        # leftover there forever (Codex review, mikelward/repo#30).
+        if not legacy_id:
+            return 0
+        # The write path compares fingerprints before writing; this path
+        # never gets there, so the same drift check has to happen here or a
+        # deletion discovered after the plan was confirmed would go through
+        # unannounced (Codex review, mikelward/repo#30).
+        if expected_fingerprint is not _NO_EXPECTATION and (
+            expected_fingerprint[-1] != legacy_disposition
+        ):
+            error(
+                f"the superseded ruleset beside '{ruleset_name}' on {repo} is not the "
+                "one that was previewed and confirmed -- it appeared, went, or became "
+                "deletable while this was waiting. Refusing to delete something nobody "
+                "was shown. Rerun to re-check."
+            )
+            return 1
+        if dry_run:
+            if cleanup_line:
+                print(cleanup_line)
+            else:
+                _report_legacy_blockers(
+                    repo, ruleset_name, legacy_name, legacy_id, legacy_blockers
+                )
+            return 0
+        if not (force or skip_confirm) and deletes_legacy:
+            if not _confirm(repo, ruleset_name, [cleanup_line]):
+                return 1
+        return _run_legacy_cleanup(
+            repo,
+            ruleset_name,
+            legacy_id,
+            legacy_name,
+            legacy_safe,
+            legacy_blockers,
+            cleanup_required,
+        )
 
     plan_lines = _describe_plan(
         repo, existing, default_branch, checks, ruleset_name, target_body.get("bypass_actors") or []
     )
+    if cleanup_line:
+        plan_lines = list(plan_lines) + [cleanup_line]
 
     if dry_run:
         for line in plan_lines:
@@ -952,22 +1319,39 @@ def apply_ruleset(
     if not _check_allow_rebase(repo):
         return 1
     try:
-        fresh_existing = _lookup_existing_ruleset(repo, ruleset_name)
+        fresh_existing, fresh_adopted_legacy = _resolve_ruleset(repo, ruleset_name)
     except RulesetError:
         return 1
     if fresh_existing and not _check_ruleset_ownership(repo, fresh_existing, ruleset_name):
         return 1
-    try:
-        _validate_merge_method_scope(repo, fresh_existing, default_branch)
-    except RulesetError:
-        return 1
-
     try:
         fresh_needs_write, fresh_target_body, fresh_introduces_pr_protection = _plan_write(
             repo, fresh_existing, checks, ruleset_name
         )
     except RulesetError:
         error(f"could not re-read ruleset '{ruleset_name}' to write it")
+        return 1
+
+    try:
+        (
+            legacy_id,
+            legacy_name,
+            legacy_safe,
+            legacy_blockers,
+            legacy_excludes_rebase,
+        ) = _plan_legacy_cleanup(
+            repo,
+            ruleset_name,
+            fresh_existing,
+            fresh_adopted_legacy,
+            default_branch,
+            (fresh_target_body or {}).get("rules") or [],
+        )
+        cleanup_required = bool(legacy_id and legacy_safe and legacy_excludes_rebase)
+        _validate_merge_method_scope(
+            repo, fresh_existing, default_branch, (legacy_id,) if cleanup_required else ()
+        )
+    except RulesetError:
         return 1
 
     if fresh_introduces_pr_protection and refuse_if_introduces_pr_protection:
@@ -984,7 +1368,13 @@ def apply_ruleset(
             error(problem)
             return 1
 
-    fresh_fingerprint = (fresh_existing, fresh_needs_write, fresh_target_body)
+    fresh_fingerprint = (
+        fresh_existing,
+        fresh_adopted_legacy,
+        fresh_needs_write,
+        fresh_target_body,
+        (legacy_id, legacy_name, legacy_safe),
+    )
     want = fingerprint if expected_fingerprint is _NO_EXPECTATION else expected_fingerprint
     if fresh_fingerprint != want:
         error(f"ruleset '{ruleset_name}' on {repo} no longer matches what was previewed and")
@@ -1004,10 +1394,17 @@ def apply_ruleset(
         except gh.GhError as e:
             error_lines(f"could not update ruleset '{ruleset_name}' on {repo}:", e.stderr)
             return 1
-        print(
-            f"{repo}: updated ruleset '{ruleset_name}' (its scope is unchanged); "
-            f"required checks: {', '.join(checks)}"
-        )
+        if fresh_adopted_legacy:
+            print(
+                f"{repo}: adopted the ruleset named '{fresh_adopted_legacy}' and renamed it "
+                f"'{ruleset_name}' (its scope, bypass actors and any other rules are "
+                f"unchanged); required checks: {', '.join(checks)}"
+            )
+        else:
+            print(
+                f"{repo}: updated ruleset '{ruleset_name}' (its scope is unchanged); "
+                f"required checks: {', '.join(checks)}"
+            )
     else:
         try:
             gh.run_with_input(
@@ -1021,6 +1418,54 @@ def apply_ruleset(
             f"{repo}: created ruleset '{ruleset_name}' on {default_branch}, main and master; "
             f"required checks: {', '.join(checks)}"
         )
+
+    # Only now, with the standard ruleset written and enforcing: a legacy
+    # one left beside it is redundant, and two aggregating rulesets are
+    # what this migration exists to end. Ordered deliberately -- delete
+    # second, so a failed write never leaves the repository with neither.
+    if legacy_id:
+        return _run_legacy_cleanup(
+            repo,
+            ruleset_name,
+            legacy_id,
+            legacy_name,
+            legacy_safe,
+            legacy_blockers,
+            cleanup_required,
+        )
+    return 0
+
+
+def _run_legacy_cleanup(
+    repo, ruleset_name, legacy_id, legacy_name, safe, blockers, required
+):
+    """Deletes the superseded ruleset, or reports why it is being kept.
+    Returns the exit status the step should carry.
+
+    Normally a failed cleanup is not the step's problem: the standard
+    ruleset is written and enforcing by now, so the repository is protected
+    either way, and turning a successful setup into a failure over a
+    redundant ruleset would be worse than the duplicate. `required` is the
+    exception -- the merge-method scan was told to skip this ruleset on the
+    promise that it would go, so if it stays, the repository may be left
+    with nothing able to merge and the caller has to hear about it. That
+    holds on both paths: the no-write one reaches this too, and returning 0
+    there would report success over the same broken state (Codex review,
+    mikelward/repo#30)."""
+    if not safe:
+        _report_legacy_blockers(repo, ruleset_name, legacy_name, legacy_id, blockers)
+        return 0
+    if _delete_legacy_ruleset(repo, legacy_id, legacy_name):
+        return 0
+    if required:
+        error(
+            f"{repo}: '{ruleset_name}' is in place, but the superseded "
+            f"'{legacy_name}' (id {legacy_id}) could not be deleted, and the "
+            "merge-method conflict check skipped it on the basis that it would "
+            "be. Both are active now; if they disagree on merge methods, nothing "
+            "can merge. Delete it by hand, or rerun."
+        )
+        return 1
     return 0
 
 

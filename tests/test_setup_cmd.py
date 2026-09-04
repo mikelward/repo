@@ -65,6 +65,7 @@ _SCAFFOLD_COMMIT_CREATE_RE = re.compile(r"^repos/([^/]+/[^/]+)/git/commits$")
 _SCAFFOLD_CONTENTS_PUT_RE = re.compile(r"^repos/([^/]+/[^/]+)/contents/(.+)$")
 
 _OWNERSHIP_JQ = ".enforcement, .target"
+_RULE_TYPES_JQ = ".rules[].type"
 
 
 def _parse_api_args(rest):
@@ -100,9 +101,12 @@ class FakeGh:
     run_with_input, closely enough to exercise repo_lib.rules, apps, and
     the secrets_cmd functions setup_cmd reuses -- without a fake `gh`
     binary on PATH. Only the two --jq forms rules.py actually sends to a
-    single ruleset id are distinguished (the enforcement check vs. the
-    scope fetch) -- there is no third, so matching on the enforcement JQ
-    string and falling back to "scope fetch" for any other is safe.
+    single ruleset id are distinguished by matching their JQ exactly (the
+    enforcement check, and the rule-type list the legacy cleanup reads),
+    with anything else falling back to "scope fetch". Add a case here
+    whenever rules.py grows a new --jq against this endpoint: an
+    unrecognized one silently answers with the scope, which reads as a
+    plausible-but-wrong value rather than an error.
     """
 
     def __init__(self):
@@ -126,6 +130,14 @@ class FakeGh:
         self.open_prs = []
         self.closed_prs = []
         self.existing_ruleset_id = None
+        # Name -> id, for the migration tests: unlike existing_ruleset_id
+        # (which answers every by-name lookup with the same id, whatever
+        # was asked for) this models a repository where "main" and the
+        # legacy "merge gates" resolve differently -- or where only one of
+        # them exists at all.
+        self.rulesets_by_name = None
+        self.ruleset_deletes = []
+        self.ruleset_delete_fails = False
         self._name_lookup_calls = 0
         # Sentinel: unset means "always answer with existing_ruleset_id".
         # Set (with existing_ruleset_id_lookup_threshold below) to model
@@ -392,6 +404,18 @@ class FakeGh:
             return "".join(sha + "\n" for sha in shas)
 
         if _RULESETS_LOOKUP_RE.match(endpoint):
+            match = re.search(r"select\(\.name == (\".*?\")\)", jq or "")
+            wanted = json.loads(match.group(1)) if match else None
+            if self.rulesets_by_name is not None:
+                self._name_lookup_calls += 1
+                rid = self.rulesets_by_name.get(wanted)
+                return f"{rid}\n" if rid else ""
+            # Without rulesets_by_name a fixture models one ruleset, the
+            # standard one: answer "no such ruleset" for a legacy name
+            # without counting the call, so the swap thresholds below stay
+            # about the lookups they were written for.
+            if wanted in rules.LEGACY_RULESET_NAMES:
+                return ""
             self._name_lookup_calls += 1
             if (
                 self._name_lookup_calls >= self.existing_ruleset_id_lookup_threshold
@@ -404,6 +428,13 @@ class FakeGh:
 
         if _RULESETS_ALL_RE.match(endpoint):
             return "".join(f"{rid}\n" for rid in self.all_ruleset_ids)
+
+        m = _RULESET_ONE_RE.match(endpoint)
+        if m and method == "DELETE":
+            if self.ruleset_delete_fails:
+                raise gh.GhError("gh: HTTP 500: Internal Server Error\n")
+            self.ruleset_deletes.append(m.group(2))
+            return ""
 
         m = _RULESET_ONE_RE.match(endpoint)
         if m:
@@ -420,6 +451,8 @@ class FakeGh:
                 # Fixtures predate the target check and are all branch
                 # rulesets; default rather than making every one restate it.
                 return obj.get("enforcement", "") + "\n" + obj.get("target", "branch") + "\n"
+            if jq == _RULE_TYPES_JQ:
+                return "".join(r["type"] + "\n" for r in obj.get("rules", []))
             if jq:
                 ref_name = obj.get("conditions", {}).get("ref_name", {})
                 return json.dumps(
@@ -806,7 +839,7 @@ class SetupCmdTest(unittest.TestCase):
         fake.all_ruleset_ids = ["42"]
         fake.ruleset_objects["42"] = {
             "id": 42,
-            "name": "merge gates",
+            "name": "main",
             "target": "branch",
             "enforcement": "active",
             "bypass_actors": [{"actor_id": 1, "actor_type": "Team"}],
@@ -878,7 +911,7 @@ class SetupCmdTest(unittest.TestCase):
         fake.all_ruleset_ids = ["42"]
         fake.ruleset_objects["42"] = {
             "id": 42,
-            "name": "merge gates",
+            "name": "main",
             "enforcement": "active",
             "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
             "rules": [
@@ -920,7 +953,7 @@ class SetupCmdTest(unittest.TestCase):
         fake.all_ruleset_ids = ["7"]
         fake.ruleset_objects["7"] = {
             "id": 7,
-            "name": "merge gates",
+            "name": "main",
             "enforcement": "active",
             "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
             "rules": [
@@ -976,7 +1009,7 @@ class SetupCmdTest(unittest.TestCase):
         fake.all_ruleset_ids = ["7"]
         fake.ruleset_objects["7"] = {
             "id": 7,
-            "name": "merge gates",
+            "name": "main",
             "enforcement": "active",
             "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
             "rules": [
@@ -1002,6 +1035,11 @@ class SetupCmdTest(unittest.TestCase):
         }
         code, _, err = _run(fake, ["--force", "--rule", "lanes", "--rule", "codex", REPO])
         self.assertEqual(code, 0, err)
+        # Three lookups for the ruleset's own name: the preview's, and the
+        # real apply's own two. The legacy-name lookups the migration adds
+        # are counted separately by the fake, since they ask a different
+        # question and would otherwise shift the swap thresholds the tests
+        # below are built on.
         self.assertEqual(fake._name_lookup_calls, 3)
 
     def test_refuses_to_write_when_the_ruleset_was_swapped_before_the_real_apply_started(self):
@@ -1023,7 +1061,7 @@ class SetupCmdTest(unittest.TestCase):
         fake.existing_ruleset_id_after_second_lookup = None  # swapped away before the real apply starts
         fake.ruleset_objects["7"] = {
             "id": 7,
-            "name": "merge gates",
+            "name": "main",
             "enforcement": "active",
             "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
             "rules": [
@@ -1071,7 +1109,7 @@ class SetupCmdTest(unittest.TestCase):
         fake.existing_ruleset_id_lookup_threshold = 3
         fake.ruleset_objects["7"] = {
             "id": 7,
-            "name": "merge gates",
+            "name": "main",
             "enforcement": "active",
             "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
             "rules": [
@@ -1108,7 +1146,7 @@ class SetupCmdTest(unittest.TestCase):
         fake.all_ruleset_ids = ["7"]
         fake.ruleset_objects["7"] = {
             "id": 7,
-            "name": "merge gates",
+            "name": "main",
             "enforcement": "active",
             "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
             "rules": [
@@ -1152,7 +1190,7 @@ class SetupCmdTest(unittest.TestCase):
         fake.all_ruleset_ids = ["7"]
         fake.ruleset_objects["7"] = {
             "id": 7,
-            "name": "merge gates",
+            "name": "main",
             "enforcement": "active",
             "bypass_actors": [{"actor_id": 1, "actor_type": "Team"}],
             "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
@@ -1294,6 +1332,460 @@ class SetupCmdTest(unittest.TestCase):
         code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
         self.assertEqual(code, 1)
         self.assertIn("targets 'tag'", err)
+    def _standard_rules(self, contexts=("lanes",)):
+        return [
+            {
+                "type": "required_status_checks",
+                "parameters": {
+                    "strict_required_status_checks_policy": True,
+                    "required_status_checks": [{"context": c} for c in contexts],
+                },
+            },
+            {
+                "type": "pull_request",
+                "parameters": {
+                    "required_review_thread_resolution": True,
+                    "allowed_merge_methods": ["rebase"],
+                    "required_approving_review_count": 0,
+                    "dismiss_stale_reviews_on_push": False,
+                    "require_code_owner_review": False,
+                    "require_last_push_approval": False,
+                },
+            },
+            {"type": "required_linear_history"},
+            {"type": "non_fast_forward"},
+        ]
+
+    def test_a_legacy_named_ruleset_is_renamed_rather_than_rivalled(self):
+        # The migration's common shape: `repo setup` created 'merge gates'
+        # before the standard name settled. Creating a second ruleset and
+        # leaving that one behind would strand its bypass actors and its
+        # scope behind a ruleset that AND-s with the new one, so it is
+        # adopted and renamed in the same write instead.
+        fake = FakeGh()
+        fake.check_runs = {fake.default_head_sha: ["lanes"]}
+        fake.rulesets_by_name = {"merge gates": "7"}
+        fake.all_ruleset_ids = ["7"]
+        fake.ruleset_objects["7"] = {
+            "id": 7,
+            "name": "merge gates",
+            "enforcement": "active",
+            "bypass_actors": [{"actor_id": 5, "actor_type": "Team"}],
+            "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+            "rules": self._standard_rules(),
+        }
+        code, out, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        # One write, to the ruleset that was already there -- not a create.
+        self.assertEqual(len(fake.puts), 1)
+        self.assertEqual(fake.puts[0][0][3], f"repos/{REPO}/rulesets/7")
+        self.assertEqual(fake.posts, [])
+        written = fake.puts[0][1]
+        self.assertEqual(written["name"], "main")
+        # Everything it carried survives the rename.
+        self.assertEqual(written["bypass_actors"], [{"actor_id": 5, "actor_type": "Team"}])
+        # Nothing to delete: the legacy ruleset *is* the standard one now.
+        self.assertEqual(fake.ruleset_deletes, [])
+        self.assertIn("adopted the ruleset named 'merge gates'", out)
+
+    def test_a_superseded_legacy_ruleset_is_deleted_after_the_write(self):
+        # The shape the owner actually hit: a hand-made 'main' plus a
+        # 'merge gates' that `repo setup` added beside it. The standard one
+        # is written first, then the redundant one goes -- that order, so a
+        # failed write never leaves the repository with neither.
+        fake = FakeGh()
+        fake.check_runs = {fake.default_head_sha: ["lanes"]}
+        fake.rulesets_by_name = {"main": "1", "merge gates": "9"}
+        fake.all_ruleset_ids = ["1", "9"]
+        fake.ruleset_objects["1"] = {
+            "id": 1,
+            "name": "main",
+            "enforcement": "active",
+            "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+            "rules": [],
+        }
+        fake.ruleset_objects["9"] = {
+            "id": 9,
+            "name": "merge gates",
+            "enforcement": "active",
+            "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+            "rules": self._standard_rules(),
+        }
+        code, out, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.puts[0][0][3], f"repos/{REPO}/rulesets/1")
+        self.assertEqual(fake.ruleset_deletes, ["9"])
+        self.assertIn("deleted the superseded ruleset 'merge gates'", out)
+
+    def test_a_legacy_ruleset_holding_more_than_the_managed_four_is_kept(self):
+        # Deleting it would remove a rule 'main' does not carry, so it is
+        # reported and left alone -- a duplicate is better than silently
+        # dropping protection.
+        fake = FakeGh()
+        fake.check_runs = {fake.default_head_sha: ["lanes"]}
+        fake.rulesets_by_name = {"main": "1", "merge gates": "9"}
+        fake.all_ruleset_ids = ["1", "9"]
+        fake.ruleset_objects["1"] = {
+            "id": 1,
+            "name": "main",
+            "enforcement": "active",
+            "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+            "rules": [],
+        }
+        fake.ruleset_objects["9"] = {
+            "id": 9,
+            "name": "merge gates",
+            "enforcement": "active",
+            "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+            "rules": self._standard_rules() + [{"type": "required_signatures"}],
+        }
+        code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.ruleset_deletes, [])
+        self.assertIn("required_signatures", err)
+        self.assertIn("would remove protection", err)
+
+    def test_a_legacy_ruleset_covering_a_ref_the_standard_one_misses_is_kept(self):
+        # Type-only supersession is not enough: an update leaves the
+        # standard ruleset's own conditions alone rather than widening them
+        # to the hardened three, so a hand-made 'main' scoped to
+        # ~DEFAULT_BRANCH beside a legacy one that also covers
+        # refs/heads/master is the real case -- deleting the legacy one
+        # would strip master of all protection (Codex review,
+        # mikelward/repo#30).
+        fake = FakeGh()
+        fake.check_runs = {fake.default_head_sha: ["lanes"]}
+        fake.rulesets_by_name = {"main": "1", "merge gates": "9"}
+        fake.all_ruleset_ids = ["1", "9"]
+        fake.ruleset_objects["1"] = {
+            "id": 1,
+            "name": "main",
+            "enforcement": "active",
+            "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+            "rules": [],
+        }
+        fake.ruleset_objects["9"] = {
+            "id": 9,
+            "name": "merge gates",
+            "enforcement": "active",
+            "conditions": {
+                "ref_name": {
+                    "include": ["~DEFAULT_BRANCH", "refs/heads/master"],
+                    "exclude": [],
+                }
+            },
+            "rules": self._standard_rules(),
+        }
+        code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.ruleset_deletes, [])
+        self.assertIn("refs/heads/master", err)
+        self.assertIn("would be left unprotected", err)
+
+    def test_a_redundant_legacy_ruleset_goes_even_when_the_standard_one_needs_no_write(self):
+        # The path an already-converged repository takes every run. Gating
+        # the cleanup on a write would mean a leftover beside an
+        # already-correct 'main' is never removed, and the fleet never
+        # converges (Codex review, mikelward/repo#30).
+        fake = FakeGh()
+        fake.check_runs = {fake.default_head_sha: ["lanes"]}
+        fake.rulesets_by_name = {"main": "1", "merge gates": "9"}
+        fake.all_ruleset_ids = ["1", "9"]
+        fake.ruleset_objects["1"] = {
+            "id": 1,
+            "name": "main",
+            "enforcement": "active",
+            "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+            "rules": self._standard_rules(),
+        }
+        fake.ruleset_objects["9"] = {
+            "id": 9,
+            "name": "merge gates",
+            "enforcement": "active",
+            "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+            "rules": self._standard_rules(),
+        }
+        code, out, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        # Nothing was written -- 'main' already said what it should -- and
+        # the leftover still went.
+        self.assertEqual(fake.puts, [])
+        self.assertEqual(fake.posts, [])
+        self.assertEqual(fake.ruleset_deletes, ["9"])
+
+    def test_a_squash_only_legacy_ruleset_is_removed_rather_than_deadlocking(self):
+        # Rulesets aggregate and allowed_merge_methods intersects, so a
+        # legacy ruleset allowing only squash beside a 'main' requiring
+        # rebase is the state where nothing can merge. The conflict scan
+        # would abort the run before the cleanup could remove it, making
+        # the one repair `repo setup` offers impossible (Codex review,
+        # mikelward/repo#30).
+        fake = FakeGh()
+        fake.check_runs = {fake.default_head_sha: ["lanes"]}
+        fake.rulesets_by_name = {"main": "1", "merge gates": "9"}
+        fake.all_ruleset_ids = ["1", "9"]
+        fake.ruleset_objects["1"] = {
+            "id": 1,
+            "name": "main",
+            "enforcement": "active",
+            "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+            "rules": [],
+        }
+        squash_only = self._standard_rules()
+        for rule in squash_only:
+            if rule["type"] == "pull_request":
+                rule["parameters"]["allowed_merge_methods"] = ["squash"]
+        fake.ruleset_objects["9"] = {
+            "id": 9,
+            "name": "merge gates",
+            "enforcement": "active",
+            "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+            "rules": squash_only,
+        }
+        code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("excludes rebase", err)
+        self.assertEqual(fake.ruleset_deletes, ["9"])
+
+    def test_failing_to_delete_a_conflicting_legacy_ruleset_fails_the_run(self):
+        # The conflict scan skipped it on the promise that it would go. If
+        # it does not, the repository is left with two rulesets that
+        # disagree on merge methods -- which is the "nothing can merge"
+        # state -- so this one failure is the step's problem.
+        fake = FakeGh()
+        fake.check_runs = {fake.default_head_sha: ["lanes"]}
+        fake.rulesets_by_name = {"main": "1", "merge gates": "9"}
+        fake.all_ruleset_ids = ["1", "9"]
+        fake.ruleset_delete_fails = True
+        fake.ruleset_objects["1"] = {
+            "id": 1,
+            "name": "main",
+            "enforcement": "active",
+            "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+            "rules": [],
+        }
+        squash_only = self._standard_rules()
+        for rule in squash_only:
+            if rule["type"] == "pull_request":
+                rule["parameters"]["allowed_merge_methods"] = ["squash"]
+        fake.ruleset_objects["9"] = {
+            "id": 9,
+            "name": "merge gates",
+            "enforcement": "active",
+            "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+            "rules": squash_only,
+        }
+        code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("nothing can merge", err)
+
+    def _both(self, legacy_rules=None, main_rules=None):
+        fake = FakeGh()
+        fake.check_runs = {fake.default_head_sha: ["lanes"]}
+        fake.rulesets_by_name = {"main": "1", "merge gates": "9"}
+        fake.all_ruleset_ids = ["1", "9"]
+        fake.ruleset_objects["1"] = {
+            "id": 1,
+            "name": "main",
+            "enforcement": "active",
+            "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+            "rules": self._standard_rules() if main_rules is None else main_rules,
+        }
+        fake.ruleset_objects["9"] = {
+            "id": 9,
+            "name": "merge gates",
+            "enforcement": "active",
+            "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+            "rules": self._standard_rules() if legacy_rules is None else legacy_rules,
+        }
+        return fake
+
+    def test_a_legacy_ruleset_demanding_an_approval_is_kept(self):
+        # Managed TYPES are not managed PARAMETERS: the standard ruleset
+        # writes required_approving_review_count 0 and the review flags
+        # off, so a legacy one asking for an approval is strictly stricter
+        # and deleting it lowers the bar (Codex review, mikelward/repo#30).
+        stricter = self._standard_rules()
+        for rule in stricter:
+            if rule["type"] == "pull_request":
+                rule["parameters"]["required_approving_review_count"] = 2
+                rule["parameters"]["require_code_owner_review"] = True
+        fake = self._both(legacy_rules=stricter)
+        code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.ruleset_deletes, [])
+        self.assertIn("approving reviews", err)
+        self.assertIn("code-owner review", err)
+
+    def test_a_legacy_ruleset_requiring_an_extra_check_is_kept(self):
+        stricter = self._standard_rules(contexts=("lanes", "extra-gate"))
+        fake = self._both(legacy_rules=stricter)
+        code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.ruleset_deletes, [])
+        self.assertIn("extra-gate", err)
+
+    def test_the_pending_deletion_is_shown_and_confirmed(self):
+        # With 'main' already matching, the delete is the only mutation --
+        # so it has to be what the plan shows and what the question asks
+        # about, or a non-interactive run without --force would delete a
+        # ruleset it never mentioned (Codex review, mikelward/repo#30).
+        fake = self._both()
+        code, out, err = _run(fake, ["--dry-run", "--rule", "lanes", REPO])
+        self.assertEqual(fake.ruleset_deletes, [])
+        self.assertIn("delete the superseded ruleset 'merge gates'", out + err)
+
+        fake = self._both()
+        code, _, err = _run(fake, ["--rule", "lanes", REPO])  # isatty False
+        self.assertEqual(code, 1)
+        self.assertEqual(fake.ruleset_deletes, [])
+        self.assertIn("stdin is not a terminal", err)
+
+    def test_failing_a_required_cleanup_on_the_no_write_path_still_fails(self):
+        # Same broken state as on the write path -- two rulesets that
+        # disagree on merge methods, with the conflict scan told to skip
+        # one -- so returning 0 here would report success over it.
+        squash_only = self._standard_rules()
+        for rule in squash_only:
+            if rule["type"] == "pull_request":
+                rule["parameters"]["allowed_merge_methods"] = ["squash"]
+        fake = self._both(legacy_rules=squash_only)
+        fake.ruleset_delete_fails = True
+        code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(fake.puts, [])  # 'main' needed no write
+        self.assertEqual(code, 1)
+        self.assertIn("nothing can merge", err)
+
+    def test_a_legacy_ruleset_binding_a_check_to_an_app_is_kept(self):
+        # integration_id binds a check to one GitHub App, so it is part of
+        # what the requirement means. Deleting a legacy ruleset that
+        # requires 'lanes' from a specific app, in favor of a standard one
+        # that requires 'lanes' from anyone, weakens the gate (Codex
+        # review, mikelward/repo#30).
+        bound = self._standard_rules()
+        for rule in bound:
+            if rule["type"] == "required_status_checks":
+                rule["parameters"]["required_status_checks"] = [
+                    {"context": "lanes", "integration_id": 77}
+                ]
+        fake = self._both(legacy_rules=bound)
+        code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.ruleset_deletes, [])
+        self.assertIn("integration_id=77", err)
+
+    def test_an_unbound_legacy_check_is_covered_by_a_bound_one(self):
+        # The other direction: the legacy ruleset accepts 'lanes' from
+        # anyone and the standard one narrows it to a single app. That is
+        # stricter, not weaker, so it supersedes and the leftover goes.
+        fake = self._both()
+        for rule in fake.ruleset_objects["1"]["rules"]:
+            if rule["type"] == "required_status_checks":
+                rule["parameters"]["required_status_checks"] = [
+                    {"context": "lanes", "integration_id": 77}
+                ]
+        code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.ruleset_deletes, ["9"])
+
+    def test_a_legacy_ruleset_appearing_after_the_preview_is_refused(self):
+        # The plan the user confirmed said nothing about a deletion. If one
+        # becomes possible while the question is waiting, the fingerprint
+        # has to catch it rather than letting the apply delete something
+        # unannounced (Codex review, mikelward/repo#30).
+        fake = self._both()
+        # No legacy ruleset when the preview looks...
+        fake.rulesets_by_name = {"main": "1"}
+
+        real_lookup = fake.run
+
+        def appearing(args, **kwargs):
+            joined = " ".join(args)
+            if "rulesets?includes_parents=false" in joined and "merge gates" in joined:
+                fake._legacy_probes = getattr(fake, "_legacy_probes", 0) + 1
+                # ...but there by the time the real apply re-checks.
+                if fake._legacy_probes > 1:
+                    return "9\n"
+                return ""
+            return real_lookup(args, **kwargs)
+
+        fake.run = appearing
+        code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("not the one that was previewed", err)
+        self.assertEqual(fake.ruleset_deletes, [])
+
+    def test_a_legacy_ruleset_appearing_after_the_preview_is_refused_on_the_write_path_too(self):
+        # Same drift, but with 'main' needing a write: there the fingerprint
+        # comparison is what has to carry the pending deletion.
+        fake = self._both(main_rules=[])
+        fake.rulesets_by_name = {"main": "1"}
+        real_lookup = fake.run
+
+        def appearing(args, **kwargs):
+            joined = " ".join(args)
+            if "rulesets?includes_parents=false" in joined and "merge gates" in joined:
+                fake._legacy_probes = getattr(fake, "_legacy_probes", 0) + 1
+                if fake._legacy_probes > 1:
+                    return "9\n"
+                return ""
+            return real_lookup(args, **kwargs)
+
+        fake.run = appearing
+        code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("no longer matches what was previewed", err)
+        self.assertEqual(fake.ruleset_deletes, [])
+
+    def test_a_failed_cleanup_does_not_fail_the_run(self):
+        # The standard ruleset is already written and enforcing by then, so
+        # the repository is protected either way; turning a successful
+        # setup into a failure over a leftover would be worse than the
+        # duplicate it was trying to remove.
+        fake = FakeGh()
+        fake.check_runs = {fake.default_head_sha: ["lanes"]}
+        fake.rulesets_by_name = {"main": "1", "merge gates": "9"}
+        fake.all_ruleset_ids = ["1", "9"]
+        fake.ruleset_delete_fails = True
+        fake.ruleset_objects["1"] = {
+            "id": 1,
+            "name": "main",
+            "enforcement": "active",
+            "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+            "rules": [],
+        }
+        fake.ruleset_objects["9"] = {
+            "id": 9,
+            "name": "merge gates",
+            "enforcement": "active",
+            "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+            "rules": self._standard_rules(),
+        }
+        code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("could not delete the superseded", err)
+
+    def test_a_dry_run_deletes_nothing(self):
+        fake = FakeGh()
+        fake.check_runs = {fake.default_head_sha: ["lanes"]}
+        fake.rulesets_by_name = {"main": "1", "merge gates": "9"}
+        fake.all_ruleset_ids = ["1", "9"]
+        fake.ruleset_objects["1"] = {
+            "id": 1,
+            "name": "main",
+            "enforcement": "active",
+            "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+            "rules": [],
+        }
+        fake.ruleset_objects["9"] = {
+            "id": 9,
+            "name": "merge gates",
+            "enforcement": "active",
+            "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+            "rules": self._standard_rules(),
+        }
+        code, _, err = _run(fake, ["--dry-run", "--rule", "lanes", REPO])
+        self.assertEqual(fake.ruleset_deletes, [])
         self.assertEqual(fake.puts, [])
 
     def test_an_inactive_ruleset_is_still_refused(self):
@@ -1587,7 +2079,7 @@ class SetupCmdTest(unittest.TestCase):
         fake.all_ruleset_ids = ["7"]
         fake.ruleset_objects["7"] = {
             "id": 7,
-            "name": "merge gates",
+            "name": "main",
             "enforcement": "active",
             "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
             "rules": [
@@ -1658,7 +2150,7 @@ class SetupCmdTest(unittest.TestCase):
         fake.all_ruleset_ids = ["7"]
         fake.ruleset_objects["7"] = {
             "id": 7,
-            "name": "merge gates",
+            "name": "main",
             "enforcement": "active",
             "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
             "rules": [
@@ -1729,7 +2221,7 @@ class SetupCmdTest(unittest.TestCase):
         fake.ruleset_content_change_threshold = 3
         base_object = {
             "id": 7,
-            "name": "merge gates",
+            "name": "main",
             "enforcement": "active",
             "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
             "rules": [
@@ -3496,7 +3988,7 @@ class BootstrapStepTest(unittest.TestCase):
         fake.ruleset_content_change_threshold = 3
         base_object = {
             "id": 7,
-            "name": "merge gates",
+            "name": "main",
             "enforcement": "active",
             "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
             "rules": [
@@ -3566,7 +4058,7 @@ class BootstrapStepTest(unittest.TestCase):
         fake.all_ruleset_ids = ["7"]
         fake.ruleset_objects["7"] = {
             "id": 7,
-            "name": "merge gates",
+            "name": "main",
             "enforcement": "active",
             "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
             "rules": [
@@ -3615,7 +4107,7 @@ class BootstrapStepTest(unittest.TestCase):
         fake.all_ruleset_ids = ["7"]
         fake.ruleset_objects["7"] = {
             "id": 7,
-            "name": "merge gates",
+            "name": "main",
             "enforcement": "active",
             "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
             "rules": [{"type": "required_linear_history"}, {"type": "non_fast_forward"}],
@@ -3650,7 +4142,7 @@ class BootstrapStepTest(unittest.TestCase):
         fake.ruleset_content_change_threshold = 3
         base_object = {
             "id": 7,
-            "name": "merge gates",
+            "name": "main",
             "enforcement": "active",
             "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
             "rules": [
@@ -3705,7 +4197,7 @@ class BootstrapStepTest(unittest.TestCase):
         fake.ruleset_content_change_threshold = 3
         base_object = {
             "id": 7,
-            "name": "merge gates",
+            "name": "main",
             "enforcement": "active",
             "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
             "rules": [

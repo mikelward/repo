@@ -967,8 +967,14 @@ def run(args):
     # reported is excluded outright: the Apply section below skips the
     # step entirely rather than writing anything, so there is nothing
     # for a confirmation to be about.
-    ruleset_needs_mutation = (
-        (not args.no_rules) and not ruleset_never_reported and ruleset_report.get("needs_write", True)
+    # A superseded ruleset waiting to be deleted is a mutation even when
+    # the ruleset itself needs no write -- and that is the common shape,
+    # since a repository whose ruleset already matches is exactly where the
+    # leftover is all that remains to fix. Without this, such a run reports
+    # nothing to confirm and then deletes a ruleset anyway (Codex review,
+    # mikelward/repo#30).
+    ruleset_needs_mutation = (not args.no_rules) and not ruleset_never_reported and (
+        ruleset_report.get("needs_write", True) or bool(ruleset_report.get("legacy_cleanup"))
     )
     apps_need_mutation = any(p.verdict == "ADD" for p in app_plans)
     needs_confirmation = (

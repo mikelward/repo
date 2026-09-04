@@ -80,8 +80,11 @@ mikelward/repo#14). Only the placeholder's replacement with real project
 jobs is left undone (see `repo_lib/scaffold.py`'s own docstring for the
 full split between what's generated and what isn't).
 `repo setup` composes four steps -- the required-checks
-branch ruleset (linear history required, force pushes blocked, plus a
-standalone warning when a repository has an actual `master` branch),
+branch ruleset (named `main`, with linear history required, force pushes
+blocked, plus a standalone warning when a repository has an actual
+`master` branch; a repository that already has a ruleset by that name has
+it adopted and updated in place rather than gaining a second one, since
+rulesets aggregate and two of them are only ever confusing),
 fanning a secret out via the same logic `repo secrets`
 uses, ensuring GitHub App installation membership, and (always on, like
 the fleet-credentials and auto-merge steps below; `--no-bootstrap` skips
