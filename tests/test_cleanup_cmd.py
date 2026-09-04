@@ -1,9 +1,12 @@
+import contextlib
 import datetime
 import errno
 import io
 import json
 import os
+import sys
 import tempfile
+import types
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import patch
@@ -233,8 +236,32 @@ class FakeGh:
         return out
 
 
+class _CaptureStream(io.StringIO):
+    """A capture buffer that can claim to be a terminal.
+
+    `redirect_stderr` hands the command a StringIO, whose isatty() is
+    False -- so a test cannot model "a real terminal" and "2>file"
+    separately without one of these.
+    """
+
+    def __init__(self, isatty=True):
+        super().__init__()
+        self._isatty = isatty
+
+    def isatty(self):
+        return self._isatty
+
+
 class CleanupTestCase(unittest.TestCase):
-    def invoke(self, fake, argv, stdin_isatty=True, answers=(), clock=None):
+    def invoke(
+        self,
+        fake,
+        argv,
+        stdin_isatty=True,
+        stderr_isatty=True,
+        answers=(),
+        clock=None,
+    ):
         """Run `repo cleanup ...` against `fake`, returning
         (code, out, err, log).
 
@@ -258,7 +285,12 @@ class CleanupTestCase(unittest.TestCase):
             except StopIteration:
                 raise EOFError
 
-        out, err = io.StringIO(), io.StringIO()
+        # stdout stays a plain buffer (isatty() False): the widget picker
+        # requires a terminal there, so the suite drives the prompt path
+        # whether or not prompt_toolkit happens to be installed. stderr's
+        # answer is a parameter because it decides whether a question can
+        # be asked at all.
+        out, err = io.StringIO(), _CaptureStream(stderr_isatty)
         argv = list(argv)
         with tempfile.TemporaryDirectory() as tmp:
             log_path = os.path.join(tmp, "cleanup.log")
@@ -358,7 +390,7 @@ class ClassificationTest(CleanupTestCase):
         self.assertEqual(code, 0)
         self.assertEqual(fake.deleted(), [])
         self.assertIn("3 commits not on the default branch", log)
-        self.assertIn("--include-unmerged", log)
+        self.assertIn("only offered on a terminal", log)
 
     def test_a_closed_unmerged_pull_request_is_reported_as_the_abandoned_signal(self):
         fake = FakeGh(
@@ -671,7 +703,7 @@ class AgeTest(CleanupTestCase):
         code, out, err, log = self.invoke(
             fake, [REPO, "--include-unmerged", "--older-than", "1", "--dry-run"]
         )
-        self.assertIn("to offer one at a time", out)
+        self.assertIn("to ask about", out)
         self.assertNotIn("too recent to offer", out)
 
     def test_a_closed_pull_request_is_offered_however_recent(self):
@@ -689,7 +721,7 @@ class AgeTest(CleanupTestCase):
         code, out, err, log = self.invoke(
             fake, [REPO, "--include-unmerged", "--dry-run"]
         )
-        self.assertIn("to offer one at a time", out)
+        self.assertIn("to ask about", out)
         self.assertNotIn("too recent to offer", out)
         self.assertIn("PR #31 closed without merging", out)
 
@@ -749,7 +781,7 @@ class AgeTest(CleanupTestCase):
         code, out, err, log = self.invoke(
             fake, [REPO, "--include-unmerged", "--dry-run"]
         )
-        self.assertIn("to offer one at a time", out)
+        self.assertIn("to ask about", out)
         self.assertNotIn("too recent to offer", out)
         # And it names the closure that justifies the offer, not the one
         # that happened to be listed first.
@@ -839,7 +871,7 @@ class AgeTest(CleanupTestCase):
         code, out, err, log = self.invoke(
             fake, [REPO, "--include-unmerged", "--dry-run"]
         )
-        self.assertIn("to offer one at a time", out)
+        self.assertIn("to ask about", out)
 
     def test_a_recent_branch_with_no_pull_request_is_still_held_back(self):
         # The other half of the same rule: with no pull request there is no
@@ -884,7 +916,7 @@ class AgeTest(CleanupTestCase):
             ],
         )
         code, out, err, log = self.invoke(
-            fake, [REPO, "--include-unmerged"], answers=["y"]
+            fake, [REPO], answers=["a"]
         )
         self.assertEqual(fake.deleted(), ["claude/dropped"])
 
@@ -938,6 +970,253 @@ class AgeTest(CleanupTestCase):
         self.assertIn("too recent to offer", out)
 
 
+class TwoStageTest(CleanupTestCase):
+    def _mixed(self):
+        return FakeGh(
+            branches=[
+                ("main", "aaa", True),
+                ("claude/done", "bbb", False),
+                ("claude/stale", "ccc", False),
+            ],
+            closed_pulls=[{"number": 7, "head_ref": "claude/done", "merged_at": "x"}],
+            compares={"claude/stale": (2, days_ago(40))},
+        )
+
+    def _only_unmerged(self):
+        """Nothing merged to sweep, one branch worth offering: the shape
+        where the merged stage's own no-terminal refusal never runs."""
+        return FakeGh(
+            branches=[("main", "aaa", True), ("claude/stale", "ccc", False)],
+            compares={"claude/stale": (2, days_ago(40))},
+        )
+
+    def test_one_run_asks_about_merged_then_unmerged(self):
+        # The point of the two stages: a provably redundant branch and one
+        # carrying unmerged commits are different questions, so they are
+        # never one keystroke apart.
+        fake = self._mixed()
+        code, out, err, log = self.invoke(fake, [REPO], answers=["a", "a"])
+        self.assertEqual(code, 0)
+        self.assertEqual(sorted(fake.deleted()), ["claude/done", "claude/stale"])
+        self.assertIn("Merged branches on owner/repo, safe to delete", err)
+        self.assertIn("Unmerged on owner/repo", err)
+
+    def test_unmerged_are_offered_without_any_flag(self):
+        fake = self._mixed()
+        code, out, err, log = self.invoke(fake, [REPO], answers=["n", "a"])
+        self.assertEqual(fake.deleted(), ["claude/stale"])
+
+    def test_declining_the_second_stage_keeps_the_first(self):
+        fake = self._mixed()
+        code, out, err, log = self.invoke(fake, [REPO], answers=["a", "n"])
+        self.assertEqual(fake.deleted(), ["claude/done"])
+
+    def test_a_deselected_merged_branch_is_recorded_as_declined(self):
+        # The plan lists every merged branch as "to delete", so one that
+        # goes unpicked needs its own line -- otherwise the record cannot
+        # tell a deliberate deselection from a deletion that silently
+        # produced no outcome.
+        fake = self._mixed()
+        code, out, err, log = self.invoke(fake, [REPO], answers=["s", "n", "n"])
+        self.assertEqual(fake.deleted(), [])
+        self.assertIn("declined claude/done", log)
+
+    def test_force_sweeps_merged_and_never_offers_unmerged(self):
+        # --force means "do not ask", and an unmerged branch is nothing but
+        # asking -- so it is left alone rather than swept unattended.
+        fake = self._mixed()
+        code, out, err, log = self.invoke(fake, [REPO, "--force"])
+        self.assertEqual(code, 0)
+        self.assertEqual(fake.deleted(), ["claude/done"])
+        self.assertIn("NOT deleted", log)
+
+    def test_a_non_terminal_offers_neither_stage(self):
+        fake = self._mixed()
+        code, out, err, log = self.invoke(fake, [REPO], stdin_isatty=False)
+        self.assertEqual(code, 1)
+        self.assertEqual(fake.deleted(), [])
+        self.assertIn("this is not an interactive terminal", err)
+
+    def test_a_redirected_stderr_asks_nothing(self):
+        # `repo cleanup owner/repo 2>cleanup.log` leaves stdin a terminal,
+        # but every question here is written to stderr -- so gating on
+        # stdin alone would print an invisible prompt into the file and
+        # then block on input the user has no idea is wanted, which looks
+        # exactly like a hang (Codex review, mikelward/repo#27). Neither
+        # stage is offered, and the reason says so.
+        fake = self._mixed()
+        code, out, err, log = self.invoke(fake, [REPO], stderr_isatty=False)
+        self.assertEqual(code, 1)
+        self.assertEqual(fake.deleted(), [])
+        self.assertIn("this is not an interactive terminal", err)
+        self.assertIn("the question is written to stderr", err)
+        self.assertNotIn("Delete [A]ll", err)
+
+    def test_a_redirected_stderr_leaves_the_unmerged_stage_unoffered(self):
+        # The same redirect with nothing merged to delete: the first stage
+        # has nothing to say, so only the unmerged offer could run -- and
+        # it is the one that would hang, since it never reaches the
+        # --force/no-terminal refusal above.
+        fake = self._only_unmerged()
+        code, out, err, log = self.invoke(fake, [REPO], stderr_isatty=False)
+        self.assertEqual(fake.deleted(), [])
+        self.assertNotIn("Delete [A]ll", err)
+        self.assertIn("NOT deleted", err)
+
+    def test_an_unrecognized_answer_selects_nothing(self):
+        # Anything that is not a, s or n is not a guess to resolve toward
+        # deleting: it selects nothing and says so.
+        fake = self._mixed()
+        code, out, err, log = self.invoke(fake, [REPO], answers=["wat", "n"])
+        self.assertEqual(fake.deleted(), [])
+        self.assertIn("is not one of a, s or n", err)
+
+
+@contextlib.contextmanager
+def _every_stream_a_terminal():
+    """stdin, stdout and stderr all claiming to be terminals -- the one
+    state in which the widget path runs at all.
+
+    Yields the stderr capture, since the fallback path reports on it.
+    A real buffer rather than a mock: `error()` writes to whatever
+    `sys.stderr` is at call time, so a mock would swallow the message
+    this needs to assert on.
+    """
+    err = _CaptureStream(isatty=True)
+    with patch.object(cleanup_cmd.sys, "stdin") as stdin, patch.object(
+        cleanup_cmd.sys, "stdout"
+    ) as stdout, patch.object(cleanup_cmd.sys, "stderr", err):
+        stdin.isatty.return_value = True
+        stdout.isatty.return_value = True
+        yield err
+
+
+@contextlib.contextmanager
+def _fake_checkboxlist(result, raises=None):
+    """A stand-in `prompt_toolkit.shortcuts` so the dialog path itself is
+    executed and asserted on.
+
+    prompt_toolkit is not a dependency and must not become one (AGENTS.md:
+    standard library only), but "not installed here" is why the constructor,
+    its defaults, cancellation and the name-to-entry mapping had no coverage
+    at all -- the path could break for everyone who does have it while the
+    suite stayed green (Codex review, mikelward/repo#27). Injecting the
+    module answers that without installing anything.
+
+    Yields the dict of keyword arguments the dialog was built with.
+    """
+    recorded = {}
+
+    class _Dialog:
+        def run(self):
+            if raises is not None:
+                raise raises
+            return result
+
+    def checkboxlist_dialog(**kwargs):
+        recorded.update(kwargs)
+        return _Dialog()
+
+    shortcuts = types.ModuleType("prompt_toolkit.shortcuts")
+    shortcuts.checkboxlist_dialog = checkboxlist_dialog
+    package = types.ModuleType("prompt_toolkit")
+    package.shortcuts = shortcuts
+    with patch.dict(
+        sys.modules,
+        {"prompt_toolkit": package, "prompt_toolkit.shortcuts": shortcuts},
+    ):
+        yield recorded
+
+
+class WidgetPickerTest(CleanupTestCase):
+    def test_a_redirected_stdout_means_no_dialog(self):
+        # prompt_toolkit draws on stdout. `repo cleanup owner/repo >out`
+        # leaves stdin and stderr terminals, so checking only those would
+        # paint the dialog into the file and then wait on input to it.
+        with patch.object(cleanup_cmd.sys, "stdin") as stdin, patch.object(
+            cleanup_cmd.sys, "stdout"
+        ) as stdout, patch.object(cleanup_cmd.sys, "stderr") as stderr:
+            stdin.isatty.return_value = True
+            stderr.isatty.return_value = True
+            stdout.isatty.return_value = False
+            self.assertIs(
+                cleanup_cmd._select_widgets([], "t"), cleanup_cmd._NO_PICKER
+            )
+
+    def test_the_dialog_is_built_with_everything_ticked(self):
+        entries = [
+            {"name": "claude/a", "why": "merged by PR #1"},
+            {"name": "claude/b", "why": "contained in main"},
+        ]
+        with _every_stream_a_terminal(), _fake_checkboxlist(["claude/a"]) as recorded:
+            chosen = cleanup_cmd._select_widgets(entries, "Pick some")
+        self.assertEqual(recorded["title"], "Pick some")
+        # (value, label) pairs, and every value preselected: the common
+        # case is "yes, all of these", so the user unticks exceptions
+        # rather than ticking the rule.
+        self.assertEqual(
+            recorded["values"],
+            [
+                ("claude/a", "claude/a -- merged by PR #1"),
+                ("claude/b", "claude/b -- contained in main"),
+            ],
+        )
+        self.assertEqual(recorded["default_values"], ["claude/a", "claude/b"])
+        # Names come back from the dialog; entries go out, so the caller
+        # never has to map them itself.
+        self.assertEqual(chosen, [entries[0]])
+
+    def test_unticking_everything_is_not_canceling(self):
+        # An empty list means "delete none of these" and is a real answer;
+        # None means the dialog was dismissed. Collapsing the two would
+        # make Escape silently delete nothing while reporting success, or
+        # an empty selection abort the second stage.
+        entries = [{"name": "claude/a", "why": "merged by PR #1"}]
+        with _every_stream_a_terminal(), _fake_checkboxlist([]):
+            self.assertEqual(cleanup_cmd._select_widgets(entries, "t"), [])
+
+    def test_a_canceled_dialog_is_none(self):
+        entries = [{"name": "claude/a", "why": "merged by PR #1"}]
+        with _every_stream_a_terminal(), _fake_checkboxlist(None):
+            self.assertIsNone(cleanup_cmd._select_widgets(entries, "t"))
+
+    def test_a_dialog_that_cannot_draw_falls_back(self):
+        # Broad on purpose: an unsupported terminal raises prompt_toolkit's
+        # own types, and an older release may not accept default_values at
+        # all. Either way the command must ask in plain text rather than
+        # dying between the plan and the deletions.
+        entries = [{"name": "claude/a", "why": "merged by PR #1"}]
+        with _every_stream_a_terminal() as err, _fake_checkboxlist(
+            None, raises=TypeError("no default_values")
+        ):
+            result = cleanup_cmd._select_widgets(entries, "t")
+        self.assertIs(result, cleanup_cmd._NO_PICKER)
+        self.assertIn("could not show the selection dialog", err.getvalue())
+        self.assertIn("no default_values", err.getvalue())
+
+    def test_an_absent_library_is_not_an_error(self):
+        # `repo` runs from a checkout with no install step, and that has to
+        # keep being true: not installed is the documented fallback, not a
+        # failure.
+        entries = [{"name": "claude/a", "why": "merged by PR #1"}]
+        with _every_stream_a_terminal() as err, patch.dict(
+            sys.modules, {"prompt_toolkit": None, "prompt_toolkit.shortcuts": None}
+        ):
+            result = cleanup_cmd._select_widgets(entries, "t")
+        self.assertIs(result, cleanup_cmd._NO_PICKER)
+        self.assertEqual(err.getvalue(), "")
+
+    def test_no_terminal_means_no_dialog(self):
+        # The widget path needs a real terminal at both ends; without one it
+        # reports that rather than trying to draw, so the caller falls back
+        # to the prompt the test suite drives.
+        with patch.object(cleanup_cmd.sys, "stdin") as stdin:
+            stdin.isatty.return_value = False
+            self.assertIs(
+                cleanup_cmd._select_widgets([], "t"), cleanup_cmd._NO_PICKER
+            )
+
+
 class OfferTest(CleanupTestCase):
     def _two_stale(self):
         return FakeGh(
@@ -955,7 +1234,7 @@ class OfferTest(CleanupTestCase):
     def test_each_offered_branch_is_asked_about_individually(self):
         fake = self._two_stale()
         code, out, err, log = self.invoke(
-            fake, [REPO, "--include-unmerged"], answers=["y", "n"]
+            fake, [REPO], answers=["s", "y", "n"]
         )
         self.assertEqual(code, 0)
         self.assertEqual(fake.deleted(), ["claude/a"])
@@ -963,7 +1242,7 @@ class OfferTest(CleanupTestCase):
     def test_declining_leaves_the_branch_alone(self):
         fake = self._two_stale()
         code, out, err, log = self.invoke(
-            fake, [REPO, "--include-unmerged"], answers=["n", "n"]
+            fake, [REPO], answers=["s", "n", "n"]
         )
         self.assertEqual(fake.deleted(), [])
 
@@ -971,14 +1250,14 @@ class OfferTest(CleanupTestCase):
         fake = self._two_stale()
         # One answer for two questions: end-of-input at the second must stop
         # the loop, not be read as a yes and sweep the rest.
-        code, out, err, log = self.invoke(fake, [REPO, "--include-unmerged"], answers=["y"])
+        code, out, err, log = self.invoke(fake, [REPO], answers=["s", "y"])
         self.assertEqual(fake.deleted(), ["claude/a"])
         self.assertIn("no more input", err)
 
     def test_the_deleted_sha_is_logged_so_the_branch_can_be_restored(self):
         fake = self._two_stale()
         code, out, err, log = self.invoke(
-            fake, [REPO, "--include-unmerged"], answers=["y", "n"]
+            fake, [REPO], answers=["s", "y", "n"]
         )
         self.assertIn("deleted claude/a (was bbb)", log)
         # The full SHA and an API restore, not a `git push` needing a clone
@@ -1051,7 +1330,7 @@ class RevalidationTest(CleanupTestCase):
             recheck={"claude/a": ("ccc", False)},
         )
         code, out, err, log = self.invoke(
-            fake, [REPO, "--include-unmerged"], answers=["y"]
+            fake, [REPO], answers=["a"]
         )
         self.assertEqual(fake.deleted(), [])
         self.assertIn("it moved to ccc", err)
@@ -1241,9 +1520,8 @@ class LogFileTest(CleanupTestCase):
                 {"number": 2, "head_ref": "claude/b", "merged_at": "x"},
             ],
         )
-        code, out, err, log = self.invoke(fake, [REPO, "--force"])
+        code, out, err, log = self.invoke(fake, [REPO, "--force"], stderr_isatty=False)
         self.assertEqual(sorted(fake.deleted()), ["claude/a", "claude/b"])
-        # stderr is a StringIO here, so isatty() is False.
         self.assertNotIn("\r", err)
         self.assertNotIn("deleting 1/2", err)
 
@@ -1582,7 +1860,7 @@ class LogFileTest(CleanupTestCase):
 
         with patch.object(cleanup_cmd, "_open_log", lambda path: FullOnDecline()):
             code, out, err, log = self.invoke(
-                fake, [REPO, "--include-unmerged"], answers=["n", "y"]
+                fake, [REPO], answers=["s", "n", "y"]
             )
         # Declining the first did not abandon the second.
         self.assertEqual(fake.deleted(), ["claude/b"])
@@ -1714,21 +1992,13 @@ class RestoreHintTest(CleanupTestCase):
 
 
 class UsageTest(CleanupTestCase):
-    def test_include_unmerged_refuses_to_combine_with_force(self):
+    def test_include_unmerged_is_accepted_but_no_longer_needed(self):
+        # The flag is kept so an existing invocation does not break, but an
+        # interactive run offers unmerged branches with or without it.
         fake = FakeGh(branches=[("main", "aaa", True)])
         code, out, err, log = self.invoke(fake, [REPO, "--include-unmerged", "--force"])
-        self.assertEqual(code, 2)
-        self.assertIn("cannot be combined", err)
-        self.assertEqual(fake.calls, [])
-
-    def test_include_unmerged_refuses_a_non_terminal_stdin(self):
-        fake = FakeGh(branches=[("main", "aaa", True)])
-        code, out, err, log = self.invoke(
-            fake, [REPO, "--include-unmerged"], stdin_isatty=False
-        )
-        self.assertEqual(code, 2)
-        self.assertIn("needs a terminal", err)
-
+        self.assertEqual(code, 0)
+        self.assertIn("no longer needed", err)
     def test_a_dry_run_may_use_include_unmerged_without_a_terminal(self):
         # Nothing is asked and nothing is written, so the terminal
         # requirement would only block a legitimate `| less`.
@@ -1761,25 +2031,37 @@ class ConfirmationTest(CleanupTestCase):
             closed_pulls=[{"number": 7, "head_ref": "claude/done", "merged_at": "x"}],
         )
 
-    def test_declining_the_confirmation_deletes_nothing(self):
+    def test_choosing_none_deletes_nothing(self):
         fake = self._one_merged()
         code, out, err, log = self.invoke(fake, [REPO], answers=["n"])
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 0)
         self.assertEqual(fake.deleted(), [])
-        self.assertIn("no branches were deleted", err)
 
-    def test_confirming_deletes(self):
+    def test_choosing_all_deletes(self):
         fake = self._one_merged()
-        code, out, err, log = self.invoke(fake, [REPO], answers=["y"])
+        code, out, err, log = self.invoke(fake, [REPO], answers=["a"])
         self.assertEqual(code, 0)
         self.assertEqual(fake.deleted(), ["claude/done"])
+
+    def test_empty_answer_means_all_since_everything_starts_selected(self):
+        fake = self._one_merged()
+        code, out, err, log = self.invoke(fake, [REPO], answers=[""])
+        self.assertEqual(code, 0)
+        self.assertEqual(fake.deleted(), ["claude/done"])
+
+    def test_selecting_one_by_one_asks_per_branch(self):
+        fake = self._one_merged()
+        code, out, err, log = self.invoke(fake, [REPO], answers=["s", "y"])
+        self.assertEqual(code, 0)
+        self.assertEqual(fake.deleted(), ["claude/done"])
+        self.assertIn("Delete claude/done?", err)
 
     def test_a_non_terminal_without_force_deletes_nothing(self):
         fake = self._one_merged()
         code, out, err, log = self.invoke(fake, [REPO], stdin_isatty=False)
         self.assertEqual(code, 1)
         self.assertEqual(fake.deleted(), [])
-        self.assertIn("stdin is not a terminal", err)
+        self.assertIn("this is not an interactive terminal", err)
 
     def test_force_still_records_the_whole_plan(self):
         # --force skips the question, not the record of what it touched.
