@@ -292,6 +292,24 @@ doesn't set today).
       `unread_mentions` already takes for a reusable-workflow call it
       can't parse) on any shape it doesn't recognize, rather than treating
       an unparseable shape as "not present."
+      **The step alone is not enough -- the ENCLOSING JOB has to select
+      the `lanes` environment too, or the move this detector triggers
+      breaks the very thing it's meant to protect** (Codex review,
+      mikelward/repo#26): an environment-scoped secret is invisible to a
+      job that doesn't declare that environment (the same fact this
+      section's own credential-placement item, and every sibling hub's
+      `AGENTS.md`, already states for the batch credentials). If the
+      detector matches the step but the job around it never sets
+      `environment: lanes`, moving `LANES_APP_ID`/`LANES_APP_PRIVATE_KEY`
+      into that environment and deleting the repository-level copies (per
+      the credential-placement item below) leaves the step reading empty
+      secret values -- the publisher silently stops working, and `repo
+      audit`'s compliant state (secrets correctly in the `lanes`
+      environment) reports it fine regardless, since it never checks
+      whether anything actually reads them from there. The detector needs
+      to confirm the job declares `environment: lanes` as part of
+      recognizing the step, not just the step in isolation, and fail
+      closed the same way on an environment expression it can't parse.
 - [ ] **The `lanes` environment needs a deployment-branch policy BEFORE
       the credential is placed in it, and today's environment creation
       doesn't set one** (Codex review, mikelward/repo#26). Lanes' own
@@ -342,8 +360,9 @@ doesn't set today).
       policy or membership were confirmed.
 - [ ] **`repo audit` should report which design a repo is actually wired
       for, and flag drift the same way it flags a stray batch credential.**
-      Four states: plain `pull_request` with no App secrets present (the
-      accepted baseline -- not a finding); `pull_request_target` with both
+      Four states: plain `pull_request` with no App secrets present AND
+      the ruleset's `lanes` entry unbound (no `integration_id`) -- the
+      accepted baseline, not a finding; `pull_request_target` with both
       secrets correctly in the `lanes` environment AND the lanes App still
       covering the repository (compliant); `pull_request_target` with the
       secrets missing, repository-scoped, or in the wrong environment, OR
@@ -360,6 +379,23 @@ doesn't set today).
       no longer succeed, so no legitimate `lanes` status can be published
       at all -- reading the secret placement alone reports it compliant
       while its publisher is actually dead.
+      **The plain-`pull_request` baseline needs the inverse check too, for
+      a repository ROLLED BACK off the App design** (Codex review,
+      mikelward/repo#26): remove the App secrets without also unbinding
+      the ruleset's `lanes` entry (the `integration_id` write the item
+      below adds), and the repository is left with no App secrets --
+      reading as the accepted baseline under the original three-state
+      version of this item -- while the required check is still
+      restricted to a publisher nothing can reach any more. An ordinary
+      Actions check-run can never satisfy a bound entry, so every future
+      merge blocks, and a history-based read (the same class of read
+      flagged above for a deleted workflow) can keep looking fine for a
+      while on the strength of the App's last, now-stale, status. Plain
+      `pull_request` with no App secrets is therefore only the accepted
+      baseline when the ruleset entry is ALSO unbound; plain
+      `pull_request` with a still-bound entry (secrets present or not) is
+      broken, `[FIX]`, and its fix is the unbind half of the
+      `integration_id` item below, applied in reverse.
       **"Covering the repository" is deliberately not "a selected member"
       -- that was wrong in an earlier revision of this item, and so was
       the function it cited** (Codex review, mikelward/repo#26, twice, in
