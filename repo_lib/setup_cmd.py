@@ -61,9 +61,11 @@ What replaced it, after those rounds, is not a revival of the shell's
 byte-for-byte TEXT comparison (which would also trip on cosmetic
 differences having nothing to do with what actually gets written) but a
 structural equivalent: apply_ruleset() computes a `fingerprint` --
-`(existing_id, needs_write, target_body)`, the ruleset it's acting on,
-whether it would actually write anything, and the exact API body it's
-about to send if so -- once per pass, exposes the preview's via
+`(existing_id, adopted_legacy, needs_write, target_body, deletions)`,
+everything it has decided to do: the ruleset it's acting on, whether it
+would actually write anything, the exact API body it's about to send if
+so, and any superseded duplicate it will delete afterwards -- once per
+pass, exposes the preview's via
 `report["fingerprint"]`, and takes that back as an optional
 expected_fingerprint on a later call, refusing if a freshly recomputed
 fingerprint (right before the real write) doesn't match. One check
@@ -967,8 +969,15 @@ def run(args):
     # reported is excluded outright: the Apply section below skips the
     # step entirely rather than writing anything, so there is nothing
     # for a confirmation to be about.
+    # needs_write is not the whole of what the ruleset step mutates: it
+    # also deletes a legacy-named ruleset that is identical to the one
+    # this run leaves behind, and the steady state that happens in is an
+    # already-correct ruleset -- so a gate reading needs_write alone would
+    # apply that deletion with nothing ever asked or shown.
     ruleset_needs_mutation = (
-        (not args.no_rules) and not ruleset_never_reported and ruleset_report.get("needs_write", True)
+        (not args.no_rules)
+        and not ruleset_never_reported
+        and (ruleset_report.get("needs_write", True) or bool(ruleset_report.get("deletions")))
     )
     apps_need_mutation = any(p.verdict == "ADD" for p in app_plans)
     needs_confirmation = (

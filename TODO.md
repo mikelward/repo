@@ -190,37 +190,30 @@
       rulesets identical in `target_body` and nothing else distinguishes
       "this is the standard one" from "this is about to become it".
 
-- [ ] **Delete a superseded legacy ruleset, rather than only reporting
-      it.** Where both names exist, `repo setup` now says so and leaves
-      both in place. Deleting the redundant one was written and then cut
-      back to this (maintainer, 2026-09-04) after review found the same
-      class of gap five times, each only visible once the previous was
-      fixed:
-
-      1. it holds a rule type outside `MANAGED_RULE_TYPES`;
-      2. it covers a ref the standard ruleset does not -- and an update
-         leaves the standard one's own conditions alone, so a hand-made
-         `main` scoped to `~DEFAULT_BRANCH` beside a legacy one covering
-         `refs/heads/master` is the real case;
-      3. it sets a managed parameter more strictly -- an approval count,
-         code-owner review, strict-up-to-date;
-      4. it binds a required check to a specific App via `integration_id`,
-         which a context-name comparison misses;
-      5. it grants no bypass actor where the standard one does, so
-         deleting it lets that actor past every remaining gate.
-
-      The lesson is the shape, not the list: "is A at least as strict as
-      B" was being reimplemented field by field, which can always be one
-      item short. Whoever picks this up should consider refusing to delete
-      anything whose managed rules, scope and bypass actors are not
-      byte-identical to the target's -- that cannot be one item short,
-      at the cost of keeping duplicates that differ harmlessly. Also
-      needed regardless: the deletion must be a planned mutation (shown in
-      `--dry-run`, covered by the confirmation, and part of the
-      fingerprint), it must run on the no-write path too since an
-      already-correct `main` is the steady state, and where the
-      merge-method conflict scan is told to skip a ruleset on the promise
-      it will go, a failed delete has to fail the step.
+- [x] **Delete a superseded legacy ruleset, rather than only reporting
+      it.** `repo setup` now deletes one whose content is identical to
+      what the standard ruleset will hold once this run has written it,
+      and reports any that is not. The comparison is whole-object
+      equality (`_comparable_ruleset`: everything GitHub reports except
+      the fields identifying that copy, and its name) rather than "is A
+      at least as strict as B", which had been reimplemented field by
+      field and found one item short five times in a row -- an unmanaged
+      rule type, a ref the other did not cover, a stricter managed
+      parameter, a required check bound to a specific App via
+      `integration_id`, a bypass actor on one side only. Equality cannot
+      be one item short; what it costs is keeping a duplicate that
+      differs harmlessly, which is the safe direction. The deletion is a
+      planned mutation: shown in `--dry-run`, counted by
+      `setup_cmd.run`'s confirmation gate (`ruleset_needs_mutation` reads
+      `deletions` as well as `needs_write`), part of the fingerprint, and
+      recomputed fresh before it happens. It runs on the no-write path
+      too, since an already-correct ruleset is the steady state. It
+      happens AFTER the write, because what makes the duplicate safe to
+      delete is that the survivor holds everything it held -- true only
+      once the write has landed -- and a failed delete fails the step.
+      The merge-method conflict scan needed no "skip the one that is
+      about to go": a deletable ruleset is identical to the target, and
+      the target always allows rebase, so the scan can never flag one.
 
 - [ ] **`repo audit` does not report a surviving legacy ruleset.** `repo
       setup` notes one on every run, which is how the fleet finds them,

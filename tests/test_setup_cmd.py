@@ -135,6 +135,8 @@ class FakeGh:
         # Set by the migration tests: the id a lookup for a legacy ruleset
         # name resolves to, or None for "there isn't one".
         self.legacy_ruleset_id = None
+        self.deleted_rulesets = []
+        self.ruleset_delete_fails = set()
         self._name_lookup_calls = 0
         # Sentinel: unset means "always answer with existing_ruleset_id".
         # Set (with existing_ruleset_id_lookup_threshold below) to model
@@ -422,6 +424,18 @@ class FakeGh:
             return "".join(f"{rid}\n" for rid in self.all_ruleset_ids)
 
         m = _RULESET_ONE_RE.match(endpoint)
+        if m and method == "DELETE":
+            rid = m.group(2)
+            if rid in self.ruleset_delete_fails:
+                raise gh.GhError("gh: HTTP 500: Internal Server Error\n")
+            self.deleted_rulesets.append(rid)
+            self.ruleset_objects.pop(rid, None)
+            if self.legacy_ruleset_id == rid:
+                self.legacy_ruleset_id = None
+            self.all_ruleset_ids = [r for r in self.all_ruleset_ids if r != rid]
+            return ""
+
+        m = _RULESET_ONE_RE.match(endpoint)
         if m:
             rid = m.group(2)
             self._ruleset_object_reads[rid] = self._ruleset_object_reads.get(rid, 0) + 1
@@ -430,6 +444,8 @@ class FakeGh:
                 and rid in self.ruleset_objects_after_change
             ):
                 obj = self.ruleset_objects_after_change[rid]
+            elif rid not in self.ruleset_objects:
+                raise gh.GhError("gh: HTTP 404: Not Found\n")
             else:
                 obj = self.ruleset_objects[rid]
             if jq == _OWNERSHIP_JQ:
@@ -1479,25 +1495,170 @@ class SetupCmdTest(unittest.TestCase):
         self.assertNotIn("would update ruleset 'main'", plan)
         self.assertEqual(fake.puts, [])
 
-    def test_a_legacy_ruleset_beside_the_standard_one_is_reported(self):
-        # Not deleted -- deciding one ruleset supersedes another is its own
-        # change (see TODO.md). But leaving it unmentioned would let a
-        # duplicate sit there unnoticed, which is the problem this is for.
-        fake = FakeGh()
+    def _matching_pair(self, fake, legacy_rules=None, legacy_scope=None):
+        """A repository carrying both the standard ruleset and a legacy-
+        named one. They are identical unless a test says otherwise, which
+        is the case worth deleting."""
         fake.check_runs = {fake.default_head_sha: ["lanes"]}
         fake.existing_ruleset_id = "1"
         fake.legacy_ruleset_id = "9"
-        fake.all_ruleset_ids = ["1"]
+        fake.all_ruleset_ids = ["1", "9"]
+        rules_body = [
+            {
+                "type": "required_status_checks",
+                "parameters": {
+                    "strict_required_status_checks_policy": True,
+                    "required_status_checks": [{"context": "lanes"}],
+                },
+            },
+            {
+                "type": "pull_request",
+                "parameters": {
+                    "required_review_thread_resolution": True,
+                    "allowed_merge_methods": ["rebase"],
+                    "required_approving_review_count": 0,
+                    "dismiss_stale_reviews_on_push": False,
+                    "require_code_owner_review": False,
+                    "require_last_push_approval": False,
+                },
+            },
+            {"type": "required_linear_history"},
+            {"type": "non_fast_forward"},
+        ]
+        scope = {"ref_name": {"include": list(_HARDENED_SCOPE), "exclude": []}}
         fake.ruleset_objects["1"] = {
             "id": 1,
             "name": "main",
+            "target": "branch",
             "enforcement": "active",
-            "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
-            "rules": [],
+            "conditions": scope,
+            "rules": rules_body,
         }
-        code, _, err = _run(fake, ["--dry-run", "--rule", "lanes", REPO])
-        self.assertIn("'merge gates' (id 9) is still there beside 'main'", err)
+        fake.ruleset_objects["9"] = {
+            "id": 9,
+            "name": "merge gates",
+            "target": "branch",
+            "enforcement": "active",
+            "conditions": legacy_scope if legacy_scope is not None else scope,
+            "rules": legacy_rules if legacy_rules is not None else rules_body,
+        }
+
+    def test_an_identical_legacy_ruleset_is_deleted(self):
+        # Rulesets aggregate, so a duplicate is not broken -- but
+        # allowed_merge_methods INTERSECTS, so a pair that ever drifts
+        # apart there leaves nothing able to merge at all. One identical
+        # to the survivor removes nothing by going.
+        fake = FakeGh()
+        self._matching_pair(fake)
+        code, out, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.deleted_rulesets, ["9"])
+        # Nothing was written to the survivor: it already matched, and the
+        # whole change was removing the duplicate.
         self.assertEqual(fake.puts, [])
+        self.assertEqual(fake.posts, [])
+        self.assertIn("deleted the superseded ruleset 'merge gates' (id 9)", out)
+
+    def test_a_deletion_with_nothing_else_to_do_is_still_planned_and_confirmed(self):
+        # The steady state this has to work in is an already-correct
+        # ruleset, so a deletion that only ran on the write path would
+        # never run at all. It is a mutation like any other: shown in
+        # --dry-run, and asked about before it happens.
+        fake = FakeGh()
+        self._matching_pair(fake)
+        code, out, err = _run(fake, ["--dry-run", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        plan = out + err
+        self.assertIn("would delete the superseded ruleset 'merge gates' (id 9)", plan)
+        self.assertEqual(fake.deleted_rulesets, [])
+
+        fake = FakeGh()
+        self._matching_pair(fake)
+        code, out, err = _run(fake, ["--rule", "lanes", REPO], isatty=False)
+        self.assertEqual(code, 1)
+        self.assertIn("stdin is not a terminal", err)
+        self.assertEqual(fake.deleted_rulesets, [])
+
+    def test_a_legacy_ruleset_that_differs_is_reported_not_deleted(self):
+        # The whole reason this is an equality test and not a
+        # field-by-field "is the survivor at least as strict": an
+        # unmanaged rule type the survivor does not carry would be lost,
+        # and so would four other things each found only after the
+        # previous was fixed (see TODO.md).
+        fake = FakeGh()
+        self._matching_pair(fake, legacy_rules=[{"type": "required_signatures"}])
+        code, out, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.deleted_rulesets, [])
+        self.assertIn("'merge gates' (id 9) is still there beside 'main'", err)
+        self.assertIn("not identical", err)
+
+    def test_a_legacy_ruleset_covering_a_ref_the_survivor_does_not_is_kept(self):
+        # Scope is part of the comparison, not just the rules: a legacy
+        # ruleset reaching a branch the standard one does not is
+        # protecting something, whatever its rules say.
+        fake = FakeGh()
+        self._matching_pair(
+            fake,
+            legacy_scope={"ref_name": {"include": [*_HARDENED_SCOPE, "refs/heads/release"], "exclude": []}},
+        )
+        code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.deleted_rulesets, [])
+        self.assertIn("is still there beside 'main'", err)
+
+    def test_a_legacy_ruleset_with_a_bypass_actor_the_survivor_lacks_is_kept(self):
+        # Deleting this one would let that actor past every remaining
+        # gate, which is the opposite of what removing a duplicate is
+        # supposed to do.
+        fake = FakeGh()
+        self._matching_pair(fake)
+        fake.ruleset_objects["9"]["bypass_actors"] = [{"actor_id": 5, "actor_type": "Team"}]
+        code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.deleted_rulesets, [])
+        self.assertIn("is still there beside 'main'", err)
+
+    def test_the_deletion_happens_after_the_write_that_makes_it_safe(self):
+        # What makes the duplicate safe to delete is that the SURVIVOR
+        # holds everything it held -- true only once this run's own write
+        # has landed. Deleting first would leave a window, and a failed
+        # write would leave the repository with neither.
+        fake = FakeGh()
+        self._matching_pair(fake)
+        # The survivor is missing a rule the legacy one already has, so it
+        # is identical to it only after this run's own write.
+        fake.ruleset_objects["1"] = dict(fake.ruleset_objects["1"])
+        fake.ruleset_objects["1"]["rules"] = [
+            r for r in fake.ruleset_objects["1"]["rules"] if r["type"] != "non_fast_forward"
+        ]
+        code, out, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(fake.puts), 1)
+        self.assertEqual(fake.deleted_rulesets, ["9"])
+        put_index = next(
+            i for i, c in enumerate(fake.calls) if "PUT" in c and f"repos/{REPO}/rulesets/1" in c
+        )
+        delete_index = next(
+            i for i, c in enumerate(fake.calls) if "DELETE" in c and c[-1].endswith("/rulesets/9")
+        )
+        self.assertLess(put_index, delete_index)
+
+    def test_a_failed_deletion_fails_the_step(self):
+        fake = FakeGh()
+        self._matching_pair(fake)
+        fake.ruleset_delete_fails = {"9"}
+        code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("could not delete the superseded ruleset 'merge gates'", err)
+
+    def test_an_unreadable_legacy_ruleset_refuses_rather_than_guessing(self):
+        fake = FakeGh()
+        self._matching_pair(fake)
+        del fake.ruleset_objects["9"]
+        code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 1)
+        self.assertEqual(fake.deleted_rulesets, [])
 
     def test_an_inactive_ruleset_is_still_refused(self):
         # The other half of the check, and the half that stays: a ruleset
