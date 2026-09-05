@@ -62,6 +62,17 @@
       repository uses the workflow, deletes the repository copy once the
       environment holds a usable credential, deletes stale copies, and
       refuses under a caller that still names its secrets.
+- [x] Hold every credential's move to the default branch's callers only,
+      and restrict every credential's environment to the default branch
+      (maintainer, 2026-09-05): a branch copy naming its secrets is a
+      `[CHECK]`, the batch environments are restricted as the lanes one is,
+      and the commit-back environment once its caller runs under
+      `pull_request_target` -- a caller under `pull_request` is `NOT FIXED`
+      with that change named, since the restriction would refuse its job.
+- [ ] Move clothescast, simmo and snoozemo's commit-back callers to
+      `pull_request_target` with `push-token`, as Type Launcher's is: until
+      then `repo setup` reports each as not fixed, and the environment stays
+      open there (a same-repo pull request's own run can read the token).
 - [x] Enable auto-merge on the repository from `repo setup`, and report it
       off as a `[FIX]` in `repo audit` (maintainer, 2026-09-01: it was off on
       readmo and "probably is for a few repos"; the weekly batches arm it on
@@ -421,22 +432,22 @@
   `main` with a ruleset, which is not one (Codex, mikelward/repo#36).
   Reversible: `restrict_environment` is the one writer, and the plan's
   `else` branch is where a rewrite would go.
-- **A branch copy of a lanes publisher does not hold the credential move
-  back; a branch copy of a batch caller still does** (autopilot,
-  2026-09-05). Codex found, on mikelward/repo#36, that a publishing job on a
-  non-default branch without `environment: lanes` vetoed moving the App pair
-  off repository level -- leaving it exposed to exactly that branch's
-  push-triggered run, for a copy the restricted environment shuts out
-  whether or not it declares the environment. Fixed for lanes: only the
-  default branch's publishers veto, and a branch copy is a `[CHECK]` line.
-  The batch callers (`settle`) have the same shape -- a branch copy naming
-  its secrets vetoes the move, per mikelward/repo#13 -- and were left as
-  they are: the same argument applies (a dispatch of a branch copy cannot
-  reach the restricted environment either), but changing a behavior a
-  reviewed PR chose on purpose is the maintainer's call, not a fix to fold
-  into this one. Reversible either way: `on_default` in the lanes block is
-  the one filter, and `settle`'s `failing` is where the batch path would
-  take the same one.
+- **Every credential's environment is restricted to the default branch,
+  not only the lanes one** (autopilot, 2026-09-05). The maintainer decided
+  that a branch copy of a caller holds no move back for any credential --
+  it runs from its branch, which a restricted environment shuts out either
+  way -- and asked whether the other workflows should work as lanes does.
+  Restricting the batch environments follows from that: every batch caller
+  runs on a schedule or a dispatch, from the default branch by default, so
+  the restriction refuses only a dispatch of a branch copy, which is the
+  reach it exists to close. The commit-back environment is restricted only
+  where the caller runs under `pull_request_target`; under `pull_request`
+  the ref is the merge ref and the restriction would refuse the commit job,
+  so that caller is reported as not fixed with the trigger change named
+  (maintainer, 2026-09-05: converge on the end state and say what is left).
+  Reversible: `settle_environment` in `setup_cmd.py` is the one planner and
+  `audit_environment` the one reporter; dropping the batch call sites
+  restores the lanes-only behavior.
 - **A lanes publisher that exists only on a branch keeps the App pair,
   and both commands say no trusted publisher reaches it yet** (autopilot,
   2026-09-05). Codex asked (mikelward/repo#36) for that case to read as

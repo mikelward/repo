@@ -1806,6 +1806,33 @@ class LanesCredentialAuditTest(unittest.TestCase):
         code, out, err = _run(fake, [REPO])
         self.assertNotIn("lanes:", out)
 
+    def test_setup_advice_is_qualified_where_the_planner_stops_first(self):
+        # `settle` returns the moment `move` reports, before
+        # `settle_environment` is reached at all -- so a bare "`repo setup`
+        # restricts it" promised a restriction the command does not perform
+        # (Codex, mikelward/repo#37). Same qualification the lanes block's
+        # own lines carry.
+        fake = FakeGh()
+        fake.workflow_files = ["gradle-update.yml"]
+        fake.workflow_texts = {
+            "gradle-update.yml": (
+                "on:\n  schedule:\n    - cron: '0 0 * * 1'\njobs:\n  update:\n"
+                "    uses: mikelward/gradle-update/.github/workflows/gradle-update.yml@main\n"
+                "    secrets: inherit\n"
+            )
+        }
+        fake.repo_secrets = []
+        fake.environments = {"gradle-update": []}  # exists, holds nothing
+        fake.env_policies = {"gradle-update": None}  # open
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "`repo setup owner/repo` restricts it to 'main' -- but not while the 'gradle-update' "
+            "environment holds no batch credential for it to place: the command reports that and "
+            "stops first",
+            out,
+        )
+
     def test_a_reusable_call_beside_a_publisher_does_not_mask_the_audit(self):
         # The planner consults the called-workflow reading only where
         # nothing publishes readably, so an unrelated reusable call in a
@@ -2005,6 +2032,7 @@ class SecretsAuditTest(unittest.TestCase):
         self.assertNotIn("does not run", out)
 
     SYNC = (
+        "on: pull_request_target\n"
         "jobs:\n  sync:\n"
         "    uses: mikelward/ci-commit-artifact/.github/workflows/commit-artifact.yml@main\n"
         "    secrets: inherit\n"
@@ -2032,9 +2060,42 @@ class SecretsAuditTest(unittest.TestCase):
         fake.workflow_files = ["ci.yml"]
         fake.workflow_texts = {"ci.yml": self.SYNC}
         fake.environments = {"ci-commit-artifact": ["CI_COMMIT_ARTIFACT_TOKEN"]}
+        fake.env_policies = {"ci-commit-artifact": ["main"]}
         code, out, err = _run(fake, [REPO])
         self.assertEqual(code, 0, err)
         self.assertIn("[ok] ci-commit-artifact: the token lives in the 'ci-commit-artifact' environment", out)
+        self.assertIn("[ok] ci-commit-artifact: environment 'ci-commit-artifact' admits only the trusted base branch", out)
+        # Open, it is the [FIX] `repo setup` closes -- the caller runs under
+        # `pull_request_target`, whose ref the restriction admits.
+        fake.env_policies = {}
+        code, out, err = _run(fake, [REPO])
+        self.assertIn(
+            "[FIX] ci-commit-artifact: environment 'ci-commit-artifact' can be reached from any branch -- "
+            f"a workflow run from any branch reaches the token too; `repo setup {REPO}` restricts it to 'main'",
+            out,
+        )
+        # Under `pull_request` the ref is the merge ref, which the restriction
+        # would refuse: the caller's own trigger is the finding, named with
+        # what to change, and the environment is not audited until then
+        # (maintainer, 2026-09-05).
+        fake.workflow_texts = {"ci.yml": self.SYNC.replace("on: pull_request_target", "on: [push, pull_request]")}
+        code, out, err = _run(fake, [REPO])
+        self.assertIn(
+            "[FIX] ci-commit-artifact: ci calls mikelward/ci-commit-artifact from a `pull_request` run, whose "
+            "ref is the merge ref: environment 'ci-commit-artifact' restricted to 'main' refuses that job, "
+            "and open it hands a same-repo pull request's own run the token -- trigger the caller on "
+            "`pull_request_target` and pass `push-token` (mikelward/ci-commit-artifact's README), as "
+            f"mikelward/typelauncher's ci.yml does; `repo setup {REPO}` then restricts the environment",
+            out,
+        )
+        self.assertNotIn("can be reached from any branch", out)
+        # A caller whose triggers cannot be read is "cannot tell", the same
+        # finding.
+        fake.workflow_texts = {"ci.yml": self.SYNC.replace("on: pull_request_target\n", "")}
+        code, out, err = _run(fake, [REPO])
+        self.assertIn("[FIX] ci-commit-artifact: ci calls mikelward/ci-commit-artifact from a `pull_request` run", out)
+        fake.workflow_texts = {"ci.yml": self.SYNC}
+        fake.env_policies = {"ci-commit-artifact": ["main"]}
         # Behind a caller naming its secrets the environment copy is idle.
         fake.workflow_texts = {
             "ci.yml": self.SYNC.replace(
@@ -2044,7 +2105,7 @@ class SecretsAuditTest(unittest.TestCase):
         code, out, err = _run(fake, [REPO])
         self.assertEqual(code, 0, err)
         self.assertIn("[FIX] ci-commit-artifact: ci passes its secrets by name", out)
-        self.assertNotIn("[ok] ci-commit-artifact:", out)
+        self.assertNotIn("[ok] ci-commit-artifact: the token lives", out)
         # Nowhere at all: the commit-back pushes as GITHUB_TOKEN.
         fake.workflow_texts = {"ci.yml": self.SYNC}
         fake.environments = {}
@@ -2067,8 +2128,12 @@ class SecretsAuditTest(unittest.TestCase):
         self.assertNotIn("moves it into", out)
 
     def test_a_caller_on_another_branch_is_read_too(self):
-        # A push to `feature` runs its workflows from `feature`; its caller
-        # naming its secrets is the finding, and the hub is not stale.
+        # A push to `feature` runs its workflows from `feature`, so the hub
+        # is not stale -- but a branch copy naming its secrets is a [CHECK],
+        # not the [FIX] that holds `repo setup`'s move back: it runs from
+        # its branch, which the restricted environment shuts out anyway
+        # (maintainer, 2026-09-05). And with no caller on the default branch
+        # nothing reaches the credential yet, so it is not the [ok] line.
         fake = FakeGh()
         fake.workflow_files = ["ci.yml"]
         fake.workflow_texts = {"ci.yml": "jobs: {}\n"}
@@ -2082,22 +2147,77 @@ class SecretsAuditTest(unittest.TestCase):
             }
         }
         fake.environments = {"gradle-update": ["GRADLE_UPDATE_PAT"]}
+        fake.env_policies = {"gradle-update": ["main"]}
         code, out, err = _run(fake, [REPO])
         self.assertEqual(code, 0, err)
-        self.assertIn("[FIX] gradle-update: weekly on feature passes its secrets by name", out)
+        self.assertIn(
+            "[CHECK] gradle-update: no workflow on the default branch calls mikelward/gradle-update; "
+            "weekly on feature does from a branch, which reaches the environment once merged",
+            out,
+        )
+        self.assertIn(
+            "[CHECK] gradle-update: weekly on feature passes its secrets by name; a branch copy runs "
+            "from its branch, which the restricted environment shuts out anyway, so it loses the "
+            "credential when the repository copy moves",
+            out,
+        )
+        self.assertNotIn("[FIX] gradle-update: weekly on feature", out)
+        self.assertNotIn("[ok] gradle-update: the batch credential", out)
         self.assertNotIn("does not run", out)
+        # A default-branch caller naming its secrets is still the [FIX].
+        fake.workflow_files = ["ci.yml", "gradle-update.yml"]
+        fake.workflow_texts = {
+            "ci.yml": "jobs: {}\n",
+            "gradle-update.yml": (
+                "jobs:\n  update:\n"
+                "    uses: mikelward/gradle-update/.github/workflows/gradle-update.yml@main\n"
+                "    secrets:\n      token: ${{ secrets.GRADLE_UPDATE_PAT }}\n"
+            ),
+        }
+        code, out, err = _run(fake, [REPO])
+        self.assertIn("[FIX] gradle-update: gradle-update passes its secrets by name", out)
 
     def test_a_credential_in_the_environment_alone_is_ok(self):
         fake = self._hub_repo()
         fake.environments = {"gradle-update": ["GRADLE_UPDATE_PAT"]}
+        fake.env_policies = {"gradle-update": ["main"]}
         code, out, err = _run(fake, [REPO])
         self.assertEqual(code, 0, err)
         self.assertIn("[ok] gradle-update: the batch credential lives in the 'gradle-update' environment", out)
+        self.assertIn("[ok] gradle-update: environment 'gradle-update' admits only the trusted base branch", out)
         self.assertNotIn("[FIX]", out)
+
+    def test_a_batch_environment_any_branch_can_reach_is_a_fix_naming_setup(self):
+        # The batch runs on a schedule or a dispatch, from the default
+        # branch; an open environment hands a dispatch of a branch copy the
+        # credential too. Audited as the lanes environment is, and `repo
+        # setup` restricts it the same way (maintainer, 2026-09-05).
+        fake = self._hub_repo()
+        fake.environments = {"gradle-update": ["GRADLE_UPDATE_PAT"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "[FIX] gradle-update: environment 'gradle-update' can be reached from any branch -- a "
+            f"workflow run from any branch reaches the credential too; `repo setup {REPO}` restricts "
+            "it to 'main'",
+            out,
+        )
+        # A policy someone set is theirs; the half-done state names setup.
+        fake.env_policies = {"gradle-update": ["release/*"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertIn(
+            "[FIX] gradle-update: environment 'gradle-update' is restricted to 'release/*', not to 'main' "
+            "alone -- restrict it to 'main' in the environment's settings",
+            out,
+        )
+        fake.env_policies = {"gradle-update": []}
+        code, out, err = _run(fake, [REPO])
+        self.assertIn(f"`repo setup {REPO}` completes it with 'main'", out)
 
     def test_the_app_pair_in_the_environment_counts_as_the_credential(self):
         fake = self._hub_repo("rust-update")
         fake.environments = {"rust-update": ["RUST_UPDATE_APP_ID", "RUST_UPDATE_APP_PRIVATE_KEY"]}
+        fake.env_policies = {"rust-update": ["main"]}
         code, out, err = _run(fake, [REPO])
         self.assertEqual(code, 0, err)
         self.assertIn("[ok] rust-update: the batch credential lives in the 'rust-update' environment", out)
@@ -2251,6 +2371,7 @@ class SecretsAuditTest(unittest.TestCase):
     def test_other_repository_secrets_are_listed_for_review_not_flagged(self):
         fake = self._hub_repo()
         fake.environments = {"gradle-update": ["GRADLE_UPDATE_PAT"]}
+        fake.env_policies = {"gradle-update": ["main"]}
         fake.repo_secrets = ["RELEASE_KEYSTORE_BASE64", "VERCEL_TOKEN"]
         code, out, err = _run(fake, [REPO])
         self.assertEqual(code, 0, err)

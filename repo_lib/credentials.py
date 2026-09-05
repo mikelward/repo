@@ -628,6 +628,55 @@ def mentions(text, workflow_prefix):
     return _mention_count(text, workflow_prefix) > 0
 
 
+def triggers(text):
+    """The events the workflow in `text` runs on, lower-cased -- `on:` as
+    one name, a sequence, or a mapping -- or None when the document does not
+    parse or carries no `on:` this can read. YAML 1.1 reads a bare `on` as
+    the boolean true, which is why both keys are looked up."""
+    doc = _document(text)
+    if not isinstance(doc, dict):
+        return None
+    on = doc.get("on", doc.get(True))
+    if isinstance(on, str):
+        return {on.lower()}
+    if isinstance(on, (list, dict)):
+        return {str(event).lower() for event in on}
+    return None
+
+
+# Every event whose run gets the merge ref, `refs/pull/<n>/merge` --
+# `pull_request` and the two review events, which GitHub documents with the
+# same ref and SHA. Checking the one literal `pull_request` missed the other
+# two, so a caller triggered on a review event was read as safely
+# restrictable and the called commit job then could not enter the
+# environment on those events (Codex, mikelward/repo#37). `triggers` returns
+# exact event names, so a longer name is a different member, not a match.
+# `pull_request_target` is deliberately absent: its ref is the base branch,
+# which is what the restriction admits.
+MERGE_REF_EVENTS = frozenset(
+    {"pull_request", "pull_request_review", "pull_request_review_comment"}
+)
+MERGE_REF_EVENT = "pull_request"  # the one the README sends callers away from
+
+
+def merge_ref_callers(texts, workflow_prefix):
+    """The default-branch workflows in `texts` that call the reusable
+    workflow at `workflow_prefix` from a run whose ref is the merge ref --
+    or whose triggers cannot be read, which is the same "cannot tell" the
+    other readers fail closed on. Such a run's ref is the merge ref, which
+    an environment restricted to the default branch refuses: the called job
+    that declares the environment never starts. The hub's own README sends
+    a caller that needs the environment's token to `pull_request_target`,
+    whose ref is the base branch."""
+    return sorted(
+        name
+        for name, text in texts.items()
+        if name.branch is None
+        and caller_inherits(text, workflow_prefix) is not None
+        and (triggers(text) is None or triggers(text) & MERGE_REF_EVENTS)
+    )
+
+
 def _is_lanes(reference):
     """Whether a step's `uses:` names the lanes action, at any ref.
 

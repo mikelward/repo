@@ -520,14 +520,223 @@ def _plan_credentials(repo, specs):
         if step.writes or step.deletes:
             plan.moves.append(step)
 
-    def settle(label, names, prefix, listed, env_secrets, env, usable, suggest):
+    def on_default(found):
+        """The callers (or publishers) on the default branch: the ones the
+        move rests on. A branch copy runs from its branch, which the
+        restricted environment shuts out whether or not it inherits -- so
+        it loses the credential either way, and keeping the repository
+        copy for its sake leaves the credential exposed to exactly that
+        branch's push-triggered run, the hole the move closes (Codex,
+        mikelward/repo#36, for the lanes pair; the maintainer extended it
+        to every credential, 2026-09-05)."""
+        return {name: verdict for name, verdict in found.items() if name.branch is None}
+
+    def settle_environment(
+        label, listed, env, moves_before, lines_before, still, why, usable, blocked=None
+    ):
+        """Plans the restriction of environment `env` to the default branch
+        once the credential's own move did not refuse: a credential in an
+        environment any branch can reach is read by a workflow run from any
+        branch, `why` names how. `blocked` is a reason the environment must
+        not be restricted yet (a caller that would be refused by it): the
+        end state is the same, so it is reported as not fixed with what
+        closes it, and the next run restricts. A policy someone set by hand
+        is reported, never rewritten (maintainer, 2026-09-05).
+
+        `usable(names)` says whether what the environment holds is a working
+        credential, for the one recheck that has to ask; `lines_before` and
+        `moves_before` bound what this step queued, so a door it cannot
+        vouch for takes the whole step back rather than leaving the writes.
+
+        Shared by the lanes pair, the batch credentials and the commit-back
+        token: every window found in the lanes path (mikelward/repo#36)
+        applies to all three, and generalizing after the fact is how the
+        other two would have kept the older, thinner version of it."""
+
+        def hold_this_runs_moves(why_held):
+            """Drops the moves this step queued and the plan lines that
+            offered them, returning the repository copies that consequently
+            stay. A run that cannot put the environment's door in a state it
+            vouches for must not write the credential into it or delete the
+            copies keeping the workflows going -- and there are two ways to
+            reach that, a policy this run may not rewrite and a policy read
+            that failed, so it is one function rather than two copies
+            (Codex, mikelward/repo#36)."""
+            held = plan.moves[moves_before:]
+            stays = [name for step in held for name, _scope in step.deletes]
+            if held:
+                del plan.moves[moves_before:]
+                del plan.lines[lines_before:]
+            for name in [write[0] for step in held for write in step.writes]:
+                # Said whatever the verbosity, like every other supplied
+                # value this run declined to use: a --credential that
+                # silently did nothing is the one a reader assumes landed.
+                line = f"{label}: {name} not set -- {why_held}"
+                plan.lines.append(line)
+                plan.always_report.append(line)
+            return stays
+
+        written_here = any(m.writes for m in plan.moves[moves_before:])
+        if listed is None and not written_here:
+            # No environment, and this run creates none: the missing
+            # credential is already reported above, and there is nothing to
+            # restrict yet.
+            return
+        if listed is None:
+            policy = "open"  # an environment this run creates admits every branch
+        else:
+            try:
+                policy = credentials.environment_branch_policy(repo, listed)
+            except credentials.ReadError as e:
+                # A door this run cannot read is one it cannot vouch for,
+                # and `plan.failed` is only reported at the END of the apply
+                # -- the moves run first, so a forced run wrote the
+                # credential into an environment nobody had established was
+                # shut and deleted the repository copies behind it (Codex,
+                # mikelward/repo#36).
+                stays = hold_this_runs_moves(
+                    f"the '{env}' environment's branch policy could not be read, so this run "
+                    f"cannot tell which branches reach it"
+                )
+                plan.failed = True
+                plan.lines.append(e.message)
+                plan.lines += [f"  {line}" for line in (e.detail or "").splitlines()]
+                if stays:
+                    plan.lines.append(
+                        f"{label}: {', '.join(stays)} stays a repository secret until the policy "
+                        f"can be read"
+                    )
+                return
+        wrong = credentials.branch_policy_verdict(policy, default)
+
+        def still_trusted(recheck):
+            """`recheck`, and then the environment's branch policy again.
+            The policy is the one input a run whose policy was already right
+            never reads twice: a restriction carries its own apply-time
+            re-read, and `move`'s destination read asks what the environment
+            holds, not who may enter it. So an administrator opening the
+            environment while the prompt sat let the apply write the
+            credential in and delete the repository copies, exiting 0 with
+            it reachable from an untrusted branch (Codex,
+            mikelward/repo#36). `recheck` runs first, so the default branch
+            this compares against is one it has already confirmed."""
+
+            def run():
+                reason = recheck()
+                if reason is not None:
+                    return reason
+                wrong_now = credentials.branch_policy_verdict(
+                    credentials.environment_branch_policy(repo, env), default
+                )
+                return None if wrong_now is None else f"environment '{env}' now {wrong_now}"
+
+            return guarded(run)
+
+        if blocked is not None:
+            plan.unfixed.append(blocked)
+        if wrong is None:
+            plan.lines.append(f"{label}: environment '{env}' admits only the trusted base branch")
+            for step in plan.moves[moves_before:]:
+                step.recheck = still_trusted(step.recheck)
+                step.shut = (env, default)
+        elif credentials.restrictable(policy) and blocked is not None:
+            # Reported above; the restriction is the one thing held back,
+            # since it is what would refuse the caller. Everything else the
+            # policy decides still applies -- reporting and returning before
+            # the read left the writes and deletes queued with the
+            # destination never vouched for at all, so the apply wrote the
+            # token into an environment nobody had read and deleted the
+            # repository copy behind it (Codex, mikelward/repo#37). This
+            # branch is only the door this run COULD have shut; a policy it
+            # may not rewrite falls to the `else` and takes the move back,
+            # blocked or not.
+            pass
+        elif credentials.restrictable(policy):
+            plan.lines.append(
+                f"{label}: restrict environment '{env}' to branch '{default}' -- it {wrong}, so {why}"
+            )
+            # Re-validated like a delete: when the environment already holds
+            # the credential, this is the only apply-time action, and a
+            # caller that went away while the prompt sat would leave it
+            # restricting an environment nothing justifies any more (Codex,
+            # mikelward/repo#36).
+            #
+            # Carried by THIS run's own move where it made one, rather than
+            # appended beside it. The apply loop runs moves in order and
+            # restricts before a move's writes and deletes, so two moves
+            # cannot express "shut the environment first": the writes move
+            # would run first, and a restriction that then failed would
+            # leave the credential in an environment any branch can enter --
+            # the exposure this placement exists to close, created by the
+            # run closing it (Codex, mikelward/repo#36).
+            mine = plan.moves[moves_before:]
+            for step in mine:
+                step.shut = (env, default)
+            if mine:
+                mine[-1].restrict = (env, default)
+            else:
+
+                def still_holds_it():
+                    # The standalone move writes and deletes nothing, so
+                    # `move`'s own destination re-read never runs for it --
+                    # and a recheck that asks only what the workflows say
+                    # would restrict an environment an administrator emptied
+                    # while the prompt sat, then exit 0 while a fresh plan
+                    # and audit both report no usable credential (Codex,
+                    # mikelward/repo#36). The restriction itself is
+                    # harmless; reporting the repository as in shape is not.
+                    reason = still()
+                    if reason is not None:
+                        return reason
+                    _listed, env_now = credentials.environment_secrets(
+                        repo, credentials.environments(repo), env
+                    )
+                    if not usable(set(env_now)):
+                        return f"the '{env}' environment no longer holds the credential"
+                    return None
+
+                plan.moves.append(
+                    CredentialMove(
+                        label=label,
+                        writes=[],
+                        deletes=[],
+                        recheck=guarded(still_holds_it),
+                        restrict=(env, default),
+                        shut=(env, default),
+                    )
+                )
+        else:
+            # The environment is shut before the credential goes into it,
+            # and this one cannot be shut at all: the policy is somebody's
+            # choice and is not rewritten, so it keeps admitting a branch
+            # this cannot trust. So the move this run queued is dropped
+            # rather than applied beside the finding -- writing the
+            # credential here would put it where such a branch reads it,
+            # which is the exposure the placement exists to close, and the
+            # deletes would then leave it only there. The same hold as a
+            # restriction that fails; the difference is only that this one
+            # is known at plan time, so the plan never offers the writes at
+            # all (Codex, mikelward/repo#36).
+            stays = hold_this_runs_moves(
+                f"the '{env}' environment admits a branch this cannot trust, and the credential is "
+                f"not placed where such a branch reads it"
+            )
+            plan.unfixed.append(
+                f"{label}: environment '{env}' {wrong} -- restrict it to '{default}' in the "
+                f"environment's settings; a policy someone set is not rewritten"
+                + (f"; {', '.join(stays)} stays a repository secret until then" if stays else "")
+            )
+
+    def settle(label, names, prefix, listed, env_secrets, env, usable, suggest, blocked_by=None):
         """Plans one reusable workflow's credentials from every workflow that
         calls it from a job, whatever the file is named -- the fleet names a
         batch's caller `<hub>.yml`, but GitHub runs any name, and a second
         caller under another name would be stranded by a delete the named
         one justifies (Codex, mikelward/repo#13). A workflow that mentions
         it in a shape the reader cannot resolve is "cannot tell", and holds
-        everything back."""
+        everything back. Then the environment is restricted to the default
+        branch, unless `blocked_by(callers, texts)` names a reason it cannot
+        be yet -- reported as not fixed, with what closes it."""
         found = credentials.callers(texts, prefix)
         unread = credentials.unread_mentions(texts, prefix)
         if unread:
@@ -540,17 +749,17 @@ def _plan_credentials(repo, specs):
             return
 
         def now():
-            """(reason, callers) as the workflows read now, for a recheck."""
+            """(reason, callers, texts) as the workflows read now, for a recheck."""
             texts_now = reread()
             callers_now = credentials.callers(texts_now, prefix)
             if credentials.unread_mentions(texts_now, prefix):
-                return f"a workflow now mentions {prefix} in a shape this cannot read as a caller", callers_now
-            return None, callers_now
+                return f"a workflow now mentions {prefix} in a shape this cannot read as a caller", callers_now, texts_now
+            return None, callers_now, texts_now
 
         if not found:
 
             def still_unused():
-                reason, callers_now = now()
+                reason, callers_now, _texts_now = now()
                 if reason is None and callers_now:
                     reason = (
                         f"{credentials.workflow_labels(sorted(callers_now))} "
@@ -568,16 +777,50 @@ def _plan_credentials(repo, specs):
             )
             return
 
+        trusted = on_default(found)
+        if not trusted:
+            # A caller only on a branch keeps the credential (Codex,
+            # mikelward/repo#13): the move is what it needs once merged.
+            # Said, so a success here is not read as a caller already
+            # reaching the credential.
+            plan.lines.append(
+                f"{label}: no workflow on the default branch calls {prefix.rstrip('/')}; "
+                f"{credentials.workflow_labels(sorted(found))} does from a branch, which reaches "
+                f"the environment once merged -- the credential is kept for it"
+            )
+        for name, inherits in sorted(found.items()):
+            if not inherits and name.branch is not None:
+                plan.lines.append(
+                    f"{label}: {credentials.workflow_label(name)} passes its secrets by name; a "
+                    f"branch copy runs from its branch, which the restricted environment shuts out "
+                    f"anyway, so it loses the credential when the repository copy moves"
+                )
+
         def still_inherits():
-            reason, callers_now = now()
+            reason, callers_now, _texts_now = now()
             if reason is not None:
                 return reason
-            if set(callers_now) != set(found):
+            # The default branch, confirmed AFTER that read and by name.
+            # Which copies count as the default's is what a rename moves,
+            # and `workflow_texts` marks the NEW default's copies
+            # `branch=None` -- so an unchanged caller filename made the set
+            # comparison below pass while `default` still held the old
+            # name, and the move went on to restrict the environment to a
+            # branch that is no longer the default and delete the
+            # repository copy behind it (Codex, mikelward/repo#37). The
+            # lanes recheck has confirmed this since mikelward/repo#36; the
+            # callers' did not.
+            default_now = credentials.default_branch(repo)
+            if default_now != default:
+                return f"the default branch is now '{default_now}', not '{default}'"
+            rested_on = trusted or found
+            rested_now = on_default(callers_now) if trusted else callers_now
+            if set(rested_now) != set(rested_on):
                 return (
                     f"the callers changed since the plan was built "
-                    f"({credentials.workflow_labels(sorted(callers_now)) or 'none'} now)"
+                    f"({credentials.workflow_labels(sorted(rested_now)) or 'none'} now)"
                 )
-            naming = sorted(name for name, inherits in callers_now.items() if not inherits)
+            naming = sorted(name for name, inherits in on_default(callers_now).items() if not inherits)
             if naming:
                 return (
                     f"{credentials.workflow_labels(naming)} no longer passes "
@@ -585,18 +828,47 @@ def _plan_credentials(repo, specs):
                 )
             return None
 
-        failing = sorted(name for name, inherits in found.items() if not inherits)
+        def still_restrictable():
+            reason = still_inherits()
+            if reason is not None:
+                return reason
+            if blocked_by is not None:
+                _reason, callers_now, texts_now = now()
+                if blocked_by(callers_now, texts_now) is not None:
+                    return f"a caller now runs under `{credentials.MERGE_REF_EVENT}`, which the restriction would refuse"
+            return None
+
+        failing = sorted(name for name, inherits in trusted.items() if not inherits)
+        unfixed_before = len(plan.unfixed)
+        moves_before = len(plan.moves)
+        lines_before = len(plan.lines)
         move(
             label,
             names,
             listed,
             env_secrets,
             env,
-            credentials.workflow_labels(failing or sorted(found)),
+            credentials.workflow_labels(failing or sorted(trusted) or sorted(found)),
             not failing,
             usable,
             suggest,
             still_inherits,
+        )
+        if len(plan.unfixed) > unfixed_before:
+            # The move refused -- a caller naming its secrets, or no value
+            # to set: the credential is stranded or missing, and the
+            # environment's policy is settled with it, not around it.
+            return
+        settle_environment(
+            label,
+            listed,
+            env,
+            moves_before,
+            lines_before,
+            still_restrictable,
+            "a workflow run from any branch reaches the credential too",
+            usable,
+            blocked=blocked_by(found, texts) if blocked_by is not None else None,
         )
 
     for hub in credentials.BATCH_HUBS:
@@ -626,6 +898,29 @@ def _plan_credentials(repo, specs):
     token = credentials.COMMIT_ARTIFACT_TOKEN
     label = credentials.COMMIT_ARTIFACT_ENV
     listed, env_secrets = held[label]
+
+    def merge_ref_caller(_callers, texts_now, label=label, listed=listed):
+        """Why the commit-back environment cannot be restricted yet, or
+        None: a caller run under `pull_request` has the merge ref, which an
+        environment restricted to the default branch refuses -- the called
+        commit job never starts -- while an open one hands that same
+        pull-request-controlled run the token. The end state needs the
+        caller on `pull_request_target`, which is the caller's own change;
+        it is reported as not fixed with that change named, and the next
+        run restricts (maintainer, 2026-09-05)."""
+        callers = credentials.merge_ref_callers(texts_now, credentials.COMMIT_ARTIFACT_WORKFLOW)
+        if not callers:
+            return None
+        return (
+            f"{label}: {credentials.workflow_labels(callers)} calls "
+            f"{credentials.COMMIT_ARTIFACT_WORKFLOW.rstrip('/')} from a `{credentials.MERGE_REF_EVENT}` "
+            f"run, whose ref is the merge ref: environment '{listed or label}' restricted to "
+            f"'{default}' refuses that job, and open it hands a same-repo pull request's own run "
+            f"the token -- trigger the caller on `pull_request_target` and pass `push-token` "
+            f"(mikelward/ci-commit-artifact's README), as mikelward/typelauncher's ci.yml does; "
+            f"the next run restricts the environment"
+        )
+
     settle(
         label,
         (token,),
@@ -635,6 +930,7 @@ def _plan_credentials(repo, specs):
         listed or label,
         lambda held_after: token in held_after,
         lambda held_after: [token],
+        blocked_by=merge_ref_caller,
     )
 
     # The lanes App pair. An action step, not a called workflow: the
@@ -804,16 +1100,9 @@ def _plan_credentials(repo, specs):
         )
         return plan
 
-    # Only the default branch's publishers hold the move back. A branch copy
-    # of a publishing workflow runs from its branch, which the restricted
-    # environment shuts out whether or not the job declares it -- so it
-    # loses the credential either way, and keeping the repository copy for
-    # its sake leaves the pair exposed to exactly that branch's
-    # push-triggered run, the hole the move closes (Codex,
-    # mikelward/repo#36). The publishing that the credential exists for
-    # runs under `pull_request_target` from the default branch's copy.
-    on_default = credentials.on_default_branch
-
+    # Only the default branch's publishers hold the move back (`on_default`):
+    # the publishing that the credential exists for runs under
+    # `pull_request_target` from the default branch's copy.
     undeclared = sorted(name for name, declares in on_default(publishers).items() if not declares)
     if not on_default(publishers):
         # A publisher only on a branch -- the pull request adopting lanes,
@@ -843,27 +1132,6 @@ def _plan_credentials(repo, specs):
     unfixed_before = len(plan.unfixed)
     lines_before = len(plan.lines)
 
-    def hold_this_runs_moves(why):
-        """Drops the moves this step queued and the plan lines that offered
-        them, returning the repository copies that consequently stay. A run
-        that cannot put the environment's door in a state it vouches for
-        must not write the pair into it or delete the copies keeping the
-        workflows going -- and there are two ways to reach that, a policy
-        this run may not rewrite and a policy read that failed, so it is
-        one function rather than two copies (Codex, mikelward/repo#36)."""
-        held = plan.moves[moves_before:]
-        stays = [name for step in held for name, _scope in step.deletes]
-        if held:
-            del plan.moves[moves_before:]
-            del plan.lines[lines_before:]
-        for name in [write[0] for step in held for write in step.writes]:
-            # Said whatever the verbosity, like every other supplied value
-            # this run declined to use: a --credential that silently did
-            # nothing is the one a reader assumes landed.
-            line = f"{label}: {name} not set -- {why}"
-            plan.lines.append(line)
-            plan.always_report.append(line)
-        return stays
     move(
         label,
         (app_id, app_key),
@@ -886,144 +1154,16 @@ def _plan_credentials(repo, specs):
         # value to set: the credential is stranded or missing, and the
         # environment's policy is settled with it, not around it.
         return plan
-    written_here = any(m.writes for m in plan.moves[moves_before:])
-    if listed is None and not written_here:
-        # No environment, and this run creates none: the missing
-        # credential is already reported above, and there is nothing to
-        # restrict yet.
-        return plan
-    if listed is None:
-        policy = "open"  # an environment this run creates admits every branch
-        env = label
-    else:
-        env = listed
-        try:
-            policy = credentials.environment_branch_policy(repo, listed)
-        except credentials.ReadError as e:
-            # A door this run cannot read is one it cannot vouch for, and
-            # `plan.failed` is only reported at the END of the apply -- the
-            # moves run first, so a forced run wrote the pair into an
-            # environment nobody had established was shut and deleted the
-            # repository copies behind it (Codex, mikelward/repo#36).
-            stays = hold_this_runs_moves(
-                f"the '{env}' environment's branch policy could not be read, so this run cannot "
-                f"tell which branches reach it"
-            )
-            plan.failed = True
-            plan.lines.append(e.message)
-            plan.lines += [f"  {line}" for line in (e.detail or "").splitlines()]
-            if stays:
-                plan.lines.append(
-                    f"{label}: {', '.join(stays)} stays a repository secret until the policy can be read"
-                )
-            return plan
-    wrong = credentials.branch_policy_verdict(policy, default)
-
-    def still_trusted(recheck):
-        """`recheck`, and then the environment's branch policy again. The
-        policy is the one input a run whose policy was already right never
-        reads twice: a restriction carries its own apply-time re-read, and
-        `move`'s destination read asks what the environment holds, not who
-        may enter it. So an administrator opening the environment while
-        the prompt sat let the apply write the pair in and delete the
-        repository copies, exiting 0 with the credential reachable from an
-        untrusted branch (Codex, mikelward/repo#36). Composed onto the
-        move's own recheck rather than folded into `lanes_changed`, which
-        answers for the workflows and is asked on paths that touch no
-        environment; `recheck` runs first, so the default branch this
-        compares against is one it has already confirmed."""
-
-        def run():
-            reason = recheck()
-            if reason is not None:
-                return reason
-            wrong_now = credentials.branch_policy_verdict(
-                credentials.environment_branch_policy(repo, env), default
-            )
-            return None if wrong_now is None else f"environment '{env}' now {wrong_now}"
-
-        return guarded(run)
-
-    if wrong is None:
-        plan.lines.append(f"{label}: environment '{env}' admits only the trusted base branch")
-        for step in plan.moves[moves_before:]:
-            step.recheck = still_trusted(step.recheck)
-            step.shut = (env, default)
-    elif credentials.restrictable(policy):
-        plan.lines.append(
-            f"{label}: restrict environment '{env}' to branch '{default}' -- it {wrong}, so a "
-            f"same-repo pull request's push-triggered workflow reads the App credential too"
-        )
-        # Re-validated like a delete: when the environment already holds
-        # the pair, this is the only apply-time action, and a workflow that
-        # stopped publishing while the prompt sat would leave it restricting
-        # an environment nothing justifies any more (Codex, mikelward/repo#36).
-        #
-        # Carried by THIS run's own move where it made one, rather than
-        # appended beside it. The apply loop runs moves in order and
-        # restricts before a move's writes and deletes, so two moves cannot
-        # express "shut the environment first": the writes move would run
-        # first, and a restriction that then failed would leave the pair in
-        # an environment any branch can enter -- the exposure this
-        # placement exists to close, created by the run closing it (Codex,
-        # mikelward/repo#36).
-        mine = plan.moves[moves_before:]
-        for step in mine:
-            step.shut = (env, default)
-        if mine:
-            mine[-1].restrict = (env, default)
-        else:
-
-            def still_holds_the_pair():
-                # The standalone move writes and deletes nothing, so
-                # `move`'s own destination re-read never runs for it -- and
-                # a recheck that asks only what the workflows say would
-                # restrict an environment an administrator emptied while
-                # the prompt sat, then exit 0 while a fresh plan and audit
-                # both report no usable credential (Codex,
-                # mikelward/repo#36). The restriction itself is harmless;
-                # reporting the repository as in shape is not.
-                reason = still_declares()
-                if reason is not None:
-                    return reason
-                _listed, env_now = credentials.environment_secrets(
-                    repo, credentials.environments(repo), env
-                )
-                if not credentials.lanes_usable(set(env_now)):
-                    return f"the '{env}' environment no longer holds the credential"
-                return None
-
-            plan.moves.append(
-                CredentialMove(
-                    label=label,
-                    writes=[],
-                    deletes=[],
-                    recheck=guarded(still_holds_the_pair),
-                    restrict=(env, default),
-                    shut=(env, default),
-                )
-            )
-    else:
-        # The environment is shut before the credential goes into it, and
-        # this one cannot be shut at all: the policy is somebody's choice
-        # and is not rewritten, so it keeps admitting a branch this cannot
-        # trust. So the move this run queued is dropped rather than applied
-        # beside the finding -- writing the pair here would put the whole
-        # App credential where such a branch reads it, which is the
-        # exposure the placement exists to close, and the deletes would
-        # then leave it only there. The same hold as a restriction that
-        # fails; the difference is only that this one is known at plan
-        # time, so the plan never offers the writes at all (Codex,
-        # mikelward/repo#36).
-        stays = hold_this_runs_moves(
-            f"the '{env}' environment admits a branch this cannot trust, and the credential is "
-            f"not placed where such a branch reads it"
-        )
-        plan.unfixed.append(
-            f"{label}: environment '{env}' {wrong} -- restrict it to '{default}' in the "
-            f"environment's settings; a policy someone set is not rewritten"
-            + (f"; {', '.join(stays)} stays a repository secret until then" if stays else "")
-        )
+    settle_environment(
+        label,
+        listed,
+        listed or label,
+        moves_before,
+        lines_before,
+        still_declares,
+        "a same-repo pull request's push-triggered workflow reads the App credential too",
+        credentials.lanes_usable,
+    )
     if on_default(publishers) and rested_state["ambient gate"]:
         plan.unfixed.append(
             f"{label}: {credentials.workflow_labels(list(rested_state['ambient gate']))} runs "
