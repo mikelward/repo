@@ -34,6 +34,7 @@ _MASTER_BRANCH_RE = re.compile(r"^repos/([^/]+/[^/]+)/branches/master$")
 _ACTIONS_SECRETS_RE = re.compile(r"^repos/([^/]+/[^/]+)/actions/secrets$")
 _ENV_SECRETS_RE = re.compile(r"^repos/([^/]+/[^/]+)/environments/([^/]+)/secrets$")
 _ENV_ONE_RE = re.compile(r"^repos/([^/]+/[^/]+)/environments/([^/]+)$")
+_ENV_POLICIES_RE = re.compile(r"^repos/([^/]+/[^/]+)/environments/([^/]+)/deployment-branch-policies$")
 _ENVIRONMENTS_RE = re.compile(r"^repos/([^/]+/[^/]+)/environments$")
 _REPO_SECRET_ONE_RE = re.compile(r"^repos/([^/]+/[^/]+)/actions/secrets/([^/]+)$")
 _ENV_SECRET_ONE_RE = re.compile(r"^repos/([^/]+/[^/]+)/environments/([^/]+)/secrets/([^/]+)$")
@@ -212,6 +213,8 @@ class FakeGh:
         self.fail_secret_recheck = set()  # keys (None or env name) whose 2nd+ list call errors
         self.env_create_fails = set()  # env names whose creation PUT fails
         self.env_get_check_fails = set()  # env names whose existence GET fails non-404
+        self.env_secrets_fail_after = {}  # env -> nth secret-names read that starts failing
+        self._env_secret_reads = {}
         self.set_fails = set()  # secret names whose `secret set` fails
         self.written_secrets = []  # (name, repo, env, value)
 
@@ -231,10 +234,40 @@ class FakeGh:
         # default's has the same blob sha and is not re-read.
         self.branch_workflows = {}
         self.workflow_texts_after_recheck = {}
+        self.branch_workflows_after_recheck = {}  # branch -> its workflows from the second listing on
+        self._branch_reads = {}
         self._workflow_reads = {}
         self.root_contents_error = None  # stderr for the root listing, or None to succeed
         self.deleted_secrets = []  # (name, env or None)
         self.delete_fails = set()  # secret names whose DELETE fails
+        # env -> which branches may reach it: None (any branch -- GitHub's
+        # default for a new environment), "protected", or a list of
+        # custom policy patterns (`tag:v*` for a tag policy).
+        self.env_policies = {}
+        self.env_protection_rules = {}  # env -> the protection_rules the GET reports
+        self.restricted = []  # (env, name) of every branch policy POSTed
+        self.env_deleted_after_restrict = set()  # envs deleted right after being restricted
+        self._restrict_confirmed = set()  # envs whose restriction this run has confirmed
+        self.env_reopened_during_writes = set()  # envs reopened as the pair is written
+        self.env_puts = []  # (env, body) of every PUT carrying a body
+        self.restrict_fails = set()  # env names whose policy PUT fails
+        self.policy_post_fails = set()  # env names whose branch-policy POST fails
+        self.policy_post_fails_adding = {}  # env -> a pattern someone adds right before that POST fails
+        # env -> can_admins_bypass an administrator changes while the run
+        # sits between its policy PUT and the restore that follows a failed
+        # POST, so the restore's settings snapshot is stale.
+        self.admin_bypass_after_failed_post = {}
+        # env -> a pattern someone adds while the settings are re-read, i.e.
+        # AFTER the rollback's branch-policy listing and before its PUT.
+        self.policy_added_before_restore = {}
+        self._add_on_next_env_read = {}
+        self.policy_added_during_post = {}  # env -> a pattern someone adds while that POST succeeds
+        # env -> the policy the SECOND read on sees, modeling one set while
+        # the plan waited on confirmation; absent => unchanged.
+        self.env_policies_after_recheck = {}
+        self.env_policies_after_read = {}  # env -> (read count, policy): switches at that read
+        self._env_reads = {}
+        self.env_admin_bypass = {}  # env -> can_admins_bypass as the GET reports it
 
         # -- App-installation step state --
         self.installations = []  # (slug, id, selection, account)
@@ -341,6 +374,28 @@ class FakeGh:
             if env is not None and env in self.env_secret_names_after_recheck:
                 return self.env_secret_names_after_recheck[env]
         return self.secret_names if env is None else self.env_secret_names.get(env, set())
+
+    def _tree_ref(self, ref):
+        """`ref` as this fake stores trees under: None for one naming the
+        default branch, which GitHub answers from the same tree as an
+        unqualified read. `workflow_texts` names the default explicitly so
+        a rename cannot silently redirect it (Codex, mikelward/repo#36),
+        and the "changed while the plan waited" hooks count default-branch
+        reads -- so without this they would stop firing and every one of
+        those tests would pass vacuously. The rename hook only moves which
+        name `.default_branch` REPORTS; the tree keeps its own name here."""
+        return None if ref == self.default_branch else ref
+
+    def _delete_after_restrict(self, env):
+        """Someone deletes `env` in the window this run cannot see: after
+        the restriction and its own confirming read, and before the next
+        thing that touches it -- the existence check the writes used to
+        make, or the write itself once that check is gone (Codex,
+        mikelward/repo#36). Fires once, so a recreate stays created."""
+        if env in self._restrict_confirmed:
+            self._restrict_confirmed.discard(env)
+            self.env_secret_names.pop(env, None)
+            self.env_policies.pop(env, None)
 
     def run(self, args):
         self.calls.append(list(args))
@@ -540,8 +595,11 @@ class FakeGh:
 
         m = _WORKFLOWS_DIR_RE.match(endpoint)
         if m:
-            ref = urllib.parse.unquote(m.group(2)) if m.group(2) else None
+            ref = self._tree_ref(urllib.parse.unquote(m.group(2))) if m.group(2) else None
             if ref:
+                self._branch_reads[ref] = self._branch_reads.get(ref, 0) + 1
+                if self._branch_reads[ref] >= 2 and ref in self.branch_workflows_after_recheck:
+                    self.branch_workflows[ref] = self.branch_workflows_after_recheck[ref]
                 files = [*(self.workflow_files or []), *self.branch_workflows[ref]]
                 return "".join(f"{n} {self._blob(n, ref)}\n" for n in dict.fromkeys(files))
             self._workflow_reads["/"] = self._workflow_reads.get("/", 0) + 1
@@ -556,7 +614,8 @@ class FakeGh:
 
         m = _WORKFLOW_FILE_RE.match(endpoint)
         if m and jq == ".content":
-            name, ref = m.group(2), (urllib.parse.unquote(m.group(3)) if m.group(3) else None)
+            name = m.group(2)
+            ref = self._tree_ref(urllib.parse.unquote(m.group(3))) if m.group(3) else None
             if ref:
                 return base64.encodebytes(self._text(name, ref).encode()).decode()
             self._workflow_reads[name] = self._workflow_reads.get(name, 0) + 1
@@ -574,9 +633,38 @@ class FakeGh:
         m = _ENV_SECRETS_RE.match(endpoint)
         if m:
             env = m.group(2)
+            if env in self.env_secrets_fail_after:
+                # Nth read onward fails: the pre-write rollback inventory is
+                # a later read than the plan's own (Codex, mikelward/repo#36).
+                self._env_secret_reads[env] = self._env_secret_reads.get(env, 0) + 1
+                if self._env_secret_reads[env] >= self.env_secrets_fail_after[env]:
+                    raise gh.GhError("gh: HTTP 500: Internal Server Error\n")
             if env not in self.env_secret_names:
                 raise gh.GhError(f"gh: HTTP 404: Not Found (.../{endpoint})\n")
             return "".join(n + "\n" for n in sorted(self._secret_names_for(env)))
+
+        m = _ENV_POLICIES_RE.match(endpoint)
+        if m and method is None:
+            env = m.group(2)
+            policy = self.env_policies.get(env)
+            if not isinstance(policy, list):
+                raise AssertionError(f"branch policies listed for {env}, whose policy is {policy!r}")
+            if env in self.policy_added_before_restore:
+                # Arm it for the NEXT environment GET, which is the
+                # rollback's settings re-read: this listing is the read the
+                # refusal above is decided from, so a pattern added before
+                # it is a different (already-covered) case.
+                self._add_on_next_env_read[env] = self.policy_added_before_restore.pop(env)
+            if env in self.env_deleted_after_restrict and [(env, p) for p in policy] == self.restricted:
+                # `restrict_environment` confirms its own postcondition by
+                # listing the policies; this listing IS that confirmation,
+                # so arm the deletion for whatever touches the environment
+                # next.
+                self.env_deleted_after_restrict.discard(env)
+                self._restrict_confirmed.add(env)
+            return "".join(
+                (f"tag {p[4:]}" if p.startswith("tag:") else f"branch {p}") + "\n" for p in policy
+            )
 
         m = _ENV_ONE_RE.match(endpoint)
         if m:
@@ -584,14 +672,24 @@ class FakeGh:
             if method == "PUT":
                 if env in self.env_create_fails:
                     raise gh.GhError(f"gh: could not create environment '{env}'\n")
+                if env not in self.env_secret_names:
+                    # A created environment has GitHub's default policy:
+                    # open to every branch. Modeling it as keeping whatever
+                    # the deleted one had would hide the exposure a
+                    # recreate-after-restrict opens (Codex,
+                    # mikelward/repo#36).
+                    self.env_policies[env] = None
                 self.env_secret_names.setdefault(env, set())
                 return ""
+            self._delete_after_restrict(env)
+            if env in self._add_on_next_env_read and isinstance(self.env_policies.get(env), list):
+                self.env_policies[env].append(self._add_on_next_env_read.pop(env))
             if env in self.env_get_check_fails:
                 raise gh.GhError(
                     "gh: HTTP 403: Resource protected by organization SAML enforcement\n"
                 )
             if env in self.env_secret_names:
-                return ""
+                return json.dumps(self._environment(env))
             raise gh.GhError(f"gh: HTTP 404: Not Found (.../{endpoint})\n")
 
         if _USER_INSTALLATIONS_RE.match(endpoint):
@@ -725,6 +823,28 @@ class FakeGh:
     def _blob(self, name, ref):
         return hashlib.sha1(self._text(name, ref).encode()).hexdigest()
 
+    def _environment(self, env):
+        """The environment object GitHub's GET reports, as far as the
+        branch-policy reader and the restriction's PUT read it."""
+        self._env_reads[env] = self._env_reads.get(env, 0) + 1
+        if self._env_reads[env] >= 2 and env in self.env_policies_after_recheck:
+            self.env_policies[env] = self.env_policies_after_recheck[env]
+        if env in self.env_policies_after_read and self._env_reads[env] >= self.env_policies_after_read[env][0]:
+            self.env_policies[env] = self.env_policies_after_read[env][1]
+        policy = self.env_policies.get(env)
+        if policy is None:
+            branch_policy = None
+        elif policy == "protected":
+            branch_policy = {"protected_branches": True, "custom_branch_policies": False}
+        else:
+            branch_policy = {"protected_branches": False, "custom_branch_policies": True}
+        return {
+            "name": env,
+            "deployment_branch_policy": branch_policy,
+            "protection_rules": self.env_protection_rules.get(env, []),
+            "can_admins_bypass": self.env_admin_bypass.get(env, True),
+        }
+
     def try_run(self, args):
         try:
             return True, self.run(args)
@@ -739,6 +859,23 @@ class FakeGh:
             env = args[args.index("--env") + 1] if "--env" in args else None
             if name in self.set_fails:
                 raise gh.GhError("gh: HTTP 500: Internal Server Error\n")
+            if env is not None:
+                self._delete_after_restrict(env)
+                if env in self.env_reopened_during_writes:
+                    # An administrator reopens the environment while the
+                    # pair is going in -- after every check this move makes
+                    # before its writes (Codex, mikelward/repo#36). Fires
+                    # once, on the first write into it.
+                    self.env_reopened_during_writes.discard(env)
+                    self.env_policies[env] = None
+                if env not in self.env_secret_names:
+                    # An environment secret needs its environment: GitHub
+                    # 404s rather than creating one. Modeling the write as
+                    # always succeeding hid what a deleted environment does
+                    # to a run that had already restricted it (Codex,
+                    # mikelward/repo#36).
+                    raise gh.GhError(f"gh: HTTP 404: Not Found (environment '{env}')\n")
+                self.env_secret_names[env].add(name)
             self.written_secrets.append((name, repo, env, input_bytes))
             return b""
         assert args[0] == "api", args
@@ -746,6 +883,20 @@ class FakeGh:
         body = json.loads(input_bytes.decode())
         if method == "PUT":
             self.puts.append((args, body))
+            m = _ENV_ONE_RE.match(endpoint)
+            if m:
+                env = m.group(2)
+                if env in self.restrict_fails:
+                    raise gh.GhError("gh: HTTP 422: Validation Failed\n")
+                self.env_puts.append((env, body))
+                policy = body.get("deployment_branch_policy")
+                if policy is None:
+                    self.env_policies[env] = None
+                elif policy.get("protected_branches"):
+                    self.env_policies[env] = "protected"
+                else:
+                    self.env_policies[env] = []
+                return b""
             m = _RULESET_ONE_RE.match(endpoint)
             if m:
                 # A successful PUT replaces the stored ruleset, so a later
@@ -764,6 +915,23 @@ class FakeGh:
                 # its own response body (`.commit.sha`).
                 return json.dumps({"commit": {"sha": "bootstrapcommitsha"}}).encode()
         elif method == "POST":
+            m = _ENV_POLICIES_RE.match(endpoint)
+            if m:
+                env = m.group(2)
+                if env in self.policy_post_fails:
+                    if env in self.policy_post_fails_adding and isinstance(self.env_policies.get(env), list):
+                        self.env_policies[env].append(self.policy_post_fails_adding[env])
+                    if env in self.admin_bypass_after_failed_post:
+                        self.env_admin_bypass[env] = self.admin_bypass_after_failed_post[env]
+                    raise gh.GhError("gh: HTTP 422: Validation Failed (policy)\n")
+                if not isinstance(self.env_policies.get(env), list):
+                    raise gh.GhError("gh: HTTP 422: custom branch policies are not enabled\n")
+                name = body["name"] if body.get("type", "branch") == "branch" else f"tag:{body['name']}"
+                self.env_policies[env].append(name)
+                if env in self.policy_added_during_post:
+                    self.env_policies[env].append(self.policy_added_during_post[env])
+                self.restricted.append((env, body["name"]))
+                return b""
             if _SCAFFOLD_BLOB_CREATE_RE.match(endpoint):
                 if self.bootstrap_blob_fails:
                     raise gh.GhError("gh: HTTP 500: Internal Server Error\n")
@@ -3012,6 +3180,1076 @@ class VerbosityTest(unittest.TestCase):
         self.assertNotIn("checking App installation", err2)
 
 
+class LanesCredentialStepTest(unittest.TestCase):
+    """The lanes App pair in the fleet-credentials step: the same move as
+    the batches', held back by a publishing job that does not declare the
+    environment rather than by a caller naming its secrets, and followed
+    by restricting the environment to the default branch when any branch
+    can reach it."""
+
+    PUBLISHER = (
+        "jobs:\n  init:\n    runs-on: ubuntu-latest\n    environment: lanes\n"
+        "    steps:\n      - uses: mikelward/lanes@main\n        with:\n"
+        "          mode: init\n          app-id: ${{ secrets.LANES_APP_ID }}\n"
+        "          app-private-key: ${{ secrets.LANES_APP_PRIVATE_KEY }}\n"
+    )
+    PAIR = {"LANES_APP_ID", "LANES_APP_PRIVATE_KEY"}
+
+    def _publisher(self, text=PUBLISHER):
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        fake.workflow_texts = {"ci.yml": text}
+        return fake
+
+    def test_a_supplied_pair_moves_into_a_new_restricted_environment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = self._publisher()
+            fake.secret_names = set(self.PAIR)
+            code, out, err = _run(
+                fake,
+                [
+                    "--force", "-v", "--no-rules",
+                    "--credential", f"LANES_APP_ID={app_id}",
+                    "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                    REPO,
+                ],
+            )
+        self.assertEqual(code, 0, err)
+        self.assertIn("lanes: set LANES_APP_ID in environment 'lanes' (new)", err)
+        self.assertIn("lanes: set LANES_APP_PRIVATE_KEY in environment 'lanes' (new)", err)
+        self.assertIn(
+            "lanes: delete repository secret LANES_APP_ID -- the 'lanes' environment holds the credential once set",
+            err,
+        )
+        self.assertIn(
+            "lanes: restrict environment 'lanes' to branch 'main' -- it can be reached from any branch, so a "
+            "same-repo pull request's push-triggered workflow reads the App credential too",
+            err,
+        )
+        self.assertEqual(
+            [w[:3] for w in fake.written_secrets],
+            [("LANES_APP_ID", REPO, "lanes"), ("LANES_APP_PRIVATE_KEY", REPO, "lanes")],
+        )
+        self.assertEqual(sorted(fake.deleted_secrets), [("LANES_APP_ID", None), ("LANES_APP_PRIVATE_KEY", None)])
+        self.assertEqual(fake.restricted, [("lanes", "main")])
+        self.assertEqual(fake.env_policies["lanes"], ["main"])
+        self.assertIn(f"{REPO}: restricted environment 'lanes' to branch 'main'", out)
+        # The environment exists, is shut, and only then holds a secret.
+        # The restriction lands BEFORE the writes: after them, a failure
+        # would leave the pair in an environment any branch can enter --
+        # the exposure this placement exists to close, created by the run
+        # closing it (Codex, mikelward/repo#36).
+        put_env = next(i for i, c in enumerate(fake.calls) if c[1:3] == ["--method", "PUT"] and c[3].endswith("/environments/lanes"))
+        write = next(i for i, c in enumerate(fake.calls) if c[:2] == ["secret", "set"])
+        restrict = next(i for i, c in enumerate(fake.calls) if c[1:3] == ["--method", "POST"] and "deployment-branch-policies" in c[3])
+        delete = next(
+            i for i, c in enumerate(fake.calls)
+            if c[1:3] == ["--method", "DELETE"] and "/actions/secrets/" in c[3]
+        )
+        self.assertLess(put_env, restrict)
+        self.assertLess(restrict, write)
+        self.assertLess(write, delete)
+
+    def test_an_open_environment_already_holding_the_pair_is_restricted(self):
+        fake = self._publisher()
+        fake.secret_names = set(self.PAIR)
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        fake.env_protection_rules = {
+            "lanes": [
+                {"type": "wait_timer", "wait_timer": 5},
+                {
+                    "type": "required_reviewers",
+                    "prevent_self_review": True,
+                    "reviewers": [{"type": "User", "reviewer": {"id": 7}}],
+                },
+            ]
+        }
+        fake.env_admin_bypass = {"lanes": False}
+        code, out, err = _run(fake, ["--force", "-v", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(sorted(fake.deleted_secrets), [("LANES_APP_ID", None), ("LANES_APP_PRIVATE_KEY", None)])
+        self.assertEqual(fake.restricted, [("lanes", "main")])
+        # The PUT re-sends every protection setting GitHub would otherwise
+        # reset, alongside the new policy.
+        [(env, body)] = fake.env_puts
+        self.assertEqual(env, "lanes")
+        self.assertEqual(
+            body,
+            {
+                "deployment_branch_policy": {"protected_branches": False, "custom_branch_policies": True},
+                "wait_timer": 5,
+                "reviewers": [{"type": "User", "id": 7}],
+                "prevent_self_review": True,
+                "can_admins_bypass": False,
+            },
+        )
+
+    def test_a_failed_policy_write_puts_the_open_policy_back(self):
+        # The restriction is two writes; the second failing after the
+        # first would leave custom-policy mode naming no branch, which
+        # admits nothing -- worse than the open state it started from.
+        fake = self._publisher()
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        fake.env_admin_bypass = {"lanes": False}
+        fake.policy_post_fails = {"lanes"}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(f"could not restrict environment 'lanes' on {REPO}:", err)
+        self.assertIn("Validation Failed (policy)", err)
+        self.assertEqual([env for env, _ in fake.env_puts], ["lanes", "lanes"])
+        restore = fake.env_puts[1][1]
+        self.assertIsNone(restore["deployment_branch_policy"])
+        # The settings the first PUT carried ride the restore too.
+        self.assertIs(restore["can_admins_bypass"], False)
+        self.assertIsNone(fake.env_policies["lanes"])
+        self.assertEqual(fake.restricted, [])
+
+    def test_a_policy_added_while_the_settings_are_re_read_is_left_in_place(self):
+        # The refusal above rests on a listing taken before the settings
+        # re-read, and that read is a round trip: a policy added across it
+        # was deleted by the restore PUT and the environment reopened to
+        # every branch, with the App pair inside it (Codex,
+        # mikelward/repo#36). The list is confirmed last now, immediately
+        # before the write that acts on it.
+        fake = self._publisher()
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        fake.policy_post_fails = {"lanes"}
+        fake.policy_added_before_restore = {"lanes": "release/*"}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "a policy someone set meanwhile -- 'release/*' -- was left in place rather than reopened over; "
+            "restrict the environment to 'main' by hand",
+            err,
+        )
+        # Theirs, kept; and no second PUT, so the environment is not open.
+        self.assertEqual(fake.env_policies["lanes"], ["release/*"])
+        self.assertEqual([env for env, _ in fake.env_puts], ["lanes"])
+
+    def test_a_policy_added_before_the_failed_write_is_left_in_place(self):
+        # The restore is over an empty list only: a pattern someone added
+        # between the two writes is theirs, and putting the open policy back
+        # would drop it and reopen the environment to every branch (Codex,
+        # mikelward/repo#36). Left as it is, with the reason, for a hand.
+        fake = self._publisher()
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        fake.policy_post_fails = {"lanes"}
+        fake.policy_post_fails_adding = {"lanes": "release/*"}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("Validation Failed (policy)", err)
+        self.assertIn(
+            "a policy someone set meanwhile -- 'release/*' -- was left in place rather than reopened over; "
+            "restrict the environment to 'main' by hand",
+            err,
+        )
+        self.assertEqual([env for env, _ in fake.env_puts], ["lanes"])
+        self.assertEqual(fake.env_policies["lanes"], ["release/*"])
+        # Exactly the default branch added meanwhile is the wanted state:
+        # done, whatever the failed write said.
+        fake = self._publisher()
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        fake.policy_post_fails = {"lanes"}
+        fake.policy_post_fails_adding = {"lanes": "main"}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "restricted environment 'lanes' to branch 'main' (the branch policy write failed, and the "
+            "branch was added meanwhile)",
+            out,
+        )
+        self.assertEqual([env for env, _ in fake.env_puts], ["lanes"])
+        self.assertEqual(fake.env_policies["lanes"], ["main"])
+
+    def test_the_restore_resends_the_settings_the_environment_has_now(self):
+        # The snapshot the restore would otherwise reuse was taken before
+        # the policy PUT, and the branch-policy re-read between them sees
+        # no protection settings at all -- so an administrator's change in
+        # that window was silently reverted by the restore (Codex,
+        # mikelward/repo#36).
+        fake = self._publisher()
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        fake.env_admin_bypass = {"lanes": False}
+        fake.policy_post_fails = {"lanes"}
+        fake.admin_bypass_after_failed_post = {"lanes": True}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertEqual([env for env, _ in fake.env_puts], ["lanes", "lanes"])
+        first, restore = fake.env_puts[0][1], fake.env_puts[1][1]
+        self.assertIs(first["can_admins_bypass"], False)
+        self.assertIs(restore["can_admins_bypass"], True)
+        self.assertIsNone(restore["deployment_branch_policy"])
+        self.assertIsNone(fake.env_policies["lanes"])
+
+    def test_a_policy_mode_set_before_the_restore_is_left_alone(self):
+        # The branch-policy list says nothing about the mode, so an
+        # administrator switching to protected mode between that read and
+        # the restore's own would have been reopened over by a PUT that
+        # came for the settings and ignored the mode it was handed (Codex,
+        # mikelward/repo#36).
+        fake = self._publisher()
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        fake.policy_post_fails = {"lanes"}
+        # The fifth environment read is the restore's own.
+        fake.env_policies_after_read = {"lanes": (5, "protected")}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "the environment's policy mode was set to 'protected' meanwhile, so the open policy was "
+            "not restored over it; restrict the environment to 'main' by hand",
+            err,
+        )
+        # Only this run's own PUT into custom mode; no restore over theirs.
+        self.assertEqual([env for env, _ in fake.env_puts], ["lanes"])
+        self.assertEqual(fake.env_policies["lanes"], "protected")
+
+    def test_a_policy_mode_found_after_the_failed_write_is_named_whole(self):
+        # `now` is a mode here, not a list of patterns, and joining over it
+        # spelled it one character at a time.
+        fake = self._publisher()
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        fake.policy_post_fails = {"lanes"}
+        fake.env_policies_after_read = {"lanes": (4, "protected")}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("a policy someone set meanwhile -- 'protected' -- was left in place", err)
+
+    def test_an_unreadable_policy_holds_this_runs_moves(self):
+        # `plan.failed` is recorded at the end of the apply and the moves
+        # run first, so a forced run wrote the pair into an environment
+        # nobody had established was shut, and deleted the repository
+        # copies behind it (Codex, mikelward/repo#36).
+        fake = self._publisher()
+        fake.secret_names = set(self.PAIR)
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        fake.env_get_check_fails = {"lanes"}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("could not read owner/repo's 'lanes' environment:", err)
+        self.assertIn(
+            "lanes: LANES_APP_ID, LANES_APP_PRIVATE_KEY stays a repository secret until the policy "
+            "can be read",
+            err,
+        )
+        self.assertEqual(fake.deleted_secrets, [])
+        self.assertEqual(fake.written_secrets, [])
+        self.assertEqual(fake.restricted, [])
+        self.assertEqual(fake.env_puts, [])
+
+    def test_a_half_done_policy_finished_before_the_failed_write_is_done(self):
+        # Custom mode naming no branch writes no PUT, so it had no restore
+        # and took no post-failure re-read either -- and reported failure
+        # over a policy another run had just installed (Codex,
+        # mikelward/repo#36).
+        fake = self._publisher()
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        fake.env_policies = {"lanes": []}
+        fake.policy_post_fails = {"lanes"}
+        fake.policy_post_fails_adding = {"lanes": "main"}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "restricted environment 'lanes' to branch 'main' (the branch policy write failed, and the "
+            "branch was added meanwhile)",
+            out,
+        )
+        # No PUT: this run never left custom mode, so there is nothing to
+        # restore and nothing of the environment's settings to rewrite.
+        self.assertEqual(fake.env_puts, [])
+        self.assertEqual(fake.env_policies["lanes"], ["main"])
+
+    def test_a_half_done_policy_still_empty_after_the_failed_write_fails(self):
+        # The other direction: the re-read is not an excuse to pass.
+        fake = self._publisher()
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        fake.env_policies = {"lanes": []}
+        fake.policy_post_fails = {"lanes"}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("Validation Failed (policy)", err)
+        self.assertEqual(fake.env_puts, [])
+        self.assertEqual(fake.env_policies["lanes"], [])
+
+    def test_a_restriction_left_half_done_is_completed(self):
+        # Custom-policy mode naming no branch: nobody sets it, and it is
+        # what a failed restore above would leave. Completed with the
+        # second write alone -- no PUT, so nothing else is touched.
+        fake = self._publisher()
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        fake.env_policies = {"lanes": []}
+        code, out, err = _run(fake, ["--force", "-v", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("lanes: restrict environment 'lanes' to branch 'main' -- it admits no branch at all", err)
+        self.assertEqual(fake.env_puts, [])
+        self.assertEqual(fake.restricted, [("lanes", "main")])
+        self.assertEqual(fake.env_policies["lanes"], ["main"])
+
+    def test_a_publisher_that_went_away_while_the_plan_waited_is_not_restricted(self):
+        # The environment already holds the pair and nothing is deleted, so
+        # the restriction is the only apply-time action -- and it is held
+        # to the same recheck a delete is (Codex, mikelward/repo#36).
+        fake = self._publisher()
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        fake.workflow_texts_after_recheck = {"ci.yml": "jobs: {}\n"}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "environment 'lanes' not restricted: the publishing workflows changed since the plan was built (none now)",
+            err,
+        )
+        self.assertEqual(fake.env_puts, [])
+        self.assertEqual(fake.restricted, [])
+
+    def test_a_default_branch_renamed_while_the_plan_waited_is_not_restricted(self):
+        # The restriction names the default branch; restricting to the old
+        # name would shut the new trusted branch out and let the stale one
+        # in (Codex, mikelward/repo#36).
+        fake = self._publisher()
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        fake.default_branch_after_bootstrap_plan = "trunk"
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("environment 'lanes' not restricted: the default branch is now 'trunk', not 'main'", err)
+        self.assertEqual(fake.restricted, [])
+
+    def test_a_deleted_environment_is_not_recreated_open_by_the_writes(self):
+        # `env_exists` on each write is a PLAN-TIME snapshot, so the writes
+        # re-ran `_ensure_environment` on the environment this run had just
+        # restricted -- and a deletion in that window is a 404 there, which
+        # CREATES it again with GitHub's default open policy. The pair then
+        # went in and the repository copies came out, into an environment
+        # any branch can enter: the run closed the door, somebody removed
+        # the door, and the run rebuilt it open and put the credential
+        # behind it, reporting success (Codex, mikelward/repo#36).
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = self._publisher()
+            fake.secret_names = set(self.PAIR)
+            fake.env_deleted_after_restrict = {"lanes"}
+            code, out, err = _run(
+                fake,
+                [
+                    "--force", "--no-rules",
+                    "--credential", f"LANES_APP_ID={app_id}",
+                    "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                    REPO,
+                ],
+            )
+        self.assertEqual(code, 1)
+        # Nothing written, nothing deleted, and no environment recreated
+        # for the pair to sit in.
+        self.assertEqual(fake.written_secrets, [])
+        self.assertEqual(fake.deleted_secrets, [])
+        self.assertNotIn("lanes", fake.env_secret_names)
+        self.assertIn("could not set 'LANES_APP_ID' on owner/repo (environment lanes)", err)
+        # The repository copies are the fallback, and they stay.
+        self.assertIn("LANES_APP_ID kept: the write it waited on failed", err)
+
+    def test_an_environment_reopened_while_the_pair_is_written_keeps_the_copies(self):
+        # Every other check this move makes happens BEFORE its writes, so
+        # the writes' own window was the last one open: an administrator
+        # reopening the environment there had the pair written into it and
+        # the repository copies deleted behind it, and the run exited 0
+        # with the credential reachable from an untrusted branch (Codex,
+        # mikelward/repo#36). The deletes are the irreversible half, so
+        # they are what the post-write confirmation gates -- and the halves
+        # this run WROTE are taken back out, since reporting alone left the
+        # credential sitting in an environment every branch could now read
+        # (Codex, mikelward/repo#36 again). The repository copies are the
+        # fallback and stay, so the run leaves the state it found.
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = self._publisher()
+            fake.secret_names = set(self.PAIR)
+            fake.env_reopened_during_writes = {"lanes"}
+            code, out, err = _run(
+                fake,
+                [
+                    "--force", "--no-rules",
+                    "--credential", f"LANES_APP_ID={app_id}",
+                    "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                    REPO,
+                ],
+            )
+        self.assertEqual(code, 1)
+        # Only this run's own environment writes are undone; the repository
+        # copies -- the irreversible half and the working fallback -- stay.
+        self.assertEqual(
+            sorted(fake.deleted_secrets),
+            [("LANES_APP_ID", "lanes"), ("LANES_APP_PRIVATE_KEY", "lanes")],
+        )
+        self.assertEqual(fake.env_secret_names["lanes"], set())
+        self.assertEqual(fake.secret_names, set(self.PAIR))
+        self.assertIn("undid the write of 'LANES_APP_ID' (environment 'lanes')", out)
+        self.assertIn(
+            "LANES_APP_ID kept: environment 'lanes' can be reached from any branch after the "
+            "credential was written",
+            err,
+        )
+        # Nothing is rewritten: the policy is left as whoever changed it
+        # left it, and the next run re-plans against what it finds.
+        self.assertEqual(fake.restricted, [("lanes", "main")])
+        self.assertIsNone(fake.env_policies["lanes"])
+
+    def test_a_first_write_into_a_reopened_environment_is_taken_back_out(self):
+        # The pair is placed into an environment that holds neither half,
+        # and an administrator reopens it mid-write. Both halves are this
+        # run's, so both come back out: leaving them reported the exposure
+        # while creating it, with a credential the operator had just handed
+        # in readable from every branch (Codex, mikelward/repo#36). There
+        # are no repository copies here, so the state restored is the one
+        # the run found -- nothing anywhere.
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = self._publisher()
+            fake.secret_names = set()
+            fake.env_secret_names = {"lanes": set()}
+            fake.env_policies = {"lanes": ["main"]}
+            fake.env_reopened_during_writes = {"lanes"}
+            code, out, err = _run(
+                fake,
+                [
+                    "--force", "--no-rules",
+                    "--credential", f"LANES_APP_ID={app_id}",
+                    "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                    REPO,
+                ],
+            )
+        self.assertEqual(code, 1)
+        self.assertEqual(fake.env_secret_names["lanes"], set())
+        self.assertEqual(
+            sorted(fake.deleted_secrets),
+            [("LANES_APP_ID", "lanes"), ("LANES_APP_PRIVATE_KEY", "lanes")],
+        )
+        self.assertIn("undid the write of 'LANES_APP_PRIVATE_KEY' (environment 'lanes')", out)
+        self.assertIn(
+            "lanes: environment 'lanes' can be reached from any branch after the credential was written",
+            err,
+        )
+
+    def test_a_rotation_with_nothing_to_delete_still_confirms_the_environment(self):
+        # A rotation into an environment that already holds the pair
+        # deletes nothing, so gating the post-write confirmation on the
+        # deletes skipped it exactly where the run had just put a FRESH
+        # credential somewhere any branch could read it -- and then
+        # reported the repository in shape (Codex, mikelward/repo#36).
+        # Nothing can be UNDONE on this path -- both halves are overwrites,
+        # whose old values are gone, and deleting them would leave no
+        # credential at all -- so the run names them instead of taking them
+        # back out (Codex, mikelward/repo#36).
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = self._publisher()
+            fake.secret_names = set()  # nothing at repository level to delete
+            fake.env_secret_names = {"lanes": set(self.PAIR)}
+            fake.env_policies = {"lanes": ["main"]}
+            fake.env_reopened_during_writes = {"lanes"}
+            code, out, err = _run(
+                fake,
+                [
+                    "--force", "--no-rules",
+                    "--credential", f"LANES_APP_ID={app_id}",
+                    "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                    REPO,
+                ],
+            )
+        self.assertEqual(code, 1)
+        self.assertEqual(fake.deleted_secrets, [])
+        self.assertIn(
+            "lanes: environment 'lanes' can be reached from any branch after the credential was written",
+            err,
+        )
+        self.assertIn(
+            "LANES_APP_ID holds the new value in environment 'lanes', which can be reached from any "
+            "branch -- it cannot be taken back out without leaving no credential at all",
+            err,
+        )
+
+    def test_a_half_written_pair_is_rolled_back_rather_than_shadowing(self):
+        # An environment secret shadows the repository copy of the same
+        # name for every job declaring that environment. So a half that
+        # lands while its partner's write fails leaves such a job
+        # authenticating with one new half and one old one -- a pair that
+        # worked before the run, broken by it (Codex, mikelward/repo#36).
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = self._publisher()
+            fake.secret_names = set(self.PAIR)  # both halves, and they work
+            fake.env_secret_names = {"lanes": set()}
+            fake.env_policies = {"lanes": ["main"]}
+            fake.set_fails = {"LANES_APP_PRIVATE_KEY"}
+            code, out, err = _run(
+                fake,
+                [
+                    "--force", "--no-rules",
+                    "--credential", f"LANES_APP_ID={app_id}",
+                    "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                    REPO,
+                ],
+            )
+        self.assertEqual(code, 1)
+        # The half that landed is undone, so the working repository pair is
+        # what every job sees again.
+        self.assertEqual(fake.env_secret_names["lanes"], set())
+        self.assertEqual(fake.deleted_secrets, [("LANES_APP_ID", "lanes")])
+        self.assertEqual(fake.secret_names, set(self.PAIR))
+        self.assertIn("undid the write of 'LANES_APP_ID' (environment 'lanes')", out)
+        self.assertIn("LANES_APP_ID kept: the write it waited on failed", err)
+
+    def test_the_first_failed_write_stops_the_rest(self):
+        # The inverse ordering of the partial rotation below: when the
+        # FIRST half's write fails, carrying on wrote the second over a
+        # pair that was working, breaking it in the one direction nothing
+        # can undo -- where stopping leaves the credential exactly as the
+        # run found it (Codex, mikelward/repo#36).
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = self._publisher()
+            fake.secret_names = set()
+            fake.env_secret_names = {"lanes": set(self.PAIR)}  # a working pair
+            fake.env_policies = {"lanes": ["main"]}
+            fake.set_fails = {"LANES_APP_ID"}
+            code, out, err = _run(
+                fake,
+                [
+                    "--force", "--no-rules",
+                    "--credential", f"LANES_APP_ID={app_id}",
+                    "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                    REPO,
+                ],
+            )
+        self.assertEqual(code, 1)
+        # The second write never happens, so nothing is mismatched and the
+        # run has nothing to report about a half it left behind.
+        self.assertEqual(
+            [c[2] for c in fake.calls if c[:2] == ["secret", "set"]], ["LANES_APP_ID"]
+        )
+        self.assertNotIn("now holds the new value", err)
+        self.assertEqual(fake.deleted_secrets, [])
+
+    def test_a_partial_rotation_says_the_pair_it_left_mismatched(self):
+        # Rotating overwrites both halves, so neither is one this run
+        # created and the rollback has nothing to undo: the environment is
+        # left with one new half and one old one, and the App cannot
+        # authenticate (Codex, mikelward/repo#36). Nothing can put it back
+        # -- GitHub never returns a secret's value -- so the run says what
+        # it left rather than reporting a bare write failure.
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = self._publisher()
+            fake.secret_names = set()
+            fake.env_secret_names = {"lanes": set(self.PAIR)}  # a working pair
+            fake.env_policies = {"lanes": ["main"]}
+            fake.set_fails = {"LANES_APP_PRIVATE_KEY"}
+            code, out, err = _run(
+                fake,
+                [
+                    "--force", "--no-rules",
+                    "--credential", f"LANES_APP_ID={app_id}",
+                    "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                    REPO,
+                ],
+            )
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "LANES_APP_ID now holds the new value in environment 'lanes' while its other half does "
+            "not, so the App cannot authenticate until both are set",
+            err,
+        )
+        # Not deleted: that would lose the credential outright rather than
+        # leave it mismatched, and the old value is not recoverable either.
+        self.assertEqual(fake.deleted_secrets, [])
+
+    def test_an_unreadable_rollback_inventory_stops_the_writes(self):
+        # The rollback needs to know which halves this run creates. Reading
+        # that can fail, and carrying on with an empty inventory made the
+        # read failure silently disable the very thing that keeps a
+        # half-written pair from shadowing a working repository one (Codex,
+        # mikelward/repo#36). So the writes do not start.
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = self._publisher()
+            fake.secret_names = set(self.PAIR)
+            fake.env_secret_names = {"lanes": set()}
+            fake.env_policies = {"lanes": ["main"]}
+            fake.env_secrets_fail_after = {"lanes": 2}  # the plan's read lands; this one does not
+            code, out, err = _run(
+                fake,
+                [
+                    "--force", "--no-rules",
+                    "--credential", f"LANES_APP_ID={app_id}",
+                    "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                    REPO,
+                ],
+            )
+        self.assertEqual(code, 1)
+        self.assertEqual(fake.written_secrets, [])
+        self.assertEqual(fake.deleted_secrets, [])
+        self.assertIn(
+            "LANES_APP_ID not set: the environment's secrets could not be read first", err
+        )
+
+    def test_a_policy_set_while_the_plan_waited_fails_the_run(self):
+        # The plan saw an open environment; by apply time someone set a
+        # policy of their own. Left alone -- and reported as a failure, not
+        # as a done step (Codex, mikelward/repo#36).
+        fake = self._publisher()
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        fake.env_policies_after_recheck = {"lanes": ["release/*"]}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "not fixed: lanes: environment 'lanes' is restricted to 'release/*', not to 'main' alone -- set "
+            "since the plan was built, and a policy someone set is not rewritten; restrict it to 'main' by hand",
+            err,
+        )
+        self.assertEqual(fake.env_puts, [])
+        self.assertEqual(fake.restricted, [])
+
+    def test_a_policy_set_between_the_two_reads_fails_the_run(self):
+        # The restriction reads the policy, then the environment again for
+        # the settings its PUT must resend; a policy set between the two
+        # is refused off the second read, never overwritten (Codex,
+        # mikelward/repo#36). The plan's read is the first, the apply-time
+        # policy recheck the second, the settings read the third.
+        fake = self._publisher()
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        fake.env_policies_after_read = {"lanes": (3, "protected")}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("changed its deployment branch policy between two reads of it", err)
+        self.assertEqual(fake.restricted, [])
+        self.assertEqual(fake.env_puts, [])
+
+    def test_a_pattern_added_before_the_half_done_completion_fails_the_run(self):
+        # Custom mode naming no branch is completed with one POST, and the
+        # policy list is re-read right before it: a pattern someone added
+        # meanwhile would otherwise gain the default branch beside it
+        # (Codex, mikelward/repo#36). Reads: the plan's, the apply-time
+        # recheck, the re-list before the POST.
+        fake = self._publisher()
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        fake.env_policies = {"lanes": []}
+        fake.env_policies_after_read = {"lanes": (3, ["release/*"])}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("changed its deployment branch policy between two reads of it", err)
+        self.assertEqual(fake.restricted, [])
+        self.assertEqual(fake.env_puts, [])
+
+    def test_a_half_done_completion_finished_meanwhile_is_done(self):
+        # Another run (or a hand) added exactly the default branch between
+        # the two reads: the environment is in the wanted state, which is
+        # done, not a conflict (Codex, mikelward/repo#36).
+        fake = self._publisher()
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        fake.env_policies = {"lanes": []}
+        fake.env_policies_after_read = {"lanes": (3, ["main"])}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("environment 'lanes' was restricted to branch 'main' since the plan was built", out)
+        self.assertEqual(fake.restricted, [])
+        self.assertEqual(fake.env_puts, [])
+
+    def test_a_restricted_environment_needs_nothing(self):
+        fake = self._publisher()
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        fake.env_policies = {"lanes": ["main"]}
+        # Alongside another step, so the combined plan is shown at all.
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+        code, out, err = _run(fake, ["--dry-run", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("lanes: the credential lives in the 'lanes' environment", out)
+        self.assertIn("lanes: environment 'lanes' admits only the trusted base branch", out)
+        self.assertEqual(fake.restricted, [])
+        self.assertEqual(fake.env_puts, [])
+
+    def test_a_policy_someone_set_is_reported_not_rewritten(self):
+        fake = self._publisher()
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        fake.env_policies = {"lanes": ["release/*"]}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "not fixed: lanes: environment 'lanes' is restricted to 'release/*', not to 'main' alone -- "
+            "restrict it to 'main' in the environment's settings; a policy someone set is not rewritten",
+            err,
+        )
+        self.assertEqual(fake.env_puts, [])
+        self.assertEqual(fake.restricted, [])
+
+    def test_a_policy_opened_while_the_plan_waited_holds_the_move(self):
+        # The policy was right when the plan was shown, so nothing queued a
+        # restriction and nothing else re-read the door -- the move's own
+        # recheck asks what the environment holds, not who may enter it
+        # (Codex, mikelward/repo#36).
+        fake = self._publisher()
+        fake.secret_names = set(self.PAIR)
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        fake.env_policies = {"lanes": ["main"]}
+        # Opened between the plan's read and the apply's.
+        fake.env_policies_after_read = {"lanes": (2, None)}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("environment 'lanes' now can be reached from any branch", err)
+        self.assertEqual(fake.deleted_secrets, [])
+        self.assertEqual(fake.written_secrets, [])
+        self.assertEqual(fake.env_puts, [])
+
+    def test_a_trusted_policy_still_trusted_at_apply_time_lets_the_move_run(self):
+        # The other direction: the re-read is a gate, not a refusal.
+        fake = self._publisher()
+        fake.secret_names = set(self.PAIR)
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        fake.env_policies = {"lanes": ["main"]}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(
+            sorted(name for name, _env in fake.deleted_secrets), sorted(self.PAIR)
+        )
+
+    def test_a_policy_someone_set_holds_the_repository_copies(self):
+        # The environment is shut before the credential goes into it, and a
+        # policy someone set is never rewritten -- so this environment
+        # cannot be shut, and deleting the repository copies would leave
+        # the pair only where a branch the policy admits can read it
+        # (Codex, mikelward/repo#36).
+        fake = self._publisher()
+        fake.secret_names = set(self.PAIR)
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        fake.env_policies = {"lanes": ["release/*"]}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "not fixed: lanes: environment 'lanes' is restricted to 'release/*', not to 'main' alone -- "
+            "restrict it to 'main' in the environment's settings; a policy someone set is not "
+            "rewritten; LANES_APP_ID, LANES_APP_PRIVATE_KEY stays a repository secret until then",
+            err,
+        )
+        self.assertEqual(fake.deleted_secrets, [])
+        self.assertEqual(fake.written_secrets, [])
+        self.assertEqual(fake.restricted, [])
+        self.assertEqual(fake.env_puts, [])
+        # The plan never offered the deletes it is not going to make.
+        self.assertNotIn("delete repository secret LANES_APP_ID", out + err)
+
+    def test_a_policy_someone_set_holds_a_supplied_pair(self):
+        # Same hold on the writes, and the declined names are said whatever
+        # the verbosity: placing the pair here would create the exposure
+        # the finding is about (Codex, mikelward/repo#36).
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = self._publisher()
+            fake.env_secret_names = {"lanes": set()}
+            fake.env_policies = {"lanes": "protected"}
+            code, out, err = _run(
+                fake,
+                [
+                    "--force", "--no-rules",
+                    "--credential", f"LANES_APP_ID={app_id}",
+                    "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                    REPO,
+                ],
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("admits protected branches", err)
+        for name in self.PAIR:
+            self.assertIn(
+                f"lanes: {name} not set -- the 'lanes' environment admits a branch this cannot "
+                f"trust, and the credential is not placed where such a branch reads it",
+                err,
+            )
+        self.assertEqual(fake.written_secrets, [])
+        self.assertEqual(fake.deleted_secrets, [])
+        self.assertEqual(fake.restricted, [])
+        self.assertEqual(fake.env_puts, [])
+        self.assertNotIn("set LANES_APP_ID in environment", out + err)
+
+    def test_a_publisher_without_the_environment_holds_the_move_back(self):
+        fake = self._publisher(self.PUBLISHER.replace("    environment: lanes\n", ""))
+        fake.secret_names = set(self.PAIR)
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "not fixed: lanes: ci publishes the lanes status as the App from a job that does not declare "
+            "`environment: lanes`, so a credential in the 'lanes' environment would never reach it -- "
+            "declare the environment on every job that takes `app-id` first; LANES_APP_ID, "
+            "LANES_APP_PRIVATE_KEY left as is",
+            err,
+        )
+        self.assertEqual(fake.deleted_secrets, [])
+        # The environment is not touched while the credential is stranded.
+        self.assertEqual(fake.restricted, [])
+
+    def test_a_branch_copy_without_the_environment_does_not_hold_the_move_back(self):
+        # The default branch's publisher declares the environment; a copy
+        # on a branch does not. That copy runs from its branch, which the
+        # restricted environment shuts out either way, so it loses the
+        # credential when the repository copy moves -- and keeping the
+        # repository copy for its sake would leave the pair exposed to
+        # exactly that branch's push-triggered run (Codex, mikelward/repo#36).
+        fake = self._publisher()
+        fake.branch_workflows = {"feature": {"ci.yml": self.PUBLISHER.replace("    environment: lanes\n", "")}}
+        fake.secret_names = set(self.PAIR)
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(sorted(fake.deleted_secrets), [("LANES_APP_ID", None), ("LANES_APP_PRIVATE_KEY", None)])
+        self.assertNotIn("not fixed", err)
+        # And the default branch's own publisher still does hold it back,
+        # whatever a branch copy declares.
+        fake = self._publisher(self.PUBLISHER.replace("    environment: lanes\n", ""))
+        fake.branch_workflows = {"feature": {"ci.yml": self.PUBLISHER}}
+        fake.secret_names = set(self.PAIR)
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("not fixed: lanes: ci publishes the lanes status", err)
+        self.assertEqual(fake.deleted_secrets, [])
+
+    def test_a_publisher_only_on_a_branch_keeps_the_pair_and_says_so(self):
+        # The pull request adopting lanes: nothing on the default branch
+        # publishes yet, the branch copy will once merged. The pair moves
+        # and the environment is restricted -- what that merge needs -- and
+        # the plan says no publisher reaches it yet (Codex, mikelward/repo#36).
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        fake.workflow_texts = {"ci.yml": "jobs: {}\n"}
+        fake.branch_workflows = {"feature": {"ci.yml": self.PUBLISHER}}
+        fake.secret_names = set(self.PAIR)
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        code, out, err = _run(fake, ["--force", "--no-rules", "-v", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "lanes: no workflow on the default branch publishes the lanes status as the App; ci on "
+            "feature does from a branch, which reaches the environment once merged -- the pair is "
+            "kept for it",
+            out + err,
+        )
+        self.assertNotIn("nothing uses it", out + err)
+        self.assertEqual(sorted(fake.deleted_secrets), [("LANES_APP_ID", None), ("LANES_APP_PRIVATE_KEY", None)])
+        self.assertEqual(len(fake.restricted), 1)
+
+    def test_a_branch_only_publisher_that_went_away_holds_the_apply_back(self):
+        # The plan rested on the branch copy alone; gone while the prompt
+        # sat, the apply would otherwise leave a pair nothing uses (Codex,
+        # mikelward/repo#36).
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        fake.workflow_texts = {"ci.yml": "jobs: {}\n"}
+        fake.branch_workflows = {"feature": {"ci.yml": self.PUBLISHER}}
+        fake.secret_names = set(self.PAIR)
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        fake.branch_workflows_after_recheck = {"feature": {"ci.yml": "jobs: {}\n"}}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("the publishing workflows changed since the plan was built (none now)", err)
+        self.assertEqual(fake.deleted_secrets, [])
+        self.assertEqual(fake.restricted, [])
+
+    def test_half_the_pair_handed_to_the_action_holds_everything(self):
+        # Neither unused nor a publisher: the pair stays where it is, and the
+        # environment is not touched, until the step takes both inputs.
+        fake = self._publisher(self.PUBLISHER.replace("          app-id: ${{ secrets.LANES_APP_ID }}\n", ""))
+        fake.secret_names = set(self.PAIR)
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "not fixed: lanes: ci hands mikelward/lanes one of `app-id` and `app-private-key` without the "
+            "other, so the step cannot authenticate as the App -- hand it both first; LANES_APP_ID, "
+            "LANES_APP_PRIVATE_KEY left as is",
+            err,
+        )
+        self.assertEqual(fake.deleted_secrets, [])
+        self.assertEqual(fake.restricted, [])
+
+    def test_a_pair_nothing_publishes_with_is_deleted(self):
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        fake.workflow_texts = {
+            "ci.yml": "jobs:\n  classify:\n    steps:\n      - uses: mikelward/lanes@main\n        with:\n          mode: classify\n"
+        }
+        fake.secret_names = {"LANES_APP_ID"}
+        fake.env_secret_names = {"lanes": {"LANES_APP_PRIVATE_KEY"}}
+        code, out, err = _run(fake, ["--force", "-v", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "lanes: delete repository secret LANES_APP_ID -- no workflow here publishes the lanes status as "
+            "the App (a mikelward/lanes step taking `app-id`), so nothing uses it",
+            err,
+        )
+        self.assertEqual(sorted(fake.deleted_secrets), [("LANES_APP_ID", None), ("LANES_APP_PRIVATE_KEY", "lanes")])
+        self.assertEqual(fake.restricted, [])
+
+    def test_a_shape_the_reader_cannot_resolve_deletes_nothing(self):
+        fake = self._publisher("jobs: {init: {steps: [{uses: mikelward/lanes@main, with: {app-id: x}}]}}\n")
+        fake.secret_names = set(self.PAIR)
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("not fixed: lanes: ci mentions mikelward/lanes in a shape this cannot read as a step", err)
+        self.assertEqual(fake.deleted_secrets, [])
+
+    def test_a_policy_added_while_the_restriction_ran_fails_the_run(self):
+        # Both writes land, which is not the same as the environment being
+        # restricted: someone adding another custom policy between them
+        # leaves it admitting an untrusted branch, and reporting success
+        # over that says the run left the repository in shape (Codex,
+        # mikelward/repo#36). The postcondition is what this function is
+        # for, so it is read rather than inferred from two exit codes.
+        fake = self._publisher()
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        fake.env_policies = {"lanes": []}
+        fake.policy_added_during_post = {"lanes": "release/*"}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "not fixed: lanes: environment 'lanes' still admits 'main', 'release/*' after adding "
+            "'main' -- a policy set while this ran, left in place rather than deleted; remove it by "
+            "hand so only 'main' remains",
+            err,
+        )
+        # Left in place: someone set it, and this deletes nobody's policy.
+        self.assertEqual(fake.env_policies["lanes"], ["main", "release/*"])
+
+    def test_half_a_supplied_pair_is_not_written_at_all(self):
+        # The repository holds one half and only the other is supplied, so
+        # the run ends with the credential still unusable. Writing the
+        # supplied half anyway put it in an environment the caller then
+        # returned early without restricting -- readable by any branch,
+        # beside the half still at repository level, which together are the
+        # whole App credential (Codex, mikelward/repo#36).
+        with tempfile.TemporaryDirectory() as tmp:
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = self._publisher()
+            fake.secret_names = {"LANES_APP_ID"}
+            code, out, err = _run(
+                fake,
+                ["--force", "--no-rules", "--credential", f"LANES_APP_PRIVATE_KEY={key}", REPO],
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("environment 'lanes' holds no credential", err)
+        self.assertIn(
+            "lanes: LANES_APP_PRIVATE_KEY not set -- half a credential is not one, and the rest "
+            "of it has to arrive in the same run",
+            err,
+        )
+        self.assertEqual(fake.written_secrets, [])
+        self.assertEqual(fake.deleted_secrets, [])
+        self.assertEqual(fake.restricted, [])
+        # The complete pair in the same run is written, so the guard is on
+        # "unusable after this run", not on "supplied".
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            both = self._publisher()
+            both.secret_names = {"LANES_APP_ID"}
+            code, out, err = _run(
+                both,
+                [
+                    "--force", "--no-rules",
+                    "--credential", f"LANES_APP_ID={app_id}",
+                    "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                    REPO,
+                ],
+            )
+        self.assertEqual(code, 0, err)
+        self.assertEqual([w[0] for w in both.written_secrets], ["LANES_APP_ID", "LANES_APP_PRIVATE_KEY"])
+        self.assertEqual(both.restricted, [("lanes", "main")])
+
+    def test_the_half_already_in_the_environment_is_re_read_before_the_write(self):
+        # Completing a half the environment already holds queues a write
+        # and no delete, and the destination re-read was gated on there
+        # being a delete -- so it skipped exactly the case where the other
+        # half is the thing that might be gone. Setup wrote one secret,
+        # restricted the environment, and exited 0 with a credential that
+        # cannot authenticate (Codex, mikelward/repo#36).
+        with tempfile.TemporaryDirectory() as tmp:
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = self._publisher()
+            fake.env_secret_names = {"lanes": {"LANES_APP_ID"}}
+            fake.env_secret_names_after_recheck = {"lanes": set()}
+            code, out, err = _run(
+                fake,
+                ["--force", "--no-rules", "--credential", f"LANES_APP_PRIVATE_KEY={key}", REPO],
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("no longer holds the credential", err)
+        self.assertEqual(fake.written_secrets, [])
+        self.assertEqual(fake.restricted, [])
+
+    def test_a_pair_removed_while_the_plan_waited_holds_the_restriction_back(self):
+        # The restriction-only move writes and deletes nothing, so `move`'s
+        # own destination re-read never runs for it. Asking only what the
+        # workflows say restricted an environment an administrator had
+        # emptied meanwhile and exited 0, while a fresh plan and the audit
+        # both report no usable credential (Codex, mikelward/repo#36).
+        fake = self._publisher()
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        fake.env_secret_names_after_recheck = {"lanes": {"LANES_APP_ID"}}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "environment 'lanes' not restricted: the 'lanes' environment no longer holds the credential",
+            err,
+        )
+        self.assertEqual(fake.restricted, [])
+        self.assertEqual(fake.env_puts, [])
+
+    def test_a_failed_restriction_holds_back_the_writes_and_the_deletes(self):
+        # The restriction is not a step beside the move, it is the door the
+        # move goes through. Failing it used to fail the run and delete the
+        # repository copies anyway, leaving the pair only in an environment
+        # any branch can enter -- and with a supplied value, writing it
+        # there in the first place (Codex, mikelward/repo#36).
+        fake = self._publisher()
+        fake.secret_names = set(self.PAIR)
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        fake.restrict_fails = {"lanes"}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(f"could not restrict environment 'lanes' on {REPO}:", err)
+        self.assertIn("LANES_APP_ID kept: the environment was not restricted", err)
+        self.assertEqual(fake.deleted_secrets, [])
+
+    def test_a_failed_restriction_writes_no_supplied_value(self):
+        # The same door, on the path that would otherwise CREATE the
+        # exposure: a supplied pair written into an environment whose
+        # restriction then failed is a credential every branch can read,
+        # where before the run there was none there at all.
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = self._publisher()
+            fake.secret_names = set(self.PAIR)
+            fake.restrict_fails = {"lanes"}
+            code, out, err = _run(
+                fake,
+                [
+                    "--force", "--no-rules",
+                    "--credential", f"LANES_APP_ID={app_id}",
+                    "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                    REPO,
+                ],
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("LANES_APP_ID not set: the environment was not restricted", err)
+        self.assertEqual(fake.written_secrets, [])
+        self.assertEqual(fake.deleted_secrets, [])
+
+
 class CredentialsStepTest(unittest.TestCase):
     """The fleet-credentials step: always on, it sets a supplied credential
     in the environment it belongs in, deletes the copies that leaves
@@ -3422,7 +4660,8 @@ class CredentialsStepTest(unittest.TestCase):
         code, out, err = _run(fake, ["--force", "--no-rules", REPO])
         self.assertEqual(code, 1)
         self.assertIn(
-            f"GRADLE_UPDATE_PAT kept: could not list {REPO}'s workflows (the plan could not be re-validated)",
+            f"GRADLE_UPDATE_PAT kept: could not list {REPO}'s workflows on branch main (the plan could not "
+            "be re-validated)",
             err,
         )
         self.assertEqual(fake.deleted_secrets, [])

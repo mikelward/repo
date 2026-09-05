@@ -55,12 +55,16 @@ at all.
 
 It also audits where secrets live (new here; the shell source never did).
 The fleet's shared credentials -- the weekly dependency batches'
-`<HUB>_PAT` (or `<HUB>_APP_ID` + `<HUB>_APP_PRIVATE_KEY` pair) and the
-screenshot commit-back token -- each belong in an environment named after
-the reusable workflow that reads them, because a secret passed to a
-reusable workflow reaches the runner of every job in it, a batch's
-untrusted update job included (repo_lib.credentials has the full
-reasoning). A credential kept as a REPOSITORY secret, a consumer (one
+`<HUB>_PAT` (or `<HUB>_APP_ID` + `<HUB>_APP_PRIVATE_KEY` pair), the
+screenshot commit-back token, and the lanes App pair (`LANES_APP_ID` +
+`LANES_APP_PRIVATE_KEY`) -- each belong in an environment named after
+the reusable workflow or action that reads them, because a secret passed
+to a reusable workflow reaches the runner of every job in it, a batch's
+untrusted update job included, and a repository secret reaches every job
+of every workflow (repo_lib.credentials has the full reasoning). The
+lanes environment is also held to admitting only the default branch: the
+App publishes the required status, so an environment any branch can reach
+hands a same-repo pull request's push-triggered run the same reach. A credential kept as a REPOSITORY secret, a consumer (one
 carrying the hub's caller workflow) whose environment holds no credential
 at all, and a batch credential left behind by a batch this repository no
 longer runs are each reported as [FIX] -- a finding `repo setup` closes,
@@ -351,6 +355,22 @@ def audit_delete_branch_on_merge(repo, ok, fix):
         )
 
 
+def _setup_stops(blocked):
+    """The caveat every `repo setup` recommendation in the lanes section
+    carries while its planner would not get that far, or "" while it
+    would. The planner reports and returns on an unreadable mention, half
+    a pair, another App's secrets, a pair nothing publishes with, or a
+    default-branch publisher whose job does not declare the environment --
+    before the move, the write and the restriction alike, so every one of
+    those recommendations promised something the run does not do. One
+    suffix rather than a fix per sentence, since each is the same promise
+    about the same command (Codex, mikelward/repo#36, twice: once for the
+    policy message, once for the credential ones beside it)."""
+    if blocked is None:
+        return ""
+    return f" -- but not while {blocked}: the command reports that and stops first"
+
+
 def audit_secrets(repo, ok, fix):
     """Reports where the fleet credentials live, and names every other
     repository-level secret. See the module docstring for the reasoning.
@@ -384,7 +404,8 @@ def audit_secrets(repo, ok, fix):
     # "cannot tell", never "does not run". Read as `repo setup` reads it,
     # so the two agree.
     try:
-        texts = credentials.workflow_texts(repo)
+        default = credentials.default_branch(repo)
+        texts = credentials.workflow_texts(repo, default)
     except credentials.ReadError as e:
         error_lines(e.message, e.detail)
         raise SystemExit(1)
@@ -536,6 +557,206 @@ def audit_secrets(repo, ok, fix):
                 f"pull request with drift wedges on checks that never arrive; "
                 f"{move_command([token])} sets one"
             )
+
+    # The lanes App credential, audited the way the token above is -- with
+    # one difference the action's shape forces: an environment secret
+    # reaches a step through the job's own `environment:` declaration, not
+    # through `secrets: inherit`, so that declaration is what each
+    # publishing job is held to. And the environment itself is audited:
+    # the credential publishes the status the ruleset requires, so an
+    # environment any branch can reach hands a same-repo pull request's
+    # push-triggered run the same reach (mikelward/lanes's README, "Trusted
+    # publishing").
+    app_id, app_key = credentials.LANES_APP_ID, credentials.LANES_APP_PRIVATE_KEY
+    label = credentials.LANES_ENV
+    action = credentials.LANES_ACTION
+    publishers = credentials.lanes_publishers(texts)
+    unread = credentials.lanes_unread(texts)
+    incomplete = credentials.lanes_incomplete(texts)
+    environment, env_secrets = environment_secrets(label)
+    as_repository = [name for name in (app_id, app_key) if name in repo_secrets]
+    for name in incomplete:
+        fix(
+            f"{label}: {credentials.workflow_label(name)} hands {action} one of `app-id` and "
+            f"`app-private-key` without the other, so the step cannot authenticate as the App and "
+            f"publishes nothing; hand it both"
+        )
+    # Whether `repo setup` would reach the environment's policy at all.
+    # Each of these makes its planner report and return before any
+    # restriction, so telling a reader the command closes an open
+    # environment is a promise it does not keep (Codex, mikelward/repo#36).
+    # A branch-only publisher is NOT one of them: that path says its piece
+    # and carries on to the move and the restriction.
+    blocked = (
+        f"{credentials.workflow_labels(unread)} mentions {action} in a shape this cannot read"
+        if unread
+        else f"{credentials.workflow_labels(incomplete)} hands {action} half the pair"
+        if incomplete
+        else f"no workflow here publishes the lanes status as the App, so the pair reads as unused"
+        if not publishers
+        else None
+    )
+
+    def policy_holds_the_move():
+        """Why a policy someone set stops every credential move here, or
+        None. `repo setup` rewrites nobody's policy, so it drops the whole
+        move rather than writing the pair into an environment it cannot
+        vouch for -- and a recommendation that named the command without
+        saying so advertised one that exits nonzero having moved nothing
+        (Codex, mikelward/repo#36). Unlike the other blockers this one
+        stops the `--credential` commands too: supplying the pair does not
+        settle the policy."""
+        if environment is None:
+            return None
+        try:
+            policy = credentials.environment_branch_policy(repo, environment)
+        except credentials.ReadError:
+            # Reported where the policy is read for its own finding; not
+            # this helper's to raise twice.
+            return None
+        if credentials.branch_policy_verdict(policy, default) is None:
+            return None
+        if credentials.restrictable(policy):
+            return None
+        return (
+            f"environment '{environment}' is set to a policy `repo setup` does not rewrite, so it "
+            f"drops the move rather than place the pair behind one it cannot vouch for"
+        )
+
+    def setup_stops(name_the_missing_pair=False):
+        """`_setup_stops` for a recommendation whose command is a plain
+        `repo setup {repo}`.
+
+        A pair held nowhere stops that command too -- the move reports it
+        and the planner returns before the policy is reached, so promising
+        an unqualified `repo setup` would restrict the environment is a
+        promise it does not keep (Codex, mikelward/repo#36). It is not part
+        of `blocked` itself because every other recommendation here names
+        `--credential`, and those commands SUPPLY the missing pair: adding
+        it there would qualify a line with the very condition its own
+        command resolves."""
+        held = policy_holds_the_move()
+        if blocked is None and held is not None:
+            return _setup_stops(held)
+        if blocked is None and name_the_missing_pair and not credentials.lanes_usable(
+            set(repo_secrets) | set(env_secrets)
+        ):
+            return _setup_stops(
+                f"neither the repository nor the '{label}' environment holds a usable {app_id} "
+                f"and {app_key} for it to place"
+            )
+        return _setup_stops(blocked)
+    if unread:
+        fix(
+            f"{label}: {credentials.workflow_labels(unread)} mentions {action} in a shape this "
+            f"cannot read as a step -- whether the App credential is used there cannot be told; "
+            f"write it as a step-level `uses:` (`repo setup` moves or deletes nothing of its until then)"
+        )
+    elif not publishers and not incomplete:
+        where = []
+        if as_repository:
+            where.append(f"{', '.join(as_repository)} as a repository secret")
+        left_behind = sorted(name for name in env_secrets if name in (app_id, app_key))
+        if left_behind:
+            where.append(f"{', '.join(left_behind)} in the '{environment}' environment")
+        if where:
+            fix(
+                f"{' and '.join(where)}, but no workflow here publishes the lanes status as the "
+                f"App (a {action} step taking `app-id`) -- `repo setup {repo}` deletes it"
+            )
+    else:
+        declares = True
+        trusted = [name for name in publishers if name.branch is None]
+        if not trusted:
+            # Ordinarily the pull request adopting lanes: the pair stays
+            # (a branch-only batch caller keeps its credential too), but
+            # nothing on the trusted branch reaches it yet, so this is not
+            # the [ok] line (Codex, mikelward/repo#36).
+            print(
+                f"  [CHECK] {label}: no workflow on the default branch publishes the lanes status "
+                f"as the App; {credentials.workflow_labels(sorted(publishers))} does from a branch, "
+                f"which reaches the environment once merged"
+            )
+        for name, verdict in sorted(publishers.items()):
+            if not verdict and name.branch is not None:
+                # A branch copy runs from its branch, which a restricted
+                # environment shuts out whether or not the job declares it;
+                # it loses the credential when the repository copy moves,
+                # and that is not a reason to keep the copy (Codex,
+                # mikelward/repo#36).
+                print(
+                    f"  [CHECK] {label}: {credentials.workflow_label(name)} publishes the lanes status "
+                    f"as the App from a job that does not declare `environment: {label}`; a branch "
+                    f"copy runs from its branch, which the restricted environment shuts out anyway, "
+                    f"so it loses the credential when the repository copy moves"
+                )
+                continue
+            if not verdict:
+                declares = False
+                if blocked is None:
+                    blocked = (
+                        f"{credentials.workflow_label(name)} publishes from a job that does not "
+                        f"declare `environment: {label}`"
+                    )
+                fix(
+                    f"{label}: {credentials.workflow_label(name)} publishes the lanes status as the "
+                    f"App from a job that does not declare `environment: {label}`, so a credential "
+                    f"in that environment never reaches it -- `init` fails outright and `gate` "
+                    f"silently falls back to the ambient check-run; declare the environment on "
+                    f"every job that takes `app-id`"
+                )
+        if as_repository:
+            # Reported even when the environment already holds a copy: the
+            # repository one is what reaches every job of every workflow --
+            # a same-repo pull request's own push-triggered run included.
+            fix(
+                f"{label}: {', '.join(as_repository)} is a repository secret, which reaches every "
+                f"job of every workflow -- a same-repo pull request's push-triggered run included, "
+                f"which is the hole trusted publishing exists to close -- "
+                f"{move_command(as_repository)} moves it into the '{label}' environment"
+                + setup_stops()
+            )
+        if credentials.lanes_usable(env_secrets):
+            if not as_repository and declares and trusted:
+                ok(f"{label}: the App credential lives in the '{label}' environment")
+        elif not credentials.lanes_usable(set(repo_secrets) | set(env_secrets)):
+            half = (
+                f", and {', '.join(as_repository)} is only half of the App pair"
+                if as_repository
+                else ""
+            )
+            fix(
+                f"{label}: environment '{label}' holds no App credential ({app_id} and "
+                f"{app_key}){half} -- the workflow cannot publish the `{label}` status the ruleset "
+                f"requires; {move_command([app_id, app_key])} sets one" + setup_stops()
+            )
+        if environment is not None:
+            try:
+                policy = credentials.environment_branch_policy(repo, environment)
+            except credentials.ReadError as e:
+                error_lines(e.message, e.detail)
+                raise SystemExit(1)
+            wrong = credentials.branch_policy_verdict(policy, default)
+            if wrong is None:
+                ok(f"{label}: environment '{environment}' admits only the trusted base branch")
+            elif policy == "open":
+                fix(
+                    f"{label}: environment '{environment}' {wrong} -- a same-repo pull request's "
+                    f"push-triggered workflow reads the App credential exactly as the trusted "
+                    f"jobs do; `repo setup {repo}` restricts it to '{default}'" + setup_stops(True)
+                )
+            elif credentials.restrictable(policy):
+                fix(
+                    f"{label}: environment '{environment}' {wrong} -- custom-policy mode with no "
+                    f"branch named, the state a restriction leaves when its second write fails, so "
+                    f"no job reaches the credential; `repo setup {repo}` completes it with "
+                    f"'{default}'" + setup_stops(True)
+                )
+            else:
+                fix(
+                    f"{label}: environment '{environment}' {wrong} -- restrict it to '{default}' "
+                    f"in the environment's settings (`repo setup` rewrites no policy someone set)"
+                )
 
     other = sorted(name for name in repo_secrets if name not in credentials.FLEET_CREDENTIALS)
     if other:

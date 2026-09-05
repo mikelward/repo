@@ -143,7 +143,21 @@ reusable workflow in a shape the audit cannot read as a caller ("cannot
 tell"), and a credential left behind by a workflow nothing here calls --
 for the batches and the commit-back workflow alike -- are each reported as
 `[FIX]` -- a finding `repo setup` closes, named with the command -- and
-every other repository-level secret is listed by name for review. A repository that does not allow auto-merge is a `[FIX]` too: the weekly
+every other repository-level secret is listed by name for review. The lanes
+App pair (`LANES_APP_ID` + `LANES_APP_PRIVATE_KEY`, which mikelward/lanes's
+`init`, `attest` and `gate` modes publish the required `lanes` status with)
+is audited the same way with one substitution the action's shape forces: a
+step reads no `secrets: inherit`, so the environment secret reaches it only
+through the job's own `environment: lanes` declaration, and a publishing job
+(one handing the action `app-id`) without that declaration is the `[FIX]`
+instead of a caller naming its secrets. The `lanes` environment itself is
+held to admitting only the default branch -- a custom policy naming exactly
+it; "protected branches only" is not that, since GitHub reads it as every
+branch while no branch-protection rule exists, and a ruleset is not one: the
+App publishes the status the ruleset requires, so an environment any branch
+can reach hands a same-repo pull request's push-triggered run the same reach
+-- an open one is a `[FIX]` that `repo setup` closes, a policy someone set
+to something else is a `[FIX]` to close by hand. A repository that does not allow auto-merge is a `[FIX]` too: the weekly
 batches arm it on their pull requests. So is one that does not delete a merged
 pull request's head branch automatically -- without it nothing sweeps the
 branches a merge leaves behind (see `repo cleanup` below). `[FIX]` findings do
@@ -166,8 +180,13 @@ one flag that places it). It refuses -- and says so, as
 (an environment secret reaches a called workflow only through
 `secrets: inherit`, so the move would hand the workflow nothing) or when the
 environment holds nothing and no value was given (GitHub never returns a
-secret's value, so a move needs it handed in). Across a fleet:
-`repo list | xargs -n1 repo setup --force --credential NPM_UPDATE_PAT=pat.txt --credential GRADLE_UPDATE_PAT=pat.txt --credential RUST_UPDATE_PAT=pat.txt --credential CI_COMMIT_ARTIFACT_TOKEN=token.txt`.
+secret's value, so a move needs it handed in). The lanes App pair moves the
+same way, held back by a publishing job that does not declare the
+environment; once the pair is settled, an open `lanes` environment is
+restricted to the default branch (re-sending its wait timer and reviewers,
+which the API would otherwise reset), and a policy someone set to anything
+else is reported, never rewritten. Across a fleet:
+`repo list | xargs -n1 repo setup --force --credential NPM_UPDATE_PAT=pat.txt --credential GRADLE_UPDATE_PAT=pat.txt --credential RUST_UPDATE_PAT=pat.txt --credential CI_COMMIT_ARTIFACT_TOKEN=token.txt --credential LANES_APP_ID=app-id.txt --credential LANES_APP_PRIVATE_KEY=app.pem`.
 `repo cleanup` deletes the branches a repository has finished with. It exists
 because this fleet used to leave GitHub's "automatically delete head branches"
 off with nothing else sweeping up -- mikelward/simmo reached 192 branches, 184
