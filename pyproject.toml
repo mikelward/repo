@@ -1,0 +1,13 @@
+# The one third-party dependency, declared where `uv run ./repo ...` reads
+# it and installs it into a project environment on its own. There is no
+# build: `./repo` runs from the checkout as it always has, so this project
+# is a virtual one to uv (`package = false`), never installed or published.
+[project]
+name = "repo"
+version = "0"
+description = "Fleet-management CLI for GitHub repositories"
+requires-python = ">=3.9"
+dependencies = ["PyYAML>=6"]
+
+[tool.uv]
+package = false

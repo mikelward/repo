@@ -23,11 +23,11 @@ jobs:
 
 
 class CallerInheritsTest(unittest.TestCase):
-    """The text reading behind every move and every delete: which jobs call
-    a reusable workflow, and whether they pass `secrets: inherit`. Its
+    """The reading behind every move and every delete: which jobs call a
+    reusable workflow, and whether they pass `secrets: inherit`. Its
     failure mode is a false "unused" -- a caller it cannot see makes the
     credential look stale, and setup deletes it -- so the shapes the fleet
-    actually writes are pinned here."""
+    actually writes are pinned here, and so is what the parser rejects."""
 
     def test_an_inheriting_job_level_caller(self):
         self.assertIs(credentials.caller_inherits(CALLER, "mikelward/npm-update/"), True)
@@ -66,10 +66,15 @@ class CallerInheritsTest(unittest.TestCase):
             )
             self.assertIs(credentials.caller_inherits(quoted, "mikelward/npm-update/"), True, quote)
 
-    def test_mentions_is_the_backstop_for_shapes_the_reader_cannot_parse(self):
+    def test_mentions_is_the_backstop_for_a_document_the_parser_rejects(self):
+        # Flow style is YAML like any other and reads as the caller it is;
+        # what resolves nothing is a document PyYAML rejects, and every
+        # mention in that is "cannot tell".
         flow = "jobs: {sync: {uses: mikelward/ci-commit-artifact/.github/workflows/commit-artifact.yml@main, secrets: inherit}}\n"
-        self.assertIsNone(credentials.caller_inherits(flow, "mikelward/ci-commit-artifact/"))
-        self.assertTrue(credentials.mentions(flow, "mikelward/ci-commit-artifact/"))
+        self.assertIs(credentials.caller_inherits(flow, "mikelward/ci-commit-artifact/"), True)
+        rejected = flow.replace("secrets: inherit}}", "secrets: inherit}")
+        self.assertIsNone(credentials.caller_inherits(rejected, "mikelward/ci-commit-artifact/"))
+        self.assertTrue(credentials.mentions(rejected, "mikelward/ci-commit-artifact/"))
         self.assertFalse(credentials.mentions(CALLER, "mikelward/ci-commit-artifact/"))
 
     def test_a_trailing_comment_does_not_hide_the_value(self):
@@ -134,11 +139,15 @@ class CallerInheritsTest(unittest.TestCase):
             found = credentials.callers({"npm-update.yml": text}, prefix)
             self.assertEqual(found, {"npm-update.yml": True}, text)
             self.assertEqual(credentials.unread_mentions({"npm-update.yml": text}, prefix), [], text)
-        # A `#` inside a quoted scalar is content, and the mention counts.
+        # A `#` inside a quoted scalar is content rather than a comment,
+        # so `mentions` -- which counts the name anywhere in a string, the
+        # direction that KEEPS a credential -- still sees it. A name in a
+        # real comment calls nothing and is not a string at all.
         quoted = 'env:\n  NOTE: "# mikelward/npm-update/ is the batch"\n'
-        self.assertEqual(credentials.unread_mentions({"ci.yml": quoted}, prefix), ["ci.yml"])
+        self.assertTrue(credentials.mentions(quoted, prefix))
         spanning = 'env:\n  NOTE: "no comment\n    # mikelward/npm-update/ here"\n'
-        self.assertEqual(credentials.unread_mentions({"ci.yml": spanning}, prefix), ["ci.yml"])
+        self.assertTrue(credentials.mentions(spanning, prefix))
+        self.assertFalse(credentials.mentions("env:\n  NOTE: plain # mikelward/npm-update/\n", prefix))
 
     def test_the_repository_name_is_matched_in_any_case(self):
         # Owner and repository names are case-insensitive on GitHub, so a
@@ -340,6 +349,37 @@ class CallersTest(unittest.TestCase):
     )
     NAMING = CALLER.replace("secrets: inherit", "secrets:\n      token: ${{ secrets.NPM_UPDATE_PAT }}")
 
+    def test_an_aliased_caller_job_is_one_node_on_both_sides(self):
+        # `_strings` visits a container once, so an anchored job aliased
+        # under a second name contributes ONE mention while the verdict
+        # list held two -- and the two disagreeing by one let a third,
+        # unresolvable mention balance the totals, so the file read as
+        # fully understood and setup deleted the credential out from under
+        # the caller it could not read. The lanes reader was given the
+        # node-counting discipline first and this path was left mixing the
+        # two (Codex, mikelward/repo#36).
+        aliased = (
+            "jobs:\n"
+            "  update: &j\n"
+            "    uses: mikelward/npm-update/.github/workflows/npm-update.yml@main\n"
+            "    secrets: inherit\n"
+            "  again: *j\n"
+        )
+        # On its own the aliased job is consistent: one node, one mention.
+        self.assertEqual(credentials.unread_mentions({"ci.yml": aliased}, self.PREFIX), [])
+        self.assertEqual(credentials.caller_inherits(aliased, self.PREFIX), True)
+        # Both names are still callers, so the reading itself is unchanged.
+        self.assertEqual(len(credentials._caller_verdicts(aliased, self.PREFIX)), 2)
+        # Add a mention nothing resolves -- a step-level `uses:`, which is
+        # not a job -- and the file is unread, which it was not before.
+        with_step = aliased + (
+            "  build:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - uses: mikelward/npm-update/.github/workflows/npm-update.yml@main\n"
+        )
+        self.assertEqual(credentials.unread_mentions({"ci.yml": with_step}, self.PREFIX), ["ci.yml"])
+
     def test_every_workflow_calling_it_is_a_caller_whatever_its_name(self):
         # The fleet names the caller `<hub>.yml`; GitHub runs any name, so
         # a second caller under another one is read too.
@@ -355,24 +395,29 @@ class CallersTest(unittest.TestCase):
         flow = "jobs: {update: {uses: mikelward/npm-update/.github/workflows/npm-update.yml@main, secrets: inherit}}\n"
         texts = {
             "npm-update.yml": self.CALLER,
+            # Flow style is YAML too, and reads as the caller it is.
             "batch.yml": flow,
+            # A mention anywhere but a job's `uses:` resolves to no caller.
             "ci.yml": "env:\n  HUB: mikelward/npm-update/\n",
+            # A document PyYAML rejects resolves nothing, so its mention is
+            # read from the raw text and is unread.
+            "broken.yml": self.CALLER.replace("secrets: inherit", "secrets: [inherit"),
             # A comment calls nothing, so it is neither a caller nor unread.
             "docs.yml": "# see mikelward/npm-update/README.md\n",
         }
         found = credentials.callers(texts, self.PREFIX)
-        self.assertEqual(sorted(found), ["npm-update.yml"])
-        self.assertEqual(credentials.unread_mentions(texts, self.PREFIX), ["batch.yml", "ci.yml"])
+        self.assertEqual(sorted(found), ["batch.yml", "npm-update.yml"])
+        self.assertEqual(credentials.unread_mentions(texts, self.PREFIX), ["broken.yml", "ci.yml"])
         self.assertFalse(credentials.mentions(texts["docs.yml"], self.PREFIX))
         # A resolved caller's own reference was read, so it is not "unread".
         self.assertEqual(credentials.unread_mentions({"npm-update.yml": self.CALLER}, self.PREFIX), [])
 
-    def test_a_second_caller_the_reader_cannot_resolve_in_a_read_file_is_unread(self):
+    def test_a_second_mention_no_caller_resolves_in_a_read_file_is_unread(self):
         # Counted per mention, not per file: the readable caller does not
-        # vouch for a flow-style second one beside it.
+        # vouch for a second mention beside it that is not a job's `uses:`.
         text = self.CALLER + (
-            "  weekly: {uses: mikelward/npm-update/.github/workflows/npm-update.yml@main, "
-            "secrets: {token: x}}\n"
+            "  weekly:\n    runs-on: ubuntu-latest\n"
+            "    env:\n      HUB: mikelward/npm-update/.github/workflows/npm-update.yml@main\n"
         )
         self.assertEqual(credentials.callers({"npm-update.yml": text}, self.PREFIX), {"npm-update.yml": True})
         self.assertEqual(credentials.unread_mentions({"npm-update.yml": text}, self.PREFIX), ["npm-update.yml"])
@@ -432,7 +477,8 @@ class LanesReaderTest(unittest.TestCase):
     declares the environment the credential lives in. Same failure mode
     as the caller reader: a publisher it cannot see makes the pair look
     unused, and setup deletes it -- so the shapes the fleet writes are
-    pinned, and anything else is "cannot tell"."""
+    pinned, every YAML shape the line reader once refused reads as YAML
+    reads it, and what PyYAML rejects is "cannot tell"."""
 
     def test_a_publishing_job_declaring_the_environment(self):
         self.assertEqual(credentials.lanes_publishers({"ci.yml": PUBLISHER}), {"ci.yml": True})
@@ -503,11 +549,61 @@ class LanesReaderTest(unittest.TestCase):
         ambient = flow.replace("{mode: init, app-id: '${{ secrets.LANES_APP_ID }}', app-private-key: x}", "{mode: init}")
         self.assertEqual(credentials.lanes_publishers({"ci.yml": ambient}), {})
         self.assertEqual(credentials.lanes_unread({"ci.yml": ambient}), [])
-        # Inputs the reader cannot see -- an alias -- leave the step
-        # unresolved, so the file is "cannot tell" rather than stale.
-        alias = flow.replace("{mode: init, app-id: '${{ secrets.LANES_APP_ID }}', app-private-key: x}", "*inputs")
-        self.assertEqual(credentials.lanes_publishers({"ci.yml": alias}), {})
-        self.assertEqual(credentials.lanes_unread({"ci.yml": alias}), ["ci.yml"])
+        # An alias reads as what it names -- here the ambient inputs the
+        # first step anchors, on the second.
+        aliased = flow.replace("{mode: init, app-id: '${{ secrets.LANES_APP_ID }}', app-private-key: x}", "&inputs {mode: classify}").replace(
+            "        with:\n          mode: classify\n", "        with: *inputs\n"
+        )
+        self.assertNotEqual(aliased, flow)
+        self.assertEqual(credentials.lanes_publishers({"ci.yml": aliased}), {})
+        self.assertEqual(credentials.lanes_unread({"ci.yml": aliased}), [])
+        # An alias naming no anchor is not YAML, and the file is "cannot
+        # tell" rather than stale.
+        dangling = flow.replace("{mode: init, app-id: '${{ secrets.LANES_APP_ID }}', app-private-key: x}", "*inputs")
+        self.assertEqual(credentials.lanes_publishers({"ci.yml": dangling}), {})
+        self.assertEqual(credentials.lanes_unread({"ci.yml": dangling}), ["ci.yml"])
+
+    def test_the_action_named_in_prose_is_not_an_unresolved_reference(self):
+        # The unread backstop compares references against what the reader
+        # resolved, so counting the name wherever it appeared made a
+        # healthy publisher unreadable whenever anything else in the file
+        # said it: a workflow titled after the action, a job name, a step
+        # name, a description. Setup then refused every move and
+        # restriction that repository needed and its pair stayed a
+        # repository secret -- the exposure the command exists to end
+        # (Codex, mikelward/repo#36). A reference is the whole scalar.
+        for prose in [
+            "name: mikelward/lanes trusted publisher\n",
+            "name: ci\nrun-name: gate by mikelward/lanes\n",
+        ]:
+            titled = PUBLISHER.replace("name: ci\n", prose, 1)
+            self.assertNotEqual(titled, PUBLISHER)
+            self.assertEqual(credentials.lanes_publishers({"ci.yml": titled}), {"ci.yml": True})
+            self.assertEqual(credentials.lanes_unread({"ci.yml": titled}), [], prose)
+        # A reference the walk cannot reach is still one, and still holds
+        # the delete back: that is what the backstop is for.
+        for broken in [
+            PUBLISHER.replace("jobs:\n", "jobs: [mikelward/lanes@main]\n#", 1),
+            PUBLISHER.replace("    steps:\n      - uses: mikelward/lanes@main\n", "    steps: mikelward/lanes@main\n", 1),
+        ]:
+            self.assertNotEqual(broken, PUBLISHER)
+            self.assertEqual(credentials.lanes_unread({"ci.yml": broken}), ["ci.yml"], broken)
+
+    def test_the_batch_prefix_in_prose_is_not_an_unresolved_caller(self):
+        # Same rule for a reusable workflow's caller: a repository whose
+        # own workflow is titled after the batch resolved one caller and
+        # counted two, so every credential move it needed was refused.
+        prefix = "mikelward/npm-update/"
+        text = (
+            "name: mikelward/npm-update/ weekly\njobs:\n  update:\n"
+            "    uses: mikelward/npm-update/.github/workflows/npm-update.yml@main\n"
+            "    secrets: inherit\n"
+        )
+        self.assertEqual(credentials.callers({"a.yml": text}, prefix), {"a.yml": True})
+        self.assertEqual(credentials.unread_mentions({"a.yml": text}, prefix), [])
+        # And a caller the walk cannot reach still reads as unread.
+        broken = text.replace("jobs:\n  update:\n    uses: ", "jobs: [", 1)
+        self.assertEqual(credentials.unread_mentions({"a.yml": broken}, prefix), ["a.yml"])
 
     def test_a_quoted_uses_key_keeps_its_column(self):
         # `"uses":` starts one column before the word; a reader that found
@@ -529,11 +625,12 @@ class LanesReaderTest(unittest.TestCase):
         self.assertNotEqual(ambient, quoted)
         self.assertEqual(credentials.lanes_publishers({"ci.yml": ambient}), {"ci.yml": True})
 
-    def test_flow_inputs_are_read_by_quote_and_nesting_state(self):
+    def test_flow_inputs_are_read_as_yaml(self):
         # A regex over the flow text found `app-id:` inside a quoted VALUE
-        # and read the step as a publisher; the scanner walks the mapping
-        # with its quote and nesting state instead, and anything it cannot
-        # read is "cannot tell" (Codex, mikelward/repo#36).
+        # and read the step as a publisher (Codex, mikelward/repo#36); the
+        # mapping is parsed now, so a quoted value, a nested collection, a
+        # node property and an explicit key all read as YAML reads them,
+        # and only what PyYAML rejects is "cannot tell".
         def flow(inputs):
             return PUBLISHER.replace(
                 "        with:\n          mode: init\n"
@@ -552,10 +649,15 @@ class LanesReaderTest(unittest.TestCase):
             'mode: classify, note: ["], app-id: placeholder, dummy: ["]',
             "mode: classify, note: {k: '], app-id: placeholder', j: 1}",
             'mode: classify, note: ["a, b", "app-id: c"]',
+            "mode",
+            'note: &x "x, app-id: placeholder", dummy: *x',
+            "note: [&x 'a, app-id: b'], mode: init",
+            "mode: !!str init",
         ):
             text = flow(inputs)
             self.assertNotEqual(text, PUBLISHER)
             self.assertEqual(credentials.lanes_publishers({"ci.yml": text}), {}, inputs)
+            self.assertEqual(credentials.lanes_incomplete({"ci.yml": text}), [], inputs)
             self.assertEqual(credentials.lanes_unread({"ci.yml": text}), [], inputs)
         for inputs in (
             'mode: init, "app-id": x, app-private-key: y',
@@ -563,30 +665,32 @@ class LanesReaderTest(unittest.TestCase):
             'note: "a\\\\", app-id: x, app-private-key: y',
             "url: http://example.com, app-id: x, app-private-key: y",
             "mode: init, app-id: x, app-private-key: y,",
+            "mode: init, &input app-id: x, app-private-key: y",
+            "? app-id : x, app-private-key: y",
+            "mode: init, !!str app-id: x, app-private-key: y",
         ):
             self.assertEqual(credentials.lanes_publishers({"ci.yml": flow(inputs)}), {"ci.yml": True}, inputs)
-        # What the scanner cannot read -- an unclosed quote or bracket, an
-        # entry with no key -- leaves the step unresolved rather than
-        # resolved as the ambient pattern.
-        for inputs in (
-            'mode: init, note: "open', "mode: init, [x", "mode", "a: 1, , b: 2",
-            "mode: init, &input app-id: x", "mode: init, *alias: x", "? app-id : x", "mode: init, !!str app-id: x",
-            'note: &x "x, app-id: placeholder", dummy: *x', "note: [&x 'a, app-id: b'], mode: init", "mode: !!str init",
-        ):
+        # What PyYAML rejects -- an unclosed quote or bracket, an entry with
+        # no key, an alias naming no anchor -- is not a document at all, so
+        # the file is unread rather than resolved as the ambient pattern.
+        for inputs in ('mode: init, note: "open', "mode: init, [x", "a: 1, , b: 2", "mode: init, *alias: x"):
             text = flow(inputs)
             self.assertEqual(credentials.lanes_publishers({"ci.yml": text}), {}, inputs)
             self.assertEqual(credentials.lanes_unread({"ci.yml": text}), ["ci.yml"], inputs)
 
-    def test_a_block_key_the_reader_cannot_read_leaves_the_step_unread(self):
-        # An anchored or complex key at the mapping's own level is a key
-        # this does not read, and a mapping with one is not a read
-        # mapping: the step is "cannot tell", never a list short of one
-        # key that resolves the publisher away (Codex, mikelward/repo#36).
-        for key in ("&input app-id", "? app-id\n          : x\n          mode", "*alias"):
+    def test_a_node_property_on_a_block_key_reads_as_yaml_reads_it(self):
+        # An anchored, tagged or explicit key was one the line reader did
+        # not read, and a mapping with one was "cannot tell" (Codex,
+        # mikelward/repo#36); parsed, the key is `app-id` as YAML says.
+        for key in ("&input app-id", "!!str app-id", "? app-id\n          : x\n          mode"):
             text = PUBLISHER.replace("          app-id:", f"          {key}:")
             self.assertNotEqual(text, PUBLISHER)
-            self.assertEqual(credentials.lanes_publishers({"ci.yml": text}), {}, key)
-            self.assertEqual(credentials.lanes_unread({"ci.yml": text}), ["ci.yml"], key)
+            self.assertEqual(credentials.lanes_publishers({"ci.yml": text}), {"ci.yml": True}, key)
+            self.assertEqual(credentials.lanes_unread({"ci.yml": text}), [], key)
+        # An alias naming no anchor is not a document, and the file is unread.
+        dangling = PUBLISHER.replace("          app-id:", "          *alias:")
+        self.assertEqual(credentials.lanes_publishers({"ci.yml": dangling}), {})
+        self.assertEqual(credentials.lanes_unread({"ci.yml": dangling}), ["ci.yml"])
         # A deeper line under a key -- a block scalar's body -- is a value,
         # not a key, and reads fine.
         folded = PUBLISHER.replace("          mode: init\n", "          mode: >\n            init\n")
@@ -696,21 +800,35 @@ class LanesReaderTest(unittest.TestCase):
             self.assertEqual(credentials.lanes_unread({"ci.yml": text}), [], uses)
 
     def test_a_shape_the_reader_cannot_resolve_is_unread(self):
-        flow = "jobs: {init: {environment: lanes, steps: [{uses: mikelward/lanes@main, with: {app-id: x}}]}}\n"
-        self.assertEqual(credentials.lanes_publishers({"ci.yml": flow}), {})
-        self.assertEqual(credentials.lanes_unread({"ci.yml": flow}), ["ci.yml"])
+        # A whole workflow in flow style reads as the publisher it is.
+        flow = "jobs: {init: {environment: lanes, steps: [{uses: mikelward/lanes@main, with: {app-id: x, app-private-key: y}}]}}\n"
+        self.assertEqual(credentials.lanes_publishers({"ci.yml": flow}), {"ci.yml": True})
+        self.assertEqual(credentials.lanes_unread({"ci.yml": flow}), [])
+        # A document PyYAML rejects resolves no step, so its mention is unread.
+        self.assertEqual(credentials.lanes_publishers({"ci.yml": flow[:-3] + "\n"}), {})
+        self.assertEqual(credentials.lanes_unread({"ci.yml": flow[:-3] + "\n"}), ["ci.yml"])
+        # So is a step whose `with:` is not a mapping: its inputs cannot be read.
+        scalar = PUBLISHER.replace(
+            "        with:\n          mode: init\n"
+            "          app-id: ${{ secrets.LANES_APP_ID }}\n"
+            "          app-private-key: ${{ secrets.LANES_APP_PRIVATE_KEY }}\n",
+            "        with: app-id\n",
+        )
+        self.assertNotEqual(scalar, PUBLISHER)
+        self.assertEqual(credentials.lanes_publishers({"ci.yml": scalar}), {})
+        self.assertEqual(credentials.lanes_unread({"ci.yml": scalar}), ["ci.yml"])
         # A comment mentions nothing; a resolved step's own reference was read.
         self.assertEqual(credentials.lanes_unread({"ci.yml": "# see mikelward/lanes\njobs: {}\n"}), [])
         # A readable publisher beside an unreadable second step is unread too.
         self.assertEqual(
-            credentials.lanes_unread({"ci.yml": PUBLISHER + "  extra: {steps: [{uses: mikelward/lanes@main}]}\n"}),
+            credentials.lanes_unread({"ci.yml": PUBLISHER + "  extra: {steps: [{uses: mikelward/lanes@main, with: [x]}]}\n"}),
             ["ci.yml"],
         )
 
-    def test_a_decoded_line_break_in_a_run_block_does_not_end_the_job(self):
-        # A `run:` block scalar quoting `$'\n'` decodes to a line break
-        # under the double-quoted-scalar reader; on its own line at column
-        # 0 that ended the jobs section, so every job after it -- one
+    def test_an_escaped_line_break_in_a_run_block_does_not_end_the_job(self):
+        # A `run:` block scalar quoting `$'\n'` decoded to a line break
+        # under the line reader this replaced; on its own line at column 0
+        # that ended the jobs section, so every job after it -- one
         # consumer's `finalize` -- went unread, and the file read as
         # "cannot tell" (the fail-closed direction, but a false one).
         text = (
@@ -720,6 +838,43 @@ class LanesReaderTest(unittest.TestCase):
         ) + PUBLISHER.split("jobs:\n", 1)[1]
         self.assertEqual(credentials.lanes_publishers({"ci.yml": text}), {"ci.yml": True})
         self.assertEqual(credentials.lanes_unread({"ci.yml": text}), [])
+
+    def test_a_document_too_deep_to_parse_is_unread_not_a_crash(self):
+        # `yaml.safe_load` exhausts its own stack on deep-but-valid
+        # nesting, and `RecursionError` is not a `YAMLError`, so it left
+        # the reader as a crashed command where every other unreadable
+        # shape is a finding (Codex, mikelward/repo#36).
+        deep = "mikelward/lanes: " + "[" * 500 + "]" * 500
+        self.assertEqual(credentials.lanes_publishers({"ci.yml": deep}), {})
+        self.assertEqual(credentials.lanes_unread({"ci.yml": deep}), ["ci.yml"])
+        self.assertEqual(credentials.lanes_incomplete({"ci.yml": deep}), [])
+        # Not only the syntax half: a scalar YAML's own resolver claims and
+        # Python then rejects raises a bare `ValueError` out of a
+        # constructor -- `2026-13-01` reads as a timestamp and dies on
+        # "month must be in 1..12" (Codex, mikelward/repo#36).
+        dated = "mikelward/lanes: 2026-13-01"
+        self.assertEqual(credentials.lanes_publishers({"ci.yml": dated}), {})
+        self.assertEqual(credentials.lanes_unread({"ci.yml": dated}), ["ci.yml"])
+
+
+    def test_a_cyclic_alias_is_walked_once_not_forever(self):
+        # `yaml.safe_load` resolves an alias pointing at its own ancestor
+        # into a self-referential object rather than rejecting it, and a
+        # naive walk recurses until Python gives up -- a crashed command
+        # where every other unreadable shape is a finding (Codex,
+        # mikelward/repo#36).
+        cyclic = "x: &x [*x]\n" + PUBLISHER
+        self.assertEqual(credentials.lanes_publishers({"ci.yml": cyclic}), {"ci.yml": True})
+        self.assertEqual(credentials.lanes_unread({"ci.yml": cyclic}), [])
+        selfish = "jobs: &j\n  init:\n    steps: []\n  more: *j\n"
+        self.assertEqual(credentials.lanes_unread({"ci.yml": selfish}), [])
+        # Identity, not equality: two equal lists are two nodes, and
+        # skipping the second would drop real mentions.
+        twice = (
+            "one: [mikelward/lanes]\nagain: [mikelward/lanes]\n"
+            "jobs:\n  init:\n    steps: []\n"
+        )
+        self.assertEqual(credentials.lanes_unread({"ci.yml": twice}), ["ci.yml"])
 
     def test_the_pair_belongs_in_the_lanes_environment(self):
         self.assertEqual(credentials.home_environment("lanes_app_id"), "lanes")

@@ -4095,7 +4095,9 @@ class LanesCredentialStepTest(unittest.TestCase):
         self.assertEqual(fake.restricted, [])
 
     def test_a_shape_the_reader_cannot_resolve_deletes_nothing(self):
-        fake = self._publisher("jobs: {init: {steps: [{uses: mikelward/lanes@main, with: {app-id: x}}]}}\n")
+        # A document PyYAML rejects resolves no step, so the mention is
+        # "cannot tell" and holds everything back.
+        fake = self._publisher("jobs: {init: {steps: [{uses: mikelward/lanes@main, with: {app-id: x}}]}\n")
         fake.secret_names = set(self.PAIR)
         code, out, err = _run(fake, ["--force", "--no-rules", REPO])
         self.assertEqual(code, 1)
@@ -4468,11 +4470,13 @@ class CredentialsStepTest(unittest.TestCase):
         )
         self.assertEqual(fake.written_secrets, [])
 
-    def test_a_second_caller_the_reader_cannot_resolve_in_a_read_file_holds_the_move_back(self):
+    def test_a_second_mention_no_caller_resolves_in_a_read_file_holds_the_move_back(self):
+        # The readable caller does not vouch for a mention beside it that
+        # resolves to no caller -- one that is not a job's `uses:`.
         fake = self._consumer(
             self.INHERITING
-            + "  weekly: {uses: mikelward/gradle-update/.github/workflows/gradle-update.yml@main, "
-            "secrets: {token: x}}\n"
+            + "  weekly:\n    runs-on: ubuntu-latest\n"
+            "    env:\n      HUB: mikelward/gradle-update/.github/workflows/gradle-update.yml@main\n"
         )
         fake.secret_names = {"GRADLE_UPDATE_PAT"}
         fake.env_secret_names = {"gradle-update": {"GRADLE_UPDATE_PAT"}}
@@ -4770,14 +4774,14 @@ class CredentialsStepTest(unittest.TestCase):
         self.assertEqual(fake.deleted_secrets, [])
 
     def test_a_mention_the_reader_cannot_parse_blocks_the_stale_delete(self):
-        # Flow style (or any shape the fleet does not write) is not a
-        # caller the reader can see, but it IS a mention -- and "unused"
-        # must mean absent from the text, not unparsed. Nothing deleted.
+        # A document PyYAML rejects is not a caller the reader can see, but
+        # it IS a mention -- and "unused" must mean absent from the text,
+        # not unparsed. Nothing deleted.
         fake = FakeGh()
         fake.workflow_files = ["ci.yml", "batch.yml"]
         fake.workflow_texts = {
-            "ci.yml": "jobs: {sync: {uses: mikelward/ci-commit-artifact/.github/workflows/commit-artifact.yml@main, secrets: inherit}}\n",
-            "batch.yml": "jobs: {update: {uses: mikelward/npm-update/.github/workflows/npm-update.yml@main, secrets: inherit}}\n",
+            "ci.yml": "jobs: {sync: {uses: mikelward/ci-commit-artifact/.github/workflows/commit-artifact.yml@main, secrets: inherit}\n",
+            "batch.yml": "jobs: {update: {uses: mikelward/npm-update/.github/workflows/npm-update.yml@main, secrets: inherit}\n",
         }
         fake.secret_names = {"CI_COMMIT_ARTIFACT_TOKEN", "NPM_UPDATE_PAT"}
         code, out, err = _run(fake, ["--force", "--no-rules", REPO])
@@ -4800,7 +4804,7 @@ class CredentialsStepTest(unittest.TestCase):
         fake.workflow_files = ["ci.yml"]
         fake.workflow_texts = {"ci.yml": "jobs:\n  build:\n    steps:\n      - run: true\n"}
         fake.workflow_texts_after_recheck = {
-            "ci.yml": "jobs: {sync: {uses: mikelward/ci-commit-artifact/.github/workflows/commit-artifact.yml@main}}\n"
+            "ci.yml": "jobs: {sync: {uses: mikelward/ci-commit-artifact/.github/workflows/commit-artifact.yml@main}\n"
         }
         fake.secret_names = {"CI_COMMIT_ARTIFACT_TOKEN"}
         code, out, err = _run(fake, ["--force", "--no-rules", REPO])

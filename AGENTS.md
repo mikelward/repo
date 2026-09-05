@@ -11,9 +11,9 @@ implementation of the `repo-list`/`repo-secrets`/`repo-setup` shell scripts in
 [mikelward/scripts](https://github.com/mikelward/scripts), which stay in
 place unchanged for now -- not a migration, so don't touch that repo as part
 of work here. See the README for why this is Python rather than another
-shell rewrite or Go (matching the sibling `vcs` tool): no dependencies,
-`argparse`/`subprocess`/`unittest` from the standard library only, run
-directly from a checkout with no build or install step.
+shell rewrite or Go (matching the sibling `vcs` tool): the standard
+library's `argparse`/`subprocess`/`unittest` plus one dependency, PyYAML,
+run directly from a checkout with no build or install step.
 
 Keep this file as short as it can be and still work. Every session loads it
 whole, so each rule costs context on every turn: add one the first time
@@ -35,9 +35,15 @@ one that has stopped biting.
 
 ## Style
 
-- No third-party dependencies. Standard library only -- what a fresh
-  `python3` gets you is what this runs on, no `pip install` step for a
-  contributor or CI to get wrong. If something genuinely needs one, that's a
+- One third-party dependency, PyYAML, and no others. The workflow reader
+  in `repo_lib/credentials.py` started out hand-rolled to keep the tool on
+  the standard library alone, and in eight of fourteen review rounds on
+  mikelward/repo#36 Codex found a YAML shape it misread -- each fix widened
+  what a regex resolved by one case, because the class was reading YAML
+  without a parser. The maintainer chose the parser (2026-09-05). It is
+  declared in `pyproject.toml`, so `uv run ./repo ...` installs it on its
+  own; `./repo` checks for it first and names the install otherwise, and
+  `test.yml` installs it before `make test`. Anything else is still a
   conversation about the tradeoff, not a quiet `pip install`.
 - `argparse` for option parsing (handles `--flag value` and `--flag=value`
   both, for free). `subprocess` for shelling out to `gh`. Prefer real data
@@ -57,7 +63,7 @@ one that has stopped biting.
   no behavior to exercise -- documentation, comments, this file -- add no
   test and don't need `make test` run over them.
 - `unittest`, not a third-party test runner -- consistent with the
-  no-dependencies rule above. Mock, in Python, rather than shelling out to a
+  one-dependency rule above. Mock, in Python, rather than shelling out to a
   fake `gh` binary on `PATH`; that was necessary in the shell scripts
   because shell has nothing better, and Python does. Two boundaries, two
   jobs: `tests/test_gh.py` patches `subprocess.run` directly to prove

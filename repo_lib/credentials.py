@@ -30,12 +30,12 @@ Names only, throughout: GitHub never returns a secret's value, which is
 why `repo setup` needs the value handed to it to complete a move.
 """
 
-import json
-
 import base64
 import dataclasses
-import re
+import json
 import urllib.parse
+
+import yaml
 
 from repo_lib import gh
 
@@ -159,12 +159,13 @@ def unread_mentions(texts, workflow_prefix):
     per mention, not per file, since a file can hold a readable caller and
     a second one in a shape the reader cannot resolve (Codex,
     mikelward/repo#13)."""
-    prefix = workflow_prefix.lower()
-    return sorted(
-        name
-        for name, text in texts.items()
-        if _content(text).lower().count(prefix) > len(_caller_verdicts(text, workflow_prefix))
-    )
+    unread = []
+    for name, text in texts.items():
+        resolved = set()
+        _caller_verdicts(text, workflow_prefix, resolved)
+        if _reference_count(text, workflow_prefix) > len(resolved):
+            unread.append(name)
+    return sorted(unread)
 
 
 FLEET_CREDENTIALS = tuple(name for hub in BATCH_HUBS for name in batch_credentials(hub)) + (
@@ -389,135 +390,183 @@ def workflow_texts(repo, default=None):
     return texts
 
 
-# The key and the value may each be quoted -- YAML allows both, and a
-# quoted reference is still the caller (Codex, mikelward/repo#13: read
-# unquoted, a quoted commit-back caller made its token look unused, and
-# setup deleted it). What this cannot read -- flow style, an anchor, a
-# multi-line scalar -- is what `mentions` is for: a decision to delete
-# needs the workflow absent from the text altogether, not merely unparsed.
-_USES_RE = re.compile(r"""^( *)["']?uses["']?: *["']?([^"'\s]+)["']? *(?:#.*)?$""")
-_SECRETS_INHERIT_RE = re.compile(r"""^( *)["']?secrets["']?: *["']?inherit["']? *(?:#.*)?$""")
+# Workflows are read as YAML, through PyYAML -- the one third-party
+# dependency this tool takes (AGENTS.md, "Style"). The reader this replaced
+# walked the text by line and regex, and in eight of the fourteen review
+# rounds on mikelward/repo#36 Codex found a shape it misread -- a search for
+# `app-id` matching another step, then `env:`, a flow mapping, whitespace
+# before a colon, a quoted key, an upper-case input name, a quoted `uses`
+# key, a node property before a quoted scalar. Each fix widened what
+# resolved by one case, because the class was reading YAML without a
+# parser; the parser deletes the class (maintainer, 2026-09-05). What a
+# parser cannot read -- a document PyYAML rejects, a `with:` that is not a
+# mapping -- is "cannot tell", never "unused".
+
+# What `_document` returns for text PyYAML rejects, as distinct from the
+# None an empty document parses to: a rejected document leaves every
+# mention in the raw text unread, while an empty one mentions nothing.
+_REJECTED = object()
 
 
-def _meaningful(line):
-    stripped = line.strip()
-    return stripped and not stripped.startswith("#")
+def _document(text):
+    """`text` parsed as YAML, `_REJECTED` when PyYAML rejects it -- an
+    unclosed quote or bracket, an alias with no anchor, a key that cannot
+    be hashed. Nothing in a rejected document resolves, so the callers
+    report every mention in it as "cannot tell"; that is the whole
+    handling, and the reason the error itself is not re-raised."""
+    try:
+        return yaml.safe_load(text)
+    except Exception:
+        # Every way this can fail means one thing here -- the document
+        # resolves nothing -- so it is caught as one, and the `try` holds a
+        # single third-party call, which is what makes that safe rather
+        # than a blanket. `YAMLError` is only the syntax half: deep-but-
+        # valid nesting (500 opened flow sequences will do it) exhausts the
+        # parser's own stack for a `RecursionError`, and a constructor
+        # raises a bare `ValueError` on a scalar YAML's own resolver claims
+        # and Python then rejects -- `2026-13-01` reads as a timestamp and
+        # dies on "month must be in 1..12". Both escaped as a crashed
+        # command from a reader whose every other unreadable shape is a
+        # finding (Codex, mikelward/repo#36, twice); enumerating the
+        # constructors' failure types would be the one-more-case pattern
+        # the line-by-line reader died of.
+        return _REJECTED
 
 
-_DOUBLE_QUOTED_RE = re.compile(r'"((?:[^"\\]|\\.)*)"', re.S)
-_ESCAPE_RE = re.compile(r"\\(\r?\n[ \t]*|x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}|.)", re.S)
-_ESCAPES = {
-    "0": "\0", "a": "\a", "b": "\b", "t": "\t", "\t": "\t", "n": "\n", "v": "\v", "f": "\f",
-    "r": "\r", "e": "\x1b", " ": " ", '"': '"', "/": "/", "\\": "\\", "N": "\u0085",
-    "_": "\u00a0", "L": "\u2028", "P": "\u2029",
-}
+def _strings(node, seen=None):
+    """Every string in `node`, keys and values alike.
+
+    Containers are visited once. A YAML alias can point at its own
+    ancestor (`x: &x [*x]`), which `yaml.safe_load` resolves into a
+    genuinely self-referential object rather than rejecting: walking it
+    naively recurses until Python gives up, and a `RecursionError` out of
+    a reader is a crashed command where every other unreadable shape is a
+    finding (Codex, mikelward/repo#36). Identity, not equality: two equal
+    lists are two nodes, and skipping the second would drop real
+    mentions."""
+    if isinstance(node, str):
+        yield node
+        return
+    if not isinstance(node, (dict, list, tuple)):
+        return
+    if seen is None:
+        seen = set()
+    if id(node) in seen:
+        return
+    seen.add(id(node))
+    if isinstance(node, dict):
+        for key, value in node.items():
+            yield from _strings(key, seen)
+            yield from _strings(value, seen)
+    else:
+        for item in node:
+            yield from _strings(item, seen)
 
 
-def _decode_double_quoted(text):
-    """`text` with the YAML escapes of every double-quoted scalar decoded,
-    so `"mikelward\\/npm-up\\u0064ate/..."` reads as the reference YAML
-    makes of it. A caller written that way is valid, and a reader that
-    missed it would delete its credential as unused (Codex,
-    mikelward/repo#13). An escape YAML does not define is left as written."""
-
-    def escape(m):
-        code = m.group(1)
-        if code.startswith(("\n", "\r\n")):
-            # An escaped line break, LF or CRLF: the value continues on the
-            # next line, its indentation dropped, with nothing in between.
-            return ""
-        if code in ('"', "\\"):
-            # An escaped quote or backslash stays as written: the flow
-            # reader below walks a decoded line by its quote state, and a
-            # bare `"` decoded into the middle of a scalar would end the
-            # scalar early -- everything after it read as keys. No
-            # reference this decodes for carries either.
-            return m.group(0)
-        if code in _ESCAPES:
-            # A decoded line break stays on its line: the readers here walk
-            # the text by line and indentation, and a `\n` inside a
-            # `run:` block scalar (`"${ids%%$'\n'*}"`, in one consumer)
-            # would otherwise split the job it sits in, ending every job
-            # after it early. No reference this decodes for can carry one.
-            return " " if _ESCAPES[code] in ("\n", "\r") else _ESCAPES[code]
-        if code[0] in "xuU" and len(code) > 1:
-            return chr(int(code[1:], 16))
-        return m.group(0)
-
-    return _DOUBLE_QUOTED_RE.sub(lambda m: '"' + _ESCAPE_RE.sub(escape, m.group(1)) + '"', text)
+# What a GitHub owner or repository name is spelled with, so a needle that
+# is one can be counted where the name ends rather than continues. Lower
+# case only: `_mention_count` folds both sides before asking.
+_NAME_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789._-")
 
 
-def _strip_comments(text):
-    """`text` without its YAML comments -- a whole line, or a trailing
-    ` #...` -- outside quoted scalars, which can carry a `#` and can span
-    lines (an escaped line break in a double-quoted one, or a plain
-    newline in either), so the quote state is tracked across the whole
-    text rather than a line at a time. A quote opens a scalar only at a
-    value position (after whitespace, `:`, `-`, `[`, `{` or `,`): the
-    apostrophe in `it's` starts nothing."""
-    out = []
-    quote = None
-    prev = "\n"
-    i = 0
-    while i < len(text):
-        c = text[i]
-        if quote == '"':
-            if c == "\\" and i + 1 < len(text):
-                out.append(text[i : i + 2])
-                i += 2
-                continue
-            if c == '"':
-                quote = None
-        elif quote == "'":
-            if c == "'":
-                if text[i + 1 : i + 2] == "'":
-                    out.append("''")
-                    i += 2
-                    continue
-                quote = None
-        elif c == "#" and prev in " \t\n":
-            while i < len(text) and text[i] != "\n":
-                i += 1
-            continue
-        elif c in "\"'" and prev in " \t\n:-[{,":
-            quote = c
-        out.append(c)
-        prev = c
-        i += 1
-    return "".join(out)
+def _occurrences(haystack, needle, boundary):
+    """How often `needle` occurs in `haystack`; with `boundary`, only where
+    a repository name ends there rather than continuing."""
+    if not boundary:
+        return haystack.count(needle)
+    total = 0
+    at = haystack.find(needle)
+    while at >= 0:
+        before = haystack[at - 1] if at else ""
+        after = haystack[at + len(needle) : at + len(needle) + 1]
+        if before not in _NAME_CHARS and after not in _NAME_CHARS:
+            total += 1
+        at = haystack.find(needle, at + 1)
+    return total
 
 
-def _content(text):
-    """`text` with its comments dropped and its double-quoted scalars
-    decoded: a comment cannot call anything, so a reference in one --
-    whole-line or trailing -- is neither a caller nor a mention that needs
-    reading (Codex, mikelward/repo#13, for the trailing one)."""
-    return _decode_double_quoted(_strip_comments(text))
+def _is_reference(value, needle, boundary):
+    """Whether `value` could be a `uses:` naming `needle` -- the whole
+    scalar, folded and stripped, never the name found inside prose. A
+    reference carries no whitespace, so a workflow whose `name:` reads
+    `mikelward/lanes trusted publisher` is not one."""
+    value = value.strip().lower()
+    if not value.startswith(needle) or any(char.isspace() for char in value):
+        return False
+    if not boundary:
+        return True
+    return value[len(needle) : len(needle) + 1] not in _NAME_CHARS
 
 
-def _caller_verdicts(text, workflow_prefix):
+def _reference_count(text, needle, boundary=False):
+    """How many strings in `text`'s document could be a `uses:` naming
+    `needle`, for comparing against what a reader resolved.
+
+    Counting the name wherever it appeared was the over-matching
+    direction, which is safe for `mentions` -- there an extra mention only
+    KEEPS a credential. Here it is the opposite: this count is compared
+    against resolved references, and one nothing can resolve makes the
+    file unread, so `repo setup` refuses every move and restriction that
+    repository needs and its copies stay at repository level. A workflow
+    named after the action did that (Codex, mikelward/repo#36), as did a
+    neighbouring repository whose name merely starts the same way.
+
+    A document PyYAML rejects still falls back to the raw substring count:
+    nothing there can be resolved either, so over-counting is the
+    fail-closed direction and the only one available."""
+    needle = needle.lower()
+    doc = _document(text)
+    if doc is _REJECTED:
+        return _occurrences(text.lower(), needle, boundary)
+    return sum(1 for string in _strings(doc) if _is_reference(string, needle, boundary))
+
+
+def _mention_count(text, needle):
+    """How often `needle` occurs anywhere in the strings of `text`'s
+    document -- keys and values, never a comment, since a comment calls
+    nothing -- or in the raw text when PyYAML rejects the document.
+
+    This is the over-counting direction, and it is only ever asked where
+    over-counting KEEPS a credential; where a count is compared against
+    what the reader resolved, `_reference_count` asks the narrower
+    question instead. Case-folded, since owner and repository names are
+    case-insensitive on GitHub (Codex, mikelward/repo#13)."""
+    needle = needle.lower()
+    doc = _document(text)
+    if doc is _REJECTED:
+        return _occurrences(text.lower(), needle, False)
+    return sum(_occurrences(string.lower(), needle, False) for string in _strings(doc))
+
+
+def _jobs(doc):
+    """The jobs of a parsed workflow that are mappings, by name -- {} for
+    a rejected document or a `jobs:` that is not a mapping."""
+    if not isinstance(doc, dict) or not isinstance(doc.get("jobs"), dict):
+        return {}
+    return {name: job for name, job in doc["jobs"].items() if isinstance(job, dict)}
+
+
+def _caller_verdicts(text, workflow_prefix, resolved=None):
     """One True/False per job in `text` calling the reusable workflow at
-    `workflow_prefix` -- see `caller_inherits`."""
-    lines = _content(text).splitlines()
-    verdicts = []
+    `workflow_prefix` -- see `caller_inherits`.
+
+    `resolved`, when given, is filled with the identity of every job
+    mapping this resolved, which is what `unread_mentions` compares
+    against. An anchored job aliased under a second name is ONE node:
+    `_strings` visits a container once, so it contributes one mention
+    while this list holds two verdicts, and the two disagreeing by one let
+    an unresolved mention balance the totals -- the file then read as
+    fully understood and setup deleted a credential out from under the
+    caller it could not read. `_lanes_jobs` was given this discipline
+    first and the generic path was left mixing node and occurrence counts
+    (Codex, mikelward/repo#36, twice)."""
     prefix = workflow_prefix.lower()
-    for index, line in enumerate(lines):
-        m = _USES_RE.match(line)
-        if not m or not m.group(2).lower().startswith(prefix):
-            continue
-        indent = len(m.group(1))
-        start = index
-        while start > 0 and (not _meaningful(lines[start - 1]) or _indent(lines[start - 1]) >= indent):
-            start -= 1
-        end = index + 1
-        while end < len(lines) and (not _meaningful(lines[end]) or _indent(lines[end]) >= indent):
-            end += 1
-        verdicts.append(
-            any(
-                (sm := _SECRETS_INHERIT_RE.match(candidate)) and len(sm.group(1)) == indent
-                for candidate in lines[start:end]
-            )
-        )
+    resolved = set() if resolved is None else resolved
+    verdicts = []
+    for job in _jobs(_document(text)).values():
+        if isinstance(job.get("uses"), str) and job["uses"].lower().startswith(prefix):
+            resolved.add(id(job))
+            verdicts.append(job.get("secrets") == "inherit")
     return verdicts
 
 
@@ -526,12 +575,7 @@ def caller_inherits(text, workflow_prefix):
     `workflow_prefix` pass their secrets: None when none does, True when
     every such job passes `secrets: inherit`, False when any names its
     secrets instead (or passes none). Job-level only -- a step's `- uses:`
-    never carries secrets, and the leading dash keeps it from matching.
-
-    A job's block is the lines indented deeper than its key; the `uses:`
-    sits directly under that key, so `secrets:` at the same indentation
-    inside the block is the job's own. Text, not YAML: enough for the
-    fleet's own callers, which this exists to read.
+    never carries secrets, and a step is not a job.
 
     Owner and repository names are case-insensitive on GitHub, so
     `MikelWard/CI-Commit-Artifact/...` is the same caller; the whole
@@ -544,324 +588,77 @@ def caller_inherits(text, workflow_prefix):
     return all(verdicts)
 
 
-def _indent(line):
-    return len(line) - len(line.lstrip(" "))
-
-
 def mentions(text, workflow_prefix):
-    """Whether `text` refers to the reusable workflow at all, in any shape
-    -- the backstop for `caller_inherits`, which reads only the shapes the
-    fleet writes. A credential is deleted as unused only when no workflow
-    so much as mentions its reader; a mention the structured reading did
-    not resolve to a caller is "cannot tell", never "unused" (Codex,
-    mikelward/repo#13). Case-folded, since owner and repository names are
-    case-insensitive on GitHub and a mention that keeps a credential is the
-    safe direction to over-match in, and the double-quoted scalars decoded
-    first, since an escaped reference is the same reference. Full-line
-    comments do not count: a comment calls nothing."""
-    return workflow_prefix.lower() in _content(text).lower()
+    """Whether `text` refers to the reusable workflow at all, anywhere in
+    its document -- the backstop for `caller_inherits`, which reads only a
+    job-level `uses:`. A credential is deleted as unused only when no
+    workflow so much as mentions its reader; a mention that did not
+    resolve to a caller is "cannot tell", never "unused" (Codex,
+    mikelward/repo#13). A comment does not count: a comment calls
+    nothing."""
+    return _mention_count(text, workflow_prefix) > 0
 
 
-# YAML allows separation whitespace before a mapping's `:`, so every key
-# here accepts it -- a reader that rejected `app-id :` read a publisher as
-# the ambient pattern and deleted its pair (Codex, mikelward/repo#36).
-# Group 1 is everything before the key -- indentation and the item's dash,
-# when the key sits on the dash line -- so the key's column is its length
-# whether or not the key is quoted; searching the line for `uses` found a
-# quoted key one column late, and the step's `with:` beneath it went
-# unread (Codex, mikelward/repo#36).
-_STEP_USES_RE = re.compile(r"""^( *(?:- +)?)["']?uses["']?\s*: *["']?([^"'\s]+)["']? *$""")
-_JOBS_RE = re.compile(r"""^["']?jobs["']?\s*: *$""")
-# A plain key never starts with a node property or indicator (`&anchor`,
-# `*alias`, `!tag`, `? complex`): an entry that does is one the reader does
-# not read, and says so rather than reading the property as the key.
-_KEY_RE = re.compile(r"""^( *)(?:["']([^"']+)["']|([^"'\s:&*!?][^"'\s:]*))\s*:( .*)?$""")
-_WITH_RE = re.compile(r"""^( *)["']?with["']?\s*:(.*)$""")
+def _is_lanes(reference):
+    """Whether a step's `uses:` names the lanes action, at any ref."""
+    prefix = LANES_ACTION.lower()
+    reference = reference.lower()
+    return reference == prefix or reference.startswith(prefix + "@")
 
 
-def _flow_entries(inner):
-    """The entries of a flow mapping's inside (`a: 1, b: "x, y", c: {d: 2}`
-    without its braces), split on the commas that separate them -- not on
-    one inside a quoted scalar or a nested collection -- or None when the
-    text cannot be read as one: an unclosed quote or bracket. A quote opens
-    a scalar only where a scalar can start (at an entry's start, or after
-    the `:` that ends its key), so the apostrophe in `it's` starts
-    nothing. Inside a double-quoted scalar a backslash escapes the next
-    character -- `_decode_double_quoted` leaves `\\"` and `\\\\` as written
-    for exactly this reason."""
-    entries = []
-    entry = []
-    depth = 0
-    quote = None
-    i = 0
-    while i < len(inner):
-        c = inner[i]
-        if quote == '"':
-            if c == "\\" and i + 1 < len(inner):
-                entry.append(inner[i : i + 2])
-                i += 2
-                continue
-            if c == '"':
-                quote = None
-        elif quote == "'":
-            if c == "'":
-                if inner[i + 1 : i + 2] == "'":
-                    entry.append("''")
-                    i += 2
-                    continue
-                quote = None
-        elif c in "\"'&*!":
-            # A scalar can start at the entry's start, or after the `:`
-            # ending a key, a `,` or an opening bracket inside a nested
-            # collection -- a quoted item of a nested sequence carries the
-            # same commas and brackets an unquoted one would be read by
-            # (Codex, mikelward/repo#36). A node property or alias in that
-            # position (`&x "..."`, `*x`, `!!str`) is a shape this does not
-            # read at all: it can precede a quoted scalar whose quote would
-            # otherwise never open, so the whole mapping is "cannot tell".
-            before = "".join(entry).rstrip()
-            if before == "" or before[-1] in ":,[{":
-                if c in "&*!":
-                    return None
-                quote = c
-        elif c in "{[":
-            depth += 1
-        elif c in "}]":
-            depth -= 1
-            if depth < 0:
-                return None
-        elif c == "," and depth == 0:
-            entries.append("".join(entry))
-            entry = []
-            i += 1
-            continue
-        entry.append(c)
-        i += 1
-    if quote is not None or depth != 0:
-        return None
-    entries.append("".join(entry))
-    return entries
-
-
-def _flow_entry_key(entry):
-    """The key of one flow-mapping entry (`key: value`, the key plain or
-    quoted), or None when the entry has no key the reader can see -- a
-    flow-set entry, or a shape this does not read."""
-    text = entry.strip()
-    if not text:
-        return None
-    if text[0] in "\"'":
-        q = text[0]
-        i = 1
-        while i < len(text):
-            if q == '"' and text[i] == "\\":
-                i += 2
-                continue
-            if text[i] == q:
-                if q == "'" and text[i + 1 : i + 2] == "'":
-                    i += 2
-                    continue
-                break
-            i += 1
-        else:
-            return None
-        key = text[1:i].replace("''", "'") if q == "'" else text[1:i]
-        rest = text[i + 1 :].lstrip()
-        return key if rest.startswith(":") else None
-    # A plain key ends at the first `: ` (or a `:` ending the entry); a
-    # `:` with no space after it is part of the scalar, as in a URL.
-    # The same rule as `_KEY_RE`: a plain key never starts with a node
-    # property or indicator (`&anchor`, `*alias`, `!tag`, `? complex`), and
-    # an entry that does is one this reader does not read.
-    m = re.match(r"([^{}\[\],&*!?][^{}\[\],]*?)\s*:(?:\s|$)", text)
-    return m.group(1).strip() if m else None
-
-
-def _flow_keys(inner):
-    """The top-level keys of a flow mapping's inside, in order, or None when
-    it cannot be read: an unclosed quote or bracket, or an entry with no
-    key. Read by walking the text with its quote and nesting state rather
-    than by a regex over it: a regex found `app-id:` inside a quoted VALUE
-    and read the step as a publisher, and the deleted pair is the reason
-    "cannot tell" has to be the answer to every shape this does not read
-    (Codex, mikelward/repo#36)."""
-    entries = _flow_entries(inner)
-    if entries is None:
-        return None
-    keys = []
-    for index, entry in enumerate(entries):
-        if not entry.strip():
-            # A trailing comma leaves an empty last entry, which YAML
-            # allows; an empty one anywhere else is not a mapping.
-            if index == len(entries) - 1:
-                continue
-            return None
-        key = _flow_entry_key(entry)
-        if key is None:
-            return None
-        keys.append(key)
-    return keys
-
-
-def _step_inputs(step, key_indent):
-    """The keys of the step's `with:` mapping -- the inputs the action is
-    actually handed -- or None when the step names inputs in a shape this
-    cannot read. Block form: the keys at the first indentation under
-    `with:`. Flow form (`with: {a: 1, b: 2}`, on one line): the keys inside
-    the braces. Anything else as the value -- an alias, a scalar -- is
-    unreadable. Read from the mapping itself rather than by searching the
-    step's lines for `app-id:`: an `env:` or a `name:` carrying that word
-    is not an input, and three readings by search each let something else
-    in (Codex, mikelward/repo#36)."""
-    for n, line in enumerate(step):
-        w = _WITH_RE.match(line)
-        if not w or len(w.group(1)) != key_indent:
-            continue
-        value = w.group(2).strip()
-        if not value:
-            child = None
-            keys = []
-            for later in step[n + 1 :]:
-                if not _meaningful(later):
-                    continue
-                indent = _indent(later)
-                if indent <= key_indent:
-                    break
-                if child is None:
-                    child = indent
-                if indent != child:
-                    continue
-                k = _KEY_RE.match(later)
-                if not k:
-                    # An entry at the mapping's own level that is not a
-                    # plain or quoted key -- an anchored one (`&x app-id:`),
-                    # a complex one (`? ...`) -- is a key this cannot read,
-                    # and a mapping with an unread key is not a read
-                    # mapping: "cannot tell", never a list short of one
-                    # (Codex, mikelward/repo#36).
-                    return None
-                keys.append(k.group(2) or k.group(3))
-            return keys
-        if value.startswith("{") and value.endswith("}"):
-            return _flow_keys(value[1:-1])
-        return None
-    return []
-_ENVIRONMENT_RE = re.compile(r"""^( *)["']?environment["']?\s*: *(?:["']?([^"'\s]*)["']?)? *$""")
-_ENV_NAME_RE = re.compile(r"""^( *)["']?name["']?\s*: *["']?([^"'\s]+)["']? *$""")
-
-
-def _job_blocks(lines):
-    """(start, end) line ranges of the jobs under a block-style `jobs:`
-    key, each starting at the job's own key: a job is a key at the
-    indentation of the first one, and runs until the next key at that
-    indentation or the first line shallower than it. Text, not YAML,
-    like `_caller_verdicts` -- enough for the shapes the fleet writes, and
-    `lanes_unread` is the backstop for the rest."""
-    start = next((i for i, line in enumerate(lines) if _JOBS_RE.match(line)), None)
-    if start is None:
+def _step_inputs(step):
+    """The names of the inputs a step is handed -- the keys of its `with:`
+    mapping, [] without one -- or None when `with:` is something else (a
+    scalar, a sequence): a step this cannot read the inputs of. Read from
+    the mapping itself rather than by searching the step for `app-id`: an
+    `env:` or a `name:` carrying that word is not an input (Codex,
+    mikelward/repo#36)."""
+    inputs = step.get("with")
+    if inputs is None:
         return []
-    body = [i for i in range(start + 1, len(lines)) if _meaningful(lines[i])]
-    if not body or _indent(lines[body[0]]) == 0:
-        return []
-    job_indent = _indent(lines[body[0]])
-    keys = []
-    for i in body:
-        indent = _indent(lines[i])
-        if indent < job_indent:
-            break
-        if indent == job_indent and _KEY_RE.match(lines[i]):
-            keys.append(i)
-    end_of_jobs = next(
-        (i for i in body if _indent(lines[i]) < job_indent), len(lines)
-    )
-    return [(key, keys[n + 1] if n + 1 < len(keys) else end_of_jobs) for n, key in enumerate(keys)]
+    if not isinstance(inputs, dict):
+        return None
+    return [str(key) for key in inputs]
 
 
-def _declares_environment(lines, block, env):
-    """Whether the job at `block` declares `environment: <env>` -- inline,
-    or as a block with `name: <env>` under it -- at its own indentation, the
-    way GitHub reads it. Case-insensitive, as environment names are."""
-    start, end = block
-    key_indent = _indent(lines[start])
-    child_indent = next(
-        (_indent(lines[i]) for i in range(start + 1, end) if _meaningful(lines[i])), None
-    )
-    if child_indent is None or child_indent <= key_indent:
-        return False
-    for i in range(start + 1, end):
-        m = _ENVIRONMENT_RE.match(lines[i])
-        if not m or len(m.group(1)) != child_indent:
-            continue
-        if m.group(2):
-            return m.group(2).lower() == env.lower()
-        for j in range(i + 1, end):
-            if not _meaningful(lines[j]):
-                continue
-            if _indent(lines[j]) <= child_indent:
-                break
-            n = _ENV_NAME_RE.match(lines[j])
-            if n and n.group(2).lower() == env.lower():
-                return True
-        return False
-    return False
-
-
-def _step_block(lines, uses, start, end):
-    """The line range of the step whose `uses:` is at line `uses`, inside
-    the job block (start, end): the item's own dash line, when the `uses:`
-    is not on it, through every line indented at or past the `uses:` key.
-    The next step's dash sits two columns shallower than the key, and a
-    job-level key shallower still, so either ends it."""
-    key_indent = len(_STEP_USES_RE.match(lines[uses]).group(1))
-    first = uses
-    # A `uses:` on the item's own dash line starts the step; only one on a
-    # later line has the item's earlier lines -- back to its dash -- to
-    # collect. Walking back from a dash line would collect the PREVIOUS
-    # step's body, whose `with:` is indented past this key too.
-    on_dash = lines[uses].lstrip().startswith("-")
-    while not on_dash and first > start + 1:
-        prev = lines[first - 1]
-        if not _meaningful(prev):
-            first -= 1
-            continue
-        if _indent(prev) >= key_indent:
-            first -= 1
-            continue
-        if _indent(prev) == key_indent - 2 and prev.lstrip().startswith("-"):
-            first -= 1
-        break
-    last = uses + 1
-    while last < end and (not _meaningful(lines[last]) or _indent(lines[last]) >= key_indent):
-        last += 1
-    return first, last, key_indent
+def _declares_environment(job, env):
+    """Whether `job` declares `environment: <env>` -- inline, or as a
+    mapping with `name: <env>` -- the way GitHub reads it.
+    Case-insensitive, as environment names are."""
+    declared = job.get("environment")
+    if isinstance(declared, dict):
+        declared = declared.get("name")
+    return isinstance(declared, str) and declared.lower() == env.lower()
 
 
 def _lanes_jobs(text):
-    """For each job in `text` with a step using the lanes action:
-    (how many such steps it has, whether one of them is handed `app-id`,
-    whether the job declares the `lanes` environment). A job handing the
-    action the credential is a publisher of the `lanes` status; one without
-    is the ambient classify/gate pattern, which reads no secret. `app-id`
-    counts only inside the lanes step's own block -- another action in the
-    same job taking an input of that name (a token-minting step, say) hands
-    lanes nothing (Codex, mikelward/repo#36)."""
-    lines = _content(text).splitlines()
-    prefix = LANES_ACTION.lower()
+    """For each job in `text` with a step using the lanes action: (how many
+    such steps it has, whether one of them is handed both App inputs,
+    whether the job declares the `lanes` environment, whether one is
+    handed only half the pair). A job handing the action the credential is
+    a publisher of the `lanes` status; one without is the ambient
+    classify/gate pattern, which reads no secret. The inputs count only on
+    the lanes step itself -- another action in the same job taking an
+    input of that name (a token-minting step, say) hands lanes nothing
+    (Codex, mikelward/repo#36)."""
     jobs = []
-    for start, end in _job_blocks(lines):
+    for job in _jobs(_document(text)).values():
+        steps = job.get("steps")
+        if not isinstance(steps, list):
+            continue
         uses = 0
         publishes = False
         half = False
-        for i in range(start + 1, end):
-            m = _STEP_USES_RE.match(lines[i])
-            if not m or not (m.group(2).lower() == prefix or m.group(2).lower().startswith(prefix + "@")):
+        for step in steps:
+            if not isinstance(step, dict):
                 continue
-            first, last, key_indent = _step_block(lines, i, start, end)
-            step = [lines[j] for j in range(first, last) if j != i]
-            inputs = _step_inputs(step, key_indent)
-            # Inputs this cannot read -- an alias, say -- leave the step
-            # unresolved: `lanes_unread` then reports the file, and nothing
-            # of its is deleted.
+            reference = step.get("uses")
+            if not isinstance(reference, str) or not _is_lanes(reference):
+                continue
+            inputs = _step_inputs(step)
+            # Inputs this cannot read leave the step unresolved:
+            # `lanes_unread` then reports the file, and nothing of its is
+            # deleted.
             if inputs is None:
                 continue
             uses += 1
@@ -880,7 +677,7 @@ def _lanes_jobs(text):
                 half = True
         if not uses:
             continue
-        jobs.append((uses, publishes, _declares_environment(lines, (start, end), LANES_ENV), half))
+        jobs.append((uses, publishes, _declares_environment(job, LANES_ENV), half))
     return jobs
 
 
@@ -891,9 +688,9 @@ LANES_INPUTS = frozenset({"app-id", "app-private-key"})
 
 def lanes_publishers(texts):
     """Every workflow in `texts` (name -> text) with a job that hands the
-    lanes action `app-id` -- the jobs that publish the required status as
-    the App -- and, for each, whether every such job declares the `lanes`
-    environment. False is the finding: without the declaration the
+    lanes action the App pair -- the jobs that publish the required status
+    as the App -- and, for each, whether every such job declares the
+    `lanes` environment. False is the finding: without the declaration the
     environment's secret never reaches the job, `init` fails outright and
     `gate` silently falls back to the ambient check-run (mikelward/lanes's
     README, "not optional")."""
@@ -922,14 +719,13 @@ def lanes_incomplete(texts):
 def lanes_unread(texts):
     """The workflows that mention the lanes action more often than the
     reader resolved a step using it: "cannot tell", the same backstop
-    `unread_mentions` is for a reusable workflow. A mention in a shape the
-    reader cannot see may be a publisher, so a credential is never deleted
-    as unused over one."""
-    prefix = LANES_ACTION.lower()
+    `unread_mentions` is for a reusable workflow. A mention in a document
+    PyYAML rejects, or on a step whose `with:` is not a mapping, may be a
+    publisher, so a credential is never deleted as unused over one."""
     return sorted(
         name
         for name, text in texts.items()
-        if _content(text).lower().count(prefix) > sum(uses for uses, _p, _d, _h in _lanes_jobs(text))
+        if _reference_count(text, LANES_ACTION) > sum(uses for uses, _p, _d, _h in _lanes_jobs(text))
     )
 
 
