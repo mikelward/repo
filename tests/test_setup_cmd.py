@@ -4643,7 +4643,11 @@ class CredentialsStepTest(unittest.TestCase):
         "    secrets: inherit\n", "    secrets:\n      token: ${{ secrets.GRADLE_UPDATE_PAT }}\n"
     )
     RUST_INHERITING = INHERITING.replace("gradle-update", "rust-update")
+    # Under `pull_request_target`, the trigger the commit-back workflow's
+    # README sends a caller needing the token to: its ref is the base branch,
+    # which the restricted environment admits.
     SYNC_INHERITING = (
+        "on: pull_request_target\n"
         "jobs:\n"
         "  build:\n"
         "    steps:\n"
@@ -4721,6 +4725,34 @@ class CredentialsStepTest(unittest.TestCase):
         self.assertLess(env_put, write)
         self.assertLess(write, delete)
         self.assertIn(f"{REPO}: deleted 'GRADLE_UPDATE_PAT'", out)
+
+    def test_a_batch_environment_reopened_mid_write_is_undone_too(self):
+        # The point of sharing `settle_environment`: every window found in
+        # the lanes path applies to the batch credentials and the
+        # commit-back token, and fixing each one where it was found would
+        # have left the other two on the older, thinner version. An
+        # administrator reopening the environment while the credential goes
+        # in gets the same answer here — the write undone, the repository
+        # copy kept, and the run saying why.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _secret_file(tmp, "pat.txt", b"ghp_example")
+            fake = self._consumer()
+            fake.secret_names = {"GRADLE_UPDATE_PAT"}
+            fake.env_policies = {"gradle-update": ["main"]}
+            fake.env_secret_names = {"gradle-update": set()}
+            fake.env_reopened_during_writes = {"gradle-update"}
+            code, out, err = _run(
+                fake, ["--force", "--no-rules", "--credential", f"GRADLE_UPDATE_PAT={path}", REPO]
+            )
+        self.assertEqual(code, 1)
+        self.assertEqual(fake.env_secret_names["gradle-update"], set())
+        self.assertEqual(fake.deleted_secrets, [("GRADLE_UPDATE_PAT", "gradle-update")])
+        self.assertEqual(fake.secret_names, {"GRADLE_UPDATE_PAT"})
+        self.assertIn(
+            "GRADLE_UPDATE_PAT kept: environment 'gradle-update' can be reached from any branch "
+            "after the credential was written",
+            err,
+        )
 
     def test_a_repository_copy_is_deleted_once_the_environment_already_holds_one(self):
         fake = self._consumer()
@@ -4862,18 +4894,37 @@ class CredentialsStepTest(unittest.TestCase):
 
     def test_a_caller_on_another_branch_is_read_too(self):
         # A push to `feature` runs its workflows from `feature`, so a caller
-        # that exists only there still needs the credential: not unused,
-        # and held to the same `inherit` test as one on the default branch.
+        # that exists only there still needs the credential: not unused.
+        # But it is not what the move rests on: the branch copy runs from
+        # its branch, which the restricted environment shuts out whether or
+        # not it inherits, so one naming its secrets is reported and holds
+        # nothing back -- keeping the repository copy for it would leave the
+        # credential exposed to exactly that branch's run (the lanes rule of
+        # mikelward/repo#36, extended to every credential by the maintainer,
+        # 2026-09-05).
         fake = FakeGh()
         fake.workflow_files = ["ci.yml"]
         fake.workflow_texts = {"ci.yml": "jobs: {}\n"}
         fake.branch_workflows = {"feature": {"ci.yml": "jobs: {}\n", "weekly.yml": self.NAMING}}
         fake.secret_names = {"GRADLE_UPDATE_PAT"}
         fake.env_secret_names = {"gradle-update": {"GRADLE_UPDATE_PAT"}}
-        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
-        self.assertEqual(code, 1)
-        self.assertIn("gradle-update: weekly on feature passes its secrets by name", out + err)
-        self.assertEqual(fake.deleted_secrets, [])
+        code, out, err = _run(fake, ["--force", "-v", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "gradle-update: no workflow on the default branch calls mikelward/gradle-update; weekly on "
+            "feature does from a branch, which reaches the environment once merged -- the credential "
+            "is kept for it",
+            err,
+        )
+        self.assertIn(
+            "gradle-update: weekly on feature passes its secrets by name; a branch copy runs from its "
+            "branch, which the restricted environment shuts out anyway, so it loses the credential "
+            "when the repository copy moves",
+            err,
+        )
+        self.assertNotIn("not fixed", err)
+        self.assertNotIn("nothing uses it", err)
+        self.assertEqual(fake.deleted_secrets, [("GRADLE_UPDATE_PAT", None)])
         # The unchanged ci.yml is not re-read on the branch: same blob.
         self.assertFalse(any("ci.yml?ref=feature" in " ".join(c) for c in fake.calls))
         # A branch name with URL metacharacters reaches the API encoded;
@@ -4883,10 +4934,22 @@ class CredentialsStepTest(unittest.TestCase):
         fake.branch_workflows = {"feature/x": {}, "feature/x#1": {"weekly.yml": self.NAMING}}
         fake.secret_names = {"GRADLE_UPDATE_PAT"}
         fake.env_secret_names = {"gradle-update": {"GRADLE_UPDATE_PAT"}}
+        code, out, err = _run(fake, ["--force", "-v", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("gradle-update: weekly on feature/x#1 passes its secrets by name", err)
+        self.assertTrue(any("?ref=feature%2Fx%231" in " ".join(c) for c in fake.calls))
+        self.assertEqual(fake.deleted_secrets, [("GRADLE_UPDATE_PAT", None)])
+        # A caller on the default branch naming its secrets still holds the
+        # move back, whatever a branch copy does.
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml", "gradle-update.yml"]
+        fake.workflow_texts = {"ci.yml": "jobs: {}\n", "gradle-update.yml": self.NAMING}
+        fake.branch_workflows = {"feature": {"gradle-update.yml": self.INHERITING}}
+        fake.secret_names = {"GRADLE_UPDATE_PAT"}
+        fake.env_secret_names = {"gradle-update": {"GRADLE_UPDATE_PAT"}}
         code, out, err = _run(fake, ["--force", "--no-rules", REPO])
         self.assertEqual(code, 1)
-        self.assertIn("gradle-update: weekly on feature/x#1 passes its secrets by name", out + err)
-        self.assertTrue(any("?ref=feature%2Fx%231" in " ".join(c) for c in fake.calls))
+        self.assertIn("not fixed: gradle-update: gradle-update passes its secrets by name", err)
         self.assertEqual(fake.deleted_secrets, [])
         # Inheriting there, the caller lets the move go ahead.
         fake = FakeGh()
@@ -5126,6 +5189,231 @@ class CredentialsStepTest(unittest.TestCase):
         )
         self.assertEqual(fake.deleted_secrets, [("CI_COMMIT_ARTIFACT_TOKEN", None)])
 
+    def test_a_batch_environment_any_branch_can_reach_is_restricted(self):
+        # The batch runs on a schedule or a dispatch, from the default
+        # branch; an open environment hands a dispatch of a branch copy the
+        # credential too. Restricted after the move, exactly as the lanes
+        # environment is (maintainer, 2026-09-05).
+        fake = self._consumer()
+        fake.secret_names = {"GRADLE_UPDATE_PAT"}
+        fake.env_secret_names = {"gradle-update": {"GRADLE_UPDATE_PAT"}}
+        code, out, err = _run(fake, ["--force", "-v", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "gradle-update: restrict environment 'gradle-update' to branch 'main' -- it can be reached "
+            "from any branch, so a workflow run from any branch reaches the credential too",
+            err,
+        )
+        self.assertEqual(fake.deleted_secrets, [("GRADLE_UPDATE_PAT", None)])
+        self.assertEqual(fake.restricted, [("gradle-update", "main")])
+        self.assertEqual(fake.env_policies["gradle-update"], ["main"])
+        # Already restricted: nothing to write (and nothing to show -- a
+        # credentials step with nothing to do prints no plan).
+        fake = self._consumer()
+        fake.env_secret_names = {"gradle-update": {"GRADLE_UPDATE_PAT"}}
+        fake.env_policies = {"gradle-update": ["main"]}
+        code, out, err = _run(fake, ["--force", "-v", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.restricted, [])
+        self.assertEqual(fake.env_puts, [])
+        # A policy someone set is theirs, and the run fails until it is right.
+        fake = self._consumer()
+        fake.env_secret_names = {"gradle-update": {"GRADLE_UPDATE_PAT"}}
+        fake.env_policies = {"gradle-update": ["release/*"]}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "not fixed: gradle-update: environment 'gradle-update' is restricted to 'release/*', not to "
+            "'main' alone -- restrict it to 'main' in the environment's settings",
+            err,
+        )
+        self.assertEqual(fake.restricted, [])
+        # Refused under a caller naming its secrets: the credential is
+        # stranded, and the policy is settled with it, not around it.
+        fake = self._consumer(self.NAMING)
+        fake.env_secret_names = {"gradle-update": {"GRADLE_UPDATE_PAT"}}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertEqual(fake.restricted, [])
+        self.assertEqual(fake.env_puts, [])
+        # And not for an environment this run neither found nor creates.
+        fake = self._consumer()
+        fake.secret_names = {"GRADLE_UPDATE_PAT"}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertEqual(fake.env_puts, [])
+
+    def test_a_caller_that_went_away_while_the_plan_waited_is_not_restricted(self):
+        # Re-validated like a delete: the restriction is the only action
+        # when the environment already holds the credential, and a caller
+        # gone by apply time leaves nothing to justify it.
+        fake = self._consumer()
+        fake.env_secret_names = {"gradle-update": {"GRADLE_UPDATE_PAT"}}
+        fake.workflow_texts_after_recheck = {"gradle-update.yml": "jobs: {}\n"}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("environment 'gradle-update' not restricted: the callers changed since the plan was built", err)
+        self.assertEqual(fake.restricted, [])
+
+    def test_the_commit_back_environment_is_restricted_under_pull_request_target(self):
+        # The caller runs under `pull_request_target`, whose ref is the base
+        # branch: the restriction admits its commit job, and closes the
+        # environment to everything else.
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        fake.workflow_texts = {"ci.yml": self.SYNC_INHERITING}
+        fake.env_secret_names = {"ci-commit-artifact": {"CI_COMMIT_ARTIFACT_TOKEN"}}
+        code, out, err = _run(fake, ["--force", "-v", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "ci-commit-artifact: restrict environment 'ci-commit-artifact' to branch 'main' -- it can be "
+            "reached from any branch, so a workflow run from any branch reaches the credential too",
+            err,
+        )
+        self.assertEqual(fake.restricted, [("ci-commit-artifact", "main")])
+
+    def test_every_merge_ref_event_holds_the_restriction(self):
+        # `pull_request_review` and `pull_request_review_comment` get the
+        # merge ref too, which a restricted environment refuses -- checking
+        # the one literal `pull_request` read a caller on either as safely
+        # restrictable, restricted the environment and deleted the
+        # repository token, and the called commit job then could not enter
+        # it on those events (Codex, mikelward/repo#37).
+        for event in ("pull_request_review", "pull_request_review_comment"):
+            with self.subTest(event=event):
+                fake = FakeGh()
+                fake.workflow_files = ["ci.yml"]
+                fake.workflow_texts = {
+                    "ci.yml": self.SYNC_INHERITING.replace(
+                        "on: pull_request_target", f"on: [push, {event}]"
+                    )
+                }
+                fake.secret_names = {"CI_COMMIT_ARTIFACT_TOKEN"}
+                fake.env_secret_names = {"ci-commit-artifact": {"CI_COMMIT_ARTIFACT_TOKEN"}}
+                code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+                self.assertEqual(code, 1)
+                self.assertEqual(fake.restricted, [])
+                self.assertIn("whose ref is the merge ref", err)
+        # `pull_request_target`'s ref is the base branch, which the
+        # restriction admits: that one is not held.
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        fake.workflow_texts = {"ci.yml": self.SYNC_INHERITING}
+        fake.secret_names = {"CI_COMMIT_ARTIFACT_TOKEN"}
+        fake.env_secret_names = {"ci-commit-artifact": {"CI_COMMIT_ARTIFACT_TOKEN"}}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.restricted, [("ci-commit-artifact", "main")])
+
+    def test_a_blocked_restriction_still_vouches_for_the_destination(self):
+        # `blocked` holds back the RESTRICTION, not the policy read: it used
+        # to report and return before the environment was read at all, so
+        # the apply wrote the token into a door nobody had looked at and
+        # deleted the repository copy behind it (Codex, mikelward/repo#37).
+        under_pr = self.SYNC_INHERITING.replace("on: pull_request_target", "on: [push, pull_request]")
+
+        def blocked_run(**attrs):
+            fake = FakeGh()
+            fake.workflow_files = ["ci.yml"]
+            fake.workflow_texts = {"ci.yml": under_pr}
+            fake.secret_names = {"CI_COMMIT_ARTIFACT_TOKEN"}
+            fake.env_secret_names = {"ci-commit-artifact": {"CI_COMMIT_ARTIFACT_TOKEN"}}
+            for name, value in attrs.items():
+                setattr(fake, name, value)
+            return fake, _run(fake, ["--force", "--no-rules", REPO])
+
+        # A policy that cannot be read is a door this run cannot vouch for.
+        fake, (code, _out, err) = blocked_run(env_get_check_fails={"ci-commit-artifact"})
+        self.assertEqual(code, 1)
+        self.assertEqual(fake.deleted_secrets, [])
+        self.assertEqual(fake.secret_names, {"CI_COMMIT_ARTIFACT_TOKEN"})
+        self.assertIn(
+            "ci-commit-artifact: CI_COMMIT_ARTIFACT_TOKEN stays a repository secret until the "
+            "policy can be read",
+            err,
+        )
+        # A policy someone set is one it may not rewrite, blocked or not.
+        fake, (code, _out, err) = blocked_run(env_policies={"ci-commit-artifact": ["release/*"]})
+        self.assertEqual(code, 1)
+        self.assertEqual(fake.deleted_secrets, [])
+        self.assertIn("a policy someone set is not rewritten", err)
+
+    def test_a_renamed_default_branch_holds_a_caller_s_move(self):
+        # `workflow_texts` marks the NEW default's copies `branch=None`, so
+        # an unchanged caller filename made the set comparison pass while
+        # `default` still held the old name -- and the move restricted the
+        # environment to a branch that is no longer the default and deleted
+        # the repository copy behind it (Codex, mikelward/repo#37). The
+        # lanes recheck has confirmed the name since mikelward/repo#36.
+        fake = self._consumer()
+        fake.secret_names = {"GRADLE_UPDATE_PAT"}
+        fake.env_secret_names = {"gradle-update": {"GRADLE_UPDATE_PAT"}}
+        fake.env_policies = {"gradle-update": ["main"]}
+        fake.default_branch_after_bootstrap_plan = "trunk"
+        fake.default_branch_renamed_after_read = 2  # between the plan and the recheck
+        # --no-bootstrap so the credentials plan is the step under test.
+        code, out, err = _run(fake, ["--force", "--no-rules", "--no-bootstrap", REPO])
+        self.assertEqual(code, 1)
+        self.assertEqual(fake.deleted_secrets, [])
+        self.assertEqual(fake.restricted, [])
+        self.assertIn("the default branch is now 'trunk', not 'main'", err)
+
+    def test_a_commit_back_caller_under_pull_request_is_not_fixed_with_the_change_named(self):
+        # Under `pull_request` the ref is the merge ref, which an environment
+        # restricted to `main` refuses -- the called commit job would never
+        # start -- while an open one hands that pull-request-controlled run
+        # the token. The end state is the same; what closes it is the
+        # caller's own trigger, so it is reported as not fixed with that
+        # change named, and the environment is left as it is until then
+        # (maintainer, 2026-09-05: converge on the end state, and say what
+        # is left).
+        under_pr = self.SYNC_INHERITING.replace("on: pull_request_target", "on: [push, pull_request]")
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        fake.workflow_texts = {"ci.yml": under_pr}
+        fake.secret_names = {"CI_COMMIT_ARTIFACT_TOKEN"}
+        fake.env_secret_names = {"ci-commit-artifact": {"CI_COMMIT_ARTIFACT_TOKEN"}}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "not fixed: ci-commit-artifact: ci calls mikelward/ci-commit-artifact from a `pull_request` "
+            "run, whose ref is the merge ref: environment 'ci-commit-artifact' restricted to 'main' "
+            "refuses that job, and open it hands a same-repo pull request's own run the token -- "
+            "trigger the caller on `pull_request_target` and pass `push-token` "
+            "(mikelward/ci-commit-artifact's README), as mikelward/typelauncher's ci.yml does; the "
+            "next run restricts the environment",
+            err,
+        )
+        # The move itself still happens: the repository copy is the wider
+        # exposure, and the environment copy is what the caller reads.
+        self.assertEqual(fake.deleted_secrets, [("CI_COMMIT_ARTIFACT_TOKEN", None)])
+        self.assertEqual(fake.restricted, [])
+        self.assertEqual(fake.env_puts, [])
+        # A caller whose triggers cannot be read is "cannot tell": the same.
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        fake.workflow_texts = {"ci.yml": self.SYNC_INHERITING.replace("on: pull_request_target\n", "")}
+        fake.env_secret_names = {"ci-commit-artifact": {"CI_COMMIT_ARTIFACT_TOKEN"}}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("from a `pull_request` run", err)
+        self.assertEqual(fake.restricted, [])
+        # Moved to `pull_request` while the plan waited: the restriction is
+        # refused at apply time rather than shutting the caller out.
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        fake.workflow_texts = {"ci.yml": self.SYNC_INHERITING}
+        fake.env_secret_names = {"ci-commit-artifact": {"CI_COMMIT_ARTIFACT_TOKEN"}}
+        fake.workflow_texts_after_recheck = {"ci.yml": under_pr}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "environment 'ci-commit-artifact' not restricted: a caller now runs under `pull_request`, "
+            "which the restriction would refuse",
+            err,
+        )
+        self.assertEqual(fake.restricted, [])
+
     def test_the_commit_back_token_stays_while_any_caller_names_it(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = _secret_file(tmp, "token.txt")
@@ -5228,10 +5516,12 @@ class CredentialsStepTest(unittest.TestCase):
             [("RUST_UPDATE_APP_PRIVATE_KEY", REPO, "rust-update", b"-----BEGIN EXAMPLE-----")],
         )
         self.assertEqual(fake.deleted_secrets, [("RUST_UPDATE_APP_PRIVATE_KEY", None)])
-        # The environment already existed, so it was not re-PUT (which
-        # would reset its protection settings).
-        env_put, write, delete = self._order(fake)
-        self.assertIsNone(env_put)
+        # The environment already existed, so it was not re-created; the
+        # one PUT is the restriction, which resends its protection settings.
+        self.assertEqual([("rust-update", "main")], fake.restricted)
+        self.assertEqual(
+            [body.get("deployment_branch_policy") is not None for _env, body in fake.env_puts], [True]
+        )
 
     def test_an_environment_listed_in_another_case_is_written_under_that_name(self):
         with tempfile.TemporaryDirectory() as tmp:

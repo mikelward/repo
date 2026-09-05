@@ -397,6 +397,71 @@ def audit_secrets(repo, ok, fix):
         flags = " ".join(f"--credential {name}=PATH" for name in names)
         return f"`repo setup {flags} {repo}`"
 
+    def on_default(found):
+        """The callers on the default branch: the ones a move rests on. A
+        branch copy runs from its branch, which the restricted environment
+        shuts out whether or not it inherits, so it is reported and never
+        the finding that holds a move back (`repo setup` reads it the same
+        way; maintainer, 2026-09-05)."""
+        return {name: verdict for name, verdict in found.items() if name.branch is None}
+
+    def audit_environment(label, environment, reach, stops=""):
+        """The environment's deployment branch policy, audited the way the
+        lanes one is: only a custom policy naming exactly the default branch
+        is [ok]; an open one is the [FIX] `repo setup` closes, `reach` saying
+        what an open one hands out; a policy someone set is a [FIX] by hand.
+
+        `stops` qualifies the two lines that name `repo setup`, for a caller
+        whose own planner would report and return before reaching the
+        restriction -- the lanes block knows that and this shared helper
+        cannot, so it is passed in rather than recomputed (Codex,
+        mikelward/repo#36)."""
+        try:
+            policy = credentials.environment_branch_policy(repo, environment)
+        except credentials.ReadError as e:
+            error_lines(e.message, e.detail)
+            raise SystemExit(1)
+        wrong = credentials.branch_policy_verdict(policy, default)
+        if wrong is None:
+            ok(f"{label}: environment '{environment}' admits only the trusted base branch")
+        elif policy == "open":
+            fix(
+                f"{label}: environment '{environment}' {wrong} -- {reach}; `repo setup {repo}` "
+                f"restricts it to '{default}'" + stops
+            )
+        elif credentials.restrictable(policy):
+            fix(
+                f"{label}: environment '{environment}' {wrong} -- custom-policy mode with no "
+                f"branch named, the state a restriction leaves when its second write fails, so "
+                f"no job reaches the credential; `repo setup {repo}` completes it with '{default}'"
+                + stops
+            )
+        else:
+            fix(
+                f"{label}: environment '{environment}' {wrong} -- restrict it to '{default}' "
+                f"in the environment's settings (`repo setup` rewrites no policy someone set)"
+            )
+
+    def audit_callers(label, callers, what):
+        """The branch-copy and branch-only findings shared by every credential
+        a reusable workflow reads: (whether every default-branch caller
+        inherits, whether any default-branch caller exists)."""
+        trusted = on_default(callers)
+        if not trusted:
+            print(
+                f"  [CHECK] {label}: no workflow on the default branch calls {what}; "
+                f"{credentials.workflow_labels(sorted(callers))} does from a branch, which reaches "
+                f"the environment once merged"
+            )
+        for caller, verdict in sorted(callers.items()):
+            if not verdict and caller.branch is not None:
+                print(
+                    f"  [CHECK] {label}: {credentials.workflow_label(caller)} passes its secrets by "
+                    f"name; a branch copy runs from its branch, which the restricted environment "
+                    f"shuts out anyway, so it loses the credential when the repository copy moves"
+                )
+        return all(trusted.values()), bool(trusted)
+
     # Every workflow is read, on every branch: a batch's caller is
     # whichever file calls it from a job -- the fleet names it `<hub>.yml`,
     # but GitHub runs any name, from any branch a push lands on -- and a
@@ -434,10 +499,9 @@ def audit_secrets(repo, ok, fix):
         # finding however the others read. Read as `repo setup` reads
         # them, so the two agree -- an [ok] here for a credential setup
         # calls NOT FIXED would be a false all-clear.
-        inherits = True
-        for caller, verdict in sorted(found[hub].items()):
+        inherits, trusted = audit_callers(hub, found[hub], credentials.hub_workflow(hub).rstrip("/"))
+        for caller, verdict in sorted(on_default(found[hub]).items()):
             if not verdict:
-                inherits = False
                 fix(
                     f"{hub}: {credentials.workflow_label(caller)} passes its secrets by name, "
                     f"so a credential in the '{hub}' "
@@ -452,7 +516,7 @@ def audit_secrets(repo, ok, fix):
                 f"{move_command(as_repository)} moves it into the '{hub}' environment"
             )
         if in_environment:
-            if not as_repository and inherits is True:
+            if not as_repository and inherits and trusted:
                 ok(f"{hub}: the batch credential lives in the '{hub}' environment")
         elif not credentials.usable(set(repo_secrets) | set(env_secrets), hub):
             # No usable credential anywhere. A whole credential at repository
@@ -470,6 +534,30 @@ def audit_secrets(repo, ok, fix):
                 f"{hub}: environment '{hub}' holds no batch credential ({pat}, or {app_id} "
                 f"and {app_key}){half} -- the batch opens its pull requests as GITHUB_TOKEN; "
                 f"{move_command([pat])} sets one"
+            )
+        if environment is not None:
+            # The batch runs on a schedule or a dispatch, both from the
+            # default branch by default; an environment any branch can reach
+            # hands a dispatch of a branch copy the credential too.
+            #
+            # Qualified where the planner would stop first, as the lanes
+            # block's own lines are: `settle` returns the moment `move`
+            # reports, before `settle_environment` is reached at all, so a
+            # bare recommendation promised a restriction the command does
+            # not perform (Codex, mikelward/repo#37).
+            audit_environment(
+                hub,
+                environment,
+                "a workflow run from any branch reaches the credential too",
+                _setup_stops(
+                    f"the '{hub}' environment holds no batch credential for it to place"
+                    if not in_environment
+                    and not credentials.usable(set(repo_secrets) | set(env_secrets), hub)
+                    else f"{credentials.workflow_labels(sorted(on_default(found[hub])))} passes its "
+                    f"secrets by name rather than inheriting them"
+                    if trusted and not inherits
+                    else None
+                ),
             )
 
     expected = {name for hub in (*hubs, *unknown) for name in credentials.batch_credentials(hub)}
@@ -529,10 +617,9 @@ def audit_secrets(repo, ok, fix):
                 f"{prefix.rstrip('/')} -- `repo setup {repo}` deletes it"
             )
     else:
-        inherits = True
-        for caller, verdict in sorted(callers.items()):
+        inherits, trusted = audit_callers(label, callers, prefix.rstrip("/"))
+        for caller, verdict in sorted(on_default(callers).items()):
             if not verdict:
-                inherits = False
                 fix(
                     f"{label}: {credentials.workflow_label(caller)} passes its secrets by name, "
                     f"so a token in the '{label}' "
@@ -547,7 +634,7 @@ def audit_secrets(repo, ok, fix):
                 f"{move_command([token])} moves it into the '{label}' environment"
             )
         if token in env_secrets:
-            if token not in repo_secrets and inherits:
+            if token not in repo_secrets and inherits and trusted:
                 ok(f"{label}: the token lives in the '{label}' environment")
         elif token not in repo_secrets:
             fix(
@@ -555,6 +642,39 @@ def audit_secrets(repo, ok, fix):
                 f"pushes as GITHUB_TOKEN, and a push it authors starts no workflow run, so a "
                 f"pull request with drift wedges on checks that never arrive; "
                 f"{move_command([token])} sets one"
+            )
+        # A caller run under `pull_request` has the merge ref, which an
+        # environment restricted to the default branch refuses -- the
+        # called commit job never starts -- while an open one hands that
+        # same pull-request-controlled run the token. The end state needs
+        # the caller on `pull_request_target`, the caller's own change, so
+        # it is the finding; the environment is audited once it is made
+        # (maintainer, 2026-09-05).
+        merge_ref = credentials.merge_ref_callers(texts, prefix)
+        if merge_ref:
+            fix(
+                f"{label}: {credentials.workflow_labels(merge_ref)} calls {prefix.rstrip('/')} from a "
+                f"`{credentials.MERGE_REF_EVENT}` run, whose ref is the merge ref: environment "
+                f"'{environment or label}' restricted to '{default}' refuses that job, and open it "
+                f"hands a same-repo pull request's own run the token -- trigger the caller on "
+                f"`pull_request_target` and pass `push-token` (mikelward/ci-commit-artifact's README), "
+                f"as mikelward/typelauncher's ci.yml does; `repo setup {repo}` then restricts the environment"
+            )
+        elif environment is not None:
+            # Qualified where the planner would stop first, as the hub and
+            # lanes lines are (Codex, mikelward/repo#37).
+            audit_environment(
+                label,
+                environment,
+                "a workflow run from any branch reaches the token too",
+                _setup_stops(
+                    f"environment '{label}' holds no {token} for it to place"
+                    if token not in env_secrets and token not in repo_secrets
+                    else f"{credentials.workflow_labels(sorted(on_default(callers)))} passes its "
+                    f"secrets by name rather than inheriting them"
+                    if trusted and not inherits
+                    else None
+                ),
             )
 
     # The lanes App credential, audited the way the token above is -- with
@@ -815,32 +935,13 @@ def audit_secrets(repo, ok, fix):
                 f"requires; {move_command([app_id, app_key])} sets one" + setup_stops()
             )
         if environment is not None:
-            try:
-                policy = credentials.environment_branch_policy(repo, environment)
-            except credentials.ReadError as e:
-                error_lines(e.message, e.detail)
-                raise SystemExit(1)
-            wrong = credentials.branch_policy_verdict(policy, default)
-            if wrong is None:
-                ok(f"{label}: environment '{environment}' admits only the trusted base branch")
-            elif policy == "open":
-                fix(
-                    f"{label}: environment '{environment}' {wrong} -- a same-repo pull request's "
-                    f"push-triggered workflow reads the App credential exactly as the trusted "
-                    f"jobs do; `repo setup {repo}` restricts it to '{default}'" + setup_stops(True)
-                )
-            elif credentials.restrictable(policy):
-                fix(
-                    f"{label}: environment '{environment}' {wrong} -- custom-policy mode with no "
-                    f"branch named, the state a restriction leaves when its second write fails, so "
-                    f"no job reaches the credential; `repo setup {repo}` completes it with "
-                    f"'{default}'" + setup_stops(True)
-                )
-            else:
-                fix(
-                    f"{label}: environment '{environment}' {wrong} -- restrict it to '{default}' "
-                    f"in the environment's settings (`repo setup` rewrites no policy someone set)"
-                )
+            audit_environment(
+                label,
+                environment,
+                "a same-repo pull request's push-triggered workflow reads the App credential exactly "
+                "as the trusted jobs do",
+                setup_stops(True),
+            )
 
     other = sorted(name for name in repo_secrets if name not in credentials.FLEET_CREDENTIALS)
     if other:

@@ -140,14 +140,21 @@ by one, reaches every job in it, a batch's untrusted update job included.
 A reusable workflow's callers are whichever workflows call it from a job,
 whatever they are named and on whichever branch (a workflow that differs
 from the default branch's copy is read on its own branch too, since a push
-there runs it). A credential kept as a repository secret, a caller
-that passes its secrets by name (an environment credential never reaches
-it), a consumer whose environment holds none, a workflow that mentions the
-reusable workflow in a shape the audit cannot read as a caller ("cannot
-tell"), and a credential left behind by a workflow nothing here calls --
-for the batches and the commit-back workflow alike -- are each reported as
-`[FIX]` -- a finding `repo setup` closes, named with the command -- and
-every other repository-level secret is listed by name for review. The lanes
+there runs it -- but only the default branch's callers decide anything: a
+branch copy runs from its branch, which the restricted environment shuts
+out either way, so one naming its secrets is a `[CHECK]`). A credential
+kept as a repository secret, a default-branch caller that passes its
+secrets by name (an environment credential never reaches it), a consumer
+whose environment holds none, a workflow that mentions the reusable
+workflow in a shape the audit cannot read as a caller ("cannot tell"), a
+credential left behind by a workflow nothing here calls, and an environment
+any branch can reach -- for the batches and the commit-back workflow alike
+-- are each reported as `[FIX]` -- a finding `repo setup` closes, named
+with the command -- and every other repository-level secret is listed by
+name for review. The commit-back workflow's caller has to run under
+`pull_request_target` before its environment can be restricted: under
+`pull_request` the run's ref is the merge ref, which the restriction would
+refuse, so that caller is the `[FIX]`, named with the change to make. The lanes
 App pair (`LANES_APP_ID` + `LANES_APP_PRIVATE_KEY`, which mikelward/lanes's
 `init`, `attest` and `gate` modes publish the required `lanes` status with)
 is audited the same way with one substitution the action's shape forces: a
@@ -171,7 +178,8 @@ not fail the audit yet (see `TODO.md`): the layout is being rolled out through
 `repo setup` makes the move, and enables auto-merge and delete-branch-on-merge
 on the repository where either is off. Its fleet-credentials step is always on: for
 each batch the repository runs (by whichever workflows call it from a job,
-whatever they are named, on any branch) and for the
+whatever they are named, on the default branch -- a caller only on a branch
+keeps the credential for the day it merges) and for the
 commit-back workflow (by a job calling it), a value passed as
 `--credential NAME=PATH` is set in the environment the name belongs in, the
 repository-level copy is deleted once the environment holds a usable
@@ -186,10 +194,13 @@ one flag that places it). It refuses -- and says so, as
 environment holds nothing and no value was given (GitHub never returns a
 secret's value, so a move needs it handed in). The lanes App pair moves the
 same way, held back by a publishing job that does not declare the
-environment; once the pair is settled, an open `lanes` environment is
+environment; once a credential is settled, its open environment is
 restricted to the default branch (re-sending its wait timer and reviewers,
-which the API would otherwise reset), and a policy someone set to anything
-else is reported, never rewritten. Across a fleet:
+which the API would otherwise reset) -- the batches' and the lanes pair's
+alike, and the commit-back workflow's once its caller runs under
+`pull_request_target`; a caller under `pull_request` is `NOT FIXED` with
+that change named, since the restriction would refuse its commit job -- and
+a policy someone set to anything else is reported, never rewritten. Across a fleet:
 `repo list | xargs -n1 repo setup --force --credential NPM_UPDATE_PAT=pat.txt --credential GRADLE_UPDATE_PAT=pat.txt --credential RUST_UPDATE_PAT=pat.txt --credential CI_COMMIT_ARTIFACT_TOKEN=token.txt --credential LANES_APP_ID=app-id.txt --credential LANES_APP_PRIVATE_KEY=app.pem`.
 `repo cleanup` deletes the branches a repository has finished with. It exists
 because this fleet used to leave GitHub's "automatically delete head branches"
