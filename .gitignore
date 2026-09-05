@@ -1,3 +1,7 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+# What `uv run` leaves behind: its environment, and a lockfile for the one
+# dependency -- not worth keeping in step by hand.
+.venv/
+uv.lock

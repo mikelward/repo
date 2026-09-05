@@ -5,15 +5,29 @@ Run directly from a checkout (this file's own directory is on sys.path,
 so `import repo_lib` resolves without installing anything) -- no build
 step, matching mikelward/scripts's own convention.
 
-Requires the gh CLI, authenticated. Cost and reliability: free -- a
-handful of GitHub REST API calls per invocation, well inside the
-5,000-authenticated-requests-an-hour limit.
+Requires the gh CLI, authenticated, and PyYAML -- the one third-party
+dependency, declared in pyproject.toml, which `uv run ./repo ...` installs
+on its own. Cost and reliability: free -- a handful of GitHub REST API
+calls per invocation, well inside the 5,000-authenticated-requests-an-hour
+limit.
 """
 
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+# Checked here, before anything imports it, so a missing PyYAML is one
+# sentence naming the fix rather than a traceback out of repo_lib.
+try:
+    import yaml  # noqa: F401
+except ImportError:
+    sys.exit(
+        "repo: PyYAML is not installed, and the workflow reader needs it. Run this as\n"
+        "`uv run ./repo ...`, which installs it into a project environment, or install it\n"
+        "yourself: `uv pip install pyyaml`, `python3 -m pip install pyyaml`, or your\n"
+        "distribution's package (`python3-yaml` on Debian and Ubuntu)."
+    )
 
 from repo_lib.cli import main
 

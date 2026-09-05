@@ -31,8 +31,12 @@ anything that matters here.
 
 ## Requirements
 
-Python 3.9+ (standard library only -- no dependencies to install) and the
-`gh` CLI, authenticated. The floor is `argparse.BooleanOptionalAction`
+Python 3.9+, [PyYAML](https://pyyaml.org/) (the one dependency, declared
+in `pyproject.toml`: `uv run ./repo ...` installs it into a project
+environment on its own, or install it yourself with `uv pip install pyyaml`,
+`python3 -m pip install pyyaml`, or your distribution's package -- `python3-yaml`
+on Debian and Ubuntu; `./repo` says so if it is missing) and the `gh` CLI,
+authenticated. The floor is `argparse.BooleanOptionalAction`
 (`repo create`'s `--scaffold`/`--no-scaffold`), added in 3.9; every
 subcommand's parser is built up front regardless of which one is invoked,
 so an older interpreter fails on any command, not just that one (Codex

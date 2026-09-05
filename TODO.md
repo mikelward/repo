@@ -399,25 +399,6 @@
   `main` with a ruleset, which is not one (Codex, mikelward/repo#36).
   Reversible: `restrict_environment` is the one writer, and the plan's
   `else` branch is where a rewrite would go.
-- **The workflow reader stays hand-rolled, failing closed, rather than
-  becoming a YAML parser** (autopilot, 2026-09-05). Codex found seven
-  shapes the lanes-step reader misread on mikelward/repo#36 -- a search
-  for `app-id` matched the wrong step, then `env:`, then a flow mapping,
-  then whitespace before a colon, then a quoted key, then an upper-case
-  input name, then a quoted `uses` key -- which is the "second verified
-  finding in the same mechanism" signal in AGENTS.md: the class is reading
-  YAML by regex, and each fix deletes one instance. The design that
-  deletes the class is a real parser, and the standard library has none;
-  `mikelward/yaml-lite` is the fleet's dependency-free one but is
-  JavaScript, so it would be a port. Kept as is because the reader's
-  contract is already the safe one -- a shape it cannot resolve is
-  `lanes_unread`'s "cannot tell" and deletes nothing -- and the fleet
-  writes one shape; each finding widened what resolves, never what is
-  deleted. The alternative is porting yaml-lite (`repo_lib/yaml_lite.py`)
-  and reading the mapping outright, which is the maintainer's call: a
-  port is a few hundred lines to review and a second copy to keep in step.
-  Reversible: `_step_block`, `_step_inputs` and `_job_blocks` are the whole
-  surface a parser would replace.
 - **A branch copy of a lanes publisher does not hold the credential move
   back; a branch copy of a batch caller still does** (autopilot,
   2026-09-05). Codex found, on mikelward/repo#36, that a publishing job on a

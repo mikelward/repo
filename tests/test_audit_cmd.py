@@ -1587,7 +1587,9 @@ class LanesCredentialAuditTest(unittest.TestCase):
         self.assertNotIn("lanes:", out)
 
     def test_a_shape_the_reader_cannot_resolve_is_cannot_tell(self):
-        fake = self._publisher("jobs: {init: {steps: [{uses: mikelward/lanes@main, with: {app-id: x}}]}}\n")
+        # A document PyYAML rejects resolves no step, so the mention is
+        # "cannot tell".
+        fake = self._publisher("jobs: {init: {steps: [{uses: mikelward/lanes@main, with: {app-id: x}}]}\n")
         fake.environments = {"lanes": self.PAIR}
         code, out, err = _run(fake, [REPO])
         self.assertEqual(code, 0, err)
@@ -1749,7 +1751,7 @@ class SecretsAuditTest(unittest.TestCase):
         fake = FakeGh()
         fake.workflow_files = ["ci.yml", "batch.yml"]
         fake.workflow_texts = {
-            "batch.yml": "jobs: {update: {uses: mikelward/gradle-update/.github/workflows/gradle-update.yml@main}}\n"
+            "batch.yml": "env:\n  HUB: mikelward/gradle-update/.github/workflows/gradle-update.yml@main\n"
         }
         fake.environments = {"gradle-update": ["GRADLE_UPDATE_PAT"]}
         code, out, err = _run(fake, [REPO])
@@ -1772,7 +1774,7 @@ class SecretsAuditTest(unittest.TestCase):
         fake = FakeGh()
         fake.workflow_files = ["ci.yml", "gradle-update.yml", "batch.yml"]
         fake.workflow_texts = {
-            "batch.yml": "jobs: {update: {uses: mikelward/gradle-update/.github/workflows/gradle-update.yml@main}}\n"
+            "batch.yml": "env:\n  HUB: mikelward/gradle-update/.github/workflows/gradle-update.yml@main\n"
         }
         fake.repo_secrets = ["GRADLE_UPDATE_PAT"]
         fake.environments = {"gradle-update": ["GRADLE_UPDATE_PAT"]}

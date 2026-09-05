@@ -71,6 +71,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
+      # The one dependency, declared in pyproject.toml; setup-python's
+      # interpreter starts without it.
+      - run: python3 -m pip install PyYAML
       - run: make test
 
   # The one check the ruleset should require. Always runs, always reports —
