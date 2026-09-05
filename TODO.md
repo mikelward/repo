@@ -325,6 +325,128 @@
 
 ## Decisions needing review
 
+- **Whether a half-failed restriction should restore the open policy at all**
+  (flagged for the maintainer, 2026-09-05). `restrict_environment` is a PUT
+  (switch to custom mode) then a POST (name the default branch). When the POST
+  fails, the environment is left in custom mode naming NO branch, which admits
+  nothing -- so the code restores the open policy, and that restore is a write
+  whose inputs can go stale. Three findings have now landed on exactly that:
+  the settings snapshot reverting somebody's protection change, the policy list
+  going stale across a round trip, and the mode changing underneath. Each is
+  fixed, and the remaining window is one API call wide, which is the floor for
+  any confirm-then-write.
+  Codex's suggestion is to stop restoring: leave the environment closed and
+  report. That deletes the class outright -- no write, no staleness, nothing to
+  clobber -- and `restrictable` already treats custom-mode-naming-nothing as a
+  half-done restriction the next `repo setup` run completes, which several
+  error paths here already rely on. What it costs is the case where the
+  environment already HELD the pair: closed means the publisher cannot read it,
+  so the required `lanes` status stops until someone re-runs. Restoring open
+  keeps the publisher working and leaves the credential exactly as exposed as
+  the run found it.
+  So it is a real trade-off between an outage and an exposure that predates the
+  run, not an obvious win either way, and it is a behavior decision about what
+  state a repository is left in -- the maintainer's call. Reversible: the
+  restore is one `try` block in `restrict_environment`, and deleting it leaves
+  the surrounding refusals intact.
+
+- **A paired credential write is three separate guards, not one unit**
+  (autopilot, 2026-09-05; flagged for the maintainer). Four findings on
+  mikelward/repo#36 landed in one mechanism -- writing two secrets that have to
+  move together, over an API with no atomic two-key write. The rollback
+  inventory could fail and silently disable the undo; a rotation's overwrites
+  left a mismatched pair with nothing to undo; a reopened environment kept what
+  the run had just written; and the first failed write did not stop the second,
+  breaking a pair that had been working. Each is fixed where it was found:
+  `unreadable` refuses before any write, `created`/`overwrote` split what can be
+  undone from what cannot, the reopened branch undoes what it created, and the
+  write loop now breaks on the first failure.
+  What that does not do is make the pair one object. The invariant -- both
+  halves move or neither does -- is currently enforced by four guards in
+  sequence in `_apply_credentials`, and the fourth was missing for four rounds
+  without any of the other three noticing. A `write_pair` that owned the whole
+  sequence (inventory, write, undo what it created, name what it overwrote,
+  confirm the policy after) would make the invariant one thing to get right
+  rather than four, and would make a fifth window a compile-time-shaped question
+  instead of a review finding. That is a design change on the apply path, so it
+  is the maintainer's call, not autopilot's: the behavior is correct as it
+  stands, and the cost of the refactor is a rewrite of the most-reviewed code on
+  this branch. Reversible either way -- the guards are all in one function.
+
+- **The lanes App pair's home is the `lanes` environment, by name**
+  (autopilot, 2026-09-05). mikelward/lanes's README says the environment may
+  be named anything, but this fleet names each credential's environment
+  after what reads it, and every consumer so far declares `lanes`, so the
+  audit and the move hold a publishing job to exactly that name. The
+  alternative -- reading each job's own `environment:` and checking that
+  one -- would let two publishing jobs disagree about where the pair lives
+  and make "where does the credential belong" a per-job question `repo
+  setup --credential` cannot answer. Reversible: `LANES_ENV` in
+  `repo_lib/credentials.py` is one string, and `_declares_environment` is
+  the one comparison.
+- **`repo setup` restricts a `lanes` environment only when it is open to
+  every branch** (autopilot, 2026-09-05); a policy set to anything else --
+  another branch, a tag pattern beside the default branch -- is reported as
+  a `[FIX]` to close by hand. The alternative, rewriting the policy to the
+  default branch alone, would delete deployment-branch policies someone
+  chose on purpose, and the PUT that carries the change resets every
+  protection setting it omits (wait timer, reviewers, self-review), which is
+  the trap `secrets_cmd._ensure_environment` already refuses. The re-sent
+  settings cover what the environment GET reports; a setting the API adds
+  later would still be reset. "Protected branches only" is reported as a
+  policy to fix by hand rather than accepted: GitHub reads it as every branch
+  while the repository has no branch-protection rule, and this fleet protects
+  `main` with a ruleset, which is not one (Codex, mikelward/repo#36).
+  Reversible: `restrict_environment` is the one writer, and the plan's
+  `else` branch is where a rewrite would go.
+- **The workflow reader stays hand-rolled, failing closed, rather than
+  becoming a YAML parser** (autopilot, 2026-09-05). Codex found seven
+  shapes the lanes-step reader misread on mikelward/repo#36 -- a search
+  for `app-id` matched the wrong step, then `env:`, then a flow mapping,
+  then whitespace before a colon, then a quoted key, then an upper-case
+  input name, then a quoted `uses` key -- which is the "second verified
+  finding in the same mechanism" signal in AGENTS.md: the class is reading
+  YAML by regex, and each fix deletes one instance. The design that
+  deletes the class is a real parser, and the standard library has none;
+  `mikelward/yaml-lite` is the fleet's dependency-free one but is
+  JavaScript, so it would be a port. Kept as is because the reader's
+  contract is already the safe one -- a shape it cannot resolve is
+  `lanes_unread`'s "cannot tell" and deletes nothing -- and the fleet
+  writes one shape; each finding widened what resolves, never what is
+  deleted. The alternative is porting yaml-lite (`repo_lib/yaml_lite.py`)
+  and reading the mapping outright, which is the maintainer's call: a
+  port is a few hundred lines to review and a second copy to keep in step.
+  Reversible: `_step_block`, `_step_inputs` and `_job_blocks` are the whole
+  surface a parser would replace.
+- **A branch copy of a lanes publisher does not hold the credential move
+  back; a branch copy of a batch caller still does** (autopilot,
+  2026-09-05). Codex found, on mikelward/repo#36, that a publishing job on a
+  non-default branch without `environment: lanes` vetoed moving the App pair
+  off repository level -- leaving it exposed to exactly that branch's
+  push-triggered run, for a copy the restricted environment shuts out
+  whether or not it declares the environment. Fixed for lanes: only the
+  default branch's publishers veto, and a branch copy is a `[CHECK]` line.
+  The batch callers (`settle`) have the same shape -- a branch copy naming
+  its secrets vetoes the move, per mikelward/repo#13 -- and were left as
+  they are: the same argument applies (a dispatch of a branch copy cannot
+  reach the restricted environment either), but changing a behavior a
+  reviewed PR chose on purpose is the maintainer's call, not a fix to fold
+  into this one. Reversible either way: `on_default` in the lanes block is
+  the one filter, and `settle`'s `failing` is where the batch path would
+  take the same one.
+- **A lanes publisher that exists only on a branch keeps the App pair,
+  and both commands say no trusted publisher reaches it yet** (autopilot,
+  2026-09-05). Codex asked (mikelward/repo#36) for that case to read as
+  unused, or to be reported; reported was chosen. The branch-only publisher
+  is ordinarily the pull request adopting lanes, and the pair it will need
+  once merged is what `repo setup --credential` places ahead of the merge --
+  deleting it as unused would undo the step the adoption just took, and a
+  branch-only batch caller keeps its credential for the same reason
+  (mikelward/repo#13). What it costs is a pair sitting in an environment
+  nothing reaches; the environment is restricted, so a stale branch cannot
+  reach it either. Reversible: the `if not on_default(publishers)` branch
+  in the lanes block is where the unused path would be taken instead.
+
 - **The scaffolded `AGENTS.md` is `mikelward/conf`'s own
   `agents/AGENTS.md`, under a generated header** (autopilot, 2026-09-04).
   Four calls, none of them settled beforehand:

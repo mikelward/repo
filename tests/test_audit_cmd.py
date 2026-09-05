@@ -26,6 +26,8 @@ _PULLS_RE = re.compile(r"^repos/([^/]+/[^/]+)/pulls\?state=(open|closed)&.*$")
 _REPO_SECRETS_RE = re.compile(r"^repos/([^/]+/[^/]+)/actions/secrets$")
 _ENVIRONMENTS_RE = re.compile(r"^repos/([^/]+/[^/]+)/environments$")
 _ENV_SECRETS_RE = re.compile(r"^repos/([^/]+/[^/]+)/environments/([^/]+)/secrets$")
+_ENV_ONE_RE = re.compile(r"^repos/([^/]+/[^/]+)/environments/([^/]+)$")
+_ENV_POLICIES_RE = re.compile(r"^repos/([^/]+/[^/]+)/environments/([^/]+)/deployment-branch-policies$")
 _WORKFLOW_FILE_RE = re.compile(r"^repos/([^/]+/[^/]+)/contents/\.github/workflows/([^/?]+)(?:\?ref=(.+))?$")
 _WORKFLOWS_DIR_RE = re.compile(r"^repos/([^/]+/[^/]+)/contents/\.github/workflows(?:\?ref=(.+))?$")
 _ROOT_CONTENTS_RE = re.compile(r"^repos/([^/]+/[^/]+)/contents(?:\?ref=(.+))?$")
@@ -138,6 +140,10 @@ class FakeGh:
         self.environments = {}  # name -> list of environment secret names
         self.environments_fails = None
         self.env_secrets_fails = set()  # environment names whose read fails
+        # name -> which branches may reach the environment: None (any
+        # branch), "protected", or a list of custom policy patterns.
+        self.env_policies = {}
+        self.env_read_fails = set()  # environment names whose own read fails
         # None models a repository with no .github/workflows at all (404);
         # a list is the file names the directory holds.
         self.workflow_files = None
@@ -279,6 +285,30 @@ class FakeGh:
                 raise gh.GhError("gh: HTTP 500: boom\n")
             assert env in self.environments, f"secrets read for an environment that does not exist: {env}"
             return "".join(name + "\n" for name in self.environments[env])
+
+        m = _ENV_POLICIES_RE.match(endpoint)
+        if m:
+            env = urllib.parse.unquote(m.group(2))
+            policy = self.env_policies.get(env)
+            assert isinstance(policy, list), f"branch policies listed for {env}, whose policy is {policy!r}"
+            return "".join(
+                (f"tag {p[4:]}" if p.startswith("tag:") else f"branch {p}") + "\n" for p in policy
+            )
+
+        m = _ENV_ONE_RE.match(endpoint)
+        if m and method is None and jq is None:
+            env = urllib.parse.unquote(m.group(2))
+            if env in self.env_read_fails:
+                raise gh.GhError("gh: HTTP 500: boom\n")
+            assert env in self.environments, f"read of an environment that does not exist: {env}"
+            policy = self.env_policies.get(env)
+            if policy is None:
+                branch_policy = None
+            elif policy == "protected":
+                branch_policy = {"protected_branches": True, "custom_branch_policies": False}
+            else:
+                branch_policy = {"protected_branches": False, "custom_branch_policies": True}
+            return json.dumps({"name": env, "deployment_branch_policy": branch_policy, "protection_rules": []})
 
         raise AssertionError(f"unexpected endpoint: {endpoint} (method={method} jq={jq})")
 
@@ -1257,6 +1287,329 @@ class DeleteBranchOnMergeAuditTest(unittest.TestCase):
         self.assertNotIn("deletes branches on merge", out)
 
 
+class LanesCredentialAuditTest(unittest.TestCase):
+    """The lanes App pair, audited like the other fleet credentials, plus
+    the environment it lives in: the App publishes the required status, so
+    an environment any branch can reach hands a same-repo pull request's
+    push-triggered run the same reach."""
+
+    PUBLISHER = (
+        "jobs:\n  init:\n    runs-on: ubuntu-latest\n    environment: lanes\n"
+        "    steps:\n      - uses: mikelward/lanes@main\n        with:\n"
+        "          mode: init\n          app-id: ${{ secrets.LANES_APP_ID }}\n"
+        "          app-private-key: ${{ secrets.LANES_APP_PRIVATE_KEY }}\n"
+    )
+    PAIR = ["LANES_APP_ID", "LANES_APP_PRIVATE_KEY"]
+    MOVE = f"`repo setup --credential LANES_APP_ID=PATH --credential LANES_APP_PRIVATE_KEY=PATH {REPO}`"
+
+    def _publisher(self, text=PUBLISHER):
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        fake.workflow_texts = {"ci.yml": text}
+        return fake
+
+    def test_the_pair_in_a_restricted_environment_is_ok(self):
+        fake = self._publisher()
+        fake.environments = {"lanes": self.PAIR}
+        fake.env_policies = {"lanes": ["main"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[ok] lanes: the App credential lives in the 'lanes' environment", out)
+        self.assertIn("[ok] lanes: environment 'lanes' admits only the trusted base branch", out)
+        self.assertNotIn("[FIX]", out)
+        # "Protected branches only" is not the guarantee: every branch while
+        # no branch-protection rule exists, and a ruleset is not one.
+        fake.env_policies = {"lanes": "protected"}
+        code, out, err = _run(fake, [REPO])
+        self.assertIn(
+            "[FIX] lanes: environment 'lanes' admits protected branches, which is every branch while no "
+            "branch-protection rule exists (a ruleset is not one) and every protected branch otherwise -- "
+            "restrict it to 'main' in the environment's settings",
+            out,
+        )
+        self.assertNotIn("[ok] lanes: environment", out)
+
+    def test_a_repository_copy_is_a_fix_naming_the_move(self):
+        fake = self._publisher()
+        fake.repo_secrets = list(self.PAIR)
+        fake.environments = {"lanes": self.PAIR}
+        fake.env_policies = {"lanes": ["main"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "[FIX] lanes: LANES_APP_ID, LANES_APP_PRIVATE_KEY is a repository secret, which reaches every job "
+            "of every workflow -- a same-repo pull request's push-triggered run included, which is the hole "
+            f"trusted publishing exists to close -- {self.MOVE} moves it into the 'lanes' environment",
+            out,
+        )
+        self.assertNotIn("holds no App credential", out)
+        self.assertNotIn("[ok] lanes: the App credential", out)
+        # A fleet credential, so not also listed for review by hand.
+        self.assertNotIn("[CHECK] repository secrets", out)
+
+    def test_no_credential_anywhere_is_a_fix_naming_the_set(self):
+        fake = self._publisher()
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "[FIX] lanes: environment 'lanes' holds no App credential (LANES_APP_ID and LANES_APP_PRIVATE_KEY) "
+            f"-- the workflow cannot publish the `lanes` status the ruleset requires; {self.MOVE} sets one",
+            out,
+        )
+        self.assertNotIn("environment 'lanes' can be reached", out)
+        # Half a pair at repository level is named as half.
+        fake.repo_secrets = ["LANES_APP_ID"]
+        code, out, err = _run(fake, [REPO])
+        self.assertIn(", and LANES_APP_ID is only half of the App pair --", out)
+
+    def test_a_publishing_job_without_the_environment_is_a_fix(self):
+        fake = self._publisher(self.PUBLISHER.replace("    environment: lanes\n", ""))
+        fake.environments = {"lanes": self.PAIR}
+        fake.env_policies = {"lanes": ["main"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "[FIX] lanes: ci publishes the lanes status as the App from a job that does not declare "
+            "`environment: lanes`, so a credential in that environment never reaches it -- `init` fails "
+            "outright and `gate` silently falls back to the ambient check-run; declare the environment on "
+            "every job that takes `app-id`",
+            out,
+        )
+        self.assertNotIn("[ok] lanes: the App credential", out)
+
+    def test_a_branch_copy_without_the_environment_is_a_check_not_a_fix(self):
+        # The default branch's publisher declares the environment; a copy
+        # on a branch does not, and a branch copy cannot reach a restricted
+        # environment either way -- it is named, and it is not the [FIX]
+        # that holds the move back (Codex, mikelward/repo#36).
+        fake = self._publisher()
+        fake.branch_workflows = {"feature": {"ci.yml": self.PUBLISHER.replace("    environment: lanes\n", "")}}
+        fake.environments = {"lanes": self.PAIR}
+        fake.env_policies = {"lanes": ["main"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "[CHECK] lanes: ci on feature publishes the lanes status as the App from a job that does not "
+            "declare `environment: lanes`; a branch copy runs from its branch, which the restricted "
+            "environment shuts out anyway, so it loses the credential when the repository copy moves",
+            out,
+        )
+        self.assertNotIn("[FIX] lanes: ci on feature", out)
+        self.assertIn("[ok] lanes: the App credential lives in the 'lanes' environment", out)
+
+    def test_a_publisher_only_on_a_branch_is_a_check_not_ok(self):
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        fake.workflow_texts = {"ci.yml": "jobs: {}\n"}
+        fake.branch_workflows = {"feature": {"ci.yml": self.PUBLISHER}}
+        fake.environments = {"lanes": self.PAIR}
+        fake.env_policies = {"lanes": ["main"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "[CHECK] lanes: no workflow on the default branch publishes the lanes status as the App; "
+            "ci on feature does from a branch, which reaches the environment once merged",
+            out,
+        )
+        self.assertNotIn("[ok] lanes: the App credential", out)
+        self.assertNotIn("no workflow here publishes", out)
+
+    def test_half_the_pair_handed_to_the_action_is_a_fix(self):
+        fake = self._publisher(self.PUBLISHER.replace("          app-private-key: ${{ secrets.LANES_APP_PRIVATE_KEY }}\n", ""))
+        fake.environments = {"lanes": self.PAIR}
+        fake.env_policies = {"lanes": ["main"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "[FIX] lanes: ci hands mikelward/lanes one of `app-id` and `app-private-key` without the other, "
+            "so the step cannot authenticate as the App and publishes nothing; hand it both",
+            out,
+        )
+        # Not unused -- the pair is plainly meant for it -- and not healthy.
+        self.assertNotIn("no workflow here publishes", out)
+        self.assertNotIn("[ok] lanes: the App credential", out)
+
+    def test_an_open_environment_is_a_fix_naming_setup(self):
+        fake = self._publisher()
+        fake.environments = {"lanes": self.PAIR}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[ok] lanes: the App credential lives in the 'lanes' environment", out)
+        self.assertIn(
+            "[FIX] lanes: environment 'lanes' can be reached from any branch -- a same-repo pull request's "
+            "push-triggered workflow reads the App credential exactly as the trusted jobs do; "
+            f"`repo setup {REPO}` restricts it to 'main'",
+            out,
+        )
+
+    def test_setup_is_not_promised_where_its_planner_stops_first(self):
+        # The lanes planner reports and returns on a workflow finding,
+        # before any restriction -- so naming the command flatly told a
+        # reader to run something that leaves the environment open (Codex,
+        # mikelward/repo#36).
+        fake = self._publisher(self.PUBLISHER.replace("    environment: lanes\n", ""))
+        fake.environments = {"lanes": self.PAIR}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            f"`repo setup {REPO}` restricts it to 'main' -- but not while ci publishes from a job "
+            f"that does not declare `environment: lanes`: the command reports that and stops first",
+            out,
+        )
+        # The credential recommendations beside it carry the same caveat,
+        # since the planner stops before the move and the write too
+        # (Codex, mikelward/repo#36).
+        moving = self._publisher(self.PUBLISHER.replace("    environment: lanes\n", ""))
+        moving.environments = {"lanes": self.PAIR}
+        moving.repo_secrets = list(self.PAIR)
+        code, out, err = _run(moving, [REPO])
+        self.assertEqual(code, 0, err)
+        recommendations = [line for line in out.splitlines() if "`repo setup" in line]
+        # The move, the environment's policy, and nothing silently missing.
+        self.assertTrue(any("moves it into the 'lanes' environment" in line for line in recommendations))
+        self.assertTrue(any("restricts it to 'main'" in line for line in recommendations))
+        for line in recommendations:
+            self.assertIn("but not while", line, line)
+        # Half a pair stops it the same way, and so does an unreadable
+        # mention -- each is its own early return.
+        half = self._publisher(
+            self.PUBLISHER.replace(
+                "          app-private-key: ${{ secrets.LANES_APP_PRIVATE_KEY }}\n", ""
+            )
+        )
+        half.environments = {"lanes": self.PAIR}
+        code, out, err = _run(half, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("but not while ci hands", out)
+
+    def test_a_pair_held_nowhere_stops_the_plain_setup_too(self):
+        # A pair held in neither scope makes the move report and the
+        # planner return before the policy, so `repo setup <repo>` leaves
+        # the environment open -- and the recommendation said flatly that
+        # it restricts it (Codex, mikelward/repo#36).
+        fake = self._publisher()
+        fake.environments = {"lanes": set()}
+        fake.repo_secrets = []
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            f"`repo setup {REPO}` restricts it to 'main' -- but not while neither the repository "
+            f"nor the 'lanes' environment holds a usable LANES_APP_ID and LANES_APP_PRIVATE_KEY "
+            f"for it to place: the command reports that and stops first",
+            out,
+        )
+        # But NOT the recommendation whose own command supplies the pair:
+        # qualifying that one with the condition it resolves would read as
+        # a contradiction.
+        supplying = [line for line in out.splitlines() if "sets one" in line]
+        self.assertEqual(len(supplying), 1, out)
+        self.assertNotIn("but not while", supplying[0])
+
+    def test_a_policy_someone_set_stops_the_move_commands_too(self):
+        # `repo setup` rewrites nobody's policy, so it drops the whole move
+        # rather than place the pair behind an environment it cannot vouch
+        # for -- and naming the command flatly advertised one that exits
+        # nonzero having moved nothing (Codex, mikelward/repo#36). Unlike
+        # the other blockers this one stops the `--credential` commands as
+        # well: supplying the pair does not settle the policy.
+        fake = self._publisher()
+        fake.environments = {"lanes": set()}
+        fake.env_policies = {"lanes": ["release/*"]}
+        fake.repo_secrets = list(self.PAIR)
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        moving = [line for line in out.splitlines() if "moves it into" in line]
+        self.assertEqual(len(moving), 1, out)
+        self.assertIn(
+            "but not while environment 'lanes' is set to a policy `repo setup` does not rewrite",
+            moving[0],
+        )
+        # The policy's own line already tells the reader to set it by hand
+        # and says the command rewrites nobody's, so it needs no caveat --
+        # it promises `repo setup` nothing.
+        policy = [line for line in out.splitlines() if "in the environment's settings" in line]
+        self.assertEqual(len(policy), 1, out)
+        self.assertNotIn("but not while", policy[0])
+
+    def test_a_restriction_left_half_done_names_setup(self):
+        fake = self._publisher()
+        fake.environments = {"lanes": self.PAIR}
+        fake.env_policies = {"lanes": []}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "[FIX] lanes: environment 'lanes' admits no branch at all -- custom-policy mode with no branch "
+            "named, the state a restriction leaves when its second write fails, so no job reaches the "
+            f"credential; `repo setup {REPO}` completes it with 'main'",
+            out,
+        )
+
+    def test_a_policy_naming_more_than_the_default_branch_is_fixed_by_hand(self):
+        fake = self._publisher()
+        fake.environments = {"lanes": self.PAIR}
+        fake.env_policies = {"lanes": ["main", "tag:v*"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "[FIX] lanes: environment 'lanes' is restricted to 'main', 'tag:v*', not to 'main' alone -- "
+            "restrict it to 'main' in the environment's settings (`repo setup` rewrites no policy someone set)",
+            out,
+        )
+        fake.default_branch = "trunk"
+        fake.env_policies = {"lanes": ["main"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertIn("is restricted to 'main', not to 'trunk' alone", out)
+
+    def test_a_credential_nothing_publishes_with_is_stale(self):
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        # The ambient pattern hands the action no credential.
+        fake.workflow_texts = {
+            "ci.yml": "jobs:\n  classify:\n    steps:\n      - uses: mikelward/lanes@main\n        with:\n          mode: classify\n"
+        }
+        fake.environments = {"lanes": ["LANES_APP_PRIVATE_KEY"]}
+        fake.repo_secrets = ["LANES_APP_ID"]
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "[FIX] LANES_APP_ID as a repository secret and LANES_APP_PRIVATE_KEY in the 'lanes' environment, "
+            "but no workflow here publishes the lanes status as the App (a mikelward/lanes step taking "
+            f"`app-id`) -- `repo setup {REPO}` deletes it",
+            out,
+        )
+        self.assertNotIn("moves it into", out)
+        # The environment's policy is not read for an unused credential.
+        self.assertNotIn("environment 'lanes' can be reached", out)
+        # Nothing anywhere and nothing publishing: nothing to say.
+        fake.environments = {}
+        fake.repo_secrets = []
+        code, out, err = _run(fake, [REPO])
+        self.assertNotIn("lanes:", out)
+
+    def test_a_shape_the_reader_cannot_resolve_is_cannot_tell(self):
+        fake = self._publisher("jobs: {init: {steps: [{uses: mikelward/lanes@main, with: {app-id: x}}]}}\n")
+        fake.environments = {"lanes": self.PAIR}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "[FIX] lanes: ci mentions mikelward/lanes in a shape this cannot read as a step -- whether the "
+            "App credential is used there cannot be told; write it as a step-level `uses:` (`repo setup` "
+            "moves or deletes nothing of its until then)",
+            out,
+        )
+        self.assertNotIn("[ok] lanes", out)
+        self.assertNotIn("deletes it", out)
+
+    def test_a_failed_environment_read_exits_1(self):
+        fake = self._publisher()
+        fake.environments = {"lanes": self.PAIR}
+        fake.env_read_fails = {"lanes"}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(f"could not read {REPO}'s 'lanes' environment:", err)
+        self.assertNotIn("environment 'lanes' can be reached", out)
+
+
 class SecretsAuditTest(unittest.TestCase):
     """Where the fleet credentials live, and what else sits repository-wide.
 
@@ -1338,7 +1691,9 @@ class SecretsAuditTest(unittest.TestCase):
         fake.workflow_text_fails = {"gradle-update.yml"}
         code, out, err = _run(fake, [REPO])
         self.assertEqual(code, 1)
-        self.assertIn("could not read owner/repo's .github/workflows/gradle-update.yml:", err)
+        # The read names the default branch, since `workflow_texts`
+        # pins it rather than letting the API resolve "the default".
+        self.assertIn("could not read owner/repo's .github/workflows/gradle-update.yml on branch main:", err)
 
     def test_a_caller_with_the_yaml_extension_is_the_batch_too(self):
         # GitHub runs `.yaml` workflows as readily as `.yml`; a batch missed
@@ -1719,7 +2074,7 @@ class SecretsAuditTest(unittest.TestCase):
         fake.workflows_error = "gh: HTTP 500: boom\n"
         code, out, err = _run(fake, [REPO])
         self.assertEqual(code, 1)
-        self.assertIn("could not list owner/repo's workflows:", err)
+        self.assertIn("could not list owner/repo's workflows on branch main:", err)
 
 
 if __name__ == "__main__":

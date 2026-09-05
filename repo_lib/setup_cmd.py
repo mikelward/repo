@@ -299,6 +299,23 @@ class CredentialMove:
     writes: list  # (name, environment, value, environment already exists)
     deletes: list  # (name, environment or None for the repository level)
     recheck: object = None  # () -> None | str
+    # (environment, default branch) to restrict the environment to, BEFORE
+    # this move's writes and deletes -- the lanes environment, when any
+    # branch can reach it. Before, because a restriction that fails after
+    # the write leaves the credential somewhere every branch can read it.
+    # Re-read at apply time; a policy someone set meanwhile is left alone.
+    restrict: object = None
+    # (environment, default branch) whose policy is confirmed once more
+    # AFTER the writes and before the deletes. Everything else about this
+    # move is checked before the writes, which leaves the writes' own
+    # window: an administrator reopening the environment there had the
+    # pair written into it and the repository copies deleted behind it,
+    # and the run exited 0 with the credential reachable from an untrusted
+    # branch (Codex, mikelward/repo#36). The deletes are the irreversible
+    # half, so they are what this gates -- the copies stay, and the run
+    # says why. Never a re-restriction: a policy someone set meanwhile is
+    # theirs, and this rewrites nobody's.
+    shut: object = None
 
 
 @dataclass
@@ -342,6 +359,13 @@ def _plan_credentials(repo, specs):
       re-read, the workflows re-listed), since the confirmation prompt can
       sit for an arbitrary time; a plan that no longer holds keeps the
       copy and fails the step;
+    - the lanes App pair follows the same rules with one substitution: the
+      action reads it from the job's own `environment:` declaration, not
+      through `secrets: inherit`, so a publishing job (one handing the
+      action `app-id`) that does not declare the `lanes` environment is
+      what holds a move back; and the environment itself, when any branch
+      can reach it, is restricted to the default branch after the write --
+      a policy someone set by hand is reported, never rewritten;
     - "unused" is decided from the text, not from what the reader could
       parse: a credential is deleted as unused only when no workflow
       mentions its reader at all. A mention with no readable job-level
@@ -357,10 +381,11 @@ def _plan_credentials(repo, specs):
     try:
         repo_secrets = credentials.repository_secrets(repo)
         environments = credentials.environments(repo)
-        texts = credentials.workflow_texts(repo)
+        default = credentials.default_branch(repo)
+        texts = credentials.workflow_texts(repo, default)
         held = {
             env: credentials.environment_secrets(repo, environments, env)
-            for env in (*credentials.BATCH_HUBS, credentials.COMMIT_ARTIFACT_ENV)
+            for env in (*credentials.BATCH_HUBS, credentials.COMMIT_ARTIFACT_ENV, credentials.LANES_ENV)
         }
     except credentials.ReadError as e:
         plan.failed = True
@@ -402,7 +427,10 @@ def _plan_credentials(repo, specs):
         if move.deletes:
             plan.moves.append(move)
 
-    def move(label, names, listed, env_secrets, env, caller_desc, inherits, usable, suggest, recheck):
+    def move(
+        label, names, listed, env_secrets, env, caller_desc, inherits, usable, suggest, recheck,
+        how=None, hint="convert the caller to `secrets: inherit` first",
+    ):
         at_repo = [name for name in names if name in repo_secrets]
         in_env = [name for name in names if name in env_secrets]
         supplied = [name for name in names if name in given]
@@ -410,17 +438,19 @@ def _plan_credentials(repo, specs):
         # A caller that names its secrets is a problem whenever there is
         # something the environment holds or would hold: a value to set, a
         # repository copy to delete, or a credential already sitting there
-        # that such a caller can never read.
+        # that such a caller can never read. `how` and `hint` name the
+        # shape for a reader that is not a reusable-workflow caller.
         if inherits is not True and (supplied or at_repo or usable(set(in_env))):
-            how = (
-                f"{caller_desc} passes its secrets by name"
-                if inherits is False
-                else f"{caller_desc} does not call the workflow"
-            )
+            if how is None:
+                how = (
+                    f"{caller_desc} passes its secrets by name"
+                    if inherits is False
+                    else f"{caller_desc} does not call the workflow"
+                )
             left = ", ".join(dict.fromkeys(supplied + at_repo))
             plan.unfixed.append(
                 f"{label}: {how}, so a credential in the '{env}' environment would never reach "
-                f"it -- convert the caller to `secrets: inherit` first"
+                f"it -- {hint}"
                 + (f"; {left} left as is" if left else "")
             )
             return
@@ -428,24 +458,42 @@ def _plan_credentials(repo, specs):
             reason = recheck()
             if reason is not None:
                 return reason
-            # The destination is re-read too: a delete justified by a
-            # credential already in the environment has to find it still
-            # there, since the confirmation prompt can have sat while an
-            # administrator removed it (Codex, mikelward/repo#13). A value
-            # supplied on the command line is about to be written, so it
-            # counts; the environment's own copy is what has to be re-seen.
-            if step.deletes and not usable(set(supplied)):
+            # The destination is re-read too, whenever usability rests on
+            # what the environment already holds: a delete justified by a
+            # credential already there has to find it still there, since
+            # the confirmation prompt can have sat while an administrator
+            # removed it (Codex, mikelward/repo#13). A value supplied on
+            # the command line is about to be written, so it counts; the
+            # environment's own copy is what has to be re-seen.
+            #
+            # Not gated on the deletes: completing a half already in the
+            # environment queues a write and no delete at all, so that
+            # gate skipped the read for exactly the case where the other
+            # half is the thing that might be gone -- setup then wrote one
+            # secret, restricted the environment and exited 0 with a
+            # credential that cannot authenticate (Codex,
+            # mikelward/repo#36). `usable(set(supplied))` is the real
+            # question either way: false means this run is relying on the
+            # destination.
+            if not usable(set(supplied)):
                 _listed, env_now = credentials.environment_secrets(repo, credentials.environments(repo), env)
                 if not usable(set(env_now) | set(supplied)):
                     return f"the '{env}' environment no longer holds the credential"
             return None
 
         step = CredentialMove(label=label, writes=[], deletes=[], recheck=guarded(recheck_all))
-        for name in supplied:
-            state = "OVERWRITES an existing value" if name in in_env else "new"
-            step.writes.append((name, env, given[name].value, listed is not None))
-            plan.lines.append(f"{label}: set {name} in environment '{env}' ({state})")
         if usable(held_after):
+            # Only a credential that WORKS after this run is written. Half a
+            # pair does nothing in the environment except sit there, and for
+            # the lanes App it sits there exposed: the caller returns early
+            # on the unfixed line below, so the environment is never
+            # restricted, and the supplied half lands somewhere any branch
+            # can read it beside the other half still at repository level
+            # (Codex, mikelward/repo#36).
+            for name in supplied:
+                state = "OVERWRITES an existing value" if name in in_env else "new"
+                step.writes.append((name, env, given[name].value, listed is not None))
+                plan.lines.append(f"{label}: set {name} in environment '{env}' ({state})")
             for name in at_repo:
                 step.deletes.append((name, None))
                 plan.lines.append(
@@ -460,6 +508,16 @@ def _plan_credentials(repo, specs):
             plan.unfixed.append(
                 f"{label}: environment '{env}' holds no credential -- pass {flags} to set one{stays}"
             )
+            for name in supplied:
+                # Said whatever the verbosity, like every other supplied
+                # value this run declined to use: a --credential that
+                # silently did nothing is the one a reader assumes landed.
+                line = (
+                    f"{label}: {name} not set -- half a credential is not one, and the rest of it "
+                    f"has to arrive in the same run"
+                )
+                plan.lines.append(line)
+                plan.always_report.append(line)
         if step.writes or step.deletes:
             plan.moves.append(step)
 
@@ -579,6 +637,309 @@ def _plan_credentials(repo, specs):
         lambda held_after: token in held_after,
         lambda held_after: [token],
     )
+
+    # The lanes App pair. An action step, not a called workflow: the
+    # secret reaches it through the job's `environment:` declaration, so
+    # a publishing job without one is the equivalent of a caller naming
+    # its secrets, and holds the move back the same way. The environment
+    # is settled too -- see CredentialMove.restrict.
+    app_id, app_key = credentials.LANES_APP_ID, credentials.LANES_APP_PRIVATE_KEY
+    label = credentials.LANES_ENV
+    action = credentials.LANES_ACTION
+    listed, env_secrets = held[label]
+    publishers = credentials.lanes_publishers(texts)
+    unread = credentials.lanes_unread(texts)
+    incomplete = credentials.lanes_incomplete(texts)
+    if incomplete:
+        # A step handing the action half the pair publishes nothing and is
+        # not the ambient pattern: the pair is neither unused nor safely
+        # moved for it. Held as is until the step takes both inputs.
+        plan.unfixed.append(
+            f"{label}: {credentials.workflow_labels(incomplete)} hands {action} one of `app-id` and "
+            f"`app-private-key` without the other, so the step cannot authenticate as the App -- hand it "
+            f"both first; {app_id}, {app_key} left as is"
+        )
+        return plan
+    if unread:
+        plan.unfixed.append(
+            f"{label}: {credentials.workflow_labels(unread)} mentions {action} in a shape this "
+            f"cannot read as a step -- whether the App credential is used there cannot be told, so "
+            f"nothing is deleted; write it as a step-level `uses:`, or delete the credential by hand"
+        )
+        return plan
+
+    def lanes_now():
+        """(reason, publishers) as the workflows read now, for a recheck."""
+        texts_now = reread()
+        if credentials.lanes_unread(texts_now):
+            return f"a workflow now mentions {action} in a shape this cannot read as a step", None
+        if credentials.lanes_incomplete(texts_now):
+            return f"a workflow now hands {action} one of the two App inputs without the other", None
+        return None, credentials.lanes_publishers(texts_now)
+
+    if not publishers:
+
+        def still_no_publisher():
+            reason, now = lanes_now()
+            if reason is None and now:
+                reason = f"{credentials.workflow_labels(sorted(now))} appeared since the plan was built"
+            return reason
+
+        unused(
+            label,
+            (app_id, app_key),
+            listed,
+            env_secrets,
+            f"no workflow here publishes the lanes status as the App (a {action} step taking "
+            f"`app-id`), so nothing uses it",
+            still_no_publisher,
+        )
+        return plan
+
+    # Only the default branch's publishers hold the move back. A branch copy
+    # of a publishing workflow runs from its branch, which the restricted
+    # environment shuts out whether or not the job declares it -- so it
+    # loses the credential either way, and keeping the repository copy for
+    # its sake leaves the pair exposed to exactly that branch's
+    # push-triggered run, the hole the move closes (Codex,
+    # mikelward/repo#36). The publishing that the credential exists for
+    # runs under `pull_request_target` from the default branch's copy.
+    def on_default(found):
+        return {name: declares for name, declares in found.items() if name.branch is None}
+
+    undeclared = sorted(name for name, declares in on_default(publishers).items() if not declares)
+    if not on_default(publishers):
+        # A publisher only on a branch -- the pull request adopting lanes,
+        # ordinarily -- keeps the pair, as a branch-only batch caller keeps
+        # its credential (Codex, mikelward/repo#13): the move and the
+        # restriction are what it needs once merged, and until then nothing
+        # publishes. Said, so a success here is not read as a publisher
+        # already reaching the credential (Codex, mikelward/repo#36).
+        plan.lines.append(
+            f"{label}: no workflow on the default branch publishes the lanes status as the App; "
+            f"{credentials.workflow_labels(sorted(publishers))} does from a branch, which reaches "
+            f"the environment once merged -- the pair is kept for it"
+        )
+
+    def still_declares():
+        # The default branch first: the restriction names it, and a rename
+        # while the prompt sat would restrict the environment to the old
+        # name -- the new trusted branch shut out, the stale one let in
+        # (Codex, mikelward/repo#36).
+        default_now = credentials.default_branch(repo)
+        if default_now != default:
+            return f"the default branch is now '{default_now}', not '{default}'"
+        reason, now = lanes_now()
+        if reason is not None:
+            return reason
+        # The publishers the plan rested on are the ones rechecked: the
+        # default branch's, or -- when it had none -- the branch copies
+        # that kept the pair, so one that went away while the prompt sat
+        # holds the apply back rather than leaving a pair nothing uses
+        # (Codex, mikelward/repo#36).
+        rested_on = on_default(publishers) or publishers
+        rested_now = on_default(now) if on_default(publishers) else now
+        if set(rested_now) != set(rested_on):
+            return (
+                f"the publishing workflows changed since the plan was built "
+                f"({credentials.workflow_labels(sorted(rested_now)) or 'none'} now)"
+            )
+        missing = sorted(name for name, declares in on_default(now).items() if not declares)
+        if missing:
+            return (
+                f"{credentials.workflow_labels(missing)} no longer declares "
+                f"`environment: {label}` on every publishing job"
+            )
+        return None
+
+    def suggest(held_after):
+        return [name for name in (app_id, app_key) if name not in held_after] or [app_id, app_key]
+
+    moves_before = len(plan.moves)
+    unfixed_before = len(plan.unfixed)
+    lines_before = len(plan.lines)
+
+    def hold_this_runs_moves(why):
+        """Drops the moves this step queued and the plan lines that offered
+        them, returning the repository copies that consequently stay. A run
+        that cannot put the environment's door in a state it vouches for
+        must not write the pair into it or delete the copies keeping the
+        workflows going -- and there are two ways to reach that, a policy
+        this run may not rewrite and a policy read that failed, so it is
+        one function rather than two copies (Codex, mikelward/repo#36)."""
+        held = plan.moves[moves_before:]
+        stays = [name for step in held for name, _scope in step.deletes]
+        if held:
+            del plan.moves[moves_before:]
+            del plan.lines[lines_before:]
+        for name in [write[0] for step in held for write in step.writes]:
+            # Said whatever the verbosity, like every other supplied value
+            # this run declined to use: a --credential that silently did
+            # nothing is the one a reader assumes landed.
+            line = f"{label}: {name} not set -- {why}"
+            plan.lines.append(line)
+            plan.always_report.append(line)
+        return stays
+    move(
+        label,
+        (app_id, app_key),
+        listed,
+        env_secrets,
+        listed or label,
+        credentials.workflow_labels(undeclared or sorted(on_default(publishers)) or sorted(publishers)),
+        not undeclared,
+        credentials.lanes_usable,
+        suggest,
+        guarded(still_declares),
+        how=(
+            f"{credentials.workflow_labels(undeclared)} publishes the lanes status as the App "
+            f"from a job that does not declare `environment: {label}`"
+        ),
+        hint="declare the environment on every job that takes `app-id` first",
+    )
+    if len(plan.unfixed) > unfixed_before:
+        # The move refused -- a publisher without the environment, or no
+        # value to set: the credential is stranded or missing, and the
+        # environment's policy is settled with it, not around it.
+        return plan
+    written_here = any(m.writes for m in plan.moves[moves_before:])
+    if listed is None and not written_here:
+        # No environment, and this run creates none: the missing
+        # credential is already reported above, and there is nothing to
+        # restrict yet.
+        return plan
+    if listed is None:
+        policy = "open"  # an environment this run creates admits every branch
+        env = label
+    else:
+        env = listed
+        try:
+            policy = credentials.environment_branch_policy(repo, listed)
+        except credentials.ReadError as e:
+            # A door this run cannot read is one it cannot vouch for, and
+            # `plan.failed` is only reported at the END of the apply -- the
+            # moves run first, so a forced run wrote the pair into an
+            # environment nobody had established was shut and deleted the
+            # repository copies behind it (Codex, mikelward/repo#36).
+            stays = hold_this_runs_moves(
+                f"the '{env}' environment's branch policy could not be read, so this run cannot "
+                f"tell which branches reach it"
+            )
+            plan.failed = True
+            plan.lines.append(e.message)
+            plan.lines += [f"  {line}" for line in (e.detail or "").splitlines()]
+            if stays:
+                plan.lines.append(
+                    f"{label}: {', '.join(stays)} stays a repository secret until the policy can be read"
+                )
+            return plan
+    wrong = credentials.branch_policy_verdict(policy, default)
+
+    def still_trusted(recheck):
+        """`recheck`, and then the environment's branch policy again. The
+        policy is the one input a run whose policy was already right never
+        reads twice: a restriction carries its own apply-time re-read, and
+        `move`'s destination read asks what the environment holds, not who
+        may enter it. So an administrator opening the environment while
+        the prompt sat let the apply write the pair in and delete the
+        repository copies, exiting 0 with the credential reachable from an
+        untrusted branch (Codex, mikelward/repo#36). Composed onto the
+        move's own recheck rather than folded into `lanes_changed`, which
+        answers for the workflows and is asked on paths that touch no
+        environment; `recheck` runs first, so the default branch this
+        compares against is one it has already confirmed."""
+
+        def run():
+            reason = recheck()
+            if reason is not None:
+                return reason
+            wrong_now = credentials.branch_policy_verdict(
+                credentials.environment_branch_policy(repo, env), default
+            )
+            return None if wrong_now is None else f"environment '{env}' now {wrong_now}"
+
+        return guarded(run)
+
+    if wrong is None:
+        plan.lines.append(f"{label}: environment '{env}' admits only the trusted base branch")
+        for step in plan.moves[moves_before:]:
+            step.recheck = still_trusted(step.recheck)
+            step.shut = (env, default)
+    elif credentials.restrictable(policy):
+        plan.lines.append(
+            f"{label}: restrict environment '{env}' to branch '{default}' -- it {wrong}, so a "
+            f"same-repo pull request's push-triggered workflow reads the App credential too"
+        )
+        # Re-validated like a delete: when the environment already holds
+        # the pair, this is the only apply-time action, and a workflow that
+        # stopped publishing while the prompt sat would leave it restricting
+        # an environment nothing justifies any more (Codex, mikelward/repo#36).
+        #
+        # Carried by THIS run's own move where it made one, rather than
+        # appended beside it. The apply loop runs moves in order and
+        # restricts before a move's writes and deletes, so two moves cannot
+        # express "shut the environment first": the writes move would run
+        # first, and a restriction that then failed would leave the pair in
+        # an environment any branch can enter -- the exposure this
+        # placement exists to close, created by the run closing it (Codex,
+        # mikelward/repo#36).
+        mine = plan.moves[moves_before:]
+        for step in mine:
+            step.shut = (env, default)
+        if mine:
+            mine[-1].restrict = (env, default)
+        else:
+
+            def still_holds_the_pair():
+                # The standalone move writes and deletes nothing, so
+                # `move`'s own destination re-read never runs for it -- and
+                # a recheck that asks only what the workflows say would
+                # restrict an environment an administrator emptied while
+                # the prompt sat, then exit 0 while a fresh plan and audit
+                # both report no usable credential (Codex,
+                # mikelward/repo#36). The restriction itself is harmless;
+                # reporting the repository as in shape is not.
+                reason = still_declares()
+                if reason is not None:
+                    return reason
+                _listed, env_now = credentials.environment_secrets(
+                    repo, credentials.environments(repo), env
+                )
+                if not credentials.lanes_usable(set(env_now)):
+                    return f"the '{env}' environment no longer holds the credential"
+                return None
+
+            plan.moves.append(
+                CredentialMove(
+                    label=label,
+                    writes=[],
+                    deletes=[],
+                    recheck=guarded(still_holds_the_pair),
+                    restrict=(env, default),
+                    shut=(env, default),
+                )
+            )
+    else:
+        # The environment is shut before the credential goes into it, and
+        # this one cannot be shut at all: the policy is somebody's choice
+        # and is not rewritten, so it keeps admitting a branch this cannot
+        # trust. So the move this run queued is dropped rather than applied
+        # beside the finding -- writing the pair here would put the whole
+        # App credential where such a branch reads it, which is the
+        # exposure the placement exists to close, and the deletes would
+        # then leave it only there. The same hold as a restriction that
+        # fails; the difference is only that this one is known at plan
+        # time, so the plan never offers the writes at all (Codex,
+        # mikelward/repo#36).
+        stays = hold_this_runs_moves(
+            f"the '{env}' environment admits a branch this cannot trust, and the credential is "
+            f"not placed where such a branch reads it"
+        )
+        plan.unfixed.append(
+            f"{label}: environment '{env}' {wrong} -- restrict it to '{default}' in the "
+            f"environment's settings; a policy someone set is not rewritten"
+            + (f"; {', '.join(stays)} stays a repository secret until then" if stays else "")
+        )
     return plan
 
 
@@ -1312,6 +1673,8 @@ def run(args):
                 error(f"{name} not set: {reason}")
             for name, env in move.deletes:
                 error(f"{name} kept: {reason}")
+            if move.restrict is not None:
+                error(f"environment '{move.restrict[0]}' not restricted: {reason}")
             failed.append(f"credential:{move.label}")
             continue
         # No absent-then-created recheck for these writes, unlike --secret's:
@@ -1319,19 +1682,226 @@ def run(args):
         # someone else set in the meantime is overwritten on purpose, and
         # the plan already said OVERWRITES where one was there to begin
         # with. _ensure_environment does its own recheck.
+        # Environments this run has just restricted. `env_exists` below is
+        # a plan-time snapshot, so without this the writes re-ran
+        # `_ensure_environment` on the environment the restriction had
+        # just shut -- and a deletion in that window is a 404 there, which
+        # CREATES it again with GitHub's default open policy. The pair
+        # then went in and the repository copies came out, into an
+        # environment any branch can enter: the run closed the door,
+        # somebody removed the door, and the run rebuilt it open and put
+        # the credential behind it, reporting success (Codex,
+        # mikelward/repo#36). A restriction that landed is what says the
+        # environment exists; a deletion after it makes the write fail
+        # rather than recreate.
+        established = set()
+        if move.restrict is not None:
+            env, default = move.restrict
+            # BEFORE the writes and the deletes, not between them. A
+            # restriction that fails after the pair is written leaves the
+            # credential in an environment any branch can enter -- the
+            # exposure this placement exists to close, created by the run
+            # that was closing it -- and the deletes then ran anyway, since
+            # a failed restriction only recorded a failure and fell
+            # through (Codex, mikelward/repo#36). Shut the door first and
+            # nothing goes through it: on any failure here the writes and
+            # deletes are held back and said to be.
+            #
+            # The environment has to exist to be restricted, and creating
+            # an empty one costs nothing if the restriction then fails.
+            if any(not exists for _n, into, _v, exists in move.writes if into == env):
+                if not secrets_cmd._ensure_environment(repo, env):
+                    for name, _e, _v, _x in move.writes:
+                        error(f"{name} not set: environment '{env}' could not be created")
+                    failed.append(f"credential:{move.label}")
+                    continue
+            held = None
+            try:
+                print(f"{repo}: {credentials.restrict_environment(repo, env, default)}")
+            except credentials.RestrictRefused as e:
+                error(f"not fixed: {move.label}: {e}")
+                held = "the environment was not restricted"
+            except credentials.ReadError as e:
+                error_lines(e.message, e.detail)
+                held = "the environment was not restricted"
+            except gh.GhError as e:
+                error_lines(f"could not restrict environment '{env}' on {repo}:", e.stderr)
+                held = "the environment was not restricted"
+            if held is not None:
+                for name, _e, _v, _x in move.writes:
+                    error(f"{name} not set: {held}")
+                for name, _e in move.deletes:
+                    error(f"{name} kept: {held}")
+                failed.append(f"credential:{move.label}")
+                continue
+            established.add(env)
+        # Which of the names about to be written the environment does not
+        # hold yet, read now rather than taken from the plan. A half that
+        # lands while its partner's write fails SHADOWS the repository copy
+        # of that name for every job declaring the environment, so the job
+        # authenticates with one new half and one old one and cannot start
+        # -- a pair that worked before the run, broken by it (Codex,
+        # mikelward/repo#36). Only a half this run created is rolled back:
+        # one it overwrote holds a value the run does not have, and
+        # deleting that would lose it.
+        creating = set()
+        unreadable = None
+        into = {env for _n, env, _v, _x in move.writes if env}
+        for env in into:
+            try:
+                _listed, held_now = credentials.environment_secrets(
+                    repo, credentials.environments(repo), env
+                )
+            except credentials.ReadError as e:
+                unreadable = (env, e)
+                break
+            creating |= {
+                (name, env) for name, at, _v, _x in move.writes if at == env and name not in held_now
+            }
+        if unreadable is not None:
+            # Without this reading the rollback cannot run, and a write
+            # that lands while its partner fails then shadows a working
+            # repository half with no way back -- so the writes do not
+            # start (Codex, mikelward/repo#36). Carrying on with an empty
+            # inventory made the read failure silently disable the very
+            # thing that keeps a half-written pair from breaking the
+            # publisher.
+            env, e = unreadable
+            error_lines(
+                f"{move.label}: not moved -- environment '{env}' could not be read, so a write that "
+                f"landed while its partner failed could not be undone:",
+                e.detail,
+            )
+            for name, _e, _v, _x in move.writes:
+                error(f"{name} not set: the environment's secrets could not be read first")
+            for name, _e in move.deletes:
+                error(f"{name} kept: the environment's secrets could not be read first")
+            failed.append(f"credential:{move.label}")
+            continue
         written = True
+        created = []
+        overwrote = []
+        # The pair is written as a unit: the first failure stops the rest.
+        # Carrying on wrote the SECOND half over a working pair after the
+        # first had already failed -- turning a run that could have left
+        # the credential untouched into one that broke it, and in the one
+        # direction (an overwrite) nothing can undo (Codex,
+        # mikelward/repo#36). Stopping costs a rerun; continuing costs the
+        # publisher.
         for name, env, value, env_exists in move.writes:
-            if not env_exists and not secrets_cmd._ensure_environment(repo, env):
+            if not env_exists and env not in established and not secrets_cmd._ensure_environment(repo, env):
                 written = False
                 failed.append(f"credential:{name}")
-                continue
+                break
             if not secrets_cmd._write_secret(repo, name, env, value):
                 written = False
                 failed.append(f"credential:{name}")
+                break
+            if (name, env) in creating:
+                created.append((name, env))
+            else:
+                overwrote.append((name, env))
         if not written:
+            for name, env in created:
+                try:
+                    credentials.delete_secret(repo, name, env)
+                except gh.GhError as e:
+                    error_lines(
+                        f"could not undo the write of '{name}' to {repo} (environment {env}), so "
+                        f"it shadows the repository copy while its other half does not:",
+                        e.stderr,
+                    )
+                    continue
+                print(
+                    f"{repo}: undid the write of '{name}' (environment '{env}') -- its other half "
+                    f"failed, and half a pair in the environment shadows the working repository one"
+                )
+            if overwrote:
+                # A rotation overwrites both halves, so neither is in
+                # `created` and the rollback above has nothing to undo: the
+                # environment is left holding one new half and one old one,
+                # and every job declaring it fails to authenticate until
+                # both are set (Codex, mikelward/repo#36). Nothing here can
+                # put it back -- GitHub never returns a secret's value, so
+                # the run holds the new one and not the old -- and refusing
+                # every rotation that overwrites would leave no way to
+                # rotate at all. So the run says exactly what it left and
+                # what settles it, rather than reporting a bare write
+                # failure over a credential that is broken as of now.
+                for name, env in overwrote:
+                    error(
+                        f"{name} now holds the new value in environment '{env}' while its other half "
+                        f"does not, so the App cannot authenticate until both are set -- re-run with "
+                        f"both `--credential` values (the old value is not recoverable: GitHub never "
+                        f"returns a secret)"
+                    )
             for name, env in move.deletes:
                 error(f"{name} kept: the write it waited on failed")
             continue
+        if move.shut is not None and (move.writes or move.deletes):
+            # The writes' own window, the last one left: everything else
+            # about this move is checked before them, so an administrator
+            # reopening the environment while the pair was going in had the
+            # repository copies deleted behind it and the run exited 0 with
+            # the credential reachable from an untrusted branch (Codex,
+            # mikelward/repo#36). The deletes are the irreversible half, so
+            # the copies stay and the run says why. Nothing is rewritten:
+            # the environment is left as whoever changed it left it, and
+            # the next run re-plans against what it finds.
+            #
+            # Asked of every move that WROTE, not only one with copies to
+            # delete. A rotation into an environment that already held the
+            # pair deletes nothing, so gating on the deletes skipped the
+            # check exactly where the run had just put a fresh credential
+            # somewhere any branch could read it -- and then said the
+            # repository was in shape (Codex, mikelward/repo#36 again).
+            # There is nothing to hold back on that path; what the finding
+            # buys is the run not claiming otherwise.
+            env, default = move.shut
+            try:
+                reopened = credentials.branch_policy_verdict(
+                    credentials.environment_branch_policy(repo, env), default
+                )
+            except credentials.ReadError as e:
+                reopened = f"could not be re-read ({e.message.rstrip(':')})"
+            if reopened is not None:
+                said = f"environment '{env}' {reopened} after the credential was written"
+                # A half this run CREATED is the run's to take back out, and
+                # taking it out is what ends the exposure: reporting alone
+                # left a credential the operator had just handed in sitting
+                # in an environment every branch could now read, which is
+                # the whole thing this placement exists to prevent (Codex,
+                # mikelward/repo#36). The same inventory the write-failure
+                # rollback uses, for the same reason -- and the repository
+                # copies are held either way, so undoing the writes leaves
+                # the state the run found. A half it OVERWROTE is not
+                # undoable: the old value is gone and deleting it would
+                # leave no pair at all, so it is named instead.
+                for name, at in created:
+                    try:
+                        credentials.delete_secret(repo, name, at)
+                    except gh.GhError as e:
+                        error_lines(
+                            f"could not undo the write of '{name}' to {repo} (environment {at}), so it "
+                            f"stays in an environment that {reopened}:",
+                            e.stderr,
+                        )
+                        continue
+                    print(
+                        f"{repo}: undid the write of '{name}' (environment '{at}') -- {said}"
+                    )
+                for name, at in overwrote:
+                    error(
+                        f"{name} holds the new value in environment '{at}', which {reopened} -- it "
+                        f"cannot be taken back out without leaving no credential at all, so restrict "
+                        f"the environment by hand or rotate it again once you have"
+                    )
+                for name, _e in move.deletes:
+                    error(f"{name} kept: {said}")
+                if not move.deletes:
+                    error(f"{move.label}: {said}")
+                failed.append(f"credential:{move.label}")
+                continue
         for name, env in move.deletes:
             try:
                 credentials.delete_secret(repo, name, env)
