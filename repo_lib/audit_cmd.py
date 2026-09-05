@@ -404,8 +404,7 @@ def audit_secrets(repo, ok, fix):
     # "cannot tell", never "does not run". Read as `repo setup` reads it,
     # so the two agree.
     try:
-        default = credentials.default_branch(repo)
-        texts = credentials.workflow_texts(repo, default)
+        default, texts = credentials.workflow_snapshot(repo)
     except credentials.ReadError as e:
         error_lines(e.message, e.detail)
         raise SystemExit(1)
@@ -573,6 +572,7 @@ def audit_secrets(repo, ok, fix):
     publishers = credentials.lanes_publishers(texts)
     unread = credentials.lanes_unread(texts)
     incomplete = credentials.lanes_incomplete(texts)
+    foreign = credentials.lanes_foreign(texts)
     environment, env_secrets = environment_secrets(label)
     as_repository = [name for name in (app_id, app_key) if name in repo_secrets]
     for name in incomplete:
@@ -581,17 +581,55 @@ def audit_secrets(repo, ok, fix):
             f"`app-private-key` without the other, so the step cannot authenticate as the App and "
             f"publishes nothing; hand it both"
         )
+    for name in foreign:
+        # The input NAMES say the step authenticates as an App; the values
+        # say as which. One reading another App's secrets is not this
+        # pair's consumer, and reading it as one reported the pair healthy
+        # while the credential actually publishing sat wherever it sat
+        # (Codex, mikelward/repo#36).
+        fix(
+            f"{label}: {credentials.workflow_label(name)} hands {action} `app-id` and "
+            f"`app-private-key` from secrets that are not {app_id} and {app_key}, so it publishes "
+            f"as an App this tool does not manage -- point it at the fleet pair, or place that App's "
+            f"own credential by hand and keep it out of repository-level secrets"
+        )
     # Whether `repo setup` would reach the environment's policy at all.
     # Each of these makes its planner report and return before any
     # restriction, so telling a reader the command closes an open
     # environment is a promise it does not keep (Codex, mikelward/repo#36).
     # A branch-only publisher is NOT one of them: that path says its piece
     # and carries on to the move and the restriction.
+    indirect = credentials.lanes_indirect(texts)
+    # Gated exactly as the planner gates it, or the two commands disagree.
+    # The planner consults this only where nothing publishes readably, so
+    # an unrelated reusable call in a repository that HAS a publisher must
+    # not stand in for the audit setup would actually carry out -- it
+    # suppressed the whole publisher audit, reporting neither a
+    # repository-level copy nor an open `lanes` environment, while setup
+    # went on to move and restrict both (Codex, mikelward/repo#36). A copy
+    # has to exist too: every repository here calls some reusable
+    # workflow, so raising this where the pair is absent would report on
+    # the many to protect the few.
+    called = (
+        credentials.lanes_called_workflows(texts)
+        if not publishers
+        and not incomplete
+        and not foreign
+        and any(name in repo_secrets or name in env_secrets for name in (app_id, app_key))
+        else []
+    )
     blocked = (
         f"{credentials.workflow_labels(unread)} mentions {action} in a shape this cannot read"
         if unread
+        else f"{credentials.workflow_labels(indirect)} names the pair with no {action} step this "
+        f"can read taking it"
+        if indirect
         else f"{credentials.workflow_labels(incomplete)} hands {action} half the pair"
         if incomplete
+        else f"{credentials.workflow_labels(foreign)} hands {action} another App's secrets"
+        if foreign
+        else f"{credentials.workflow_labels(called)} calls a reusable workflow this cannot read"
+        if called
         else f"no workflow here publishes the lanes status as the App, so the pair reads as unused"
         if not publishers
         else None
@@ -652,7 +690,21 @@ def audit_secrets(repo, ok, fix):
             f"cannot read as a step -- whether the App credential is used there cannot be told; "
             f"write it as a step-level `uses:` (`repo setup` moves or deletes nothing of its until then)"
         )
-    elif not publishers and not incomplete:
+    elif indirect:
+        fix(
+            f"{label}: {credentials.workflow_labels(indirect)} names {app_id} or {app_key} with no "
+            f"{action} step this can read taking them -- a local composite action reads its own "
+            f"`action.yml`, which this does not, so whether the credential is used there cannot be "
+            f"told (`repo setup` moves or deletes nothing of its until then)"
+        )
+    elif called:
+        fix(
+            f"{label}: {credentials.workflow_labels(called)} calls a reusable workflow this cannot "
+            f"read, and a lanes step in that workflow is invisible here -- whether the credential "
+            f"publishes cannot be told, so it is kept (`repo setup` deletes nothing of its until "
+            f"a workflow here publishes readably)"
+        )
+    elif not publishers and not incomplete and not foreign:
         where = []
         if as_repository:
             where.append(f"{', '.join(as_repository)} as a repository secret")
@@ -667,11 +719,15 @@ def audit_secrets(repo, ok, fix):
     else:
         declares = True
         trusted = [name for name in publishers if name.branch is None]
-        if not trusted:
+        if publishers and not trusted:
             # Ordinarily the pull request adopting lanes: the pair stays
             # (a branch-only batch caller keeps its credential too), but
             # nothing on the trusted branch reaches it yet, so this is not
-            # the [ok] line (Codex, mikelward/repo#36).
+            # the [ok] line (Codex, mikelward/repo#36). Only when a branch
+            # publisher actually exists: an incomplete or foreign step
+            # reaches this block with no publishers at all, and the line
+            # then claimed a branch publisher that is not there, over the
+            # top of its own [FIX] (Codex, mikelward/repo#36).
             print(
                 f"  [CHECK] {label}: no workflow on the default branch publishes the lanes status "
                 f"as the App; {credentials.workflow_labels(sorted(publishers))} does from a branch, "
@@ -716,8 +772,36 @@ def audit_secrets(repo, ok, fix):
                 f"{move_command(as_repository)} moves it into the '{label}' environment"
                 + setup_stops()
             )
+        if trusted and not credentials.lanes_status_publishers(credentials.on_default_branch(texts)):
+            # The default branch's copies only: a feature branch running
+            # `init` publishes from a branch the restricted environment
+            # shuts out, so reading it here would answer "the trusted base
+            # publishes a status" with a copy that cannot (Codex,
+            # mikelward/repo#36). A branch-only adoption is the [CHECK]
+            # above instead.
+            fix(
+                f"{label}: {credentials.workflow_labels(sorted(trusted))} hands {action} the App "
+                f"credential only to steps that publish no status -- `classify`, or a `mode` the "
+                f"action refuses to start on -- so the required "
+                f"`{label}` status is still the ambient check-run a pull request's own workflow "
+                f"produces -- hand the pair to the `init` and gate steps too (mikelward/lanes's "
+                f"README, \"Trusted publishing\")"
+            )
+        ambient_gate = credentials.lanes_ambient_gate(credentials.on_default_branch(texts))
+        if trusted and ambient_gate:
+            # `gate` handed neither input is the one publishing mode that
+            # falls back in silence, so a repository whose `init` step
+            # holds the pair and whose `gate` step does not reads as
+            # publishing while the required verdict is still ambient
+            # (Codex, mikelward/repo#36).
+            fix(
+                f"{label}: {credentials.workflow_labels(ambient_gate)} runs {action} in `gate` mode "
+                f"with no App credential, so the required `{label}` status it posts is the ambient "
+                f"check-run a pull request's own workflow produces -- hand that step the pair too "
+                f"(mikelward/lanes's README, \"Trusted publishing\")"
+            )
         if credentials.lanes_usable(env_secrets):
-            if not as_repository and declares and trusted:
+            if not as_repository and declares and trusted and not foreign and not ambient_gate:
                 ok(f"{label}: the App credential lives in the '{label}' environment")
         elif not credentials.lanes_usable(set(repo_secrets) | set(env_secrets)):
             half = (

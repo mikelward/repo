@@ -381,8 +381,7 @@ def _plan_credentials(repo, specs):
     try:
         repo_secrets = credentials.repository_secrets(repo)
         environments = credentials.environments(repo)
-        default = credentials.default_branch(repo)
-        texts = credentials.workflow_texts(repo, default)
+        default, texts = credentials.workflow_snapshot(repo)
         held = {
             env: credentials.environment_secrets(repo, environments, env)
             for env in (*credentials.BATCH_HUBS, credentials.COMMIT_ARTIFACT_ENV, credentials.LANES_ENV)
@@ -650,6 +649,19 @@ def _plan_credentials(repo, specs):
     publishers = credentials.lanes_publishers(texts)
     unread = credentials.lanes_unread(texts)
     incomplete = credentials.lanes_incomplete(texts)
+    foreign = credentials.lanes_foreign(texts)
+    if foreign:
+        # The step authenticates as an App this tool does not manage: the
+        # fleet pair is not what publishes here, so moving it would claim
+        # a placement that changes nothing, and deleting it as unused is
+        # the destructive half of the same misreading (Codex,
+        # mikelward/repo#36).
+        plan.unfixed.append(
+            f"{label}: {credentials.workflow_labels(foreign)} hands {action} `app-id` and "
+            f"`app-private-key` from secrets that are not {app_id} and {app_key}, so it publishes "
+            f"as an App this tool does not manage; {app_id}, {app_key} left as is"
+        )
+        return plan
     if incomplete:
         # A step handing the action half the pair publishes nothing and is
         # not the ambient pattern: the pair is neither unused nor safely
@@ -667,23 +679,119 @@ def _plan_credentials(repo, specs):
             f"nothing is deleted; write it as a step-level `uses:`, or delete the credential by hand"
         )
         return plan
+    indirect = credentials.lanes_indirect(texts)
+    if indirect:
+        # The pair is named where no step this reader can see takes it --
+        # a local composite action is the shape that does it, and its own
+        # `action.yml` is a file this reads none of. Cannot tell, so
+        # nothing moves: deleting all four copies as unused broke the
+        # publisher and lost the values, which GitHub never gives back
+        # (Codex, mikelward/repo#36).
+        plan.unfixed.append(
+            f"{label}: {credentials.workflow_labels(indirect)} names {app_id} or {app_key} with no "
+            f"{action} step this can read taking them -- a local composite action reads its own "
+            f"`action.yml`, which this does not; whether the credential is used there cannot be "
+            f"told, so nothing is moved or deleted"
+        )
+        return plan
 
-    def lanes_now():
-        """(reason, publishers) as the workflows read now, for a recheck."""
-        texts_now = reread()
-        if credentials.lanes_unread(texts_now):
-            return f"a workflow now mentions {action} in a shape this cannot read as a step", None
-        if credentials.lanes_incomplete(texts_now):
-            return f"a workflow now hands {action} one of the two App inputs without the other", None
-        return None, credentials.lanes_publishers(texts_now)
+    rested_state = credentials.lanes_state(texts)
+    # How each field of that state reads when it is the one that moved. The
+    # comparison is wholesale (see `credentials.lanes_state`); this is only
+    # the wording, so a reason names what changed rather than "something".
+    changed_reason = {
+        "unread": lambda now: f"a workflow now mentions {action} in a shape this cannot read as a step",
+        "indirect": lambda now: (
+            f"a workflow now names {app_id} or {app_key} with no {action} step this can read taking them"
+        ),
+        "called workflows": lambda now: (
+            f"{credentials.workflow_labels(list(now)) or 'a workflow'} now calls a reusable workflow "
+            f"this cannot read"
+        ),
+        "incomplete": lambda now: (
+            f"a workflow now hands {action} one of the two App inputs without the other"
+        ),
+        "foreign": lambda now: (
+            f"{credentials.workflow_labels(list(now))} now hands {action} an App credential that is "
+            f"not {app_id} and {app_key}"
+        ),
+        "publishers": lambda now: (
+            f"the publishing workflows changed since the plan was built "
+            f"({credentials.workflow_labels([name for name, _ in now]) or 'none'} now)"
+        ),
+        "status publishers": lambda now: (
+            f"the workflows publishing the `{label}` status as the App changed since the plan was "
+            f"built ({credentials.workflow_labels(list(now)) or 'none'} now)"
+        ),
+        "ambient gate": lambda now: (
+            f"the workflows running {action} in `gate` mode with no App credential changed since "
+            f"the plan was built ({credentials.workflow_labels(list(now)) or 'none'} now)"
+        ),
+    }
+
+    def lanes_changed():
+        """Why the workflows no longer say what the plan rested on, or None.
+
+        Every fact either command reads, compared as one value. Enumerating
+        them by hand is what has to be got right every time, and twice was
+        not: a mode that stopped publishing, then a step wired to another
+        App, each passed a recheck that only asked after the names (Codex,
+        mikelward/repo#36).
+
+        The default branch is confirmed AFTER that read rather than before,
+        so the two are one snapshot. Which branch's copies count as the
+        default's is what a rename moves -- and a name checked FIRST then
+        agreed while the state came from the new branch, so the run went on
+        to restrict the environment to the old name: the real default shut
+        out, the stale one let in. Confirming the name last catches the
+        rename whichever side of the read it lands on, since a rename
+        before it is what this read then reports (Codex,
+        mikelward/repo#36). `workflow_texts` also names the branch it was
+        given rather than letting the API resolve "the default", so a
+        rename before the read is a 404 there too rather than another
+        branch's copies filed as this one's. A rename after every read is
+        nobody's to catch without a transaction, and the next run
+        replans."""
+        state_now = credentials.lanes_state(reread())
+        default_now = credentials.default_branch(repo)
+        if default_now != default:
+            return f"the default branch is now '{default_now}', not '{default}'"
+        for field, rested in rested_state.items():
+            if state_now[field] != rested:
+                return changed_reason[field](state_now[field])
+        return None
 
     if not publishers:
+        # Only where there is something to lose. Every repository here
+        # calls some reusable workflow, so raising this wherever one
+        # appears would report a credential that is not present on most of
+        # them -- noise on the many to protect the few, and `unused` has
+        # nothing to delete when no copy exists anyway.
+        at_stake = [n for n in (app_id, app_key) if n in repo_secrets or n in env_secrets or n in given]
+        called = credentials.lanes_called_workflows(texts) if at_stake else []
+        if called:
+            # A job-level `uses:` this reader cannot follow can hold the
+            # lanes step that publishes: the caller names neither the
+            # action nor either secret, so every reader came back empty and
+            # the pair was deleted as unused -- the called workflow broken
+            # and the values gone (Codex, mikelward/repo#36). Only the
+            # delete is held. A move made wrongly can be undone from the
+            # value the operator handed in; a delete made wrongly cannot,
+            # and holding the move too would keep the credential out of
+            # every repository here, since they all call something.
+            line = (
+                f"{label}: {credentials.workflow_labels(called)} calls a reusable workflow this "
+                f"cannot read, which may be what publishes; {app_id}, {app_key} left as is"
+            )
+            plan.unfixed.append(line)
+            return plan
 
-        def still_no_publisher():
-            reason, now = lanes_now()
-            if reason is None and now:
-                reason = f"{credentials.workflow_labels(sorted(now))} appeared since the plan was built"
-            return reason
+        # The same whole-state comparison, the default branch included:
+        # the plan rested on there being no publisher AND nothing held back
+        # by a finding, and a delete is what it authorizes, so any of those
+        # moving refuses -- a rename among them, since which copies count
+        # as the default's is what "no publisher" was read from.
+        still_no_publisher = lanes_changed
 
         unused(
             label,
@@ -704,8 +812,7 @@ def _plan_credentials(repo, specs):
     # push-triggered run, the hole the move closes (Codex,
     # mikelward/repo#36). The publishing that the credential exists for
     # runs under `pull_request_target` from the default branch's copy.
-    def on_default(found):
-        return {name: declares for name, declares in found.items() if name.branch is None}
+    on_default = credentials.on_default_branch
 
     undeclared = sorted(name for name, declares in on_default(publishers).items() if not declares)
     if not on_default(publishers):
@@ -721,36 +828,13 @@ def _plan_credentials(repo, specs):
             f"the environment once merged -- the pair is kept for it"
         )
 
-    def still_declares():
-        # The default branch first: the restriction names it, and a rename
-        # while the prompt sat would restrict the environment to the old
-        # name -- the new trusted branch shut out, the stale one let in
-        # (Codex, mikelward/repo#36).
-        default_now = credentials.default_branch(repo)
-        if default_now != default:
-            return f"the default branch is now '{default_now}', not '{default}'"
-        reason, now = lanes_now()
-        if reason is not None:
-            return reason
-        # The publishers the plan rested on are the ones rechecked: the
-        # default branch's, or -- when it had none -- the branch copies
-        # that kept the pair, so one that went away while the prompt sat
-        # holds the apply back rather than leaving a pair nothing uses
-        # (Codex, mikelward/repo#36).
-        rested_on = on_default(publishers) or publishers
-        rested_now = on_default(now) if on_default(publishers) else now
-        if set(rested_now) != set(rested_on):
-            return (
-                f"the publishing workflows changed since the plan was built "
-                f"({credentials.workflow_labels(sorted(rested_now)) or 'none'} now)"
-            )
-        missing = sorted(name for name, declares in on_default(now).items() if not declares)
-        if missing:
-            return (
-                f"{credentials.workflow_labels(missing)} no longer declares "
-                f"`environment: {label}` on every publishing job"
-            )
-        return None
+    # Everything the workflows say and the branch they were read against,
+    # compared whole: what a run applies has to be the plan it showed, and
+    # each fact left out of this comparison was one the run went on to
+    # apply over. Held back rather than fixed up in place -- the next run
+    # replans against what is there now, places what it can, and says the
+    # rest.
+    still_declares = lanes_changed
 
     def suggest(held_after):
         return [name for name in (app_id, app_key) if name not in held_after] or [app_id, app_key]
@@ -939,6 +1023,29 @@ def _plan_credentials(repo, specs):
             f"{label}: environment '{env}' {wrong} -- restrict it to '{default}' in the "
             f"environment's settings; a policy someone set is not rewritten"
             + (f"; {', '.join(stays)} stays a repository secret until then" if stays else "")
+        )
+    if on_default(publishers) and rested_state["ambient gate"]:
+        plan.unfixed.append(
+            f"{label}: {credentials.workflow_labels(list(rested_state['ambient gate']))} runs "
+            f"{action} in `gate` mode with no App credential, so the required `{label}` status it "
+            f"posts is the ambient check-run a pull request's own workflow produces -- hand that "
+            f"step the pair too (mikelward/lanes's README, \"Trusted publishing\")"
+        )
+    if on_default(publishers) and not rested_state["status publishers"]:
+        # The pair reaches only `classify` steps: the generated lane has
+        # its credential, and the required `lanes` status is still posted
+        # by the ambient check-run -- the fallback mikelward/lanes's README
+        # calls "defeating the whole mechanism with no error to notice it
+        # by". The credential is placed and the environment settled either
+        # way, since classify needs both; what is left is the caller's own
+        # (Codex, mikelward/repo#36).
+        plan.unfixed.append(
+            f"{label}: {credentials.workflow_labels(sorted(on_default(publishers)))} hands {action} "
+            f"the App credential only to steps that publish no status -- `classify`, or a "
+            f"`mode` the action refuses to start on -- so the required "
+            f"`{label}` status is still the ambient check-run a pull request's own workflow "
+            f"produces -- hand the pair to the `init` and gate steps too (mikelward/lanes's "
+            f"README, \"Trusted publishing\")"
         )
     return plan
 

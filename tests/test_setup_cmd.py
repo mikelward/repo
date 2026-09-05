@@ -119,6 +119,16 @@ class FakeGh:
         self.default_branch = "main"
         self._default_branch_reads = 0
         self.default_branch_after_bootstrap_plan = None
+        # Which read first reports the renamed branch, counting every
+        # read this run makes. 3 (the default) puts it at the bootstrap
+        # step's pre-apply recheck; 5 puts it BETWEEN the credentials
+        # recheck's two reads, which is the window a name checked before
+        # the workflows left open (Codex, mikelward/repo#36). The
+        # credentials plan makes the first two: `workflow_snapshot` reads
+        # the name, reads the workflows pinned to it, and confirms the
+        # name again -- the confirming read is the second, since the
+        # workflows are not read through this counter.
+        self.default_branch_renamed_after_read = 3
         self.allow_rebase = "true"
         self.allow_auto_merge = "true"
         self.fail_allow_auto_merge = False
@@ -384,7 +394,13 @@ class FakeGh:
         reads -- so without this they would stop firing and every one of
         those tests would pass vacuously. The rename hook only moves which
         name `.default_branch` REPORTS; the tree keeps its own name here."""
-        return None if ref == self.default_branch else ref
+        if ref in (self.default_branch, self.default_branch_after_bootstrap_plan):
+            # A rename moves the branch: the old name stops resolving and
+            # the new one answers from the same tree. This fake keeps one
+            # tree and moves only the name `.default_branch` reports, so
+            # both names read it.
+            return None
+        return ref
 
     def _delete_after_restrict(self, env):
         """Someone deletes `env` in the window this run cannot see: after
@@ -418,15 +434,20 @@ class FakeGh:
             # rename between the bootstrap plan's own read and setup_cmd's
             # pre-apply recheck -- None (the default) means every read
             # sees the same branch, matching every other test in this
-            # file. The threshold is 2, not 1: _plan_credentials's own
-            # unconditional credentials.workflow_texts call reads
-            # .default_branch before the bootstrap step ever does (Codex
-            # review, mikelward/repo#14 -- caught here, not by that PR
-            # comment, while writing this fixture), so the bootstrap
-            # plan's own read is the SECOND call, and the pre-apply
-            # recheck this fixture exists to test is the third.
+            # file. The threshold counts the reads the credentials plan
+            # makes first: `workflow_snapshot` reads the name, then the
+            # workflows pinned to it, then the name again to confirm the
+            # two are one reading (Codex, mikelward/repo#36; the first of
+            # those was already ahead of the bootstrap step at
+            # mikelward/repo#14 -- caught here, not by that PR comment,
+            # while writing this fixture). So the bootstrap plan's own
+            # read is the THIRD call, and the pre-apply recheck this
+            # fixture exists to test is the fourth.
             branch = self.default_branch
-            if self._default_branch_reads > 2 and self.default_branch_after_bootstrap_plan is not None:
+            if (
+                self._default_branch_reads > self.default_branch_renamed_after_read
+                and self.default_branch_after_bootstrap_plan is not None
+            ):
                 branch = self.default_branch_after_bootstrap_plan
             return branch + "\n"
         if m and jq == ".allow_auto_merge":
@@ -600,7 +621,9 @@ class FakeGh:
                 self._branch_reads[ref] = self._branch_reads.get(ref, 0) + 1
                 if self._branch_reads[ref] >= 2 and ref in self.branch_workflows_after_recheck:
                     self.branch_workflows[ref] = self.branch_workflows_after_recheck[ref]
-                files = [*(self.workflow_files or []), *self.branch_workflows[ref]]
+                # `.get`, not `[]`: a rename makes the OLD default branch
+                # an ordinary branch, and it has no entry here.
+                files = [*(self.workflow_files or []), *self.branch_workflows.get(ref, {})]
                 return "".join(f"{n} {self._blob(n, ref)}\n" for n in dict.fromkeys(files))
             self._workflow_reads["/"] = self._workflow_reads.get("/", 0) + 1
             files = self.workflow_files
@@ -3799,6 +3822,122 @@ class LanesCredentialStepTest(unittest.TestCase):
             "LANES_APP_ID not set: the environment's secrets could not be read first", err
         )
 
+    def test_a_repoint_while_the_workflows_are_read_refuses_the_whole_plan(self):
+        # Pinning the workflow reads to the default branch turns a RENAME
+        # into a 404, but a repoint to a branch that still exists answers
+        # happily from the old one. The plan then judged the environment's
+        # policy against a name that had stopped being the default -- and
+        # where nothing needed doing it queued no move, so no apply-time
+        # recheck ever ran and the run reported the repository healthy
+        # while the real default branch was shut out of its own
+        # environment (Codex, mikelward/repo#36). The name is confirmed
+        # after the texts, so the two are one reading.
+        fake = self._publisher()
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        fake.env_policies = {"lanes": ["main"]}
+        fake.default_branch_after_bootstrap_plan = "trunk"
+        fake.default_branch_renamed_after_read = 1  # between the two reads of the name
+        # --no-bootstrap so the credentials plan is the step under test:
+        # with the scaffold step running, IT catches the repoint first and
+        # the run never reaches the reading this pins.
+        code, out, err = _run(fake, ["--force", "--no-rules", "--no-bootstrap", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "default branch changed from 'main' to 'trunk' while its workflows were being read",
+            err,
+        )
+        self.assertEqual(fake.restricted, [])
+        self.assertEqual(fake.deleted_secrets, [])
+
+    def test_a_rename_between_the_recheck_s_two_reads_is_caught(self):
+        # The window a name checked BEFORE the workflows left open: the
+        # rename lands after that check and before the workflow read, so
+        # the name agrees while the state read describes the new branch's
+        # copies. Identical states then passed the comparison and the run
+        # restricted the environment to the old name, reporting success
+        # (Codex, mikelward/repo#36). Confirming the name after the read
+        # catches it, since the read is what the rename precedes.
+        fake = self._publisher()
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        fake.default_branch_after_bootstrap_plan = "trunk"
+        fake.default_branch_renamed_after_read = 5
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("environment 'lanes' not restricted: the default branch is now 'trunk', not 'main'", err)
+        self.assertEqual(fake.restricted, [])
+        self.assertEqual(fake.env_puts, [])
+
+    def test_a_rename_holds_back_the_delete_of_an_unused_pair(self):
+        # The no-publisher path deletes, and which copies count as the
+        # default branch's is what "no publisher" was read from -- so the
+        # rename refuses there too. One comparison for both, rather than a
+        # second check beside it (Codex, mikelward/repo#36).
+        fake = self._publisher()
+        fake.workflow_texts = {"ci.yml": "jobs: {}\n"}
+        fake.secret_names = set(self.PAIR)
+        fake.default_branch_after_bootstrap_plan = "trunk"
+        fake.default_branch_renamed_after_read = 5
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("the default branch is now 'trunk', not 'main'", err)
+        self.assertEqual(fake.deleted_secrets, [])
+
+    COMPOSITE = (
+        "name: ci\non: pull_request_target\njobs:\n  init:\n    runs-on: ubuntu-latest\n"
+        "    environment: lanes\n    steps:\n      - uses: ./.github/actions/lanes-init\n"
+        "        with:\n          app-id: ${{ secrets.LANES_APP_ID }}\n"
+        "          app-private-key: ${{ secrets.LANES_APP_PRIVATE_KEY }}\n"
+    )
+
+    MIXED = (
+        "name: ci\non: pull_request_target\njobs:\n"
+        "  init:\n    runs-on: ubuntu-latest\n    environment: lanes\n    steps:\n"
+        "      - uses: mikelward/lanes@main\n        with:\n          mode: init\n"
+        "          app-id: ${{ secrets.LANES_APP_ID }}\n"
+        "          app-private-key: ${{ secrets.LANES_APP_PRIVATE_KEY }}\n"
+        "  extra:\n    runs-on: ubuntu-latest\n    steps:\n"
+        "      - uses: ./.github/actions/lanes-extra\n        with:\n"
+        "          app-id: ${{ secrets.LANES_APP_ID }}\n"
+        "          app-private-key: ${{ secrets.LANES_APP_PRIVATE_KEY }}\n"
+    )
+
+    def test_a_readable_publisher_does_not_vouch_for_the_rest_of_its_file(self):
+        # One job publishes readably, another hands the pair to a local
+        # composite action. Asking only whether the FILE had a lanes step
+        # excluded it whole, and setup then moved and deleted the pair on
+        # the strength of the publisher, breaking the consumer it never saw
+        # (Codex, mikelward/repo#36). The accounting is per reference: a
+        # mention counts unless a resolved step was handed it.
+        fake = self._publisher(self.MIXED)
+        fake.secret_names = set(self.PAIR)
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        fake.env_policies = {"lanes": ["main"]}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertEqual(fake.deleted_secrets, [])
+        self.assertIn("with no mikelward/lanes step this can read taking them", err)
+
+    def test_a_pair_named_with_no_readable_step_is_never_deleted(self):
+        # A workflow can hand the pair to a local composite action, and the
+        # `mikelward/lanes` reference then lives in that action's own
+        # `action.yml` -- a file this reads none of. So every reader came
+        # back empty, the pair read as used by nothing, and all FOUR copies
+        # were deleted: the publisher broken and the values gone, since
+        # GitHub never gives a secret back (Codex, mikelward/repo#36).
+        fake = self._publisher(self.COMPOSITE)
+        fake.secret_names = set(self.PAIR)
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        fake.env_policies = {"lanes": ["main"]}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertEqual(fake.deleted_secrets, [])
+        self.assertEqual(fake.written_secrets, [])
+        self.assertIn(
+            "names LANES_APP_ID or LANES_APP_PRIVATE_KEY with no mikelward/lanes step this can "
+            "read taking them",
+            err,
+        )
+
     def test_a_policy_set_while_the_plan_waited_fails_the_run(self):
         # The plan saw an open environment; by apply time someone set a
         # policy of their own. Left alone -- and reported as a failure, not
@@ -3873,6 +4012,33 @@ class LanesCredentialStepTest(unittest.TestCase):
         self.assertIn("lanes: environment 'lanes' admits only the trusted base branch", out)
         self.assertEqual(fake.restricted, [])
         self.assertEqual(fake.env_puts, [])
+
+    def test_an_uncredentialed_gate_is_reported_and_the_pair_still_placed(self):
+        # `init` holds the pair, so the classify-only finding stays quiet
+        # while the step posting the required verdict has no credential and
+        # falls back to the ambient check-run in silence (Codex,
+        # mikelward/repo#36). The pair is still placed and the environment
+        # still restricted -- the credentialed steps need both.
+        mixed = self.PUBLISHER + """  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: mikelward/lanes@main
+        with:
+          mode: gate
+"""
+        fake = self._publisher(mixed)
+        fake.secret_names = set(self.PAIR)
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "not fixed: lanes: ci runs mikelward/lanes in `gate` mode with no App credential",
+            err,
+        )
+        self.assertNotIn("only to steps that publish no status", err)
+        # Placed and shut regardless: this is a report, not a hold.
+        self.assertEqual(fake.restricted, [("lanes", "main")])
+        self.assertEqual(sorted(name for name, _e in fake.deleted_secrets), sorted(self.PAIR))
 
     def test_a_policy_someone_set_is_reported_not_rewritten(self):
         fake = self._publisher()
@@ -4094,6 +4260,74 @@ class LanesCredentialStepTest(unittest.TestCase):
         self.assertEqual(sorted(fake.deleted_secrets), [("LANES_APP_ID", None), ("LANES_APP_PRIVATE_KEY", "lanes")])
         self.assertEqual(fake.restricted, [])
 
+    def test_a_reusable_workflow_call_this_cannot_read_holds_the_delete(self):
+        # The called workflow's own file is not among the texts, so a lanes
+        # step in it is invisible: the caller names neither the action nor
+        # either secret, every reader came back empty, and both copies were
+        # deleted with their values (Codex, mikelward/repo#36).
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        fake.workflow_texts = {
+            "ci.yml": "jobs:\n  ci:\n    uses: some-org/shared/.github/workflows/ci.yml@main\n    secrets: inherit\n"
+        }
+        fake.secret_names = {"LANES_APP_ID"}
+        fake.env_secret_names = {"lanes": {"LANES_APP_PRIVATE_KEY"}}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "not fixed: lanes: ci calls a reusable workflow this cannot read, which may be what "
+            "publishes; LANES_APP_ID, LANES_APP_PRIVATE_KEY left as is",
+            err,
+        )
+        self.assertEqual(fake.deleted_secrets, [])
+
+    def test_a_reusable_workflow_call_is_silent_with_no_pair_to_lose(self):
+        # Every repository here calls some reusable workflow, so raising it
+        # where the pair is not present would report on the many to protect
+        # the few -- and there is nothing for `unused` to delete anyway.
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        fake.workflow_texts = {
+            "ci.yml": "jobs:\n  ci:\n    uses: some-org/shared/.github/workflows/ci.yml@main\n    secrets: inherit\n"
+        }
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("reusable workflow this cannot read", err)
+
+    def test_a_local_reusable_workflow_call_is_read_directly(self):
+        # Its file is among the texts, so its lanes step publishes on its
+        # own account and the pair moves as usual.
+        fake = self._publisher()
+        fake.workflow_files = ["ci.yml", "call.yml"]
+        fake.workflow_texts = dict(fake.workflow_texts)
+        fake.workflow_texts["call.yml"] = (
+            "jobs:\n  ci:\n    uses: ./.github/workflows/ci.yml\n    secrets: inherit\n"
+        )
+        fake.secret_names = set(self.PAIR)
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        fake.env_policies = {"lanes": ["main"]}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("reusable workflow this cannot read", err)
+
+    def test_a_reusable_call_beside_a_publisher_still_moves(self):
+        # The other half of the audit's parity test: the reading is
+        # consulted only where nothing publishes readably, so an unrelated
+        # call does not hold back a repository whose own workflow publishes.
+        fake = self._publisher()
+        fake.workflow_files = list(fake.workflow_files) + ["call.yml"]
+        fake.workflow_texts = dict(fake.workflow_texts)
+        fake.workflow_texts["call.yml"] = (
+            "jobs:\n  ci:\n    uses: some-org/shared/.github/workflows/ci.yml@main\n    secrets: inherit\n"
+        )
+        fake.secret_names = set(self.PAIR)
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        fake.env_policies = {"lanes": ["main"]}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("reusable workflow this cannot read", err)
+        self.assertEqual(sorted(fake.deleted_secrets), [("LANES_APP_ID", None), ("LANES_APP_PRIVATE_KEY", None)])
+
     def test_a_shape_the_reader_cannot_resolve_deletes_nothing(self):
         # A document PyYAML rejects resolves no step, so the mention is
         # "cannot tell" and holds everything back.
@@ -4103,6 +4337,105 @@ class LanesCredentialStepTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("not fixed: lanes: ci mentions mikelward/lanes in a shape this cannot read as a step", err)
         self.assertEqual(fake.deleted_secrets, [])
+
+    def test_the_pair_reaching_only_classify_is_not_fixed(self):
+        # `classify` takes the credential for the generated lane, so the
+        # pair is placed and the environment restricted either way -- but
+        # nothing publishes the required status as the App, which is the
+        # silent fallback to the ambient check-run mikelward/lanes's README
+        # warns about, so the run says so and fails (Codex,
+        # mikelward/repo#36).
+        fake = self._publisher(self.PUBLISHER.replace("          mode: init\n", "          mode: classify\n"))
+        fake.secret_names = set(self.PAIR)
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "not fixed: lanes: ci hands mikelward/lanes the App credential only to steps that publish "
+            "no status -- `classify`, or a `mode` the action refuses to start on -- so the required "
+            "`lanes` status is still the ambient check-run a pull request's own workflow produces "
+            "-- hand the pair to the `init` and gate steps too",
+            err,
+        )
+        # The move and the restriction still happen: classify needs both.
+        self.assertEqual(sorted(fake.deleted_secrets), [("LANES_APP_ID", None), ("LANES_APP_PRIVATE_KEY", None)])
+        self.assertEqual(fake.restricted, [("lanes", "main")])
+
+    def test_a_step_wired_to_another_app_holds_the_pair(self):
+        fake = self._publisher(
+            self.PUBLISHER.replace("secrets.LANES_APP_ID", "secrets.OTHER_ID").replace(
+                "secrets.LANES_APP_PRIVATE_KEY", "secrets.OTHER_KEY"
+            )
+        )
+        fake.secret_names = set(self.PAIR)
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "not fixed: lanes: ci hands mikelward/lanes `app-id` and `app-private-key` from secrets "
+            "that are not LANES_APP_ID and LANES_APP_PRIVATE_KEY, so it publishes as an App this "
+            "tool does not manage; LANES_APP_ID, LANES_APP_PRIVATE_KEY left as is",
+            err,
+        )
+        # Neither moved nor deleted: a placement here would change nothing,
+        # and a deletion is the destructive half of the same misreading.
+        self.assertEqual(fake.deleted_secrets, [])
+        self.assertEqual(fake.written_secrets, [])
+        self.assertEqual(fake.restricted, [])
+
+    def test_a_branch_copy_running_init_does_not_answer_for_the_default_branch(self):
+        # The default branch hands the pair only to `classify` while a
+        # feature branch's copy runs `init`. That copy publishes from a
+        # branch the restricted environment shuts out, so it cannot stand
+        # in for the trusted base -- reading it as one hid the finding
+        # (Codex, mikelward/repo#36).
+        fake = self._publisher(self.PUBLISHER.replace("          mode: init\n", "          mode: classify\n"))
+        fake.branch_workflows = {"feature": {"ci.yml": self.PUBLISHER}}
+        fake.secret_names = set(self.PAIR)
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "not fixed: lanes: ci hands mikelward/lanes the App credential only to steps that publish "
+            "no status -- `classify`, or a `mode` the action refuses to start on --",
+            err,
+        )
+
+    def test_a_branch_only_publisher_raises_no_classify_finding(self):
+        # Nothing on the default branch publishes at all, which the plan
+        # already says; the branch copy's mode is its own pull request's
+        # business until it merges.
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        fake.workflow_texts = {"ci.yml": "jobs: {}\n"}
+        fake.branch_workflows = {
+            "feature": {"ci.yml": self.PUBLISHER.replace("          mode: init\n", "          mode: classify\n")}
+        }
+        fake.secret_names = set(self.PAIR)
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        code, out, err = _run(fake, ["--force", "-v", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("lanes: no workflow on the default branch publishes the lanes status as the App", out + err)
+        self.assertNotIn("only to steps that publish no status", out + err)
+
+    def test_a_publisher_that_stopped_publishing_a_status_while_the_plan_waited_holds_it_back(self):
+        # Same workflow, same job, one word changed: `init` to `classify`
+        # while the prompt sat. The names the recheck compares are
+        # identical, so comparing them alone applied the plan and exited
+        # clean while the required status had gone back to the ambient
+        # check-run (Codex, mikelward/repo#36).
+        fake = self._publisher()
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        fake.workflow_texts_after_recheck = {
+            "ci.yml": self.PUBLISHER.replace("          mode: init\n", "          mode: classify\n")
+        }
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "environment 'lanes' not restricted: the workflows publishing the `lanes` status as the "
+            "App changed since the plan was built (none now)",
+            err,
+        )
+        self.assertEqual(fake.restricted, [])
 
     def test_a_policy_added_while_the_restriction_ran_fails_the_run(self):
         # Both writes land, which is not the same as the environment being
@@ -4126,6 +4459,42 @@ class LanesCredentialStepTest(unittest.TestCase):
         # Left in place: someone set it, and this deletes nobody's policy.
         self.assertEqual(fake.env_policies["lanes"], ["main", "release/*"])
 
+    def test_a_finding_appearing_while_the_plan_waited_holds_the_apply_back(self):
+        # The recheck compares everything the workflows say, as one value:
+        # enumerating the facts by hand is what has to be got right every
+        # time, and twice was not (Codex, mikelward/repo#36). Here a second
+        # job wired to another App appears beside the publisher the plan
+        # rested on -- the publisher list is unchanged, so a comparison of
+        # names alone would apply the plan and exit clean.
+        fake = self._publisher()
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        fake.workflow_texts_after_recheck = {
+            "ci.yml": self.PUBLISHER + self.PUBLISHER.replace("jobs:\n  init:", "  second:").replace(
+                "secrets.LANES_APP_ID", "secrets.OTHER_ID"
+            ).replace("secrets.LANES_APP_PRIVATE_KEY", "secrets.OTHER_KEY")
+        }
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "environment 'lanes' not restricted: ci now hands mikelward/lanes an App credential "
+            "that is not LANES_APP_ID and LANES_APP_PRIVATE_KEY",
+            err,
+        )
+        self.assertEqual(fake.restricted, [])
+
+    def test_a_publisher_appearing_while_the_plan_waited_keeps_the_pair(self):
+        # The other direction of the same comparison: the plan rested on
+        # nothing publishing, so the delete it authorized is refused once
+        # something does.
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        fake.workflow_texts = {"ci.yml": "jobs: {}\n"}
+        fake.workflow_texts_after_recheck = {"ci.yml": self.PUBLISHER}
+        fake.secret_names = set(self.PAIR)
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("LANES_APP_ID kept: the publishing workflows changed since the plan was built", err)
+        self.assertEqual(fake.deleted_secrets, [])
     def test_half_a_supplied_pair_is_not_written_at_all(self):
         # The repository holds one half and only the other is supplied, so
         # the run ends with the credential still unusable. Writing the
