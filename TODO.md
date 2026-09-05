@@ -373,6 +373,28 @@
   stands, and the cost of the refactor is a rewrite of the most-reviewed code on
   this branch. Reversible either way -- the guards are all in one function.
 
+- **A `uses:` the reader cannot follow holds the unused DELETE, not the
+  move** (autopilot, 2026-09-05). Three findings on mikelward/repo#36 were
+  the same shape -- a local composite action, an anchored `with:` shared
+  between two steps, and now a job-level call to an external reusable
+  workflow -- each a file this reader does not read and might hold the lanes
+  step that publishes. What distinguishes the third is that a called
+  workflow can reach a secret WITHOUT the caller naming it, through `secrets:
+  inherit` or the called job's own `environment: lanes`; a step-level action
+  gets only what its `with:`/`env:` hands it, which is a mention this reader
+  already sees. So the blind spots enumerate: files handed the secret (a
+  mention catches those) and files that can take it unhanded (only a called
+  reusable workflow). `lanes_called_workflows` covers the second.
+  It holds the unused delete alone. A move made on a wrong reading can be
+  undone from the value the operator handed in; a delete cannot, since
+  GitHub never returns a secret. Holding the move too -- the safer-sounding
+  reading -- would keep the credential out of every repository in the fleet,
+  since they all call something. The alternative considered and not taken was
+  reading the called workflow, which recurses without a floor and makes every
+  level another chance to conclude "unused" in the deleting direction.
+  Reversible: `lanes_called_workflows` is one function and the planner
+  consults it in one place; widening it to hold the move is two lines, and
+  narrowing it to callers that pass secrets is one condition.
 - **The lanes App pair's home is the `lanes` environment, by name**
   (autopilot, 2026-09-05). mikelward/lanes's README says the environment may
   be named anything, but this fleet names each credential's environment
@@ -427,6 +449,87 @@
   nothing reaches; the environment is restricted, so a stale branch cannot
   reach it either. Reversible: the `if not on_default(publishers)` branch
   in the lanes block is where the unused path would be taken instead.
+- **A plan-time read is confirmed after the reading it belongs to, not
+  before it** (autopilot, 2026-09-05). The lanes work has now taken five
+  corrections of one shape: a fact the plan rested on was read once, and
+  something moved before the run acted on it. Four were closed by
+  re-reading at apply time (the whole-state comparison, the branch policy
+  on a queued move, the environment's own contents, the default branch);
+  this one is closed at the read instead -- `workflow_snapshot` confirms
+  the default branch AFTER the workflows it pinned to that name, so the
+  two are one reading, because on a plan with nothing to do there is no
+  apply-time recheck to reach. That is the same design question already
+  open below: one snapshot of every plan-time read, re-derived and
+  compared whole, would delete the class rather than the instance, and is
+  the maintainer's call. What the current shape costs is a read per fact
+  and a rule -- confirm the name last -- that each new fact has to be
+  remembered by. Reversible: `credentials.workflow_snapshot` is the one
+  function, and both commands call it in one line each.
+- **The unread backstop counts references, not the name in prose --
+  and the counting model has now moved three times** (autopilot,
+  2026-09-05). `unread_mentions` and `lanes_unread` exist to refuse a
+  delete where the reader cannot tell whether a credential is used: they
+  compare how often a file names the workflow against how many uses of it
+  the walk resolved. What "names" means started as a raw substring, became
+  a substring in a parsed string (a comment calls nothing), then gained a
+  name boundary (`mikelward/lanes-helper` is not lanes), and is now the
+  whole scalar -- so a workflow titled after the action is a title, while
+  `mikelward/lanes@main` sitting somewhere the walk cannot reach is still
+  a reference and still holds the delete back. Each of those was a real
+  finding, but three corrections to one predicate is evidence about the
+  model rather than three bugs: the reader is inferring "could this be a
+  `uses:`?" from a string, where the structural walk already knows which
+  positions are executable. Deriving the count from the walk's own
+  refusals -- every `uses:` it saw, plus every position it could not read
+  at all -- would delete the class instead of the instance, and is the
+  maintainer's call per this file's rule that a design change is not
+  autopilot's to make. What the current shape costs is a scalar that is
+  a reference in neither direction: a `uses:` split across a YAML
+  concatenation would read as prose, and a bare quoted `mikelward/lanes`
+  in a `with:` value reads as a reference. Reversible: `_is_reference`
+  and `_reference_count` in `repo_lib/credentials.py` are the two
+  functions, and `_lanes_jobs` already fills a `resolved` set the other
+  side of the comparison could come from.
+
+  **Codex has now asked twice for the other half of this** (mikelward/repo#36,
+  rounds 37 and 40): count only structurally valid `uses` positions. Declined
+  both times, because taken alone it inverts the error into the destructive
+  direction -- a `uses:` in a document the walk cannot descend (a `jobs:` that
+  is not a mapping, a `steps:` that is not a list) would count as neither
+  referenced nor resolved, so the credential reads as unused and setup
+  DELETES it, in exactly the case the reader admits it cannot see. Whereas
+  an over-count only refuses a move, loudly, with the copies left where they
+  are. The model that satisfies both is one sentence long and is the design
+  change above, stated concretely: count the `uses:` values the walk reached,
+  PLUS whole-scalar references in any part of the document it could not
+  descend, falling back to the raw text for a rejected one. That needs
+  `_lanes_jobs` to record where it refused as well as what it resolved --
+  perhaps fifteen lines. It is a design change, so per this file's own rule
+  it is the maintainer's to take, not autopilot's; the instance Codex names
+  (a scalar that is exactly `owner/repo@ref` but is not a `uses:`) stays
+  unfixed until then, and costs a repository that its credential move is
+  refused rather than mis-applied.
+- **A lanes step or job carrying an `if:` is read as one that runs**
+  (autopilot, 2026-09-05). Codex asked (mikelward/repo#36) for statically
+  disabled steps -- `if: false` on the step or its job -- to be excluded
+  from the publishers, in the shared workflow-state model rather than as
+  another predicate. Declined for now, for the reason the `mode` expression
+  took: only the literal is decidable, and `${{ false }}`, `'false'`,
+  `github.ref == ...` and this fleet's own `needs.classify.outputs.lane ==
+  'code'` all need an Actions expression evaluator, which is the
+  one-more-case failure the hand-written YAML reader died of. The direction
+  also matters: reading a disabled step as running keeps the credential,
+  while reading it as not running makes the pair unused and lets setup
+  delete it -- so the naive fix turns a missed advisory line into a
+  destructive act on a step somebody disabled for an afternoon. What it
+  costs is that the classify-only `[FIX]` is not raised where the only
+  status publisher cannot run; the missing `lanes` status announces itself
+  on the next pull request, since the gate never reports. Splitting the two
+  questions -- disabled steps still hold the credential but do not publish
+  a status -- is coherent and is the maintainer's call, per this file's own
+  rule that a design change is not autopilot's to make. Reversible: the
+  step and job mappings are already in hand in `_lanes_jobs`, so an `if:`
+  test has one place to go.
 
 - **The scaffolded `AGENTS.md` is `mikelward/conf`'s own
   `agents/AGENTS.md`, under a generated header** (autopilot, 2026-09-04).

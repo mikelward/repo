@@ -1414,6 +1414,156 @@ class LanesCredentialAuditTest(unittest.TestCase):
         self.assertNotIn("[ok] lanes: the App credential", out)
         self.assertNotIn("no workflow here publishes", out)
 
+    def test_no_branch_publisher_line_when_there_is_no_publisher(self):
+        # An incomplete or foreign step reaches the same block with no
+        # publishers at all, and the branch-publisher line then named an
+        # empty list -- claiming a branch publisher that is not there, over
+        # the top of its own [FIX] (Codex, mikelward/repo#36).
+        half = self.PUBLISHER.replace("          app-private-key: ${{ secrets.LANES_APP_PRIVATE_KEY }}\n", "")
+        foreign = self.PUBLISHER.replace("secrets.LANES_APP_ID", "secrets.OTHER_ID").replace(
+            "secrets.LANES_APP_PRIVATE_KEY", "secrets.OTHER_KEY"
+        )
+        for text in (half, foreign):
+            fake = self._publisher(text)
+            fake.environments = {"lanes": self.PAIR}
+            fake.env_policies = {"lanes": ["main"]}
+            code, out, err = _run(fake, [REPO])
+            self.assertEqual(code, 0, err)
+            self.assertIn("[FIX] lanes: ci hands mikelward/lanes", out)
+            self.assertNotIn("does from a branch", out)
+
+    def test_a_step_wired_to_another_app_is_a_fix_not_an_ok(self):
+        fake = self._publisher(
+            self.PUBLISHER.replace("secrets.LANES_APP_ID", "secrets.OTHER_ID").replace(
+                "secrets.LANES_APP_PRIVATE_KEY", "secrets.OTHER_KEY"
+            )
+        )
+        fake.environments = {"lanes": self.PAIR}
+        fake.env_policies = {"lanes": ["main"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "[FIX] lanes: ci hands mikelward/lanes `app-id` and `app-private-key` from secrets that "
+            "are not LANES_APP_ID and LANES_APP_PRIVATE_KEY, so it publishes as an App this tool "
+            "does not manage",
+            out,
+        )
+        # Not healthy, and not unused either: the pair is held, not deleted.
+        self.assertNotIn("[ok] lanes: the App credential", out)
+        self.assertNotIn("deletes it", out)
+
+    def test_a_mode_the_action_would_refuse_publishes_nothing(self):
+        # mikelward/lanes's lanes.mjs throws `Unknown mode` before
+        # anything else runs unless the input is exactly one of its four
+        # words, so a step with no `mode`, or one whose value is not a
+        # string, publishes nothing -- counting those as publishers hid
+        # this finding for a step that cannot even start (Codex,
+        # mikelward/repo#36).
+        for mode in ("", "          mode:\n", "          mode: [gate]\n", "          mode: gaet\n"):
+            with self.subTest(mode=mode):
+                fake = self._publisher(self.PUBLISHER.replace("          mode: init\n", mode))
+                fake.environments = {"lanes": self.PAIR}
+                fake.env_policies = {"lanes": ["main"]}
+                code, out, err = _run(fake, [REPO])
+                self.assertEqual(code, 0, err)
+                self.assertIn("only to steps that publish no status", out)
+
+    def test_an_uncredentialed_gate_beside_a_credentialed_init_is_a_finding(self):
+        # `init` holds the pair, so something publishes as the App and the
+        # classify-only finding stays quiet -- but the `gate` step posting
+        # the required verdict has no credential, and that mode falls back
+        # to the ambient check-run in silence (Codex, mikelward/repo#36).
+        mixed = self.PUBLISHER + """  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: mikelward/lanes@main
+        with:
+          mode: gate
+"""
+        fake = self._publisher(mixed)
+        fake.environments = {"lanes": self.PAIR}
+        fake.env_policies = {"lanes": ["main"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "runs mikelward/lanes in `gate` mode with no App credential, so the required `lanes` "
+            "status it posts is the ambient check-run",
+            out,
+        )
+        # Not the classify-only finding, and not healthy either.
+        self.assertNotIn("only to steps that publish no status", out)
+        self.assertNotIn("[ok] lanes: the App credential", out)
+        self.assertNotIn("deletes it", out)
+
+    def test_a_credentialed_gate_is_not_the_ambient_fallback(self):
+        # The other direction: the same shape with the pair on the gate
+        # step is the healthy one.
+        backed = self.PUBLISHER + """  gate:
+    runs-on: ubuntu-latest
+    environment: lanes
+    steps:
+      - uses: mikelward/lanes@main
+        with:
+          mode: gate
+          app-id: ${{ secrets.LANES_APP_ID }}
+          app-private-key: ${{ secrets.LANES_APP_PRIVATE_KEY }}
+"""
+        fake = self._publisher(backed)
+        fake.environments = {"lanes": self.PAIR}
+        fake.env_policies = {"lanes": ["main"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("with no App credential", out)
+        self.assertIn("[ok] lanes: the App credential lives in the 'lanes' environment", out)
+
+    def test_a_mode_only_run_time_resolves_is_not_a_finding(self):
+        # The one case this cannot decide, so the one that counts as
+        # publishing: "cannot tell" must not raise a finding of its own.
+        fake = self._publisher(
+            self.PUBLISHER.replace("          mode: init\n", "          mode: ${{ inputs.mode }}\n")
+        )
+        fake.environments = {"lanes": self.PAIR}
+        fake.env_policies = {"lanes": ["main"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("only to steps that publish no status", out)
+        self.assertIn("[ok] lanes: the App credential lives in the 'lanes' environment", out)
+
+    def test_a_branch_copy_running_init_does_not_answer_for_the_default_branch(self):
+        # The default branch hands the pair only to `classify`; a feature
+        # branch's copy runs `init`. That copy publishes from a branch the
+        # restricted environment shuts out, so it says nothing about what
+        # the trusted base publishes -- reading it as an answer hid the
+        # finding entirely (Codex, mikelward/repo#36).
+        fake = self._publisher(self.PUBLISHER.replace("          mode: init\n", "          mode: classify\n"))
+        fake.branch_workflows = {"feature": {"ci.yml": self.PUBLISHER}}
+        fake.environments = {"lanes": self.PAIR}
+        fake.env_policies = {"lanes": ["main"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "[FIX] lanes: ci hands mikelward/lanes the App credential only to steps that publish no "
+            "status -- `classify`, or a `mode` the action refuses to start on --",
+            out,
+        )
+
+    def test_a_branch_only_publisher_raises_no_classify_finding(self):
+        # Nothing on the default branch publishes at all, which the [CHECK]
+        # above says; naming the branch copy's mode on top would be a second
+        # finding about a workflow still in review.
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        fake.workflow_texts = {"ci.yml": "jobs: {}\n"}
+        fake.branch_workflows = {
+            "feature": {"ci.yml": self.PUBLISHER.replace("          mode: init\n", "          mode: classify\n")}
+        }
+        fake.environments = {"lanes": self.PAIR}
+        fake.env_policies = {"lanes": ["main"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[CHECK] lanes: no workflow on the default branch publishes", out)
+        self.assertNotIn("only to steps that publish no status", out)
+
     def test_half_the_pair_handed_to_the_action_is_a_fix(self):
         fake = self._publisher(self.PUBLISHER.replace("          app-private-key: ${{ secrets.LANES_APP_PRIVATE_KEY }}\n", ""))
         fake.environments = {"lanes": self.PAIR}
@@ -1428,6 +1578,26 @@ class LanesCredentialAuditTest(unittest.TestCase):
         # Not unused -- the pair is plainly meant for it -- and not healthy.
         self.assertNotIn("no workflow here publishes", out)
         self.assertNotIn("[ok] lanes: the App credential", out)
+
+    def test_the_pair_reaching_only_classify_is_a_fix(self):
+        # The credential is in the right place and the environment is
+        # right, but nothing publishes the required status as the App --
+        # the ambient check-run a pull request's own workflow produces is
+        # what the ruleset sees (Codex, mikelward/repo#36).
+        fake = self._publisher(self.PUBLISHER.replace("          mode: init\n", "          mode: classify\n"))
+        fake.environments = {"lanes": self.PAIR}
+        fake.env_policies = {"lanes": ["main"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "[FIX] lanes: ci hands mikelward/lanes the App credential only to steps that publish no "
+            "status -- `classify`, or a `mode` the action refuses to start on -- so the required "
+            "`lanes` status is still the ambient check-run a pull request's own workflow produces "
+            "-- hand the pair to the `init` and gate steps too",
+            out,
+        )
+        # Still [ok] on placement: the pair is where it belongs.
+        self.assertIn("[ok] lanes: the App credential lives in the 'lanes' environment", out)
 
     def test_an_open_environment_is_a_fix_naming_setup(self):
         fake = self._publisher()
@@ -1531,6 +1701,28 @@ class LanesCredentialAuditTest(unittest.TestCase):
         self.assertEqual(len(policy), 1, out)
         self.assertNotIn("but not while", policy[0])
 
+    def test_a_pair_named_with_no_readable_step_is_reported_not_stale(self):
+        # A workflow can hand the pair to a local composite action, whose
+        # own `action.yml` this reads none of -- so every other reader came
+        # back empty and the pair read as used by nothing (Codex,
+        # mikelward/repo#36).
+        composite = (
+            "name: ci\non: pull_request_target\njobs:\n  init:\n    runs-on: ubuntu-latest\n"
+            "    environment: lanes\n    steps:\n      - uses: ./.github/actions/lanes-init\n"
+            "        with:\n          app-id: ${{ secrets.LANES_APP_ID }}\n"
+            "          app-private-key: ${{ secrets.LANES_APP_PRIVATE_KEY }}\n"
+        )
+        fake = self._publisher(composite)
+        fake.environments = {"lanes": self.PAIR}
+        code, out, err = _run(fake, [REPO])
+        self.assertIn(
+            "names LANES_APP_ID or LANES_APP_PRIVATE_KEY with no mikelward/lanes step this can "
+            "read taking them",
+            out,
+        )
+        # And never the stale-credential reading, which recommends a delete.
+        self.assertNotIn("reads as unused", out)
+
     def test_a_restriction_left_half_done_names_setup(self):
         fake = self._publisher()
         fake.environments = {"lanes": self.PAIR}
@@ -1585,6 +1777,56 @@ class LanesCredentialAuditTest(unittest.TestCase):
         fake.repo_secrets = []
         code, out, err = _run(fake, [REPO])
         self.assertNotIn("lanes:", out)
+
+    def test_a_reusable_workflow_call_is_cannot_tell(self):
+        # The called workflow's file is not read here, so a lanes step in
+        # it is invisible and the pair reads as unused -- which is the
+        # reading `repo setup` deleted both copies on (Codex,
+        # mikelward/repo#36). The audit must not promise that deletion
+        # either.
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        fake.workflow_texts = {
+            "ci.yml": "jobs:\n  ci:\n    uses: some-org/shared/.github/workflows/ci.yml@main\n    secrets: inherit\n"
+        }
+        fake.environments = {"lanes": ["LANES_APP_PRIVATE_KEY"]}
+        fake.repo_secrets = ["LANES_APP_ID"]
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "[FIX] lanes: ci calls a reusable workflow this cannot read, and a lanes step in that "
+            "workflow is invisible here -- whether the credential publishes cannot be told, so it "
+            "is kept (`repo setup` deletes nothing of its until a workflow here publishes readably)",
+            out,
+        )
+        self.assertNotIn("deletes it", out)
+        # Nothing held anywhere: no credential to protect, nothing to say.
+        fake.environments = {}
+        fake.repo_secrets = []
+        code, out, err = _run(fake, [REPO])
+        self.assertNotIn("lanes:", out)
+
+    def test_a_reusable_call_beside_a_publisher_does_not_mask_the_audit(self):
+        # The planner consults the called-workflow reading only where
+        # nothing publishes readably, so an unrelated reusable call in a
+        # repository that HAS a publisher must not stand in for the audit
+        # setup actually carries out: it reported neither the
+        # repository-level copy nor the open environment, while setup went
+        # on to move and restrict both (Codex, mikelward/repo#36).
+        fake = self._publisher()
+        fake.workflow_files = list(fake.workflow_files) + ["call.yml"]
+        fake.workflow_texts = dict(fake.workflow_texts)
+        fake.workflow_texts["call.yml"] = (
+            "jobs:\n  ci:\n    uses: some-org/shared/.github/workflows/ci.yml@main\n    secrets: inherit\n"
+        )
+        fake.repo_secrets = ["LANES_APP_ID", "LANES_APP_PRIVATE_KEY"]
+        fake.environments = {"lanes": []}
+        fake.env_policies = {"lanes": None}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("calls a reusable workflow this cannot read", out)
+        self.assertIn("moves it into the 'lanes' environment", out)
+        self.assertIn("environment 'lanes' can be reached from any branch", out)
 
     def test_a_shape_the_reader_cannot_resolve_is_cannot_tell(self):
         # A document PyYAML rejects resolves no step, so the mention is

@@ -262,6 +262,84 @@ class RefQueryTest(unittest.TestCase):
         self.assertEqual(credentials._ref_suffix(None), "")
 
 
+class LanesIndirectTest(unittest.TestCase):
+    HEALTHY = (
+        "name: ci\non: pull_request_target\njobs:\n  init:\n    runs-on: ubuntu-latest\n"
+        "    environment: lanes\n    steps:\n      - uses: mikelward/lanes@main\n        with:\n"
+        "          mode: init\n          app-id: ${{ secrets.LANES_APP_ID }}\n"
+        "          app-private-key: ${{ secrets.LANES_APP_PRIVATE_KEY }}\n"
+    )
+
+    def test_a_healthy_publisher_accounts_for_its_own_mentions(self):
+        self.assertEqual(credentials.lanes_indirect({"ci.yml": self.HEALTHY}), [])
+
+    def test_a_shared_input_mapping_is_cannot_tell(self):
+        # `_strings` visits a container once, so an anchored `with:` reused
+        # by a lanes step and a composite one yields its mentions once
+        # while consumption is counted per step -- the two balanced exactly
+        # and the composite consumer went unseen (Codex, mikelward/repo#36).
+        # Where the bases can disagree the comparison is not trusted.
+        aliased = (
+            "name: ci\non: pull_request_target\njobs:\n"
+            "  init:\n    runs-on: ubuntu-latest\n    environment: lanes\n    steps:\n"
+            "      - uses: mikelward/lanes@main\n        with: &creds\n          mode: init\n"
+            "          app-id: ${{ secrets.LANES_APP_ID }}\n"
+            "          app-private-key: ${{ secrets.LANES_APP_PRIVATE_KEY }}\n"
+            "  extra:\n    runs-on: ubuntu-latest\n    steps:\n"
+            "      - uses: ./.github/actions/lanes-extra\n        with: *creds\n"
+        )
+        self.assertEqual(credentials.lanes_indirect({"ci.yml": aliased}), ["ci.yml"])
+
+    def test_a_rejected_document_naming_the_pair_is_cannot_tell(self):
+        self.assertEqual(
+            credentials.lanes_indirect({"ci.yml": "env: [${{ secrets.LANES_APP_ID }}\n"}),
+            ["ci.yml"],
+        )
+
+    def test_a_file_naming_neither_secret_is_not_reported(self):
+        self.assertEqual(credentials.lanes_indirect({"ci.yml": "jobs: {}\n"}), [])
+
+
+class LanesCalledWorkflowsTest(unittest.TestCase):
+    """A job-level `uses:` this reader cannot follow can hold the lanes
+    step that publishes, and the caller names neither the action nor either
+    secret -- so the pair read as used by nothing and was deleted (Codex,
+    mikelward/repo#36)."""
+
+    def test_an_external_call_is_reported(self):
+        text = (
+            "name: ci\non: pull_request\njobs:\n  ci:\n"
+            "    uses: some-org/shared/.github/workflows/ci.yml@main\n    secrets: inherit\n"
+        )
+        self.assertEqual(credentials.lanes_called_workflows({"ci.yml": text}), ["ci.yml"])
+
+    def test_an_external_call_passing_nothing_is_reported_too(self):
+        # The called job's own `environment: lanes` reaches the pair
+        # whatever the caller passes, so the call is the signal rather than
+        # the `secrets:` beside it.
+        text = (
+            "name: ci\non: pull_request\njobs:\n  ci:\n"
+            "    uses: some-org/shared/.github/workflows/ci.yml@main\n"
+        )
+        self.assertEqual(credentials.lanes_called_workflows({"ci.yml": text}), ["ci.yml"])
+
+    def test_a_local_call_is_not_one_of_these(self):
+        # That file is among the texts and read directly, so a lanes step
+        # in it counts as a publisher on its own account.
+        text = (
+            "name: ci\non: pull_request\njobs:\n  ci:\n"
+            "    uses: ./.github/workflows/inner.yml\n    secrets: inherit\n"
+        )
+        self.assertEqual(credentials.lanes_called_workflows({"ci.yml": text}), [])
+
+    def test_a_step_level_uses_is_not_a_call(self):
+        text = (
+            "name: ci\non: pull_request\njobs:\n  ci:\n    steps:\n"
+            "      - uses: actions/checkout@v4\n"
+        )
+        self.assertEqual(credentials.lanes_called_workflows({"ci.yml": text}), [])
+
+
 class DefaultBranchPinTest(unittest.TestCase):
     """`workflow_texts` names the default branch on its own reads."""
 
@@ -541,17 +619,17 @@ class LanesReaderTest(unittest.TestCase):
             "        with:\n          mode: init\n"
             "          app-id: ${{ secrets.LANES_APP_ID }}\n"
             "          app-private-key: ${{ secrets.LANES_APP_PRIVATE_KEY }}\n",
-            "        with: {mode: init, app-id: '${{ secrets.LANES_APP_ID }}', app-private-key: x}\n",
+            "        with: {mode: init, app-id: '${{ secrets.LANES_APP_ID }}', app-private-key: '${{ secrets.LANES_APP_PRIVATE_KEY }}'}\n",
         )
         self.assertNotEqual(flow, PUBLISHER)
         self.assertEqual(credentials.lanes_publishers({"ci.yml": flow}), {"ci.yml": True})
         self.assertEqual(credentials.lanes_unread({"ci.yml": flow}), [])
-        ambient = flow.replace("{mode: init, app-id: '${{ secrets.LANES_APP_ID }}', app-private-key: x}", "{mode: init}")
+        ambient = flow.replace("{mode: init, app-id: '${{ secrets.LANES_APP_ID }}', app-private-key: '${{ secrets.LANES_APP_PRIVATE_KEY }}'}", "{mode: init}")
         self.assertEqual(credentials.lanes_publishers({"ci.yml": ambient}), {})
         self.assertEqual(credentials.lanes_unread({"ci.yml": ambient}), [])
         # An alias reads as what it names -- here the ambient inputs the
         # first step anchors, on the second.
-        aliased = flow.replace("{mode: init, app-id: '${{ secrets.LANES_APP_ID }}', app-private-key: x}", "&inputs {mode: classify}").replace(
+        aliased = flow.replace("{mode: init, app-id: '${{ secrets.LANES_APP_ID }}', app-private-key: '${{ secrets.LANES_APP_PRIVATE_KEY }}'}", "&inputs {mode: classify}").replace(
             "        with:\n          mode: classify\n", "        with: *inputs\n"
         )
         self.assertNotEqual(aliased, flow)
@@ -559,7 +637,7 @@ class LanesReaderTest(unittest.TestCase):
         self.assertEqual(credentials.lanes_unread({"ci.yml": aliased}), [])
         # An alias naming no anchor is not YAML, and the file is "cannot
         # tell" rather than stale.
-        dangling = flow.replace("{mode: init, app-id: '${{ secrets.LANES_APP_ID }}', app-private-key: x}", "*inputs")
+        dangling = flow.replace("{mode: init, app-id: '${{ secrets.LANES_APP_ID }}', app-private-key: '${{ secrets.LANES_APP_PRIVATE_KEY }}'}", "*inputs")
         self.assertEqual(credentials.lanes_publishers({"ci.yml": dangling}), {})
         self.assertEqual(credentials.lanes_unread({"ci.yml": dangling}), ["ci.yml"])
 
@@ -660,14 +738,14 @@ class LanesReaderTest(unittest.TestCase):
             self.assertEqual(credentials.lanes_incomplete({"ci.yml": text}), [], inputs)
             self.assertEqual(credentials.lanes_unread({"ci.yml": text}), [], inputs)
         for inputs in (
-            'mode: init, "app-id": x, app-private-key: y',
-            "mode: init, 'app-id': x, app-private-key: y",
-            'note: "a\\\\", app-id: x, app-private-key: y',
-            "url: http://example.com, app-id: x, app-private-key: y",
-            "mode: init, app-id: x, app-private-key: y,",
-            "mode: init, &input app-id: x, app-private-key: y",
-            "? app-id : x, app-private-key: y",
-            "mode: init, !!str app-id: x, app-private-key: y",
+            'mode: init, "app-id": \'${{ secrets.LANES_APP_ID }}\', app-private-key: \'${{ secrets.LANES_APP_PRIVATE_KEY }}\'',
+            "mode: init, 'app-id': '${{ secrets.LANES_APP_ID }}', app-private-key: '${{ secrets.LANES_APP_PRIVATE_KEY }}'",
+            'note: "a\\\\", app-id: \'${{ secrets.LANES_APP_ID }}\', app-private-key: \'${{ secrets.LANES_APP_PRIVATE_KEY }}\'',
+            "url: http://example.com, app-id: '${{ secrets.LANES_APP_ID }}', app-private-key: '${{ secrets.LANES_APP_PRIVATE_KEY }}'",
+            "mode: init, app-id: '${{ secrets.LANES_APP_ID }}', app-private-key: '${{ secrets.LANES_APP_PRIVATE_KEY }}',",
+            "mode: init, &input app-id: '${{ secrets.LANES_APP_ID }}', app-private-key: '${{ secrets.LANES_APP_PRIVATE_KEY }}'",
+            "? app-id : '${{ secrets.LANES_APP_ID }}', app-private-key: '${{ secrets.LANES_APP_PRIVATE_KEY }}'",
+            "mode: init, !!str app-id: '${{ secrets.LANES_APP_ID }}', app-private-key: '${{ secrets.LANES_APP_PRIVATE_KEY }}'",
         ):
             self.assertEqual(credentials.lanes_publishers({"ci.yml": flow(inputs)}), {"ci.yml": True}, inputs)
         # What PyYAML rejects -- an unclosed quote or bracket, an entry with
@@ -682,7 +760,7 @@ class LanesReaderTest(unittest.TestCase):
         # An anchored, tagged or explicit key was one the line reader did
         # not read, and a mapping with one was "cannot tell" (Codex,
         # mikelward/repo#36); parsed, the key is `app-id` as YAML says.
-        for key in ("&input app-id", "!!str app-id", "? app-id\n          : x\n          mode"):
+        for key in ("&input app-id", "!!str app-id", "? app-id\n          : ${{ secrets.LANES_APP_ID }}\n          mode"):
             text = PUBLISHER.replace("          app-id:", f"          {key}:")
             self.assertNotEqual(text, PUBLISHER)
             self.assertEqual(credentials.lanes_publishers({"ci.yml": text}), {"ci.yml": True}, key)
@@ -713,7 +791,7 @@ class LanesReaderTest(unittest.TestCase):
             "        with:\n          mode: init\n"
             "          app-id: ${{ secrets.LANES_APP_ID }}\n"
             "          app-private-key: ${{ secrets.LANES_APP_PRIVATE_KEY }}\n",
-            "        with: {mode: init, APP-ID: x, App-Private-Key: y}\n",
+            "        with: {mode: init, APP-ID: '${{ secrets.LANES_APP_ID }}', App-Private-Key: '${{ secrets.LANES_APP_PRIVATE_KEY }}'}\n",
         )
         self.assertEqual(credentials.lanes_publishers({"ci.yml": flow}), {"ci.yml": True})
         self.assertEqual(credentials.lanes_incomplete({"ci.yml": flow}), [])
@@ -730,7 +808,7 @@ class LanesReaderTest(unittest.TestCase):
             "        with:\n          mode: init\n"
             "          app-id: ${{ secrets.LANES_APP_ID }}\n"
             "          app-private-key: ${{ secrets.LANES_APP_PRIVATE_KEY }}\n",
-            "        with: {mode: init, App-Id: '${{ secrets.LANES_APP_ID }}', app-private-key: x}\n",
+            "        with: {mode: init, App-Id: '${{ secrets.LANES_APP_ID }}', app-private-key: '${{ secrets.LANES_APP_PRIVATE_KEY }}'}\n",
         )
         self.assertNotEqual(mixed, PUBLISHER)
         self.assertEqual(credentials.lanes_publishers({"ci.yml": mixed}), {"ci.yml": True})
@@ -780,7 +858,7 @@ class LanesReaderTest(unittest.TestCase):
             "        with:\n          mode: init\n"
             "          app-id: ${{ secrets.LANES_APP_ID }}\n"
             "          app-private-key: ${{ secrets.LANES_APP_PRIVATE_KEY }}\n",
-            "        with : {mode : init, app-id : x, app-private-key : y}\n",
+            "        with : {mode : init, app-id : '${{ secrets.LANES_APP_ID }}', app-private-key : '${{ secrets.LANES_APP_PRIVATE_KEY }}'}\n",
         )
         self.assertEqual(credentials.lanes_publishers({"ci.yml": flow}), {"ci.yml": True})
 
@@ -794,14 +872,64 @@ class LanesReaderTest(unittest.TestCase):
         self.assertEqual(credentials.lanes_publishers({"ci.yml": second}), {"ci.yml": False})
 
     def test_a_quoted_or_pinned_reference_is_still_the_action(self):
-        for uses in ('"mikelward/lanes@main"', "'mikelward/lanes@v2'", "MikelWard/Lanes@abc1234", "mikelward/lanes"):
+        for uses in ('"mikelward/lanes@main"', "'mikelward/lanes@v2'", "MikelWard/Lanes@abc1234"):
             text = PUBLISHER.replace("uses: mikelward/lanes@main", f"uses: {uses}")
             self.assertEqual(credentials.lanes_publishers({"ci.yml": text}), {"ci.yml": True}, uses)
             self.assertEqual(credentials.lanes_unread({"ci.yml": text}), [], uses)
 
+    def test_a_reference_with_no_ref_is_a_step_that_cannot_start(self):
+        # GitHub requires `owner/repo@ref` for a remote action, so these are
+        # workflows that fail to start. Reading one as a step made a job
+        # that cannot run report as a healthy publisher, and setup kept or
+        # moved the credential for a workflow publishing nothing (Codex,
+        # mikelward/repo#36). It resolves to no step, so the mention is
+        # unread -- "cannot tell", which holds everything.
+        for uses in ("mikelward/lanes", "mikelward/lanes@", '"mikelward/lanes"'):
+            text = PUBLISHER.replace("uses: mikelward/lanes@main", f"uses: {uses}")
+            self.assertEqual(credentials.lanes_publishers({"ci.yml": text}), {}, uses)
+            self.assertEqual(credentials.lanes_unread({"ci.yml": text}), ["ci.yml"], uses)
+
+    def test_an_aliased_step_is_one_node_on_both_sides_of_the_backstop(self):
+        # `_strings` visits a container once, so an anchored step aliased
+        # into two jobs contributes ONE mention while the per-job counts
+        # saw it twice. That one-off let a third step which mentions the
+        # action and resolves to nothing balance the totals, and the file
+        # read as fully resolved -- setup trusting the aliased publishers
+        # and deleting the pair out from under the step it could not read
+        # (Codex, mikelward/repo#36).
+        shared = (
+            "jobs:\n"
+            "  init:\n"
+            "    environment: lanes\n"
+            "    steps:\n"
+            "      - &step\n"
+            "        uses: mikelward/lanes@main\n"
+            "        with:\n"
+            "          mode: init\n"
+            "          app-id: ${{ secrets.LANES_APP_ID }}\n"
+            "          app-private-key: ${{ secrets.LANES_APP_PRIVATE_KEY }}\n"
+            "  second:\n"
+            "    environment: lanes\n"
+            "    steps:\n"
+            "      - *step\n"
+        )
+        # On its own the alias is consistent: one node, one mention, and
+        # both jobs still read as publishers.
+        self.assertEqual(credentials.lanes_unread({"ci.yml": shared}), [])
+        self.assertEqual(credentials.lanes_publishers({"ci.yml": shared}), {"ci.yml": True})
+        # Add a step the reader cannot resolve -- a `with:` that is not a
+        # mapping -- and the file must be unread whatever the aliasing.
+        opaque = shared + (
+            "  third:\n"
+            "    steps:\n"
+            "      - uses: mikelward/lanes@main\n"
+            "        with: [not, a, mapping]\n"
+        )
+        self.assertEqual(credentials.lanes_unread({"ci.yml": opaque}), ["ci.yml"])
+
     def test_a_shape_the_reader_cannot_resolve_is_unread(self):
         # A whole workflow in flow style reads as the publisher it is.
-        flow = "jobs: {init: {environment: lanes, steps: [{uses: mikelward/lanes@main, with: {app-id: x, app-private-key: y}}]}}\n"
+        flow = "jobs: {init: {environment: lanes, steps: [{uses: mikelward/lanes@main, with: {app-id: '${{ secrets.LANES_APP_ID }}', app-private-key: '${{ secrets.LANES_APP_PRIVATE_KEY }}'}}]}}\n"
         self.assertEqual(credentials.lanes_publishers({"ci.yml": flow}), {"ci.yml": True})
         self.assertEqual(credentials.lanes_unread({"ci.yml": flow}), [])
         # A document PyYAML rejects resolves no step, so its mention is unread.
@@ -856,6 +984,250 @@ class LanesReaderTest(unittest.TestCase):
         self.assertEqual(credentials.lanes_publishers({"ci.yml": dated}), {})
         self.assertEqual(credentials.lanes_unread({"ci.yml": dated}), ["ci.yml"])
 
+    def test_the_pair_the_step_reads_is_the_pair_it_consumes(self):
+        # The input NAMES say the step authenticates as an App; only the
+        # values say as which. A step wired to another App's secrets is not
+        # a consumer of the fleet pair, and reading it as one reported that
+        # pair healthy while the credential actually publishing sat at
+        # repository level (Codex, mikelward/repo#36).
+        other = PUBLISHER.replace("secrets.LANES_APP_ID", "secrets.OTHER_ID").replace(
+            "secrets.LANES_APP_PRIVATE_KEY", "secrets.OTHER_KEY"
+        )
+        self.assertEqual(credentials.lanes_publishers({"ci.yml": other}), {})
+        self.assertEqual(credentials.lanes_foreign({"ci.yml": other}), ["ci.yml"])
+        # Resolved, so not "cannot tell" -- and not unused either: the
+        # finding is what holds the pair, not a deletion.
+        self.assertEqual(credentials.lanes_unread({"ci.yml": other}), [])
+        # Half of the fleet's pair is still not the fleet's pair.
+        mixed = PUBLISHER.replace("secrets.LANES_APP_PRIVATE_KEY", "secrets.OTHER_KEY")
+        self.assertEqual(credentials.lanes_publishers({"ci.yml": mixed}), {})
+        self.assertEqual(credentials.lanes_foreign({"ci.yml": mixed}), ["ci.yml"])
+        # Case-folded, as GitHub matches secret names.
+        cased = PUBLISHER.replace("secrets.LANES_APP_ID", "secrets.lanes_app_id")
+        self.assertEqual(credentials.lanes_publishers({"ci.yml": cased}), {"ci.yml": True})
+        self.assertEqual(credentials.lanes_foreign({"ci.yml": cased}), [])
+        # The value has to BE a secret reference, not merely contain the
+        # name: a fallback resolves to whatever the other source holds,
+        # which this cannot know, and the expected name's presence is not
+        # the answer (Codex, mikelward/repo#36, twice -- once for a second
+        # secret, once for a non-secret source).
+        for value in (
+            "${{ secrets.OTHER_ID || secrets.LANES_APP_ID }}",
+            "${{ env.OTHER_ID || secrets.LANES_APP_ID }}",
+            "${{ vars.PICK && secrets.LANES_APP_ID || secrets.OTHER_ID }}",
+            "prefix-${{ secrets.LANES_APP_ID }}",
+            "${{ secrets.LANES_APP_ID }} ${{ secrets.OTHER_ID }}",
+        ):
+            text = PUBLISHER.replace("${{ secrets.LANES_APP_ID }}", value)
+            self.assertEqual(credentials.lanes_publishers({"ci.yml": text}), {}, value)
+            self.assertEqual(credentials.lanes_foreign({"ci.yml": text}), [], value)
+            self.assertEqual(credentials.lanes_unread({"ci.yml": text}), ["ci.yml"], value)
+        # Whitespace inside the expression is still the same reference.
+        spaced = PUBLISHER.replace("${{ secrets.LANES_APP_ID }}", "${{   secrets . LANES_APP_ID   }}")
+        self.assertEqual(credentials.lanes_publishers({"ci.yml": spaced}), {"ci.yml": True})
+        # So is the index form, which Actions accepts alongside the dotted
+        # one: reading only the dotted form reported a workflow written
+        # that way unreadable, and setup then refused every move and
+        # restriction it needed (Codex, mikelward/repo#36).
+        for value in ("${{ secrets['LANES_APP_ID'] }}", "${{ secrets[ 'LANES_APP_ID' ] }}"):
+            text = PUBLISHER.replace("${{ secrets.LANES_APP_ID }}", value)
+            self.assertEqual(credentials.lanes_publishers({"ci.yml": text}), {"ci.yml": True}, value)
+            self.assertEqual(credentials.lanes_unread({"ci.yml": text}), [], value)
+        indexed_other = PUBLISHER.replace("${{ secrets.LANES_APP_ID }}", "${{ secrets['OTHER_ID'] }}")
+        self.assertEqual(credentials.lanes_publishers({"ci.yml": indexed_other}), {})
+        self.assertEqual(credentials.lanes_foreign({"ci.yml": indexed_other}), ["ci.yml"])
+        # A double-quoted index is not an Actions expression at all, so it
+        # names no secret this can resolve -- "cannot tell", not the pair.
+        quoted_index = PUBLISHER.replace("${{ secrets.LANES_APP_ID }}", '${{ secrets["LANES_APP_ID"] }}')
+        self.assertEqual(credentials.lanes_publishers({"ci.yml": quoted_index}), {})
+        self.assertEqual(credentials.lanes_unread({"ci.yml": quoted_index}), ["ci.yml"])
+        # A value naming no secret at all cannot be resolved either way:
+        # "cannot tell", so the file is unread and nothing of its is
+        # deleted -- never a guess in either direction.
+        for value in ("${{ env.APP_ID }}", "${{ inputs.app-id }}", "12345", "${{ vars.APP_ID }}"):
+            text = PUBLISHER.replace("${{ secrets.LANES_APP_ID }}", value)
+            self.assertEqual(credentials.lanes_publishers({"ci.yml": text}), {}, value)
+            self.assertEqual(credentials.lanes_foreign({"ci.yml": text}), [], value)
+            self.assertEqual(credentials.lanes_unread({"ci.yml": text}), ["ci.yml"], value)
+
+    def test_a_classify_step_holds_the_credential_but_publishes_nothing(self):
+        # `classify` takes the pair for the generated lane -- it carries
+        # forward only a `lanes` status the App itself posted, so it needs
+        # the credential to know the App's login (mikelward/lanes's
+        # action.yml). So it keeps the pair and needs the environment, and
+        # is not a finding; what IS a finding is the pair reaching only
+        # such steps, since then nothing publishes the required status as
+        # the App (Codex, mikelward/repo#36).
+        classify_only = PUBLISHER.replace("          mode: init\n", "          mode: classify\n")
+        self.assertNotEqual(classify_only, PUBLISHER)
+        self.assertEqual(credentials.lanes_publishers({"ci.yml": classify_only}), {"ci.yml": True})
+        self.assertEqual(credentials.lanes_unread({"ci.yml": classify_only}), [])
+        self.assertEqual(credentials.lanes_status_publishers({"ci.yml": classify_only}), [])
+        # Any publishing mode answers it, on any job.
+        for mode in ("init", "gate", "attest"):
+            text = PUBLISHER.replace("          mode: init\n", f"          mode: {mode}\n")
+            self.assertEqual(credentials.lanes_status_publishers({"ci.yml": text}), ["ci.yml"], mode)
+        # But only spelled exactly as the action compares it. `lanes.mjs`
+        # tests the raw input with `!==` against four lower-case words --
+        # no folding, no trim -- and GitHub hands a `with:` value to a step
+        # as written, so each of these throws `Unknown mode` exactly as a
+        # typo does. Reading them as `gate` said a step published a status
+        # when it could not start (Codex, mikelward/repo#36).
+        for mode in ("Gate", "GATE", "' gate '", "'gate '"):
+            text = PUBLISHER.replace("          mode: init\n", f"          mode: {mode}\n")
+            self.assertEqual(credentials.lanes_status_publishers({"ci.yml": text}), [], mode)
+            # Still a publisher for every other purpose: it holds the pair.
+            self.assertEqual(credentials.lanes_publishers({"ci.yml": text}), {"ci.yml": True}, mode)
+        # The input NAME is the opposite case, and stays case-insensitive:
+        # GitHub upper-cases it into `INPUT_MODE` however it was written.
+        named = PUBLISHER.replace("          mode: init\n", "          Mode: gate\n")
+        self.assertEqual(credentials.lanes_status_publishers({"ci.yml": named}), ["ci.yml"])
+        beside = classify_only + (
+            "  finalize:\n    runs-on: ubuntu-latest\n    environment: lanes\n    steps:\n"
+            "      - uses: mikelward/lanes@main\n        with:\n          mode: gate\n"
+            "          app-id: ${{ secrets.LANES_APP_ID }}\n"
+            "          app-private-key: ${{ secrets.LANES_APP_PRIVATE_KEY }}\n"
+        )
+        self.assertEqual(credentials.lanes_status_publishers({"ci.yml": beside}), ["ci.yml"])
+        # An expression is the one mode this cannot decide, so the one
+        # that counts as publishing: "cannot tell" raises no finding of
+        # its own. That holds even where a reader could see through the
+        # expression -- `${{ 'classify' }}` always resolves to a mode that
+        # publishes nothing, and deciding so needs an Actions expression
+        # evaluator rather than a special case, since the next shape is
+        # `format(...)`, then `inputs.mode`, then `env.M || 'init'`. Each
+        # partial answer is a new way to be confidently wrong, which is
+        # what cost this reader nine rounds before PyYAML replaced it
+        # (Codex, mikelward/repo#36).
+        for mode in ("${{ inputs.mode }}", "${{ 'classify' }}", "${{ env.M || 'init' }}"):
+            expression = PUBLISHER.replace("          mode: init\n", f"          mode: {mode}\n")
+            self.assertEqual(credentials.lanes_status_publishers({"ci.yml": expression}), ["ci.yml"], mode)
+        # A mode that is missing, empty, or not a string is not "cannot
+        # tell": `lanes.mjs` reads the input as a string and throws
+        # `Unknown mode` unless it is exactly one of its four words, so
+        # the step publishes nothing -- counting these as publishers hid
+        # the finding for a step that cannot start (Codex,
+        # mikelward/repo#36).
+        for mode in ("\n            name: init", "\n            - gate", "", ": true"):
+            text = PUBLISHER.replace("          mode: init\n", f"          mode:{mode}\n")
+            self.assertEqual(credentials.lanes_status_publishers({"ci.yml": text}), [], repr(mode))
+        gone = PUBLISHER.replace("          mode: init\n", "")
+        self.assertEqual(credentials.lanes_status_publishers({"ci.yml": gone}), [])
+        # Still a publisher for every other purpose: it holds the pair, so
+        # it needs the environment and keeps the credential.
+        self.assertEqual(credentials.lanes_publishers({"ci.yml": gone}), {"ci.yml": True})
+        self.assertEqual(credentials.lanes_unread({"ci.yml": gone}), [])
+        # A word the action does not know publishes nothing either.
+        typo = PUBLISHER.replace("          mode: init\n", "          mode: gaet\n")
+        self.assertEqual(credentials.lanes_status_publishers({"ci.yml": typo}), [])
+        # The ambient pattern hands the action nothing, so there is no
+        # credentialed step to ask the mode of.
+        ambient = "jobs:\n  classify:" + PUBLISHER.split("  classify:")[1]
+        self.assertEqual(credentials.lanes_status_publishers({"ci.yml": ambient}), [])
+
+    def test_a_neighboring_repository_name_is_not_a_lanes_mention(self):
+        # `mikelward/lanes-helper@main` is a different repository, and
+        # `_is_lanes` says so -- but the mention count was a substring, so
+        # the file read as holding an unresolved mention and setup refused
+        # every move the repository needed, leaving the pair at repository
+        # level (Codex, mikelward/repo#36).
+        neighbor = PUBLISHER + """  helper:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: mikelward/lanes-helper@main
+"""
+        self.assertEqual(credentials.lanes_unread({"ci.yml": neighbor}), [])
+        self.assertEqual(credentials.lanes_publishers({"ci.yml": neighbor}), {"ci.yml": True})
+        # A name that merely ends where this one does is still a mention:
+        # `mikelward/lanes` with no ref, and a subdirectory reference, are
+        # both shapes the reader cannot resolve, so both stay "cannot tell".
+        for reference in ("mikelward/lanes", "mikelward/lanes/sub@main"):
+            text = PUBLISHER + f"""  more:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: {reference}
+"""
+            self.assertEqual(credentials.lanes_unread({"ci.yml": text}), ["ci.yml"], reference)
+        # And a name this one merely ends with is not one either.
+        prefixed = PUBLISHER.replace("mikelward/lanes@main", "notmikelward/lanes@main", 1)
+        self.assertEqual(credentials.lanes_unread({"ci.yml": prefixed}), [])
+
+    def test_an_input_named_twice_in_two_cases_is_unreadable(self):
+        # GitHub matches an action's input names case-insensitively, so
+        # `app-id` beside `APP-ID` is one input written twice and nothing
+        # here can say which value the step is handed. Taking the first
+        # spelling read the fleet's secret as the answer while the other
+        # named another App's, so the step reported as a healthy publisher
+        # (Codex, mikelward/repo#36).
+        collide = PUBLISHER.replace(
+            "          app-id: ${{ secrets.LANES_APP_ID }}\n",
+            "          app-id: ${{ secrets.LANES_APP_ID }}\n"
+            "          APP-ID: ${{ secrets.OTHER_ID }}\n",
+        )
+        self.assertNotEqual(collide, PUBLISHER)
+        self.assertEqual(credentials.lanes_publishers({"ci.yml": collide}), {})
+        self.assertEqual(credentials.lanes_foreign({"ci.yml": collide}), [])
+        self.assertEqual(credentials.lanes_incomplete({"ci.yml": collide}), [])
+        self.assertEqual(credentials.lanes_unread({"ci.yml": collide}), ["ci.yml"])
+        # The same for the mode, which this reader also consults.
+        mode = PUBLISHER.replace(
+            "          mode: init\n", "          mode: init\n          MODE: gate\n"
+        )
+        self.assertEqual(credentials.lanes_publishers({"ci.yml": mode}), {})
+        self.assertEqual(credentials.lanes_unread({"ci.yml": mode}), ["ci.yml"])
+        # An input this reader never looks at is the author's problem, not
+        # a value it misreads: the step still reads as it did.
+        other = PUBLISHER.replace(
+            "          mode: init\n", "          mode: init\n          token: a\n          TOKEN: b\n"
+        )
+        self.assertEqual(credentials.lanes_publishers({"ci.yml": other}), {"ci.yml": True})
+        self.assertEqual(credentials.lanes_unread({"ci.yml": other}), [])
+        self.assertEqual(credentials.lanes_status_publishers({"ci.yml": other}), ["ci.yml"])
+        # One spelling is still read whatever its case.
+        cased = PUBLISHER.replace("          app-id:", "          APP-Id:")
+        self.assertEqual(credentials.lanes_publishers({"ci.yml": cased}), {"ci.yml": True})
+        self.assertEqual(credentials.lanes_unread({"ci.yml": cased}), [])
+
+    def test_an_uncredentialed_gate_step_is_the_silent_fallback(self):
+        # `gate` handed neither input is opt-in and does exactly what it did
+        # before the credential existed: it lets the ambient check-run
+        # report. So a workflow whose `init` step holds the pair and whose
+        # `gate` step does not publishes the required verdict ambiently
+        # while `lanes_status_publishers` reads non-empty on `init` alone
+        # (Codex, mikelward/repo#36).
+        mixed = PUBLISHER + """  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: mikelward/lanes@main
+        with:
+          mode: gate
+"""
+        self.assertEqual(credentials.lanes_status_publishers({"ci.yml": mixed}), ["ci.yml"])
+        self.assertEqual(credentials.lanes_unread({"ci.yml": mixed}), [])
+        self.assertEqual(credentials.lanes_incomplete({"ci.yml": mixed}), [])
+        self.assertEqual(credentials.lanes_ambient_gate({"ci.yml": mixed}), ["ci.yml"])
+        # Hand that step the pair and it is not a fallback any more.
+        backed = mixed.replace(
+            "        with:\n          mode: gate\n",
+            "        with:\n          mode: gate\n"
+            "          app-id: ${{ secrets.LANES_APP_ID }}\n"
+            "          app-private-key: ${{ secrets.LANES_APP_PRIVATE_KEY }}\n",
+        )
+        self.assertNotEqual(backed, mixed)
+        self.assertEqual(credentials.lanes_ambient_gate({"ci.yml": backed}), [])
+        # The other publishing modes refuse to start without the pair, so
+        # they are loud rather than silent and raise nothing here; nor does
+        # an expression, which is "cannot tell".
+        for mode in ("init", "attest", "classify", "${{ inputs.mode }}"):
+            other = mixed.replace("          mode: gate\n", f"          mode: {mode}\n")
+            self.assertEqual(credentials.lanes_ambient_gate({"ci.yml": other}), [], mode)
+        # Half the pair is `lanes_incomplete`'s finding, not this one.
+        half = mixed.replace(
+            "        with:\n          mode: gate\n",
+            "        with:\n          mode: gate\n          app-id: ${{ secrets.LANES_APP_ID }}\n",
+        )
+        self.assertEqual(credentials.lanes_ambient_gate({"ci.yml": half}), [])
+        self.assertEqual(credentials.lanes_incomplete({"ci.yml": half}), ["ci.yml"])
 
     def test_a_cyclic_alias_is_walked_once_not_forever(self):
         # `yaml.safe_load` resolves an alias pointing at its own ancestor

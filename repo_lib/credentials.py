@@ -33,6 +33,7 @@ why `repo setup` needs the value handed to it to complete a move.
 import base64
 import dataclasses
 import json
+import re
 import urllib.parse
 
 import yaml
@@ -390,6 +391,34 @@ def workflow_texts(repo, default=None):
     return texts
 
 
+def workflow_snapshot(repo):
+    """`(default branch, every workflow's text)` as one consistent
+    reading, for a command that needs both.
+
+    The name is confirmed AFTER the texts, not just read before them. The
+    reads are pinned to it (see `workflow_texts`), so a repoint to a
+    branch that still exists answers happily from the old one -- pinning
+    turns a rename into a 404, but a repoint leaves both branches there.
+    The plan then judged the environment's policy against a name that had
+    stopped being the default, and where nothing needed doing it queued no
+    move, so no apply-time recheck ever ran and the run reported the
+    repository healthy while the real default branch was shut out of its
+    own environment (Codex, mikelward/repo#36). Confirming last makes the
+    two one snapshot, the same reasoning `setup_cmd`'s apply-time recheck
+    already carries. A repoint after every read is nobody's to catch
+    without a transaction, and the next run reads it."""
+    default = default_branch(repo)
+    texts = workflow_texts(repo, default)
+    again = default_branch(repo)
+    if again != default:
+        raise ReadError(
+            f"{repo}'s default branch changed from '{default}' to '{again}' while its workflows "
+            f"were being read, so this reading is of neither:",
+            "nothing was changed; run it again",
+        )
+    return default, texts
+
+
 # Workflows are read as YAML, through PyYAML -- the one third-party
 # dependency this tool takes (AGENTS.md, "Style"). The reader this replaced
 # walked the text by line and regex, and in eight of the fourteen review
@@ -600,25 +629,50 @@ def mentions(text, workflow_prefix):
 
 
 def _is_lanes(reference):
-    """Whether a step's `uses:` names the lanes action, at any ref."""
-    prefix = LANES_ACTION.lower()
+    """Whether a step's `uses:` names the lanes action, at any ref.
+
+    A ref is required, because GitHub requires one: a remote `uses:` is
+    `owner/repo@ref`, and `mikelward/lanes` on its own is a workflow that
+    fails to start. Reading it as a step made a job that cannot run report
+    as a healthy publisher, and setup then kept or moved the credential for
+    a workflow publishing nothing (Codex, mikelward/repo#36). Refused here
+    rather than reported: the mention is still counted, so the file reads
+    as `lanes_unread` -- "cannot tell", which holds everything -- and a
+    reference nobody can run is not a fact to reason from either way."""
+    prefix = LANES_ACTION.lower() + "@"
     reference = reference.lower()
-    return reference == prefix or reference.startswith(prefix + "@")
+    return reference.startswith(prefix) and len(reference) > len(prefix)
 
 
 def _step_inputs(step):
-    """The names of the inputs a step is handed -- the keys of its `with:`
-    mapping, [] without one -- or None when `with:` is something else (a
-    scalar, a sequence): a step this cannot read the inputs of. Read from
-    the mapping itself rather than by searching the step for `app-id`: an
-    `env:` or a `name:` carrying that word is not an input (Codex,
+    """The inputs a step is handed -- its `with:` mapping, {} without one
+    -- or None when `with:` is something else (a scalar, a sequence): a
+    step this cannot read the inputs of. Read from the mapping itself
+    rather than by searching the step for `app-id`: an `env:` or a
+    `name:` carrying that word is not an input (Codex,
     mikelward/repo#36)."""
     inputs = step.get("with")
     if inputs is None:
-        return []
+        return {}
     if not isinstance(inputs, dict):
         return None
-    return [str(key) for key in inputs]
+    folded = {}
+    for key, value in inputs.items():
+        name = str(key).lower()
+        if name in _READ_INPUTS and name in folded:
+            # GitHub matches an action's input names case-insensitively,
+            # so `app-id` beside `APP-ID` is one input written twice and
+            # nothing here can say which value the step is handed. Taking
+            # the first spelling read `${{ secrets.LANES_APP_ID }}` as the
+            # answer while the other named another App's secret, so the
+            # step reported as a healthy fleet publisher and setup moved a
+            # pair it does not publish with (Codex, mikelward/repo#36).
+            # Only the names this reader consults: a collision on some
+            # other input is the workflow author's problem, not a value
+            # this misreads.
+            return None
+        folded[name] = value
+    return folded
 
 
 def _declares_environment(job, env):
@@ -631,16 +685,110 @@ def _declares_environment(job, env):
     return isinstance(declared, str) and declared.lower() == env.lower()
 
 
-def _lanes_jobs(text):
+# A `mode:` only run time resolves -- a `${{ }}` expression. The one case
+# this cannot decide, and so the one that counts as publishing: "cannot
+# tell" must not raise a finding of its own.
+MODE_UNREADABLE = object()
+
+
+def _step_mode(step):
+    """The lanes step's `mode:` input verbatim; `MODE_UNREADABLE` for an
+    expression; None when the step names no readable mode at all.
+
+    None is not "cannot tell": mikelward/lanes's `lanes.mjs` reads the
+    input as a string and throws `Unknown mode` before anything else runs
+    unless it is exactly `classify`, `gate`, `attest` or `init`, so a step
+    with no `mode`, or one whose value is not a string, publishes nothing
+    -- it fails outright. Counting those as publishers hid the
+    classify-only finding for a step that cannot even start (Codex,
+    mikelward/repo#36).
+
+    Verbatim, and that is the point: the comparison there is `!==` against
+    four lower-case words, with no folding and no trim, and GitHub hands
+    `with:` values to a step as written. So `INIT` and a quoted `" init "`
+    both throw exactly as a typo does, and reading either as `init` said a
+    step published a status when it could not start. The input NAME is
+    still matched case-insensitively, because that one really is: GitHub
+    upper-cases it into `INPUT_MODE` whatever case it was written in
+    (Codex, mikelward/repo#36).
+
+    An expression stays "cannot tell" even when a reader could see through
+    it -- `${{ 'classify' }}` always resolves to a mode that publishes
+    nothing. Deciding that needs an Actions expression evaluator, not a
+    special case: the next shape is `${{ format(...) }}`, then
+    `${{ inputs.mode }}`, then `${{ env.M || 'init' }}`, and each partial
+    answer is a new way to be confidently wrong -- the failure that cost
+    this reader nine review rounds before PyYAML replaced it. So the
+    finding it would raise stays unraised, which is the direction that
+    never fails a correct repository's run over a value this cannot
+    read."""
+    inputs = _step_inputs(step)
+    if not inputs:
+        # No `with:`, one this cannot read, or one naming an input twice
+        # in two cases: either way no readable mode, and the caller that
+        # cares about "cannot tell" has already refused the step on its
+        # own read of the inputs.
+        return None
+    value = inputs.get("mode")
+    if not isinstance(value, str):
+        # A mapping, a list, a number, `true`, an empty value, or absent:
+        # handed to the action stringified, and never one of its four
+        # words.
+        return None
+    if "${{" in value:
+        return MODE_UNREADABLE
+    return value
+
+
+def _lanes_jobs(text, resolved=None, consumed=None):
     """For each job in `text` with a step using the lanes action: (how many
     such steps it has, whether one of them is handed both App inputs,
     whether the job declares the `lanes` environment, whether one is
-    handed only half the pair). A job handing the action the credential is
-    a publisher of the `lanes` status; one without is the ambient
-    classify/gate pattern, which reads no secret. The inputs count only on
-    the lanes step itself -- another action in the same job taking an
-    input of that name (a token-minting step, say) hands lanes nothing
-    (Codex, mikelward/repo#36)."""
+    handed only half the pair, whether one of the credentialed steps runs
+    a mode that publishes a status). A job handed the credential needs the
+    environment and keeps the pair whatever its mode -- `classify` takes it
+    too, for the generated lane, which carries forward only a `lanes`
+    status the App itself posted and so needs the credential to know the
+    App's login (mikelward/lanes's action.yml: "init mode always; gate mode
+    optionally; classify mode for the generated lane"). Whether anything
+    *publishes* is the narrower question `LANES_PUBLISHING_MODES` answers
+    of the mode `_step_mode` reads: only an expression publishes unread,
+    since "cannot tell" must not raise a finding of its own, while a mode
+    that is missing or not a string is one the action refuses to start on
+    (Codex, mikelward/repo#36). A job with
+    no credentialed step is the ambient pattern, which reads no secret.
+    The inputs count only on the lanes step itself -- another action in the
+    same job taking an input of that name (a token-minting step, say) hands
+    lanes nothing (Codex, mikelward/repo#36).
+
+    `resolved`, when given, is filled with the identity of every step node
+    this resolved -- what `lanes_unread` compares against, and why it
+    cannot use the per-job counts. An anchored step aliased into two jobs
+    is ONE node: `_strings` visits a container once, so it contributes one
+    mention, while the per-job counts see it twice. The two disagreeing by
+    one let a third step that mentions the action and resolves to nothing
+    balance the totals, and the file then read as fully resolved -- setup
+    trusting the aliased publishers and deleting the pair out from under
+    the consumer it could not read (Codex, mikelward/repo#36). Counting
+    distinct nodes matches the walker's own discipline, which is what
+    makes the comparison mean anything; a path-local walk would count both
+    occurrences instead, at the price of going exponential on a shared
+    subtree."""
+    resolved = set() if resolved is None else resolved
+    consumed = [] if consumed is None else consumed
+
+    def take(inputs, step):
+        """Records what a resolved step is handed on the App inputs, so
+        `lanes_indirect` can tell a mention this reader accounted for from
+        one it could not. Per reference, not per file: a workflow with a
+        readable publisher in one job and a composite consumer in another
+        is both, and excluding the whole file for the first hid the second
+        (Codex, mikelward/repo#36)."""
+        resolved.add(id(step))
+        consumed.extend(
+            value for key, value in inputs.items() if key.lower() in LANES_INPUTS
+        )
+
     jobs = []
     for job in _jobs(_document(text)).values():
         steps = job.get("steps")
@@ -649,6 +797,9 @@ def _lanes_jobs(text):
         uses = 0
         publishes = False
         half = False
+        publishing = False
+        foreign = False
+        unbacked = False
         for step in steps:
             if not isinstance(step, dict):
                 continue
@@ -661,29 +812,155 @@ def _lanes_jobs(text):
             # deleted.
             if inputs is None:
                 continue
-            uses += 1
             # Action input names are case-insensitive on GitHub, so `APP-ID:`
             # hands the action the credential as surely as `app-id:` does
             # (Codex, mikelward/repo#36).
             handed = {key.lower() for key in inputs} & LANES_INPUTS
             if handed == LANES_INPUTS:
+                source = _credential_source(inputs)
+                if source is CREDENTIAL_UNREADABLE:
+                    # Which credential this step publishes with cannot be
+                    # told, so the step is unresolved: `lanes_unread`
+                    # reports the file and nothing of its is deleted, the
+                    # same handling a `with:` this cannot read gets.
+                    continue
+                uses += 1
+                take(inputs, step)
+                if source is CREDENTIAL_OTHER:
+                    # An App this tool does not manage. Not a publisher of
+                    # the fleet pair -- reading it as one reported that
+                    # pair healthy while the credential actually
+                    # publishing stayed at repository level.
+                    foreign = True
+                    continue
                 publishes = True
-            elif handed:
+                mode = _step_mode(step)
+                if mode is MODE_UNREADABLE or mode in LANES_PUBLISHING_MODES:
+                    publishing = True
+                continue
+            uses += 1
+            take(inputs, step)
+            if handed:
                 # One input without the other: the action cannot authenticate
                 # as the App, so this publishes nothing -- and it is not the
                 # ambient pattern either, since the pair is plainly meant
                 # for it. Reported by `lanes_incomplete`; it keeps the pair
                 # from reading as unused (Codex, mikelward/repo#36).
                 half = True
+            elif _step_mode(step) == "gate":
+                # Neither input, running the mode that posts the terminal
+                # `lanes` verdict. `gate` is opt-in: handed no credential it
+                # does exactly what it did before either existed and lets
+                # the ambient check-run report -- the one publishing mode
+                # that falls back in SILENCE, where `init` and `attest`
+                # refuse to start. So a repository whose `init` step holds
+                # the pair and whose `gate` step does not read as healthy
+                # while the required status is still ambient (Codex,
+                # mikelward/repo#36). Only the literal counts: an
+                # expression is "cannot tell", which raises no finding of
+                # its own, exactly as it counts AS publishing above.
+                unbacked = True
         if not uses:
             continue
-        jobs.append((uses, publishes, _declares_environment(job, LANES_ENV), half))
+        jobs.append(
+            (uses, publishes, _declares_environment(job, LANES_ENV), half, publishing, foreign, unbacked)
+        )
     return jobs
 
 
 # The two inputs the lanes action authenticates as the App with; a step
 # handing it one without the other publishes nothing.
 LANES_INPUTS = frozenset({"app-id", "app-private-key"})
+
+# Every input name this reader consults. A `with:` naming one of these
+# twice in two cases leaves the step unreadable; see `_step_inputs`.
+_READ_INPUTS = LANES_INPUTS | {"mode"}
+
+# Which of the fleet's two secrets each of those inputs must be handed.
+LANES_INPUT_SECRET = {"app-id": LANES_APP_ID, "app-private-key": LANES_APP_PRIVATE_KEY}
+
+# A value that is a `${{ secrets.NAME }}` reference and NOTHING else. The
+# whole value, not a search: `${{ env.OTHER_ID || secrets.LANES_APP_ID }}`
+# contains the expected name while resolving to whatever `OTHER_ID` holds,
+# and a search for the name read that as the fleet's credential (Codex,
+# mikelward/repo#36).
+#
+# Both property forms, since an Actions expression writes either: `.NAME`
+# and `['NAME']` name the same secret, and refusing the second reported a
+# workflow this can read perfectly well as unreadable -- which holds the
+# credential where it is and refuses every move (Codex, mikelward/repo#36).
+# Single quotes only: an Actions expression has no double-quoted string, so
+# `secrets["NAME"]` is not a reference this should resolve.
+#
+# Names are matched case-folded, as GitHub matches them.
+_SECRET_RE = re.compile(
+    r"""\A\s*\$\{\{\s*secrets\s*
+        (?:\.\s*(?P<dotted>[A-Za-z_][A-Za-z0-9_]*)
+         |\[\s*'(?P<indexed>[A-Za-z_][A-Za-z0-9_]*)'\s*\])
+        \s*\}\}\s*\Z""",
+    re.VERBOSE,
+)
+
+
+def _referenced_secret(value):
+    """The secret `value` is a reference to, or None when it is not one."""
+    match = _SECRET_RE.match(value)
+    if match is None:
+        return None
+    return match.group("dotted") or match.group("indexed")
+
+# What credential a lanes step is handed, once it has both App inputs.
+CREDENTIAL_FLEET = "fleet"  # the pair this tool places
+CREDENTIAL_OTHER = "other"  # some other App's secrets, which it does not
+CREDENTIAL_UNREADABLE = "unreadable"  # a value naming no secret at all
+
+
+def _credential_source(inputs):
+    """Which credential a lanes step's App inputs read: the fleet's pair,
+    another App's secrets, or a value this cannot resolve to a secret.
+
+    The input NAMES say the step authenticates as an App; only their
+    values say as which. A step handed `app-id: ${{ secrets.OTHER_ID }}`
+    publishes as an App this tool does not manage -- reading it as a
+    consumer of the fleet pair reported that pair healthy while the
+    credential actually publishing sat at repository level, reachable by
+    every workflow, which is the exposure the placement exists to close
+    (Codex, mikelward/repo#36).
+
+    The value has to BE a secret reference -- the whole value, not a name
+    found somewhere in it. `${{ secrets.OTHER_ID || secrets.LANES_APP_ID }}`
+    and `${{ env.OTHER_ID || secrets.LANES_APP_ID }}` both carry the
+    expected name while resolving to whatever the other source holds,
+    which this cannot know; reading the name's presence as the answer let
+    either report the pair healthy while another credential published
+    (Codex, mikelward/repo#36, twice). So anything with a fallback, a
+    concatenation or a condition in it is UNREADABLE, along with a value
+    naming no secret at all -- `${{ env.APP_ID }}`, an input passed
+    through, a literal. "Cannot tell" holds the pair where a guess would
+    move or delete it, and there is no shape of expression left for a
+    later round to find: what is accepted is one exact form.
+
+    Case-folded, as GitHub matches secret names."""
+    for name in sorted(LANES_INPUTS):
+        value = inputs.get(name)
+        if not isinstance(value, str):
+            return CREDENTIAL_UNREADABLE
+        named = _referenced_secret(value)
+        if named is None:
+            return CREDENTIAL_UNREADABLE
+        if named.lower() != LANES_INPUT_SECRET[name].lower():
+            return CREDENTIAL_OTHER
+    return CREDENTIAL_FLEET
+
+# The modes that write a status as the App: `init` posts the `pending`,
+# `gate` the terminal verdict the ruleset requires, `attest` the
+# `lanes-attest` a generated push carries forward. `classify` takes the
+# credential too but writes nothing with it -- it reads the App's own login
+# so the generated lane can tell the App's `lanes` status from anyone
+# else's (mikelward/lanes's action.yml). Anything else -- a typo, a missing
+# `mode` -- is a step `lanes.mjs` throws `Unknown mode` on, which publishes
+# nothing either.
+LANES_PUBLISHING_MODES = frozenset({"init", "gate", "attest"})
 
 
 def lanes_publishers(texts):
@@ -696,10 +973,141 @@ def lanes_publishers(texts):
     README, "not optional")."""
     found = {}
     for name, text in texts.items():
-        publishing = [declares for _uses, publishes, declares, _half in _lanes_jobs(text) if publishes]
+        publishing = [
+            declares
+            for _uses, publishes, declares, _half, _publishing, _foreign, _unbacked in _lanes_jobs(text)
+            if publishes
+        ]
         if publishing:
             found[name] = all(publishing)
     return found
+
+
+def _shares_a_node(node, seen=None, shared=None):
+    """Whether any container in `node` is reachable by more than one path
+    -- what a YAML alias makes.
+
+    `_strings` visits a container once, so a mapping aliased into two
+    steps yields its strings once however many steps use it. Counting
+    mentions that way and consumption per step compares two different
+    bases: an anchored `with:` shared by a lanes step and a composite one
+    balanced exactly, and the composite consumer went unseen (Codex,
+    mikelward/repo#36). Where the bases can disagree the comparison is not
+    trustworthy, so `lanes_indirect` stops trusting it and reports."""
+    seen = set() if seen is None else seen
+    shared = [False] if shared is None else shared
+    if not isinstance(node, (dict, list, tuple)):
+        return shared[0]
+    if id(node) in seen:
+        shared[0] = True
+        return True
+    seen.add(id(node))
+    items = [*node.keys(), *node.values()] if isinstance(node, dict) else list(node)
+    for item in items:
+        if _shares_a_node(item, seen, shared) or shared[0]:
+            return True
+    return shared[0]
+
+
+def lanes_indirect(texts):
+    """The workflows that name the App pair's secrets with no step this
+    reader can see taking them.
+
+    A workflow can hand the pair to a local composite action, and the
+    `mikelward/lanes` reference then lives in that action's own
+    `action.yml` -- a file this reads none of. So the workflow mentions
+    neither the action nor a step to resolve, every other reader comes
+    back empty, the pair reads as used by nothing, and `repo setup`
+    deleted all four copies as unused: the publisher broken and the
+    values gone, since GitHub never gives a secret back (Codex,
+    mikelward/repo#36).
+
+    Naming the secret is what says otherwise. It cannot say what the
+    consumer does with it -- whether the credential is placed right, or
+    published with at all -- so this is "cannot tell" like an unreadable
+    mention, not a publisher: nothing is deleted, moved or restricted
+    around it. A workflow with a lanes step this reader DID see is left to
+    the readers that saw it.
+
+    The accounting is per REFERENCE, not per file. Asking only whether the
+    file had any lanes step at all excluded a workflow with a readable
+    publisher in one job and a composite consumer in another -- and setup
+    then moved and deleted the pair on the strength of the publisher,
+    breaking the consumer it never saw (Codex, mikelward/repo#36). So a
+    mention counts unless a step this reader resolved was handed it.
+
+    Over-matching is the safe direction on both sides of that comparison,
+    since an unaccounted mention only keeps the credential: any string in
+    the document naming either secret is a mention, and only the App
+    inputs of a resolved step account for one."""
+    named = []
+    for name, text in texts.items():
+        mentions = _mention_count(text, LANES_APP_ID) + _mention_count(text, LANES_APP_PRIVATE_KEY)
+        if not mentions:
+            continue
+        document = _document(text)
+        if document is _REJECTED or _shares_a_node(document):
+            # A rejected document is unread whole; a shared node makes the
+            # two sides of the comparison below count on different bases
+            # (see `_shares_a_node`). Either way this cannot tell.
+            named.append(name)
+            continue
+        consumed = []
+        list(_lanes_jobs(text, consumed=consumed))
+        taken = sum(
+            _occurrences(str(value).lower(), LANES_APP_ID.lower(), False)
+            + _occurrences(str(value).lower(), LANES_APP_PRIVATE_KEY.lower(), False)
+            for value in consumed
+        )
+        if mentions > taken:
+            named.append(name)
+    return sorted(named)
+
+
+def lanes_called_workflows(texts):
+    """The workflows calling a reusable workflow this reader cannot read --
+    a job-level `uses:` naming something outside this repository.
+
+    The called workflow's own file is not among `texts`, so a lanes step in
+    it is invisible here: the caller names neither the action nor either
+    secret, every reader comes back empty, and the pair read as used by
+    nothing. `repo setup --force` then deleted both copies and the values
+    with them, since GitHub never gives a secret back (Codex,
+    mikelward/repo#36). The pair reaches such a job through `secrets:
+    inherit`, through a `secrets:` block naming it, or through the called
+    job's own `environment: lanes` -- and the last of those is invisible in
+    the caller whatever it passes, so the call itself is the signal rather
+    than what accompanies it.
+
+    A LOCAL call (`./.github/workflows/x.yml`) is not one of these: that
+    file is read directly, so its lanes step counts as a publisher on its
+    own account.
+
+    This holds the unused DELETE, not the move. The two differ in what a
+    wrong answer costs: setup has the value it writes, handed in on the
+    command line, so a move made wrongly can be undone from what the
+    operator still has, while a delete made wrongly loses a value nobody
+    can read back. Holding the move as well would be the safer-sounding
+    reading and the more expensive one -- every repository here calls some
+    reusable workflow, so the credential could never be placed anywhere.
+
+    Reading the called workflow instead would recurse without a floor, the
+    same objection as a composite action's `action.yml`, and every level is
+    another chance to conclude "unused" in the direction that deletes."""
+    calling = []
+    for name, text in texts.items():
+        document = _document(text)
+        if document is _REJECTED:
+            # Unread whole, and `lanes_unread` already holds a mention in
+            # it. Nothing here to add: a rejected document with no mention
+            # names no credential this could be protecting.
+            continue
+        for job in _jobs(document).values():
+            uses = job.get("uses")
+            if isinstance(uses, str) and not uses.strip().startswith("./"):
+                calling.append(name)
+                break
+    return sorted(calling)
 
 
 def lanes_incomplete(texts):
@@ -712,7 +1120,85 @@ def lanes_incomplete(texts):
     return sorted(
         name
         for name, text in texts.items()
-        if any(half for _uses, _publishes, _declares, half in _lanes_jobs(text))
+        if any(half for _uses, _publishes, _declares, half, _publishing, _foreign, _unbacked in _lanes_jobs(text))
+    )
+
+
+def on_default_branch(mapping):
+    """The entries of a workflow mapping -- texts, publishers, anything
+    keyed by `WorkflowName` -- read from the default branch: the copies a
+    trusted run actually executes. A branch copy answers only for its own
+    branch, which the restricted environment shuts out, so a question
+    about what the trusted base publishes must never be answered by one
+    (Codex, mikelward/repo#36)."""
+    return {name: value for name, value in mapping.items() if name.branch is None}
+
+
+def lanes_status_publishers(texts):
+    """The workflows with a job whose credentialed lanes step actually
+    publishes a status -- `init`, `gate` or `attest`, or a `${{ }}`
+    expression only run time resolves. The pair reaching none of those
+    means the generated lane has its credential while the required
+    `lanes` status is still posted by
+    the ambient check-run, which is the fallback mikelward/lanes's README
+    calls "defeating the whole mechanism with no error to notice it by"
+    (Codex, mikelward/repo#36).
+
+    Both callers pass `on_default_branch(texts)`: a branch copy running
+    `init` says nothing about what the trusted base publishes, and reading
+    one as an answer would hide exactly this finding (Codex,
+    mikelward/repo#36)."""
+    return sorted(
+        name
+        for name, text in texts.items()
+        if any(publishing for _uses, _publishes, _declares, _half, publishing, _foreign, _unbacked in _lanes_jobs(text))
+    )
+
+
+def lanes_ambient_gate(texts):
+    """The workflows with a `gate` step handed neither App input -- the one
+    publishing mode that falls back to the ambient check-run in silence.
+    `init` and `attest` refuse to start without the credential, and a
+    half-handed step is `lanes_incomplete`, so this is the shape that
+    reads as healthy while the required `lanes` verdict is not the App's:
+    a workflow whose `init` step holds the pair and whose `gate` step does
+    not makes `lanes_status_publishers` non-empty on `init` alone (Codex,
+    mikelward/repo#36).
+
+    Reported alongside the credential rather than folded into the
+    classify-only finding: making that one ask for a credentialed `gate`
+    would decide that `gate` mode is mandatory, and a repository using
+    lanes for `classify` and `attest` alone is not broken. Naming the step
+    that will silently fall back says the same thing without settling
+    that. Both callers pass `on_default_branch(texts)`, and both ask it
+    only where the pair reaches something: with no pair anywhere, "the
+    credential is missing" is already the finding.
+
+    """
+    return sorted(
+        name
+        for name, text in texts.items()
+        if any(unbacked for _u, _p, _d, _half, _pub, _foreign, unbacked in _lanes_jobs(text))
+    )
+
+
+def lanes_foreign(texts):
+    """The workflows with a job handing the lanes action both App inputs
+    from secrets that are not the fleet's pair -- an App this tool does
+    not manage.
+
+    Reported by both commands and holds everything as is, the way
+    `lanes_incomplete` does: the pair is not in use here, so a `[ok]`
+    would be false, and the credential that IS publishing is one this
+    tool cannot place -- if it sits at repository level, every workflow
+    reaches it, which is the exposure the placement exists to close
+    (Codex, mikelward/repo#36). Deleting the fleet pair as unused on that
+    reading is the destructive half of the same mistake, so nothing is
+    deleted either."""
+    return sorted(
+        name
+        for name, text in texts.items()
+        if any(foreign for _uses, _p, _d, _half, _pub, foreign, _unbacked in _lanes_jobs(text))
     )
 
 
@@ -722,11 +1208,39 @@ def lanes_unread(texts):
     `unread_mentions` is for a reusable workflow. A mention in a document
     PyYAML rejects, or on a step whose `with:` is not a mapping, may be a
     publisher, so a credential is never deleted as unused over one."""
-    return sorted(
-        name
-        for name, text in texts.items()
-        if _reference_count(text, LANES_ACTION) > sum(uses for uses, _p, _d, _h in _lanes_jobs(text))
-    )
+    unread = []
+    for name, text in texts.items():
+        resolved = set()
+        _lanes_jobs(text, resolved)
+        if _reference_count(text, LANES_ACTION, boundary=True) > len(resolved):
+            unread.append(name)
+    return sorted(unread)
+
+
+def lanes_state(texts):
+    """Everything both commands read out of the workflows about the lanes
+    credential, as one comparable value.
+
+    The apply-time recheck compares this wholesale rather than asking after
+    each fact by name. Twice now a fact the plan rested on was left out of
+    that comparison -- the publishing modes, then a step wired to another
+    App -- and each time the run applied a plan a fresh one would have
+    refused, then exited claiming the repository was in shape (Codex,
+    mikelward/repo#36). Enumerating by hand is what has to be got right
+    every time; a whole-state comparison is right by default, and anything
+    added here joins it without a second edit.
+
+    Ordered and hashable throughout, so equality is the whole test."""
+    return {
+        "unread": tuple(lanes_unread(texts)),
+        "indirect": tuple(lanes_indirect(texts)),
+        "called workflows": tuple(lanes_called_workflows(texts)),
+        "incomplete": tuple(lanes_incomplete(texts)),
+        "foreign": tuple(lanes_foreign(texts)),
+        "publishers": tuple(sorted(lanes_publishers(texts).items())),
+        "status publishers": tuple(lanes_status_publishers(on_default_branch(texts))),
+        "ambient gate": tuple(lanes_ambient_gate(on_default_branch(texts))),
+    }
 
 
 def environment_branch_policy(repo, listed):
