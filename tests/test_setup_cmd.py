@@ -7366,6 +7366,30 @@ class BootstrapStepTest(unittest.TestCase):
             [c for c in fake.calls if c[0] == "api"],
         )
 
+    def test_the_docs_lane_reading_matches_the_lanes_conf_the_scaffold_writes(self):
+        # The predicate and the config are two statements of one rule, and
+        # a commit prefix is wrong the moment they disagree. `*.md` and
+        # `**/docs/*.md` (maintainer, 2026-09-06) -- so root markdown, and
+        # markdown directly inside a docs/ directory at any depth.
+        conf = scaffold._LANES_CONF
+        self.assertIn("\ndocs *.md\n", conf)
+        self.assertIn("\ndocs **/docs/*.md\n", conf)
+
+        for path in ("README.md", "AGENTS.md", "docs/guide.md", "packages/ui/docs/api.md"):
+            self.assertTrue(scaffold._docs_lane_only({path}), path)
+        for path in (
+            "docs/guide/setup.md",  # **/docs/*.md is one level, not a tree
+            "src/main.py",
+            ".github/workflows/ci.yml",
+            "notes.txt",
+            "docsy/thing.md",  # a directory merely starting with "docs"
+        ):
+            self.assertFalse(scaffold._docs_lane_only({path}), path)
+
+        # Every path has to ride it, and an empty gap rides nothing.
+        self.assertFalse(scaffold._docs_lane_only({"AGENTS.md", "src/main.py"}))
+        self.assertFalse(scaffold._docs_lane_only(set()))
+
     def test_a_docs_only_gap_carries_the_docs_prefix_its_own_lanes_conf_requires(self):
         # The lanes gate fails a docs-only diff whose commit subject
         # carries no docs prefix -- and the scaffold's own lanes.conf is
