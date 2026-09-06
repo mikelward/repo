@@ -81,10 +81,12 @@ that says how to replace it. It also writes `AGENTS.md` -- this account's
 shared agent conventions, fetched from `mikelward/conf`, under a generated
 header whose two sections (what the project is, what a contributor runs)
 are left as TODOs -- and a `CLAUDE.md` that imports it, so a brand-new
-repository is not the one place an agent works with no conventions at all. `lanes` and `zizmor` report from the scaffold's
-own CI run; `codex` needs a pull request first, since its status-writing
-sweep triggers on pull-request activity, not a bare push (Codex review,
-mikelward/repo#14). Only the placeholder's replacement with real project
+repository is not the one place an agent works with no conventions at
+all. `lanes` and `zizmor` report from the scaffold's own CI run; `codex`
+needs a pull request whose BASE branch already carries its workflow,
+since its status-writing sweep runs under `pull_request_target` (Codex
+review, mikelward/repo#14) -- so on the first pull request opened after
+the scaffold lands, not on the one adding it. Only the placeholder's replacement with real project
 jobs is left undone (see `repo_lib/scaffold.py`'s own docstring for the
 full split between what's generated and what isn't).
 `repo setup` composes four steps -- the required-checks
@@ -106,9 +108,30 @@ the fleet-credentials and auto-merge steps below; `--no-bootstrap` skips
 it) adding whichever of the fleet's own CI scaffold files an
 already-existing repository is still missing -- reusing `repo create
 --scaffold`'s own generated files, never overwriting one already there,
-as one commit on top of the branch's current tip (or, for a repository
-whose branch has no commits yet, the same two-commit bootstrap `repo
-create --scaffold` uses). This is what makes `repo setup --force`
+as one commit on a branch of its own, opened as a pull request against
+the default branch (or, for a repository whose branch has no commits yet
+and so has no base for a pull request to target, the same two-commit
+bootstrap `repo create --scaffold` uses, written directly). A pull
+request rather than a direct push for two reasons that point the same
+way: it is the only write a branch an earlier run already protected
+accepts at all, and it is what makes the checks the scaffold installs
+actually run -- `lanes` and `zizmor` report on that pull request, and a
+ruleset cannot require a check that has never reported. A scaffold pull
+request an earlier run left open is reported and reused, never reopened
+beside itself, so this stays safe to run over a fleet on a loop. Until
+it merges, the ruleset step holds back a ruleset write that would need the
+scaffold to have landed -- one requiring pull requests for the first time,
+or newly requiring a check -- but only where what is still missing
+actually stops a required check reporting. The question is
+asked of the branch, never of the pending pull request: a publisher among
+the missing paths is one the branch cannot report from, and whether some
+pull request would supply it is not a question with a durable answer --
+a pull request is editable by anyone at any moment. So a gap containing
+`ci.yml`, `zizmor.yml` or codex-review's check workflow waits for that
+pull request to merge, and a gap of only `AGENTS.md` holds nothing back. Where the branch ALREADY requires a check
+whose publisher is one of the missing files, the repository is wedged
+before this tool arrives -- nothing can merge -- and `repo setup` says
+so rather than leaving it to be discovered. This is what makes `repo setup --force`
 fix a repository regardless of its starting state in the common case: a
 brand-new repo, one only partway set up, and one already complete all
 converge on the same result -- behind one combined plan and a single
@@ -117,12 +140,10 @@ actually changed, so `repo list | xargs -n1 repo setup --force` stays
 quiet across an already-in-shape fleet; `-v`/`--verbose` shows the full
 plan (what a repository already has, not just what moved) and a
 progress line per step, for a closer look at one repository or a run
-you're debugging. One case still doesn't converge
-(see TODO.md): a repository a PRIOR `repo setup` run already protected
-with a pull-request-requiring ruleset has no scaffold fix here yet --
-the direct ref update this step makes is exactly what that ruleset
-blocks, and closing it needs a branch-and-PR write path this tool
-doesn't have. `repo
+you're debugging. Converging a repository that was missing scaffold
+files takes more than one run, and always will: the pull request has to
+merge before the ruleset step can require the checks it installs, and
+`codex` reports a run later still (see TODO.md). `repo
 audit` is the read-only counterpart: it reports whether a branch's rules
 (required checks, conversation resolution, up-to-date merges, force-push
 and deletion protection, bypass actors, and -- when auditing the
