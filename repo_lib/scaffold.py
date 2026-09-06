@@ -330,12 +330,14 @@ rules:
 _LANES_CONF = """\
 # Ordered: the FIRST matching rule wins, and anything matching no rule is code.
 #
-# Starting policy for a fresh repo -- root markdown and the docs/ tree ride
-# the docs lane, everything else is code. Narrow this as the project's real
-# layout emerges (see any sibling repo's own .github/lanes.conf for examples
-# of a tighter code/docs split).
+# Starting policy for a fresh repo -- root markdown, and markdown in any
+# docs/ directory, ride the docs lane; everything else is code. Deliberately
+# the smallest pair that covers where a fresh repository actually puts prose,
+# on the maintainer's call (2026-09-06): a repository expands it as its own
+# layout emerges, rather than starting broad and having to be narrowed (see
+# any sibling repo's own .github/lanes.conf for examples).
 docs *.md
-docs docs/**/*.md
+docs **/docs/*.md
 
 # The subject prefixes a commit on the docs lane must carry -- only the two
 # every fleet AGENTS.md documents for a docs-only diff.
@@ -885,16 +887,29 @@ def checks_no_pull_request_can_report(missing, checks):
 
 def _docs_lane_only(paths):
     """True if every path rides the docs lane under the lanes.conf this
-    scaffold itself writes (root markdown, plus docs/**/*.md). The gate
-    fails a docs-only diff whose commit subject carries no docs prefix, so
-    a pull request adding only AGENTS.md and CLAUDE.md needs one. A
-    repository that has narrowed its own lanes.conf can still disagree
-    with this reading -- that shows up as a failing check on the pull
+    scaffold itself writes -- `*.md` and `**/docs/*.md`, so root markdown
+    and markdown sitting directly in any docs/ directory, at any depth.
+    The gate fails a docs-only diff whose commit subject carries no docs
+    prefix, so a pull request adding only AGENTS.md and CLAUDE.md needs
+    one.
+
+    Kept deliberately in step with _LANES_CONF above: this reads the same
+    two rules, and changing one without the other would put a wrong prefix
+    on the commit. A repository that has since edited its own lanes.conf
+    can still disagree -- that shows up as a failing check on the pull
     request, which is a reviewable thing, rather than as a wrong file
     landing."""
-    return bool(paths) and all(
-        path.endswith(".md") and ("/" not in path or path.startswith("docs/")) for path in paths
-    )
+    return bool(paths) and all(_rides_the_docs_lane(path) for path in paths)
+
+
+def _rides_the_docs_lane(path):
+    if not path.endswith(".md"):
+        return False
+    head, _, _ = path.rpartition("/")
+    # `*.md`: no directory at all. `**/docs/*.md`: the file's own directory
+    # is named docs, wherever it sits (`**` matches zero segments too, so a
+    # top-level docs/ counts).
+    return not head or head == "docs" or head.endswith("/docs")
 
 
 def _gap_commit_message(missing):

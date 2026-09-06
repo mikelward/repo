@@ -145,17 +145,38 @@
       meanwhile and the branch it already pushed is named so the pull
       request can be opened by hand.
 
-- [ ] **Which `lanes.conf` docs rule `repo setup` generates: guessed,
-      not settled.** The fleet is split: eight repositories including
-      `mikelward/lanes` use the shorthand `docs **/*.md`, while
-      `mikelward/lanes`'s own README documents the narrow pair
-      `docs *.md` + `docs docs/**/*.md` as the standard. Put to the
-      maintainer 2026-09-04, unanswered; autopilot kept the narrow pair
-      the scaffold already writes (see *Decisions needing review*). What
-      is still open is the fleet: whichever form wins, the other half
-      needs converting, and `mikelward/lanes`'s own `TODO.md` carries the
-      matching entry. Nothing in this repository changes either way --
-      `_LANES_CONF` in `scaffold.py` is one string.
+- [x] **Which `lanes.conf` docs rule `repo setup` generates: settled.**
+      The fleet was split: eight repositories including `mikelward/lanes`
+      use the shorthand `docs **/*.md`, while `mikelward/lanes`'s own
+      README documents `docs *.md` + `docs docs/**/*.md` as the standard.
+      Maintainer, 2026-09-06: `*.md` and `**/docs/*.md` -- "it can expand
+      itself later as needed". So neither of the two forms already in the
+      fleet, and chosen on that reasoning rather than by counting them: a
+      fresh repository should start with the smallest pair that covers
+      where it actually puts prose, and widen when its own layout calls
+      for it, which is cheap; starting broad and discovering later that
+      code has been riding the docs lane is not. Note the difference from
+      the README's second rule, which is deliberate: `**/docs/*.md` is
+      markdown sitting directly in any `docs/` directory at any depth,
+      where `docs/**/*.md` is the whole tree under a top-level one.
+      `_LANES_CONF` in `scaffold.py` now writes it, and `_docs_lane_only`
+      reads the same two rules so the gap commit's subject prefix agrees
+      with the config it ships beside.
+
+      Keeping the one argument worth keeping from the autopilot guess this
+      replaces (removed from *Decisions needing review*, since it is no
+      longer a guess): the shorthand `docs **/*.md` is the wrong direction
+      for a repository nobody has looked at yet, because it routes
+      markdown at ANY depth down the docs lane -- a README sitting beside
+      code included -- so it can skip a code lane on a diff that needed
+      one. Both rules chosen here can only cost a docs-only change a full
+      CI run, which is the error worth making.
+
+- [ ] **The fleet still needs converting to that rule.** Eight
+      repositories carry `docs **/*.md` and the rest the README's narrow
+      pair; nothing here changes either. `mikelward/lanes`'s own `TODO.md`
+      carries the matching entry, and its README documents the old pair as
+      the standard, so that wants updating too.
 
 - [x] **The gap-fill goes in as a pull request, not a direct push.** Two
       problems, one fix. A repository a PRIOR run already protected had
@@ -735,23 +756,6 @@
   direction -- the reporting is one function, and failing it would need
   `setup_cmd` to tell "this step found something it cannot fix" apart from
   "this step could not run" first.
-
-- **The scaffold's `lanes.conf` keeps the narrow docs pair
-  (`docs *.md` + `docs docs/**/*.md`), not the shorthand `docs **/*.md`**
-  (autopilot, 2026-09-04; the question had been put to the maintainer and
-  was unanswered). Two reasons. It is what `mikelward/lanes`'s own README
-  documents as the standard, so a repository this creates matches the
-  documentation a reader will find. And it is the safer of the two to
-  apply to a repository nobody has looked at yet: `**/*.md` routes
-  markdown at any depth down the docs lane, including a README sitting
-  beside code the full CI validates -- readmo's own guide says markdown
-  outside the root and `docs/` is code for exactly that reason -- so the
-  shorthand can skip a code lane on a diff that needed it, while the
-  narrow pair only ever costs a docs-only change a full CI run. The
-  alternative was matching the eight repositories using the shorthand.
-  Reversible: `_LANES_CONF` in `scaffold.py` is one string, and it only
-  affects repositories scaffolded after the change -- an existing
-  `lanes.conf` is never overwritten.
 
 - **The scaffold does not write a `TODO.md`, and autopilot left it that
   way** (2026-09-04; the maintainer's own note was "i'm not sure if we
