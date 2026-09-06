@@ -103,12 +103,13 @@
       files an already-existing repository is still missing, always on
       like the fleet-credentials and auto-merge steps (`--no-bootstrap`
       to skip it): builds the same file set `repo create --scaffold`
-      generates, diffs it against the target's current tree, and pushes
+      generates, diffs it against the target's current tree, and adds
       whatever's missing as one commit -- never overwriting a path
       already occupied by anything, file or directory. Applies BEFORE
-      the ruleset step in the same run, since a ruleset requiring pull
-      requests blocks the direct ref update this uses (Codex review,
-      mikelward/repo#14).
+      the ruleset step in the same run, which is what the one remaining
+      direct write (a branch with no commits yet) needs: a ruleset
+      requiring pull requests blocks it (Codex review, mikelward/repo#14).
+      Everything else goes in as a pull request -- see below.
 - [x] **The scaffold no longer writes a `TODO.md`, and that stands**
       (maintainer, 2026-09-04: "i'm not sure if we need that"; kept
       removed under autopilot, 2026-09-04 -- see *Decisions needing
@@ -133,16 +134,16 @@
       `CLAUDE.md` gets made, and what happens where one already exists as
       a symlink.
 
-- [x] **The bootstrap failure names `--no-bootstrap`.** A repository the
-      item below describes fails with GitHub's own rejection relayed
-      verbatim -- "Changes must be made through a pull request" -- which
-      says nothing about what to do next. `apply_gaps`'s ref-update
-      failure now adds a line naming the way past both of the two causes
-      it cannot tell apart: rerun if the branch simply moved, and
-      `--no-bootstrap` to get the rest of `repo setup` through a branch
-      this step cannot write to at all, with the scaffold left to add by
-      hand. The write path itself is still the item below (maintainer,
-      2026-09-04: "branch-and-PR write path is a TODO for later").
+- [x] **The bootstrap failure names `--no-bootstrap`.** GitHub's own
+      rejection, relayed verbatim, says nothing about what to do next, so
+      the failure names the way past it. The cause that prompted this --
+      a ruleset blocking the direct ref update -- is gone with the write
+      path itself (the item below, which the maintainer had deferred on
+      2026-09-04: "branch-and-PR write path is a TODO for later"); what
+      the line now covers is a pull request this step could not open,
+      where `--no-bootstrap` gets the rest of `repo setup` through
+      meanwhile and the branch it already pushed is named so the pull
+      request can be opened by hand.
 
 - [ ] **Which `lanes.conf` docs rule `repo setup` generates: guessed,
       not settled.** The fleet is split: eight repositories including
@@ -156,21 +157,161 @@
       matching entry. Nothing in this repository changes either way --
       `_LANES_CONF` in `scaffold.py` is one string.
 
-- [ ] **A repository a PRIOR `repo setup` run already protected has no
-      path to a scaffold fix here at all.** The ordering fix above only
-      covers a ruleset THIS run is the one creating; apply_gaps's direct
-      `git/refs/heads/{branch}` PATCH is still the only write this step
-      knows how to make, and any ruleset requiring pull requests blocks
-      it outright for a non-bypass caller (which `repo setup` never
-      configures itself to be). Today that shows up as a plain write
-      failure -- `failed on: bootstrap`, GitHub's own rejection relayed
-      verbatim -- rather than a fix. Closing it for real needs a second
-      write path: create a new (unprotected) branch off the current tip,
-      push the missing files there, open a pull request, and either wait
-      for it or auto-merge it once its own checks (which the scaffold it
-      is adding may be the very thing that makes exist) pass. Until then,
-      an already-protected repository missing a scaffold file needs it
-      added by hand, through an ordinary PR.
+- [x] **The gap-fill goes in as a pull request, not a direct push.** Two
+      problems, one fix. A repository a PRIOR run already protected had
+      no path to a scaffold fix at all -- the direct
+      `git/refs/heads/{branch}` PATCH is exactly what a pull-request rule
+      blocks for a non-bypass caller, which `repo setup` never configures
+      itself to be. And a direct push does not run the checks the
+      scaffold exists to install, so `lanes`, `zizmor` and `codex` stayed
+      never-reported and the ruleset step could never require them.
+      `scaffold.open_gap_pull_request` now pushes the missing files to a
+      `repo-setup/fleet-ci-scaffold-<sha>` branch and opens a pull
+      request against the default branch; `lanes` and `zizmor` report on
+      it. One an earlier run left open is found (by that branch prefix,
+      in this repository only -- a fork's branch of the same name is not
+      ours) and reported rather than reopened beside itself, read once at
+      plan time and again right before the write. A branch with no
+      commits still bootstraps directly: there is no base for a pull
+      request to target. Where every missing path rides the docs lane the
+      commit subject takes the `docs` prefix its own lanes.conf requires,
+      so the pull request does not fail the gate it is installing. Until
+      that pull request merges, the ruleset step holds back a ruleset
+      write that would need it to have landed: one requiring pull requests
+      for the first time, or -- on a branch that already requires them --
+      one newly requiring a check. Narrowed to the gap that actually
+      blocks a check: `scaffold.CHECK_PUBLISHERS` says which file
+      publishes each check and whether GitHub reads it from the pull
+      request's head or the base branch. Where a pull request was opened,
+      a base-published publisher (`codex`) is beyond it, as is any
+      publisher that pull request does not itself carry; where none was --
+      the step failed, or the token could not write the workflows -- any
+      missing publisher blocks, since there is nothing to report on. The
+      warning about a check the branch ALREADY requires reads GitHub's
+      effective rules, not the managed ruleset, since rulesets
+      aggregate. A gap of only `AGENTS.md` holds nothing back either way, even
+      when adding it failed. `--dry-run` previews the same skip, and the
+      branch tip the whole assessment rests on is re-verified immediately
+      before the ruleset write.
+
+- [ ] **Key the scaffold branch name to the paths it adds.** Reusing an
+      open scaffold pull request is matched by branch prefix -- an
+      IDENTITY test ("this tool opened it") answering a CONTENTS question
+      ("does it add what is missing now?"). The gap between the two is
+      bridged by a separate `pulls/{n}/files` read (`_uncovered_by`), and
+      six review findings on mikelward/repo#42 were all that one shape:
+      the canonical-name comparison, the workflow-scope gate reading
+      around it, the contents check itself, the uncovered-workflow gate, a
+      file the pull request DELETES counted as coverage, and a cached
+      coverage answer going stale across the confirmation wait. Naming the
+      branch `repo-setup/fleet-ci-scaffold-<hash of the sorted paths>`
+      would make the name itself the answer: a matching name covers
+      exactly this gap by construction, a changed gap takes a different
+      name, and there is nothing left to read, misparse or cache. Hash the
+      PATHS, not their bytes -- the templates are fetched live, so hashing
+      content would report a mismatch every time upstream moves. Not free:
+      a pull request opened by today's code carries the old sha-keyed
+      name, so the files read stays as a fallback while any such pull
+      request is open, and the prefix lookup stays either way (it is what
+      keeps a second, conflicting pull request from being opened, which is
+      why "one branch per gap, several open at once" is NOT the answer --
+      a changed gap almost always overlaps the old one). Maintainer,
+      2026-09-06: keep the current shape for now, revisit if the reuse
+      path produces another finding.
+
+      Revisited the same day, on the seventh finding, and the case is
+      weaker than it first looked: a name says what this step OPENED, not
+      what the branch holds now. A branch edited after the fact -- which
+      is exactly that seventh finding, a scaffold pull request altered to
+      delete a workflow still present on the default branch -- defeats a
+      name-derived answer precisely as it defeats a cached one. So the
+      contents read cannot be deleted, only narrowed: content-keying
+      would remove the read for the untouched case and nothing more.
+      Whatever the branch name says, the trustworthy answer comes from
+      reading what the pull request actually does -- and the step no
+      longer reads it at all (see the item below), so content-keying now
+      buys nothing but a tidier name. Left here only because the name is
+      still an identity match, and a future feature that DOES need to know
+      what a scaffold pull request contains would face the same choice
+      again.
+
+      Revisited again on the eighth finding, which is a different and
+      much better argument for the same change: two `repo setup` runs
+      overlapping on one repository. Both list open pull requests, both
+      find none, and both build a commit -- a second apart, so the
+      commit-keyed names differ, GitHub accepts a scaffold pull request
+      from each, and the "one scaffold pull request per repository"
+      promise is broken. Keyed to the paths, both runs pick the SAME
+      branch name, GitHub grants that ref to exactly one of them, and the
+      loser finds the winner's pull request instead of opening a second.
+      That is the name as an atomic CLAIM, not as an answer to a contents
+      question -- which is why the objection above doesn't touch it:
+      nothing is concluded from the name, both runs only have to pick the
+      same one. It needs two more things beside the rename: a ref that
+      already exists must be accepted whatever it points at (under a
+      stable name the shas always differ, so today's equality check would
+      refuse exactly the race the name settles), and a pull-request create
+      that GitHub refuses because one already exists for that head must
+      re-list and report it rather than fail. Maintainer, 2026-09-06:
+      descoped from mikelward/repo#42 -- the race is real but narrow (it
+      needs two concurrent runs on one repository), today's behavior fails
+      loudly rather than silently, and this is a design change that
+      deserves its own branch.
+
+- [x] **Stopped vouching for a pending scaffold pull request.** The
+      bootstrap step used to READ an open scaffold pull request -- what it
+      adds, deletes, renames away, whether its head moved since -- so the
+      ruleset step could decide the gap blocked no check and proceed. Ten
+      review findings on mikelward/repo#42 were that read being wrong in a
+      new way: a deleted path counted as coverage, a renamed-away path
+      invisible, an answer cached across the confirmation wait, a head
+      force-pushed after the read, a branch edited into something the step
+      never opened, a pull request closed or retargeted while its diff
+      still read the same. A pull request is mutable by anyone at any
+      moment, so no answer derived from one stays true, and each fix bought
+      one instance. Now nothing is derived: `checks_a_gap_leaves_
+      unpublished` asks only of the BRANCH -- is a publisher among the
+      missing paths? -- and a gap that contains one holds the ruleset back
+      until the pull request merges. Deleted `_read_coverage`, the
+      `uncovered`/`removes` fields, three re-reads and every staleness
+      guard around them. The cost is real and bounded: a repository whose
+      gap contains `ci.yml` waits one merge for its ruleset, where before
+      the run could reason that the pull request would supply it. A gap of
+      only `AGENTS.md` -- most of this fleet -- contains no publisher and
+      defers nothing, which is the case an earlier round of that review
+      was right to protect.
+
+- [ ] **The scaffold adds, it never updates.** A scaffold file already on
+      a branch is left exactly as it is, template drift included -- the
+      module's own promise, and deliberate, since reconciling drift is a
+      human decision and the difference may be a project's own
+      customization. The cost is that nothing in the fleet ever brings an
+      old copy forward when `mikelward/codex-review`'s templates move: the
+      file is present, so every later run passes over it. Raised as a
+      finding against the reuse path (Codex, mikelward/repo#42: an older
+      scaffold pull request adding the same filenames with older contents
+      merges, and those contents then persist), but it is the whole
+      design, not that path -- the same is true of any repository whose
+      copy predates a template change, pull request or not. Closing it
+      means a real update step: compare each present scaffold file against
+      the template, report the drift, and offer to take the template's
+      version -- which is a different, riskier thing from gap-filling and
+      wants its own flag and its own confirmation.
+
+- [ ] **Converging a repository still takes three runs, and `codex` is
+      why.** The scaffold pull request makes `lanes` and `zizmor` report,
+      but not `codex`: its status-writing workflow runs under
+      `pull_request_target`, which GitHub takes from the BASE branch's
+      copy, so the pull request adding that workflow is the one pull
+      request it cannot run on. So: run one opens the pull request, a
+      human merges it, run two still skips the ruleset step (`codex` has
+      never reported), some real pull request happens, run three writes
+      the ruleset. `--force` waives the never-reported guard and is a
+      legitimate way to cut that to two, since the workflow IS on the
+      default branch by then and the next pull request will report.
+      Closing it properly needs `repo setup` to open something for
+      `codex` to run on once the scaffold has landed -- which means
+      inventing a diff, and no good candidate has turned up yet.
 
 ## repo setup: one ruleset per repository
 

@@ -292,6 +292,58 @@ def _collect_reported(repo, wanted, ref=None):
     return names, app_pairs
 
 
+def effective_required_checks(repo, branch):
+    """Every status check `branch` actually requires, from GitHub's own
+    effective-rules endpoint -- across every ruleset covering it, not just
+    the one this module manages. Rulesets AGGREGATE, so a check another
+    (or an inherited) ruleset requires is enforced just as hard as one in
+    ours, and a caller asking "can a pull request satisfy this branch"
+    gets the wrong answer from the managed ruleset alone (Codex review,
+    mikelward/repo#42).
+
+    Returns (context, integration_id or None) pairs, the same shape
+    never_reported speaks, because the App a requirement is BOUND to is
+    part of what it requires: an unbound entry is satisfied by any
+    producer of that context, while a bound one names the single App that
+    may report it. A caller reasoning about which workflow publishes a
+    context must not read a same-named requirement bound to some other
+    App as one of its own (Codex review, mikelward/repo#42).
+
+    Raises RulesetError on a failed read. audit_cmd.py reads the same
+    endpoint for much more than this (every rule type, and each check's
+    App binding); this is the narrow answer setup_cmd.py needs, not a
+    replacement for that."""
+    try:
+        # --paginate concatenates each page's own array rather than
+        # merging them, so '.[]' unwraps per page into one rule per line
+        # -- the same shape audit_cmd.py uses, and for the same reason.
+        raw = gh.run(
+            [
+                "api",
+                "--paginate",
+                f"repos/{repo}/rules/branches/{urllib.parse.quote(branch, safe='')}",
+                "--jq",
+                ".[]",
+            ]
+        )
+    except gh.GhError as e:
+        raise RulesetError(f"reading {repo}'s effective rules for {branch}:\n{e.stderr}")
+    contexts = set()
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        try:
+            rule = json.loads(line)
+        except ValueError:
+            raise RulesetError(f"reading {repo}'s effective rules for {branch}: unexpected response")
+        if rule.get("type") != "required_status_checks":
+            continue
+        for entry in (rule.get("parameters") or {}).get("required_status_checks") or []:
+            if entry.get("context"):
+                contexts.add((entry["context"], entry.get("integration_id") or None))
+    return contexts
+
+
 def quoted(names):
     """Check names for a message, quoted and comma-separated. A name can
     contain spaces -- this repository has one called "Classify the diff" --
@@ -925,9 +977,11 @@ def _build_update_body(repo, existing_id, checks, ruleset_name):
     names, an exclusion, and every other condition key (repository
     properties, say) are untouched.
 
-    Returns (changed, target, had_pull_request, scope_added) -- target is
-    the full object to PUT, `changed` is whether it differs from what's
-    there now, and scope_added lists the refs the widening appended."""
+    Returns (changed, target, had_pull_request, scope_added, checks_added)
+    -- target is the full object to PUT, `changed` is whether it differs
+    from what's there now, scope_added lists the refs the widening
+    appended, and checks_added the required checks this write would name
+    that the ruleset does not require today."""
     try:
         raw = gh.run(["api", f"repos/{repo}/rulesets/{existing_id}"])
     except gh.GhError as e:
@@ -938,6 +992,12 @@ def _build_update_body(repo, existing_id, checks, ruleset_name):
         original.pop(field, None)
 
     wanted_contexts = [{"context": c} for c in checks]
+    # Contexts the ruleset requires TODAY, so the caller can be told which
+    # of `checks` this write would newly require -- a distinction that
+    # matters to a caller holding back a write until something that can
+    # satisfy the new requirement exists (setup_cmd.py's pending-scaffold
+    # gate, Codex review, mikelward/repo#42).
+    existing_contexts = set()
     has_status_checks = False
     has_pull_request = False
     has_linear_history = False
@@ -951,6 +1011,7 @@ def _build_update_body(repo, existing_id, checks, ruleset_name):
             have_by_context = {
                 h.get("context"): h for h in params.get("required_status_checks") or []
             }
+            existing_contexts = set(have_by_context)
             params["required_status_checks"] = [
                 have_by_context.get(w["context"], dict(w)) for w in wanted_contexts
             ]
@@ -1010,12 +1071,13 @@ def _build_update_body(repo, existing_id, checks, ruleset_name):
     # Adopting a legacy-named ruleset renames it here rather than in a
     # separate call, so the rename and the rules land in one write.
     target["name"] = ruleset_name
-    return target != original, target, has_pull_request, scope_added
+    checks_added = [c for c in checks if c not in existing_contexts]
+    return target != original, target, has_pull_request, scope_added, checks_added
 
 
 def _plan_write(repo, existing_id, checks, ruleset_name):
     """Returns (needs_write, target_body, introduces_pr_protection,
-    scope_added): the
+    scope_added, checks_added): the
     full API body this step would PUT to `existing_id` (or POST as a new
     ruleset, when `existing_id` is falsy) to reach `checks`, whether that
     differs from what's there now, and whether writing it would be what
@@ -1030,13 +1092,15 @@ def _plan_write(repo, existing_id, checks, ruleset_name):
     than what this call is about to write. scope_added -- the refs the
     update widens the ruleset's scope by -- rides along the same way: it
     is already inside target_body, and travels separately only so the
-    plan can name what changed."""
+    plan can name what changed. checks_added -- which of `checks` the
+    ruleset does not require today -- rides along for the same reason, and
+    is every check for a ruleset being created fresh."""
     if existing_id:
-        changed, target, had_pull_request, scope_added = _build_update_body(
+        changed, target, had_pull_request, scope_added, checks_added = _build_update_body(
             repo, existing_id, checks, ruleset_name
         )
-        return changed, target, not had_pull_request, scope_added
-    return True, _create_body(ruleset_name, checks), True, []
+        return changed, target, not had_pull_request, scope_added, checks_added
+    return True, _create_body(ruleset_name, checks), True, [], list(checks)
 
 
 def _bypass_actor_note(bypass_actors):
@@ -1166,7 +1230,9 @@ def apply_ruleset(
     report=None,
     skip_confirm=False,
     refuse_if_introduces_pr_protection=False,
-    verify_scaffold_before_introducing_pr_protection=None,
+    refuse_if_adds_required_checks=False,
+    refuse_if_widens_scope=False,
+    verify_scaffold_before_requiring_checks=None,
     quiet=False,
 ):
     """Runs the whole repo-rules port against `repo`. Returns 0 on success
@@ -1220,7 +1286,11 @@ def apply_ruleset(
     report: when given a dict, records structured facts back to the
     caller rather than leaving them to re-derive from rendered text
     (which a --rule value matching NO_OP_MESSAGE could otherwise fool):
-    report["needs_write"], report["deletions"], report["existing_id"]
+    report["checks_added"] -- which of `checks` the ruleset does not
+    require today, so a caller can hold back a write whose new requirement
+    nothing can satisfy yet. report["scope_added"] -- the refs the write
+    would newly target, since a ruleset's existing rules become newly
+    effective on a branch its scope newly covers. report["needs_write"], report["deletions"], report["existing_id"]
     (also fingerprint[0]), report["fingerprint"]. report["never_reported"]
     is set instead, and the others left absent, when this refuses over the
     never-reported-check guard without force -- the one refusal reason that
@@ -1244,17 +1314,40 @@ def apply_ruleset(
     where the preview said False, and _build_update_body would silently
     reconstruct the same target body regardless -- passing the ordinary
     fingerprint check, since that compares WHAT would be written, not why.
+    refuse_if_adds_required_checks: the same window, for the same reason,
+    over the other half of what a caller may be holding this write back
+    for. An administrator removing a required CHECK during the wait makes
+    the fresh recompute name it in checks_added where the preview named
+    nothing -- and the target body is unchanged by that (it rebuilds the
+    same wanted contexts either way, and an entry with no integration_id
+    reconstructs byte for byte), so the fingerprint passes and the write
+    silently re-adds a check nothing may be able to report yet (Codex
+    review, mikelward/repo#42).
+
+    refuse_if_widens_scope: the third way a write can newly impose this
+    ruleset's rules on a branch that did not have them -- not by changing
+    the rules at all, but by widening the ruleset's SCOPE to cover that
+    branch. A ruleset carrying pull_request and `codex` but targeting only
+    `refs/heads/release` answers False to both flags above, while
+    _build_update_body widens it to the hardened three refs and makes both
+    newly effective on the default branch (Codex review,
+    mikelward/repo#42).
+
     Refusing this here, from the same fresh recompute the fingerprint
     check itself uses, is what actually closes that window rather than
     narrowing it (Codex review, mikelward/repo#14).
 
-    verify_scaffold_before_introducing_pr_protection: when given, called
-    with the FRESH default_branch (the same re-read this function's own
-    fresh recompute already did) exactly when a real write would
-    introduce pull-request protection for the first time and
-    refuse_if_introduces_pr_protection didn't already refuse it -- the
-    return value is an error message (refuses and prints it) or None
-    (proceeds). This module knows nothing about the fleet CI scaffold;
+    verify_scaffold_before_requiring_checks: when given, called with the
+    FRESH default_branch (the same re-read this function's own fresh
+    recompute already did) exactly when a real write would introduce
+    pull-request protection for the first time OR name a check the
+    ruleset does not require today, and the matching refusal above didn't
+    already refuse it -- the return value is an error message (refuses and
+    prints it) or None (proceeds). Both, not just the first: adding a
+    required check wedges a branch that already requires pull requests
+    just as surely, so the caller's "is the branch still what my answer
+    was computed against" check has to cover it (Codex review,
+    mikelward/repo#42). This module knows nothing about the fleet CI scaffold;
     the callback is how setup_cmd.py verifies that concern against the
     branch this call is ACTUALLY about to protect, not a snapshot from
     before this function re-read the default branch -- an administrator
@@ -1334,7 +1427,7 @@ def apply_ruleset(
         return 1
 
     try:
-        needs_write, target_body, introduces_pr_protection, scope_added = _plan_write(
+        needs_write, target_body, introduces_pr_protection, scope_added, checks_added = _plan_write(
             repo, existing, checks, ruleset_name
         )
     except RulesetError:
@@ -1353,6 +1446,8 @@ def apply_ruleset(
         report["deletions"] = list(deletions)
         report["fingerprint"] = fingerprint
         report["introduces_pr_protection"] = introduces_pr_protection
+        report["checks_added"] = list(checks_added)
+        report["scope_added"] = list(scope_added)
 
     if not needs_write and not deletions:
         # Outside the quiet guard, like the one on the write path below and
@@ -1429,6 +1524,7 @@ def apply_ruleset(
             fresh_target_body,
             fresh_introduces_pr_protection,
             fresh_scope_added,
+            fresh_checks_added,
         ) = _plan_write(repo, fresh_existing, checks, ruleset_name)
     except RulesetError:
         error(f"could not re-read ruleset '{ruleset_name}' to write it")
@@ -1442,8 +1538,25 @@ def apply_ruleset(
             "refuse exactly that. Not writing it. Rerun to re-check."
         )
         return 1
-    if fresh_introduces_pr_protection and verify_scaffold_before_introducing_pr_protection is not None:
-        problem = verify_scaffold_before_introducing_pr_protection(default_branch)
+    if fresh_scope_added and refuse_if_widens_scope:
+        error(
+            f"ruleset '{ruleset_name}' on {repo} would widen its scope to also target "
+            f"{', '.join(fresh_scope_added)}, making its existing rules newly effective there, "
+            "and the caller asked to refuse exactly that. Not writing it. Rerun to re-check."
+        )
+        return 1
+    if fresh_checks_added and refuse_if_adds_required_checks:
+        error(
+            f"ruleset '{ruleset_name}' on {repo} would now newly require "
+            f"{quoted(fresh_checks_added)} (it didn't when this was last checked -- the ruleset "
+            "was edited while this was waiting), and the caller asked to refuse exactly that. "
+            "Not writing it. Rerun to re-check."
+        )
+        return 1
+    if (
+        fresh_introduces_pr_protection or fresh_checks_added or fresh_scope_added
+    ) and verify_scaffold_before_requiring_checks is not None:
+        problem = verify_scaffold_before_requiring_checks(default_branch)
         if problem is not None:
             error(problem)
             return 1

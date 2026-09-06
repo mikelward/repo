@@ -64,6 +64,22 @@ _SCAFFOLD_CONVENTIONS_RE = re.compile(r"^repos/mikelward/conf/contents/agents/AG
 # so the fixture can only answer a read on the route real GitHub actually
 # serves it on (Codex review, mikelward/repo#14).
 _SCAFFOLD_REF_READ_RE = re.compile(r"^repos/([^/]+/[^/]+)/git/ref/heads/([^/?]+)$")
+# The bootstrap step's pull-request write path. The gap branch carries a
+# `/`, so it needs its own read route -- the default-branch one above
+# deliberately stops at a path separator. The listing is matched ahead of
+# _PULLS_RE, whose shape (state + per_page) this one also fits.
+_SCAFFOLD_GAP_REF_READ_RE = re.compile(
+    r"^repos/([^/]+/[^/]+)/git/ref/heads/(" + re.escape(scaffold.GAP_BRANCH_PREFIX) + r".*)$"
+)
+_SCAFFOLD_GAP_PULLS_RE = re.compile(
+    r"^repos/([^/]+/[^/]+)/pulls\?state=open&per_page=100&base=(.+)$"
+)
+_SCAFFOLD_REF_CREATE_RE = re.compile(r"^repos/([^/]+/[^/]+)/git/refs$")
+# GitHub's effective-rules endpoint: what a branch actually enforces
+# across every ruleset covering it, which is what the scaffold step reads
+# to say whether its pull request can merge on its own.
+_EFFECTIVE_RULES_RE = re.compile(r"^repos/([^/]+/[^/]+)/rules/branches/(.+)$")
+_SCAFFOLD_PULL_CREATE_RE = re.compile(r"^repos/([^/]+/[^/]+)/pulls$")
 _SCAFFOLD_REF_WRITE_RE = re.compile(r"^repos/([^/]+/[^/]+)/git/refs/heads/([^/?]+)$")
 _SCAFFOLD_COMMIT_RE = re.compile(r"^repos/([^/]+/[^/]+)/git/commits/([^/?]+)$")
 _SCAFFOLD_TREE_RE = re.compile(r"^repos/([^/]+/[^/]+)/git/trees/([^/?]+)\?recursive=1$")
@@ -71,6 +87,20 @@ _SCAFFOLD_BLOB_CREATE_RE = re.compile(r"^repos/([^/]+/[^/]+)/git/blobs$")
 _SCAFFOLD_TREE_CREATE_RE = re.compile(r"^repos/([^/]+/[^/]+)/git/trees$")
 _SCAFFOLD_COMMIT_CREATE_RE = re.compile(r"^repos/([^/]+/[^/]+)/git/commits$")
 _SCAFFOLD_CONTENTS_PUT_RE = re.compile(r"^repos/([^/]+/[^/]+)/contents/(.+)$")
+
+# Every path build_scaffold_files produces -- what a scaffold pull request
+# adds when it covers the whole gap.
+_SCAFFOLD_PATHS = (
+    ".github/lanes.conf",
+    ".github/workflows/ci.yml",
+    ".github/workflows/codex-review-check.yml",
+    ".github/workflows/codex-review-listener.yml",
+    ".github/workflows/codex-review.yml",
+    ".github/workflows/zizmor.yml",
+    ".github/zizmor.yml",
+    "AGENTS.md",
+    "CLAUDE.md",
+)
 
 _OWNERSHIP_JQ = ".enforcement, .target"
 
@@ -335,6 +365,13 @@ class FakeGh:
         # apply_gaps's own pre-PATCH recheck, never letting the write
         # happen at all (Codex review, mikelward/repo#14).
         self.bootstrap_ref_sha_after_own_write = None
+        # (read_count, sha): the branch's tip changing once more than
+        # `read_count` ref reads have happened -- a concurrent push
+        # landing at a chosen point in the run. bootstrap_ref_sha_after_
+        # first_read cannot express that where the bootstrap step makes a
+        # recheck of its own (it would fire on that recheck and fail the
+        # step before the thing under test is reached).
+        self.bootstrap_ref_sha_after_read = None
         self.bootstrap_tree_sha = "deadbeeftree"
         self.bootstrap_commit_read_fails = False
         self.bootstrap_tree_read_fails = False
@@ -353,6 +390,39 @@ class FakeGh:
         self.bootstrap_tree_create_fails = False
         self.bootstrap_commit_create_fails = False
         self.bootstrap_ref_update_fails = False
+        # The pull-request write path the gap-fill takes on a branch that
+        # has commits. bootstrap_open_pulls models what the open-pull-
+        # request listing answers -- (number, head ref, head-and-base are
+        # the same repository, url) tuples, as the --jq line format the
+        # step reads.
+        self.bootstrap_open_pulls = []
+        self.bootstrap_pulls_list_fails = False
+        # What the listing answers from its SECOND call on -- a scaffold
+        # pull request somebody opened during the confirmation wait, which
+        # only the step's own recheck before writing can see.
+        self.bootstrap_open_pulls_later = None
+        self._gap_pulls_reads = 0
+        # There is deliberately no route for a pull request's file list.
+        # The bootstrap step never reads what an open scaffold pull
+        # request contains -- nothing derived from a mutable pull request
+        # stays true -- so a call for one is a regression, and with no
+        # route the fixture raises rather than answering it (Codex review,
+        # mikelward/repo#42).
+        # The branch's effective rules, as one object per line. Empty (the
+        # default) is an unprotected branch: nothing required, so nothing
+        # this pull request could fail to satisfy.
+        self.effective_rules = []
+        self.effective_rules_read_fails = False
+        self.bootstrap_ref_create_fails = False
+        # The sha an already-existing ref of the gap branch's name holds,
+        # for the "a rerun rebuilt the same commit" path -- None means the
+        # ref genuinely isn't there.
+        self.bootstrap_gap_ref_sha = None
+        self.bootstrap_pull_create_fails = False
+        self.bootstrap_pull_create_response = None
+        self.bootstrap_pull_number = 42
+        self.created_refs = []
+        self.created_pulls = []
         # The gh token's own OAuth scopes, as scaffold._missing_workflow_
         # scope reads them (via gh.token_scopes -> X-OAuth-Scopes). None
         # (the default) models a token this can't tell the scopes of at
@@ -488,6 +558,25 @@ class FakeGh:
         if m:
             contexts = self.statuses.get(m.group(2), [])
             return "".join(json.dumps(c) + "\n" for c in contexts)
+
+        m = _EFFECTIVE_RULES_RE.match(endpoint)
+        if m:
+            if self.effective_rules_read_fails:
+                raise gh.GhError("gh: HTTP 500: Internal Server Error\n")
+            return "".join(json.dumps(rule) + "\n" for rule in self.effective_rules)
+
+        m = _SCAFFOLD_GAP_PULLS_RE.match(endpoint)
+        if m:
+            if self.bootstrap_pulls_list_fails:
+                raise gh.GhError("gh: HTTP 500: Internal Server Error\n")
+            self._gap_pulls_reads += 1
+            pulls = self.bootstrap_open_pulls
+            if self._gap_pulls_reads > 1 and self.bootstrap_open_pulls_later is not None:
+                pulls = self.bootstrap_open_pulls_later
+            return "".join(
+                f"{number} {head_ref} {'true' if same_repo else 'false'} {url}\n"
+                for number, head_ref, same_repo, url in pulls
+            )
 
         m = _PULLS_RE.match(endpoint)
         if m:
@@ -767,6 +856,12 @@ class FakeGh:
                 raise gh.GhError("gh: HTTP 404: Not Found (.../repos/mikelward/lanes)\n")
             return base64.encodebytes(self.zizmor_workflow_content.encode()).decode()
 
+        m = _SCAFFOLD_GAP_REF_READ_RE.match(endpoint)
+        if m and method is None and jq is None:
+            if self.bootstrap_gap_ref_sha is None:
+                raise gh.GhError("gh: HTTP 404: Not Found\n")
+            return json.dumps({"object": {"sha": self.bootstrap_gap_ref_sha}})
+
         m = _SCAFFOLD_REF_READ_RE.match(endpoint)
         if m and method is None and jq is None:
             if self.bootstrap_ref_missing:
@@ -786,6 +881,10 @@ class FakeGh:
             sha = self._scaffold_ref_current_sha
             if self._scaffold_ref_reads > 1 and self.bootstrap_ref_sha_after_first_read is not None:
                 sha = self.bootstrap_ref_sha_after_first_read
+            if self.bootstrap_ref_sha_after_read is not None:
+                after, later = self.bootstrap_ref_sha_after_read
+                if self._scaffold_ref_reads > after:
+                    sha = later
             if self._scaffold_ref_patched and self.bootstrap_ref_sha_after_own_write is not None:
                 sha = self.bootstrap_ref_sha_after_own_write
             return json.dumps({"object": {"sha": sha}})
@@ -936,6 +1035,14 @@ class FakeGh:
                 # repository whose branch has no commits yet -- the one
                 # write GitHub allows there, and the only PUT that parses
                 # its own response body (`.commit.sha`).
+                #
+                # It also creates the branch: a later read has to see it,
+                # or a run that bootstrapped an empty repository would
+                # then fail its own post-bootstrap recheck against a ref
+                # the fixture still claims doesn't exist.
+                self.bootstrap_ref_missing = False
+                self.bootstrap_ref_empty_409 = False
+                self._scaffold_ref_current_sha = "bootstrapcommitsha"
                 return json.dumps({"commit": {"sha": "bootstrapcommitsha"}}).encode()
         elif method == "POST":
             m = _ENV_POLICIES_RE.match(endpoint)
@@ -971,6 +1078,24 @@ class FakeGh:
                     raise gh.GhError("gh: HTTP 500: Internal Server Error\n")
                 self.posts.append((args, body))
                 return json.dumps({"sha": "newscaffoldcommitsha"}).encode()
+            if _SCAFFOLD_REF_CREATE_RE.match(endpoint):
+                self.posts.append((args, body))
+                if self.bootstrap_ref_create_fails:
+                    raise gh.GhError("gh: HTTP 422: Reference already exists\n")
+                self.created_refs.append(body)
+                return json.dumps({"ref": body["ref"]}).encode()
+            m = _SCAFFOLD_PULL_CREATE_RE.match(endpoint)
+            if m:
+                self.posts.append((args, body))
+                if self.bootstrap_pull_create_fails:
+                    raise gh.GhError("gh: HTTP 422: Validation Failed\n")
+                self.created_pulls.append(body)
+                if self.bootstrap_pull_create_response is not None:
+                    return self.bootstrap_pull_create_response
+                number = self.bootstrap_pull_number
+                return json.dumps(
+                    {"number": number, "html_url": f"https://github.com/{m.group(1)}/pull/{number}"}
+                ).encode()
             self.posts.append((args, body))
         elif method == "PATCH":
             if _SCAFFOLD_REF_WRITE_RE.match(endpoint) and self.bootstrap_ref_update_fails:
@@ -5550,8 +5675,14 @@ class BootstrapStepTest(unittest.TestCase):
                 endpoint,
                 f"read call {endpoint!r} used the plural, write-only git/refs/... route",
             )
-        self.assertEqual(len(fake.patches), 1)
-        self.assertIn("/git/refs/heads/", fake.patches[0][0][3])
+        # The write is a ref CREATE -- the gap branch the pull request is
+        # opened from -- which is a POST to the plural collection itself,
+        # not to a ref path under it.
+        self.assertEqual(len(fake.created_refs), 1)
+        self.assertTrue(
+            fake.created_refs[0]["ref"].startswith(f"refs/heads/{scaffold.GAP_BRANCH_PREFIX}"),
+            fake.created_refs[0],
+        )
 
     def test_a_partially_scaffolded_repository_adds_only_what_is_missing(self):
         fake = FakeGh()
@@ -5568,11 +5699,13 @@ class BootstrapStepTest(unittest.TestCase):
         self.assertIn("add .github/workflows/ci.yml", out)
         self.assertNotIn("add .github/workflows/codex-review-listener.yml", out)
         self.assertNotIn("add .github/lanes.conf", out)
+        self.assertIn("open a pull request adding 7 file(s):", out)
         self.assertIn("already present, untouched: 2 file(s)", out)
 
         code, out, err = _run(fake, ["--force", "--no-rules", REPO])
         self.assertEqual(code, 0, err)
-        self.assertIn(f"{REPO}: added 7 fleet CI scaffold file(s)", out)
+        self.assertIn(f"{REPO}: opened pull request #42 adding 7 fleet CI scaffold file(s)", out)
+        self.assertIn("https://github.com/owner/repo/pull/42", out)
         blob_paths = {body["encoding"] for _args, body in fake.posts if "encoding" in body}
         self.assertEqual(blob_paths, {"utf-8"})
         blob_posts = [body for _args, body in fake.posts if "encoding" in body]
@@ -5595,8 +5728,19 @@ class BootstrapStepTest(unittest.TestCase):
         commit_posts = [body for _args, body in fake.posts if "parents" in body]
         self.assertEqual(len(commit_posts), 1)
         self.assertEqual(commit_posts[0]["parents"], [fake.bootstrap_commit_sha])
-        self.assertEqual(len(fake.patches), 1)
-        self.assertEqual(fake.patches[0][1], {"sha": "newscaffoldcommitsha", "force": False})
+        # The commit goes on a branch of its own and the pull request is
+        # opened from it -- nothing is written to the default branch, so
+        # a ruleset requiring pull requests cannot block any of this.
+        self.assertEqual(
+            fake.created_refs,
+            [{"ref": "refs/heads/repo-setup/fleet-ci-scaffold-newscaf", "sha": "newscaffoldcommitsha"}],
+        )
+        self.assertEqual(len(fake.created_pulls), 1)
+        self.assertEqual(fake.created_pulls[0]["base"], "main")
+        self.assertEqual(fake.created_pulls[0]["head"], "repo-setup/fleet-ci-scaffold-newscaf")
+        self.assertEqual(fake.created_pulls[0]["title"], "Add missing fleet CI scaffold files")
+        self.assertIn("`.github/workflows/ci.yml`", fake.created_pulls[0]["body"])
+        self.assertEqual(fake.patches, [])
 
     def test_a_symlinked_claude_md_counts_as_present_not_occupied(self):
         # Most of this fleet points CLAUDE.md at AGENTS.md with a symlink,
@@ -5658,14 +5802,14 @@ class BootstrapStepTest(unittest.TestCase):
         self.assertIn("failed on: bootstrap", err)
 
     def test_bootstrap_applies_before_the_ruleset_step(self):
-        # A ruleset requiring pull requests blocks apply_gaps's own direct
-        # ref update for anyone not a configured bypass actor -- which the
-        # ruleset step never configures the caller to be. Applying the
-        # scaffold before this run creates that ruleset is what keeps a
-        # fresh repository's first-ever `repo setup --force` working
-        # (Codex review, mikelward/repo#14).
+        # The one branch the scaffold still lands on directly -- one with
+        # no commits, which has no base for a pull request to target -- is
+        # written before this run's own ruleset takes effect, since a
+        # ruleset requiring pull requests blocks that write for anyone not
+        # a configured bypass actor, which the ruleset step never
+        # configures the caller to be (Codex review, mikelward/repo#14).
         fake = FakeGh()
-        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_ref_missing = True
         fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
         code, out, err = _run(fake, ["--force", REPO])
         self.assertEqual(code, 0, err)
@@ -5673,11 +5817,605 @@ class BootstrapStepTest(unittest.TestCase):
         def first(predicate):
             return next(i for i, c in enumerate(fake.calls) if predicate(c))
 
-        bootstrap_call = first(lambda c: len(c) > 3 and c[3] == f"repos/{REPO}/git/blobs")
+        bootstrap_call = first(
+            lambda c: len(c) > 3 and c[2] == "PUT" and c[3].startswith(f"repos/{REPO}/contents/")
+        )
         ruleset_call = first(
             lambda c: len(c) > 3 and c[2] == "POST" and c[3] == f"repos/{REPO}/rulesets"
         )
         self.assertLess(bootstrap_call, ruleset_call)
+
+    def test_a_scaffold_still_in_a_pull_request_holds_back_new_pr_protection(self):
+        # The gap-fill's own ordering answer, now that it goes in as a
+        # pull request: the files are NOT on the branch when the ruleset
+        # step runs, so a ruleset that would first require pull requests
+        # -- and with them `lanes`, `codex` and `zizmor` -- would block
+        # the very pull request installing those checks. It waits for the
+        # merge instead.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+        code, out, err = _run(fake, ["--force", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(f"{REPO}: opened pull request #42", out)
+        self.assertIn("skipping the ruleset step", err)
+        self.assertIn("still only in pull request #42", err)
+        self.assertIn("Merge it, then rerun.", err)
+        self.assertIn("failed on: ruleset", err)
+        self.assertFalse(
+            any(len(c) > 3 and c[2] == "POST" and c[3] == f"repos/{REPO}/rulesets" for c in fake.calls)
+        )
+
+    def test_a_scaffold_pull_request_does_not_hold_back_an_already_protecting_ruleset(self):
+        # Only a ruleset that would introduce pull-request protection for
+        # the FIRST time waits: where the branch already requires one,
+        # this run changes nothing about the pull request's own odds, so
+        # the ruleset step runs as it always would.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+        fake.existing_ruleset_id = "7"
+        fake.all_ruleset_ids = ["7"]
+        fake.ruleset_objects["7"] = {
+            "id": 7,
+            "name": "main",
+            "enforcement": "active",
+            "conditions": {"ref_name": {"include": list(_HARDENED_SCOPE), "exclude": []}},
+            "rules": [
+                {
+                    "type": "required_status_checks",
+                    "parameters": {
+                        "strict_required_status_checks_policy": True,
+                        # All three already required: the ruleset step adds
+                        # no check here, so nothing about it needs the
+                        # pending scaffold to have landed. (Only linear
+                        # history and force-push blocking are missing, so
+                        # there is still a write to make.)
+                        "required_status_checks": [
+                            {"context": "lanes"},
+                            {"context": "codex"},
+                            {"context": "zizmor"},
+                        ],
+                    },
+                },
+                {
+                    "type": "pull_request",
+                    "parameters": {
+                        "required_review_thread_resolution": True,
+                        "allowed_merge_methods": ["rebase"],
+                        "required_approving_review_count": 0,
+                        "dismiss_stale_reviews_on_push": False,
+                        "require_code_owner_review": False,
+                        "require_last_push_approval": False,
+                    },
+                },
+            ],
+        }
+        code, out, err = _run(fake, ["--force", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"{REPO}: opened pull request #42", out)
+        self.assertNotIn("skipping the ruleset step", err)
+        self.assertEqual(len(fake.puts), 1)  # the ruleset update itself
+
+    def test_a_docs_only_gap_does_not_hold_back_the_ruleset(self):
+        # Every workflow is already on the branch and only AGENTS.md is
+        # missing, so every requested check can already report -- the
+        # scaffold pull request is docs, and holding the ruleset back for
+        # it defers a safe write over a gap that blocks nothing. This is
+        # most of the fleet, since the conventions files joined the
+        # scaffold long after the workflows did (Codex review,
+        # mikelward/repo#42).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set(_SCAFFOLD_PATHS) - {"AGENTS.md", "CLAUDE.md"}
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+        code, out, err = _run(fake, ["--force", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"{REPO}: opened pull request #42", out)
+        self.assertNotIn("skipping the ruleset step", err)
+        ruleset_posts = [(a, b) for a, b in fake.posts if a[3] == f"repos/{REPO}/rulesets"]
+        self.assertEqual(len(ruleset_posts), 1)
+
+    def test_a_docs_only_gap_that_fails_to_open_still_lets_the_ruleset_through(self):
+        # The bootstrap step failed, but what it failed to add was
+        # AGENTS.md -- which publishes no check, so every requested check
+        # is still reachable and the ruleset write has nothing to wait
+        # for. Treating any bootstrap failure as "hold everything" skipped
+        # an unrelated, safe write (Codex review, mikelward/repo#42).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set(_SCAFFOLD_PATHS) - {"AGENTS.md", "CLAUDE.md"}
+        fake.bootstrap_pull_create_fails = True
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+        code, out, err = _run(fake, ["--force", REPO])
+        self.assertEqual(code, 1)  # the bootstrap step did fail
+        self.assertIn("failed on: bootstrap", err)
+        self.assertNotIn("skipping the ruleset step", err)
+        ruleset_posts = [(a, b) for a, b in fake.posts if a[3] == f"repos/{REPO}/rulesets"]
+        self.assertEqual(len(ruleset_posts), 1)
+
+    def test_a_failed_gap_that_would_leave_a_check_unpublished_still_holds_back(self):
+        # The other side: no pull request was opened, so a HEAD-published
+        # check is as unreachable as a base-published one -- `lanes` has
+        # nowhere to run from if ci.yml never landed.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set(_SCAFFOLD_PATHS) - {".github/workflows/ci.yml"}
+        fake.bootstrap_pull_create_fails = True
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+        code, out, err = _run(fake, ["--force", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("skipping the ruleset step", err)
+        self.assertEqual(
+            [(a, b) for a, b in fake.posts if a[3] == f"repos/{REPO}/rulesets"], []
+        )
+
+    def test_a_push_after_a_nonblocking_scaffold_pull_request_blocks_the_ruleset(self):
+        # A docs-only gap lets the ruleset through, which means the run
+        # goes on to require checks on the strength of a gap assessment
+        # made before the pull request was opened. A push landing after
+        # that -- one dropping a publisher, say -- invalidates it, so the
+        # tip is re-verified right before the write even though nothing
+        # was written to the branch (Codex review, mikelward/repo#42).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set(_SCAFFOLD_PATHS) - {"AGENTS.md", "CLAUDE.md"}
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+        # Reads: plan_gaps, open_gap_pull_request's own recheck, then the
+        # pre-write verification -- so the third read is the first to see
+        # the push.
+        fake.bootstrap_ref_sha_after_read = (2, "a-later-concurrent-push-sha")
+        code, out, err = _run(fake, ["--force", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(f"{REPO}: opened pull request #42", out)
+        self.assertIn("changed after the bootstrap step read it (a concurrent push)", err)
+        self.assertIn("failed on: ruleset", err)
+        self.assertEqual(
+            [(a, b) for a, b in fake.posts if a[3] == f"repos/{REPO}/rulesets"], []
+        )
+
+    def test_a_missing_codex_workflow_still_holds_back_the_ruleset(self):
+        # The other side of the same cut: `codex`'s publisher is among
+        # the missing files, and GitHub reads it from the base branch, so
+        # no pull request -- this one included -- can make it report.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set(_SCAFFOLD_PATHS) - {
+            ".github/workflows/codex-review-check.yml"
+        }
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+        code, out, err = _run(fake, ["--force", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("skipping the ruleset step", err)
+        self.assertEqual(
+            [(a, b) for a, b in fake.posts if a[3] == f"repos/{REPO}/rulesets"], []
+        )
+
+    def test_a_check_already_required_that_this_pull_request_cannot_report_is_flagged(self):
+        # The repository is already wedged -- its ruleset requires `codex`
+        # while the workflow that publishes `codex` is missing from the
+        # branch -- so the pull request this opens cannot merge on its own
+        # either. Reported rather than left to be discovered (Codex
+        # review, mikelward/repo#42).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set(_SCAFFOLD_PATHS) - {
+            ".github/workflows/codex-review-check.yml"
+        }
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+        fake.existing_ruleset_id = "7"
+        fake.all_ruleset_ids = ["7"]
+        fake.ruleset_objects["7"] = {
+            "id": 7,
+            "name": "main",
+            "enforcement": "active",
+            "conditions": {"ref_name": {"include": list(_HARDENED_SCOPE), "exclude": []}},
+            "rules": [
+                {
+                    "type": "required_status_checks",
+                    "parameters": {
+                        "strict_required_status_checks_policy": True,
+                        "required_status_checks": [
+                            {"context": "lanes"},
+                            {"context": "codex"},
+                            {"context": "zizmor"},
+                        ],
+                    },
+                },
+                {
+                    "type": "pull_request",
+                    "parameters": {
+                        "required_review_thread_resolution": True,
+                        "allowed_merge_methods": ["rebase"],
+                        "required_approving_review_count": 0,
+                        "dismiss_stale_reviews_on_push": False,
+                        "require_code_owner_review": False,
+                        "require_last_push_approval": False,
+                    },
+                },
+            ],
+        }
+        fake.effective_rules = [
+            {
+                "type": "required_status_checks",
+                "parameters": {
+                    "required_status_checks": [
+                        {"context": "lanes"},
+                        {"context": "codex"},
+                        {"context": "zizmor"},
+                    ]
+                },
+            }
+        ]
+        code, out, err = _run(fake, ["--force", REPO])
+        self.assertIn(f"{REPO}: opened pull request #42", out)
+        self.assertIn("this branch already requires 'codex'", err)
+        self.assertIn("needs someone who can bypass the rule", err)
+
+    def test_the_dry_run_says_the_branch_is_wedged_too(self):
+        # --dry-run returns long before the Apply section, so the read has
+        # to happen at plan time -- otherwise the preview tells someone to
+        # open a scaffold pull request without mentioning that the
+        # branch's own gate makes it unmergeable (Codex review,
+        # mikelward/repo#42).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set(_SCAFFOLD_PATHS) - {
+            ".github/workflows/codex-review-check.yml"
+        }
+        fake.effective_rules = [
+            {
+                "type": "required_status_checks",
+                "parameters": {"required_status_checks": [{"context": "codex"}]},
+            }
+        ]
+        code, out, err = _run(fake, ["--dry-run", "--no-rules", REPO])
+        self.assertIn("HEADS UP:", out)
+        self.assertIn("this branch already requires 'codex'", out)
+        self.assertIn("needs someone who can bypass the rule", out)
+
+    def test_a_check_required_by_another_ruleset_is_flagged_too(self):
+        # Rulesets aggregate, so a check some OTHER (or inherited) ruleset
+        # requires blocks this pull request just as hard -- and reading
+        # only the ruleset this tool manages missed exactly that case
+        # (Codex review, mikelward/repo#42). Here the managed ruleset does
+        # not exist at all, so nothing in `checks_added` would have
+        # revealed it.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set(_SCAFFOLD_PATHS) - {
+            ".github/workflows/codex-review-check.yml"
+        }
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+        fake.effective_rules = [
+            {
+                "type": "required_status_checks",
+                "parameters": {"required_status_checks": [{"context": "codex"}]},
+            }
+        ]
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertIn(f"{REPO}: opened pull request #42", out)
+        self.assertIn("this branch already requires 'codex'", err)
+
+    def test_a_required_check_outside_the_requested_rules_is_flagged_too(self):
+        # `--rule lanes` says what this run would write; it says nothing
+        # about what the branch already enforces. A `codex` requirement
+        # from another ruleset blocks this pull request whether or not
+        # this run mentions `codex` (Codex review, mikelward/repo#42).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set(_SCAFFOLD_PATHS) - {
+            ".github/workflows/codex-review-check.yml"
+        }
+        fake.effective_rules = [
+            {
+                "type": "required_status_checks",
+                "parameters": {"required_status_checks": [{"context": "codex"}]},
+            }
+        ]
+        fake.check_runs = {fake.default_head_sha: ["lanes"]}
+        code, out, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertIn(f"{REPO}: opened pull request #42", out)
+        self.assertIn("this branch already requires 'codex'", err)
+
+    def test_the_wedge_advisory_claims_nothing_about_a_reused_pull_request(self):
+        # `missing` proves the publisher is absent from the BRANCH and
+        # nothing more. A pull request an earlier run left open may not
+        # carry it -- GapPullRequest deliberately holds no evidence either
+        # way -- so the advisory must not say it does, nor that merging it
+        # lifts the wedge (Codex review, mikelward/repo#42).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set(_SCAFFOLD_PATHS) - {
+            ".github/workflows/codex-review-check.yml"
+        }
+        fake.bootstrap_open_pulls = [
+            (
+                11,
+                "repo-setup/fleet-ci-scaffold-abc1234",
+                True,
+                "https://github.com/owner/repo/pull/11",
+            )
+        ]
+        fake.effective_rules = [
+            {
+                "type": "required_status_checks",
+                "parameters": {"required_status_checks": [{"context": "codex"}]},
+            }
+        ]
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertIn("pull request #11 is adding the fleet CI scaffold", out)
+        self.assertIn("this branch already requires 'codex'", err)
+        # The wedge is real either way, and stated about the branch.
+        self.assertIn("missing from 'main'", err)
+        self.assertIn("needs someone who can bypass the rule", err)
+        self.assertNotIn("this pull request adds", err)
+        self.assertNotIn("merging it", err)
+
+    def test_a_head_published_check_the_pull_request_carries_is_not_flagged(self):
+        # `lanes` is published by ci.yml, which GitHub reads from the pull
+        # request's OWN head -- so the pull request adding ci.yml runs it,
+        # `lanes` reports, and the pull request merges on its own. Only
+        # `codex`, read from the base branch, wedges the repository.
+        # Flagging a head-published check sent someone looking for a bypass
+        # actor they don't need (Codex review, mikelward/repo#42).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set(_SCAFFOLD_PATHS) - {".github/workflows/ci.yml"}
+        fake.effective_rules = [
+            {
+                "type": "required_status_checks",
+                "parameters": {"required_status_checks": [{"context": "lanes"}]},
+            }
+        ]
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertIn(f"{REPO}: opened pull request #42", out)
+        self.assertNotIn("already requires", err)
+
+    def test_a_base_published_check_is_still_flagged_beside_a_head_published_one(self):
+        # Both are required and both publishers are missing, so the
+        # narrowing has to name `codex` and stay silent about `lanes`
+        # rather than reporting all or nothing (Codex review,
+        # mikelward/repo#42).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set(_SCAFFOLD_PATHS) - {
+            ".github/workflows/ci.yml",
+            ".github/workflows/codex-review-check.yml",
+        }
+        fake.effective_rules = [
+            {
+                "type": "required_status_checks",
+                "parameters": {
+                    "required_status_checks": [{"context": "lanes"}, {"context": "codex"}]
+                },
+            }
+        ]
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertIn(f"{REPO}: opened pull request #42", out)
+        self.assertIn("this branch already requires 'codex'", err)
+        self.assertNotIn("lanes", err)
+
+    def test_a_check_bound_to_an_app_is_not_attributed_to_the_scaffold(self):
+        # A requirement bound to a specific App names that App as the only
+        # one allowed to report it, and nothing here knows which App the
+        # fleet's own workflow publishes as -- so a same-named context
+        # bound elsewhere says nothing about the scaffold's missing
+        # workflow. Silence beats a wrong claim in an advisory (Codex
+        # review, mikelward/repo#42).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set(_SCAFFOLD_PATHS) - {
+            ".github/workflows/codex-review-check.yml"
+        }
+        fake.effective_rules = [
+            {
+                "type": "required_status_checks",
+                "parameters": {
+                    "required_status_checks": [{"context": "codex", "integration_id": 99}]
+                },
+            }
+        ]
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertIn(f"{REPO}: opened pull request #42", out)
+        self.assertNotIn("already requires", err)
+
+    def test_an_empty_branch_previews_the_added_check_refusal_too(self):
+        # --no-bootstrap on a branch with no commits, whose ruleset already
+        # requires pull requests but not every check: the real run refuses
+        # the check addition (an empty branch has never run a workflow, so
+        # nothing can satisfy it), and the preview has to say the same
+        # rather than reporting the update and exiting 0 (Codex review,
+        # mikelward/repo#42).
+        fake = FakeGh()
+        fake.bootstrap_ref_missing = True
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+        fake.existing_ruleset_id = "7"
+        fake.all_ruleset_ids = ["7"]
+        fake.ruleset_objects["7"] = {
+            "id": 7,
+            "name": "main",
+            "enforcement": "active",
+            "conditions": {"ref_name": {"include": list(_HARDENED_SCOPE), "exclude": []}},
+            "rules": [
+                {
+                    "type": "required_status_checks",
+                    "parameters": {
+                        "strict_required_status_checks_policy": True,
+                        "required_status_checks": [{"context": "lanes"}],
+                    },
+                },
+                {
+                    "type": "pull_request",
+                    "parameters": {
+                        "required_review_thread_resolution": True,
+                        "allowed_merge_methods": ["rebase"],
+                        "required_approving_review_count": 0,
+                        "dismiss_stale_reviews_on_push": False,
+                        "require_code_owner_review": False,
+                        "require_last_push_approval": False,
+                    },
+                },
+            ],
+        }
+        code, out, err = _run(fake, ["--dry-run", "--no-bootstrap", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("SKIPPED", out)
+        self.assertIn("branch has no commits yet", out)
+
+        code, out, err = _run(fake, ["--force", "--no-bootstrap", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("skipping the ruleset step", err)
+        self.assertEqual(fake.puts, [])
+
+    def test_an_unreadable_effective_rules_read_does_not_fail_the_step(self):
+        # The warning is advisory: it says whether the pull request can
+        # merge on its own, and a read that failed only means this run
+        # cannot say.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.effective_rules_read_fails = True
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"{REPO}: opened pull request #42", out)
+        self.assertIn("could not check which checks", err)
+
+    def test_no_run_reads_what_an_open_scaffold_pull_request_contains(self):
+        # The point of the redesign, asserted rather than left implicit:
+        # ten review findings came from deriving an answer out of a pull
+        # request anyone can change at any moment, and the fix was to stop
+        # deriving one (Codex review, mikelward/repo#42). The fixture has
+        # no route for a pull request's file list, so a call would raise --
+        # this checks the calls themselves too, so the guarantee survives
+        # a fixture that grows one back.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = [
+            (27, "repo-setup/fleet-ci-scaffold-abc1234", True, "https://github.com/owner/repo/pull/27")
+        ]
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("pull request #27 is adding the fleet CI scaffold", out)
+        self.assertFalse(
+            [c for c in fake.calls if any("/pulls/" in str(a) for a in c)],
+            "the step read an open pull request's contents",
+        )
+
+    def test_a_gap_containing_a_publisher_holds_back_even_with_a_pull_request_open(self):
+        # The gap contains `ci.yml`, so the BRANCH has no way to report
+        # `lanes` -- and whether the open pull request would supply it is
+        # exactly the question this step stopped asking, because no answer
+        # read out of a pull request stays true (Codex review,
+        # mikelward/repo#42).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set(_SCAFFOLD_PATHS) - {".github/workflows/ci.yml"}
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+        fake.bootstrap_open_pulls = [
+            (20, "repo-setup/fleet-ci-scaffold-abc1234", True, "https://github.com/owner/repo/pull/20")
+        ]
+        code, out, err = _run(fake, ["--force", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("skipping the ruleset step", err)
+        self.assertEqual(
+            [(a, b) for a, b in fake.posts if a[3] == f"repos/{REPO}/rulesets"], []
+        )
+
+    def test_a_ruleset_widened_onto_this_branch_is_held_back_too(self):
+        # A ruleset can newly impose its rules on this branch without
+        # changing a rule at all: it already carries pull_request and all
+        # three checks but targets only refs/heads/release, and the write
+        # widens its scope to cover the default branch. Both the
+        # introduces-protection and the added-check predicates answer
+        # False, so nothing held it back while `codex`'s publisher was
+        # still inside the scaffold pull request (Codex review,
+        # mikelward/repo#42).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+        fake.existing_ruleset_id = "7"
+        fake.all_ruleset_ids = ["7"]
+        fake.ruleset_objects["7"] = {
+            "id": 7,
+            "name": "main",
+            "enforcement": "active",
+            "conditions": {"ref_name": {"include": ["refs/heads/release"], "exclude": []}},
+            "rules": [
+                {
+                    "type": "required_status_checks",
+                    "parameters": {
+                        "strict_required_status_checks_policy": True,
+                        "required_status_checks": [
+                            {"context": "lanes"},
+                            {"context": "codex"},
+                            {"context": "zizmor"},
+                        ],
+                    },
+                },
+                {
+                    "type": "pull_request",
+                    "parameters": {
+                        "required_review_thread_resolution": True,
+                        "allowed_merge_methods": ["rebase"],
+                        "required_approving_review_count": 0,
+                        "dismiss_stale_reviews_on_push": False,
+                        "require_code_owner_review": False,
+                        "require_last_push_approval": False,
+                    },
+                },
+            ],
+        }
+        code, out, err = _run(fake, ["--dry-run", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("SKIPPED: the fleet CI scaffold will not be on the branch", out)
+
+        code, out, err = _run(fake, ["--force", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("newly target", err)
+        self.assertIn("skipping the ruleset step", err)
+        self.assertEqual(fake.puts, [])
+
+    def test_a_scaffold_pull_request_holds_back_a_ruleset_that_adds_a_check(self):
+        # The other half of the same hazard, and the one a first-time-
+        # pull-request-protection test cannot reach: the branch ALREADY
+        # requires pull requests, so introduces_pr_protection is False,
+        # but the ruleset requires only `lanes` and this write would add
+        # `codex` and `zizmor`. `codex` publishes under
+        # `pull_request_target` from the BASE branch's copy, which is
+        # still inside the scaffold pull request -- so nothing could
+        # report it, nothing could merge, the scaffold's own pull request
+        # included, and only an administrator could undo it (Codex review,
+        # mikelward/repo#42).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+        fake.existing_ruleset_id = "7"
+        fake.all_ruleset_ids = ["7"]
+        fake.ruleset_objects["7"] = {
+            "id": 7,
+            "name": "main",
+            "enforcement": "active",
+            "conditions": {"ref_name": {"include": list(_HARDENED_SCOPE), "exclude": []}},
+            "rules": [
+                {
+                    "type": "required_status_checks",
+                    "parameters": {
+                        "strict_required_status_checks_policy": True,
+                        "required_status_checks": [{"context": "lanes"}],
+                    },
+                },
+                {
+                    "type": "pull_request",
+                    "parameters": {
+                        "required_review_thread_resolution": True,
+                        "allowed_merge_methods": ["rebase"],
+                        "required_approving_review_count": 0,
+                        "dismiss_stale_reviews_on_push": False,
+                        "require_code_owner_review": False,
+                        "require_last_push_approval": False,
+                    },
+                },
+            ],
+        }
+        # The dry run previews the same skip and the same exit status.
+        code, out, err = _run(fake, ["--dry-run", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("SKIPPED: the fleet CI scaffold will not be on the branch", out)
+        self.assertIn("would newly require 'codex', 'zizmor'", out)
+
+        code, out, err = _run(fake, ["--force", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(f"{REPO}: opened pull request #42", out)
+        self.assertIn("skipping the ruleset step", err)
+        self.assertIn("newly require 'codex', 'zizmor'", err)
+        self.assertIn("failed on: ruleset", err)
+        self.assertEqual(fake.puts, [])  # the ruleset was never written
 
     def test_a_never_reported_repository_still_gets_bootstrapped_and_only_skips_the_ruleset(self):
         # The exact case this exists for: a fresh (or never-fully-
@@ -5700,10 +6438,10 @@ class BootstrapStepTest(unittest.TestCase):
         self.assertIn("never reported", err)
         self.assertIn("--force", err)
         # Bootstrap's writes actually landed...
-        self.assertIn(f"{REPO}: added", out)
+        self.assertIn(f"{REPO}: opened pull request #42", out)
         blob_posts = [body for _args, body in fake.posts if "encoding" in body]
         self.assertTrue(blob_posts, "no scaffold blobs were written")
-        self.assertEqual(len(fake.patches), 1)
+        self.assertEqual(len(fake.created_pulls), 1)
         # ...but no ruleset was ever created.
         ruleset_posts = [(a, b) for a, b in fake.posts if a[3] == f"repos/{REPO}/rulesets"]
         self.assertEqual(ruleset_posts, [])
@@ -5727,6 +6465,31 @@ class BootstrapStepTest(unittest.TestCase):
         self.assertNotIn(f"{REPO}: added", out)
         self.assertEqual(fake.posts, [])
         self.assertEqual(fake.patches, [])
+
+    def test_a_scope_blocked_scaffold_previews_the_ruleset_skip_too(self):
+        # A missing `workflow` scope leaves the scaffold off the branch
+        # just as surely as a pending pull request does, and the Apply
+        # section skips the ruleset for it -- so the preview has to say so
+        # too, rather than promising a ruleset the real run holds back and
+        # asking to confirm a write that will not happen (Codex review,
+        # mikelward/repo#42).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.token_scopes = ("gist", "read:org", "repo")
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+        code, out, err = _run(fake, ["--dry-run", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("SKIPPED: the fleet CI scaffold will not be on the branch", out)
+
+        # And the real run agrees, without a confirmation: the only
+        # mutation left is one it is about to skip.
+        code, out, err = _run(fake, [REPO])  # no --force, stdin is not a terminal
+        self.assertEqual(code, 1)
+        self.assertNotIn("stdin is not a terminal", err)
+        self.assertIn("skipping the bootstrap step", err)
+        self.assertIn("skipping the ruleset step", err)
+        self.assertEqual(fake.posts, [])
+        self.assertEqual(fake.puts, [])
 
     def test_missing_workflow_scope_message_counts_only_workflow_files(self):
         # Codex review, mikelward/repo#18: the skip message counted
@@ -5752,24 +6515,25 @@ class BootstrapStepTest(unittest.TestCase):
         fake.token_scopes = None
         code, out, err = _run(fake, ["--no-rules", "--force", REPO])
         self.assertEqual(code, 0, err)
-        self.assertIn(f"{REPO}: added", out)
-        self.assertEqual(len(fake.patches), 1)
+        self.assertIn(f"{REPO}: opened pull request #42", out)
+        self.assertEqual(len(fake.created_pulls), 1)
 
     def test_a_concurrent_push_after_bootstrap_blocks_activating_the_ruleset(self):
-        # A concurrent push landing between apply_gaps's own write
-        # finishing and the ruleset step activating protection doesn't
-        # touch the ruleset's own fingerprint, so nothing else here would
-        # notice before locking in protection over a scaffold that may no
-        # longer be complete (Codex review, mikelward/repo#14).
+        # A concurrent push landing between the bootstrap step finishing
+        # and the ruleset step activating protection doesn't touch the
+        # ruleset's own fingerprint, so nothing else here would notice
+        # before locking in protection over a scaffold that may no longer
+        # be complete (Codex review, mikelward/repo#14). The scaffold is
+        # already complete here (the default fixture), which is what
+        # leaves the ruleset step free to run at all: the push lands after
+        # the bootstrap step's own recheck confirmed it.
         fake = FakeGh()
-        fake.bootstrap_existing_paths = set()
         fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
-        fake.bootstrap_ref_sha_after_own_write = "a-later-concurrent-push-sha"
+        fake.bootstrap_ref_sha_after_read = (2, "a-later-concurrent-push-sha")
         code, out, err = _run(fake, ["--force", REPO])
         self.assertEqual(code, 1)
         self.assertIn(
-            "'main' changed after the bootstrap step finished verifying the scaffold "
-            "(a concurrent push)",
+            "'main' changed after the bootstrap step read it (a concurrent push)",
             err,
         )
         self.assertIn("failed on: ruleset", err)
@@ -5788,7 +6552,6 @@ class BootstrapStepTest(unittest.TestCase):
         # fresh answer -- not the preview's -- can still catch the
         # concurrent push (Codex review, mikelward/repo#14).
         fake = FakeGh()
-        fake.bootstrap_existing_paths = set()
         fake.check_runs = {fake.default_head_sha: ["lanes"]}
         fake.existing_ruleset_id = "7"
         fake.all_ruleset_ids = ["7"]
@@ -5823,14 +6586,13 @@ class BootstrapStepTest(unittest.TestCase):
         changed_object = json.loads(json.dumps(base_object))
         changed_object["rules"] = [changed_object["rules"][0]]  # pull_request removed
         fake.ruleset_objects_after_change["7"] = changed_object
-        fake.bootstrap_ref_sha_after_own_write = "a-later-concurrent-push-sha"
+        fake.bootstrap_ref_sha_after_read = (2, "a-later-concurrent-push-sha")
 
         code, out, err = _run(fake, ["--force", "--rule", "lanes", REPO])
         self.assertEqual(code, 1)
         self.assertNotIn("skipping the ruleset step", err)  # no precomputed gate caught this
         self.assertIn(
-            "'main' changed after the bootstrap step finished verifying the scaffold "
-            "(a concurrent push)",
+            "'main' changed after the bootstrap step read it (a concurrent push)",
             err,
         )
         self.assertEqual(fake.puts, [])
@@ -5951,7 +6713,11 @@ class BootstrapStepTest(unittest.TestCase):
             "id": 7,
             "name": "main",
             "enforcement": "active",
-            "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+            # Hardened already, so this write widens no scope: the
+            # early gate must have nothing of its own to fire on,
+            # or it would catch this before the fresh recompute
+            # the test is about.
+            "conditions": {"ref_name": {"include": list(_HARDENED_SCOPE), "exclude": []}},
             "rules": [
                 {
                     "type": "required_status_checks",
@@ -6006,7 +6772,11 @@ class BootstrapStepTest(unittest.TestCase):
             "id": 7,
             "name": "main",
             "enforcement": "active",
-            "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+            # Hardened already, so this write widens no scope: the
+            # early gate must have nothing of its own to fire on,
+            # or it would catch this before the fresh recompute
+            # the test is about.
+            "conditions": {"ref_name": {"include": list(_HARDENED_SCOPE), "exclude": []}},
             "rules": [
                 {
                     "type": "required_status_checks",
@@ -6108,6 +6878,153 @@ class BootstrapStepTest(unittest.TestCase):
         self.assertIn("never reported", out)
         self.assertIn("add .github/workflows/ci.yml", out)  # bootstrap's own plan still shown
         self.assertEqual(fake.posts, [])  # dry run: no writes at all regardless
+
+    def test_a_check_removed_during_the_wait_is_not_silently_re_added(self):
+        # The other half of the window the introduces_pr_protection
+        # refusal already closes. The preview sees all three checks
+        # already required (so nothing is held back) but a write still
+        # needed for the linear-history rule; an administrator then
+        # removes `codex` during the confirmation wait. The fresh
+        # recompute rebuilds the SAME target body -- an entry with no
+        # integration_id reconstructs byte for byte -- so the fingerprint
+        # passes, and without this refusal the write would silently
+        # re-add a check whose workflow is still inside the pending
+        # scaffold pull request (Codex review, mikelward/repo#42).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()  # scaffold pending, so the caller refuses
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+        fake.existing_ruleset_id = "7"
+        fake.all_ruleset_ids = ["7"]
+        base_object = {
+            "id": 7,
+            "name": "main",
+            "enforcement": "active",
+            "conditions": {"ref_name": {"include": list(_HARDENED_SCOPE), "exclude": []}},
+            "rules": [
+                {
+                    "type": "required_status_checks",
+                    "parameters": {
+                        "strict_required_status_checks_policy": True,
+                        "required_status_checks": [
+                            {"context": "lanes"},
+                            {"context": "codex"},
+                            {"context": "zizmor"},
+                        ],
+                    },
+                },
+                {
+                    "type": "pull_request",
+                    "parameters": {
+                        "required_review_thread_resolution": True,
+                        "allowed_merge_methods": ["rebase"],
+                        "required_approving_review_count": 0,
+                        "dismiss_stale_reviews_on_push": False,
+                        "require_code_owner_review": False,
+                        "require_last_push_approval": False,
+                    },
+                },
+            ],
+        }
+        fake.ruleset_objects["7"] = json.loads(json.dumps(base_object))
+        changed = json.loads(json.dumps(base_object))
+        changed["rules"][0]["parameters"]["required_status_checks"] = [
+            {"context": "lanes"},
+            {"context": "zizmor"},
+        ]
+        fake.ruleset_objects_after_change["7"] = changed
+        fake.ruleset_content_change_threshold = 3
+
+        code, out, err = _run(fake, ["--force", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("would now newly require 'codex'", err)
+        self.assertIn("Not writing it", err)
+        self.assertEqual(fake.puts, [])
+
+    def test_a_held_back_ruleset_write_is_not_something_to_confirm(self):
+        # With a scaffold pull request already open there is nothing for
+        # the bootstrap step to write, and the ruleset write is one the
+        # Apply section is already going to skip -- so there is no
+        # question to ask. Before this, a non-interactive run without
+        # --force refused at the stdin check and never reached the step
+        # that reports the open pull request (Codex review,
+        # mikelward/repo#42).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+        fake.bootstrap_open_pulls = [
+            (18, "repo-setup/fleet-ci-scaffold-abc1234", True, "https://github.com/owner/repo/pull/18")
+        ]
+        code, out, err = _run(fake, [REPO])  # no --force, stdin is not a terminal
+        self.assertEqual(code, 1)
+        self.assertNotIn("stdin is not a terminal", err)
+        self.assertIn("pull request #18 is adding the fleet CI scaffold", out)
+        self.assertIn("skipping the ruleset step", err)
+        self.assertEqual(fake.puts, [])
+        self.assertEqual(fake.created_pulls, [])
+
+    def test_dry_run_previews_the_pending_scaffold_ruleset_skip_accurately(self):
+        # Same accuracy requirement again, for the skip the pull-request
+        # write path introduces: with files missing and the checks already
+        # reporting, --dry-run reached neither the Apply section's gate nor
+        # the never-reported one, so it printed the ruleset as creatable
+        # and exited 0 while the equivalent real run
+        # (test_a_scaffold_still_in_a_pull_request_holds_back_new_pr_
+        # protection) skips it and exits 1 (Codex review,
+        # mikelward/repo#42).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+        code, out, err = _run(fake, ["--dry-run", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("SKIPPED: the fleet CI scaffold will not be on the branch", out)
+        self.assertIn("open a pull request adding 9 file(s):", out)  # bootstrap's own plan still shown
+        self.assertEqual(fake.posts, [])  # dry run: no writes at all regardless
+
+    def test_dry_run_does_not_claim_the_skip_where_protection_already_exists(self):
+        # Only a ruleset that would introduce pull-request protection for
+        # the first time waits on the scaffold, so the preview must not
+        # announce a skip the real run wouldn't make either.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+        fake.existing_ruleset_id = "7"
+        fake.all_ruleset_ids = ["7"]
+        fake.ruleset_objects["7"] = {
+            "id": 7,
+            "name": "main",
+            "enforcement": "active",
+            "conditions": {"ref_name": {"include": list(_HARDENED_SCOPE), "exclude": []}},
+            "rules": [
+                {
+                    "type": "required_status_checks",
+                    "parameters": {
+                        "strict_required_status_checks_policy": True,
+                        # All three already required -- this write adds no
+                        # check, so it needs nothing from the pending
+                        # scaffold (the test below is the other half).
+                        "required_status_checks": [
+                            {"context": "lanes"},
+                            {"context": "codex"},
+                            {"context": "zizmor"},
+                        ],
+                    },
+                },
+                {
+                    "type": "pull_request",
+                    "parameters": {
+                        "required_review_thread_resolution": True,
+                        "allowed_merge_methods": ["rebase"],
+                        "required_approving_review_count": 0,
+                        "dismiss_stale_reviews_on_push": False,
+                        "require_code_owner_review": False,
+                        "require_last_push_approval": False,
+                    },
+                },
+            ],
+        }
+        code, out, err = _run(fake, ["--dry-run", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("SKIPPED: the fleet CI scaffold will not be on the branch", out)
 
     def test_no_bootstrap_emptiness_check_failure_fails_closed(self):
         # Can't tell whether the branch has commits or not -- fail closed
@@ -6264,22 +7181,253 @@ class BootstrapStepTest(unittest.TestCase):
         self.assertIn("failed on: bootstrap", err)
         self.assertEqual(fake.posts, [])
 
-    def test_ref_moving_since_the_plan_was_built_is_refused_not_overwritten(self):
+    def test_a_pull_request_that_cannot_be_opened_says_where_the_commit_went(self):
+        # The commit and its branch are already pushed by the time the
+        # pull request itself is attempted, so a failure here leaves
+        # something behind -- said plainly, rather than reported as if
+        # nothing had happened. It also names the flag that gets the rest
+        # of `repo setup` through a repository this step cannot finish on.
         fake = FakeGh()
         fake.bootstrap_existing_paths = set()
-        fake.bootstrap_ref_update_fails = True
+        fake.bootstrap_pull_create_fails = True
         code, out, err = _run(fake, ["--force", "--no-rules", REPO])
         self.assertEqual(code, 1)
-        self.assertIn("could not update main to the scaffold gap-fill's commit", err)
-        self.assertIn("moved since the plan was built, or a ruleset already blocks a direct push", err)
-        # Neither cause is diagnosable from GitHub's own response, so the
-        # error names the way past both -- including the flag that gets
-        # the rest of `repo setup` through a branch this step cannot write
-        # to at all, which its rejection ("Changes must be made through a
-        # pull request") says nothing about.
-        self.assertIn("`--no-bootstrap` skips this step", err)
-        self.assertIn("adding by hand", err)
+        self.assertIn("could not open a pull request adding the scaffold", err)
+        self.assertIn("repo-setup/fleet-ci-scaffold-newscaf", err)
+        self.assertIn("`--no-bootstrap`", err)
         self.assertIn("failed on: bootstrap", err)
+        self.assertEqual(len(fake.created_refs), 1)
+        self.assertEqual(fake.created_pulls, [])
+
+    def test_a_scaffold_pull_request_already_open_is_reported_not_reopened(self):
+        # `repo setup` runs unattended across a fleet, so a step that
+        # cannot see its own earlier pull request opens a second one on
+        # every run. It is reported instead -- the one thing standing
+        # between this repository and a scaffold -- and nothing is written.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = [
+            (11, "repo-setup/fleet-ci-scaffold-abc1234", True, "https://github.com/owner/repo/pull/11")
+        ]
+        code, out, err = _run(fake, ["--dry-run", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("pull request #11 is adding the scaffold", out)
+        self.assertIn("still absent from the default branch: 9 file(s)", out)
+        self.assertNotIn("open a pull request adding", out)
+
+        code, out, err = _run(fake, ["--no-rules", REPO])  # no --force, no terminal
+        self.assertEqual(code, 0, err)
+        self.assertIn("pull request #11 is adding the fleet CI scaffold", out)
+        self.assertIn("merge it, then rerun", out)
+        # Nothing to confirm and nothing to write: not a blob, not a
+        # branch, not a second pull request.
+        self.assertEqual(fake.posts, [])
+        self.assertEqual(fake.created_refs, [])
+        self.assertEqual(fake.created_pulls, [])
+
+    def test_a_scaffold_pull_request_that_closed_during_the_wait_is_not_replaced(self):
+        # Finding one open is what takes the bootstrap write out of the
+        # confirmation, so nobody agreed to opening one. If it closes
+        # before the recheck, opening another would be a write the preview
+        # said would not happen -- on a non-interactive run that refuses
+        # unconfirmed changes for exactly this reason (Codex review,
+        # mikelward/repo#42).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = [
+            (
+                11,
+                "repo-setup/fleet-ci-scaffold-abc1234",
+                True,
+                "https://github.com/owner/repo/pull/11",
+            )
+        ]
+        fake.bootstrap_open_pulls_later = []
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("pull request #11", err)
+        self.assertIn("no longer open", err)
+        self.assertIn("Rerun to plan", err)
+        self.assertIn("failed on: bootstrap", err)
+        # Nothing was written in its place.
+        self.assertEqual(fake.created_refs, [])
+        self.assertEqual(fake.created_pulls, [])
+
+    def test_a_moved_base_is_refused_even_when_a_pull_request_is_being_reused(self):
+        # Reusing an open pull request writes nothing, but it still hands
+        # the caller `plan.missing` -- and every answer built on that (what
+        # is still absent, and so which checks the gap keeps from
+        # reporting) is wrong if the branch has moved since. A branch that
+        # lost a base-published workflow during the wait would otherwise
+        # leave the run concluding the gap blocks nothing (Codex review,
+        # mikelward/repo#42).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = [
+            (19, "repo-setup/fleet-ci-scaffold-abc1234", True, "https://github.com/owner/repo/pull/19")
+        ]
+        fake.bootstrap_ref_sha_after_first_read = "a-branch-that-moved"
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("no longer points at the commit this plan was built from", err)
+        self.assertIn("failed on: bootstrap", err)
+        self.assertEqual(fake.created_pulls, [])
+        self.assertNotIn("already adds the fleet CI scaffold", out)
+
+    def test_one_opened_during_the_confirmation_wait_is_found_before_writing(self):
+        # The plan's answer is a snapshot, and the combined plan waits on
+        # a confirmation for as long as the person takes. The listing is
+        # read again immediately before the write for exactly that reason.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls_later = [
+            (12, "repo-setup/fleet-ci-scaffold-def5678", True, "https://github.com/owner/repo/pull/12")
+        ]
+        with patch("builtins.input", return_value="y"):
+            code, out, err = _run(fake, ["--no-rules", REPO], isatty=True)
+        self.assertEqual(code, 0, err)
+        self.assertIn("open a pull request adding 9 file(s):", err)  # what the plan showed
+        self.assertIn("pull request #12 is adding the fleet CI scaffold", out)
+        self.assertEqual(fake.created_refs, [])
+        self.assertEqual(fake.created_pulls, [])
+
+    def test_a_pull_request_from_a_fork_branch_of_the_same_name_does_not_count(self):
+        # A fork's branch can be named anything at all; one that happens
+        # to carry this prefix is not a pull request this tool opened, and
+        # treating it as one would leave the repository unscaffolded
+        # forever on somebody else's say-so. Asked of GitHub as head and
+        # base sharing a repository id, so a caller that typed the
+        # repository's name in another casing (or a name it has since been
+        # renamed away from) doesn't read every one of its own pull
+        # requests as a fork's.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = [
+            (13, "repo-setup/fleet-ci-scaffold-abc1234", False, "https://example.invalid/13"),
+            (14, "some-unrelated-branch", True, "https://example.invalid/14"),
+        ]
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"{REPO}: opened pull request #42", out)
+        self.assertEqual(len(fake.created_pulls), 1)
+        # Pinned, because the alternative -- comparing the head's
+        # canonical full_name against the name the caller typed -- is
+        # wrong in a way nothing else here would catch: it reads every one
+        # of this tool's own pull requests as a fork's the moment a caller
+        # types the repository in another casing, or under a name GitHub
+        # has since renamed away from.
+        listings = [c for c in fake.calls if any("&base=" in a for a in c)]
+        self.assertTrue(listings, "the open-pull-request listing was never made")
+        self.assertIn(".head.repo.id == .base.repo.id", listings[0][listings[0].index("--jq") + 1])
+
+    def test_an_open_pull_request_is_reported_even_without_the_workflow_scope(self):
+        # The scope only matters for a write. With a scaffold pull request
+        # already open there is no write to make, so failing the step over
+        # a token that could not have made one reports a problem this
+        # repository does not have -- and buries the pull request that is
+        # the actual next step (Codex review, mikelward/repo#42).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.token_scopes = ("gist", "read:org", "repo")
+        fake.bootstrap_open_pulls = [
+            (15, "repo-setup/fleet-ci-scaffold-abc1234", True, "https://github.com/owner/repo/pull/15")
+        ]
+        code, out, err = _run(fake, ["--dry-run", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("pull request #15 is adding the scaffold", out)
+        self.assertNotIn("workflow", err)
+
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("pull request #15 is adding the fleet CI scaffold", out)
+        self.assertEqual(fake.posts, [])
+
+    def test_an_unreadable_pull_request_listing_fails_the_step_closed(self):
+        # "Could not tell" must not read as "there is none": that opens a
+        # second pull request beside one already there.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_pulls_list_fails = True
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("could not list", err)
+        self.assertIn("failed on: bootstrap", err)
+        self.assertEqual(fake.posts, [])
+
+    def test_a_complete_repository_never_lists_its_pull_requests(self):
+        # The listing only ever answers "what would this run open", so a
+        # repository with nothing missing -- every one of them, once a
+        # fleet has converged -- must not pay for it.
+        fake = FakeGh()
+        code, out, err = _run(fake, ["--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertFalse(
+            any("&base=" in c[1] for c in fake.calls if c[0] == "api" and len(c) > 1),
+            [c for c in fake.calls if c[0] == "api"],
+        )
+
+    def test_a_docs_only_gap_carries_the_docs_prefix_its_own_lanes_conf_requires(self):
+        # The lanes gate fails a docs-only diff whose commit subject
+        # carries no docs prefix -- and the scaffold's own lanes.conf is
+        # what puts root markdown on that lane. A pull request adding only
+        # AGENTS.md and CLAUDE.md would fail the very check it installs.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = {
+            ".github/workflows/codex-review.yml",
+            ".github/workflows/codex-review-check.yml",
+            ".github/workflows/codex-review-listener.yml",
+            ".github/workflows/zizmor.yml",
+            ".github/workflows/ci.yml",
+            ".github/zizmor.yml",
+            ".github/lanes.conf",
+        }
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        commit_posts = [body for _args, body in fake.posts if "parents" in body]
+        self.assertEqual(len(commit_posts), 1)
+        self.assertTrue(
+            commit_posts[0]["message"].startswith("docs: Add missing fleet CI scaffold files"),
+            commit_posts[0]["message"],
+        )
+
+    def test_a_mixed_gap_carries_no_prefix(self):
+        # Anything outside the docs lane makes it a code-lane diff, which
+        # the gate does not ask a prefix of.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = {".github/zizmor.yml"}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        commit_posts = [body for _args, body in fake.posts if "parents" in body]
+        self.assertTrue(
+            commit_posts[0]["message"].startswith("Add missing fleet CI scaffold files"),
+            commit_posts[0]["message"],
+        )
+
+    def test_a_gap_branch_that_already_holds_this_exact_commit_is_reused(self):
+        # The branch name carries the commit's own sha, so a ref already
+        # there under that name and pointing at that commit is a rerun
+        # that rebuilt an identical commit -- not somebody else's branch.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_ref_create_fails = True
+        fake.bootstrap_gap_ref_sha = "newscaffoldcommitsha"
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"{REPO}: opened pull request #42", out)
+        self.assertEqual(len(fake.created_pulls), 1)
+
+    def test_a_gap_branch_holding_something_else_is_refused_not_moved(self):
+        # The other side of the same check: this module never overwrites
+        # what is already there, a ref included.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_ref_create_fails = True
+        fake.bootstrap_gap_ref_sha = "somebody-elses-commit"
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("could not create the branch", err)
+        self.assertIn("failed on: bootstrap", err)
+        self.assertEqual(fake.created_pulls, [])
 
     def test_a_branch_reset_backward_is_refused_rather_than_silently_restored(self):
         # force: False alone only guarantees a fast-forward -- an
