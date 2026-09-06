@@ -228,14 +228,16 @@ def audit_duplicate_rulesets(repo, ok, note):
     """Reports a SECOND ruleset carrying the managed name.
 
     GitHub does not make a ruleset's name unique within a repository, so
-    two can be named `main` and both apply. `repo setup` writes the first
-    the repository OWNS and says it is leaving the others alone; nothing
-    fixes it, because what to do when the two disagree is undecided (see
-    TODO.md).
+    two can carry `main`. `repo setup` writes the first the repository
+    OWNS and leaves the others alone.
 
-    [CHECK], therefore, not [FIX] or [GAP]: [FIX] would claim `repo setup`
-    closes it, which it does not, and [GAP] would fail the audit over a
-    state no command here can resolve.
+    [CHECK]: the standard is a floor (see TODO.md), so nothing is missing
+    for a [GAP], and there is nothing for `repo setup` to close for a
+    [FIX].
+
+    The note reports the names and points at the extras, and says it did
+    not read their rules -- this is a name lookup, so a [CHECK] here is
+    not an all-clear on what they carry.
 
     Two lookups, on purpose. With parents included -- an org- or
     enterprise-level ruleset of the same name aggregates with the
@@ -269,6 +271,9 @@ def audit_duplicate_rulesets(repo, ok, note):
     if owned:
         parts.append(f"`repo setup` writes {owned[0]} and leaves the rest alone")
     else:
+        # No prediction of what setup writes instead: with nothing owned
+        # under the managed name it may create one or ADOPT an owned
+        # legacy-named one, which audit_legacy_rulesets reports itself.
         parts.append(
             "`repo setup` writes none of them -- it only ever writes a ruleset the "
             "repository owns"
@@ -276,7 +281,8 @@ def audit_duplicate_rulesets(repo, ok, note):
     note(
         f"more than one ruleset is named '{rules.DEFAULT_RULESET_NAME}': "
         + "; ".join(parts)
-        + ". Rulesets aggregate, so all of them apply. Reconcile them by hand"
+        + ". Worth reading the others to see what they say -- this audit does not read "
+        "their rules"
     )
 
 

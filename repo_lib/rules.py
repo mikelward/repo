@@ -436,10 +436,8 @@ def _lookup_existing_ruleset(repo, ruleset_name):
     """The id of the ruleset this run will write under `ruleset_name`, or
     None. The first of several sharing the name -- which is a real
     possibility, see _lookup_ruleset_ids. The others are reported by
-    find_duplicate_standard_rulesets rather than silently passed over, but
-    they are not adopted, updated or deleted here: what to do when two
-    rulesets under the managed name disagree is its own decision (see
-    TODO.md), and picking one quietly is what this is fixing."""
+    find_duplicate_standard_rulesets and left alone: the standard is a
+    floor (see TODO.md)."""
     ids = _lookup_ruleset_ids(repo, ruleset_name)
     return ids[0] if ids else None
 
@@ -634,17 +632,17 @@ def _still_superseded(repo, ruleset_name, survivor_id, legacy_name, legacy_id):
 def _report_duplicate_standard(repo, ruleset_name, existing, extras):
     """Says so when more than one ruleset carries the managed name.
 
-    Rulesets aggregate, so the others apply too -- and this run writes
-    only the first, so a second one keeps whatever it says, including a
-    stricter rule nobody asked for or a bypass actor nobody sees.
-    Reported, not resolved: silently picking the first was the problem,
-    and deciding what happens when the two disagree is its own change
-    (see TODO.md)."""
+    Reported, not resolved: the standard is a floor (see TODO.md), so an
+    extra is not a half-done repository.
+
+    The message reports the name and points at the extra, claiming
+    nothing about what it does -- this lookup filters by name and never
+    reads enforcement, scope or rules."""
     for rid in extras:
         error(
             f"{repo}: note -- more than one ruleset is named '{ruleset_name}'; this run "
-            f"writes id {existing} and leaves id {rid} alone. Rulesets aggregate, so both "
-            "apply. Check what the other one says, then reconcile them by hand."
+            f"writes id {existing} and leaves id {rid} alone. Worth "
+            f"reading id {rid} to see what it says."
         )
 
 

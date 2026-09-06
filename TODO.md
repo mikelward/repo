@@ -411,24 +411,85 @@
       evaluates the refs the write actually brings into range rather than
       the narrower ones it replaces.
 
-- [ ] **Two rulesets under the STANDARD name are reported, not
-      reconciled.** GitHub does not make a ruleset's name unique within a
-      repository, and `_lookup_existing_ruleset` writes the first id under
-      `main`. That is no longer silent -- `repo setup` says which one it
-      wrote and which it left alone, and `repo audit` counts an inherited
-      org-level ruleset of the same name too (it aggregates the same way;
-      setup asks without parents, since it can only write what the
-      repository owns) and reports a `[CHECK]`
-      (not `[FIX]`: nothing here closes it; not `[GAP]`: it would fail the
-      audit over a state no command can resolve). What is still open is
-      the decision itself: what should happen when the two disagree.
-      Adopting both is not available -- a rename would just produce two
-      rulesets sharing the new name. The candidates are updating every id
-      under the name, or deleting the extras on the same byte-identical
-      test the legacy path uses, and both are writes against a ruleset a
-      human made deliberately.
+- [x] **Two rulesets under the STANDARD name: settled, and the answer is
+      that there was less to do than it looked.** GitHub does not make a
+      ruleset's name unique within a repository, and
+      `_lookup_existing_ruleset` writes the first id under `main`, leaving
+      any others alone. The open question was what should happen when the
+      two disagree.
+
+      Maintainer, 2026-09-06: **the fleet standard is a FLOOR** -- a
+      repository must enforce at least it, and may enforce more. That
+      settles it without a reconcile step, because aggregation only ever
+      ADDS constraints: a second ruleset can make the branch stricter,
+      never looser, and its bypass actors excuse nobody from the rules the
+      managed one carries. So once `repo setup` has written the ruleset the
+      repository owns, the extra cannot lower what the branch enforces --
+      the repository is not half-done, and the extra is something to know
+      about rather than something blocking. `repo setup`'s note and `repo
+      audit`'s `[CHECK]` now say that, instead of sending the reader off
+      to reconcile something that is not broken.
+
+      Both notes report what was found and point at it, and claim
+      nothing about what the extras DO. Seven review rounds went into
+      arriving there, each finding one more claim the check could not
+      support: it is a lookup by NAME, and it never reads enforcement,
+      scope or rules. So it cannot say the branch is at or above the
+      standard (a ruleset excluding the default branch protects nothing
+      on it), nor that the extras apply at all (a disabled or
+      evaluate-mode one does not), nor what `repo setup` will write
+      instead on the inherited-only path (it may create one or ADOPT an
+      owned legacy-named one). Each of those has reporting elsewhere that
+      did the read: `_report_excluded_hardened`,
+      `_find_merge_method_conflicts`, `audit_legacy_rulesets`, and `repo
+      audit`'s own effective-rules checks. Neither claims the branch is therefore at or above the
+      standard: that is a question about coverage, and a ruleset
+      excluding the default branch protects nothing on it whatever its
+      rules hold -- `_report_excluded_hardened` would contradict the
+      claim in the same run. Coverage is reported where it can be
+      grounded: that function in `repo setup`, and `repo audit`'s
+      covering-main checks read from the effective-rules API.
+
+      One way an extra can genuinely break the branch is scanned for:
+      `_find_merge_method_conflicts` catches `allowed_merge_methods`
+      intersecting down to nothing mergeable, across inherited rulesets
+      too. It is the failure mode currently scanned, not the only one --
+      it reads `pull_request.allowed_merge_methods` and nothing else, so
+      an extra carrying an unmanaged rule (`lock_branch`, a required
+      deployment or workflow that cannot complete) can leave the branch
+      just as unmergeable and go unreported (Codex review,
+      mikelward/repo#44).
+
+      **Deleting an extra once it adds nothing beyond the standard is
+      deliberately NOT done.** It reads as the tidy finish, and it needs
+      exactly the comparison this module already retreated from: "is A at
+      least as strict as B", per field, which was reimplemented five times
+      and was one field short every time (see `_comparable_ruleset`). The
+      legacy path can use equality because equality cannot be incomplete;
+      a subset test cannot, and here a false "adds nothing" deletes a
+      ruleset that was holding the branch up. Tidiness is not worth that
+      failure mode. If it is ever revisited, the safe slice is an extra
+      whose *scope* provably excludes the default branch -- no strictness
+      comparison needed at all.
 
 ## repo cleanup
+
+- [ ] **`repo audit` cannot see an unmergeable branch.**
+      `allowed_merge_methods` INTERSECTS across rulesets, so two active
+      ones covering `main` -- one allowing only rebase, another only
+      squash -- leave nothing mergeable at all. `repo setup` detects
+      exactly that in `_find_merge_method_conflicts`, across inherited
+      rulesets too, but `repo audit` never inspects the field, so a
+      fleet sweep exits 0 over a branch nothing can merge into. Surfaced
+      against the duplicate-ruleset note, which is why that note says
+      outright that this audit does not read the extras' rules, rather
+      than reading as an all-clear (Codex review, mikelward/repo#44). Closing it means
+      reading every ruleset body rather than just names and ids -- the
+      audit's duplicate check is a name lookup today -- so it has a real
+      per-repository read cost and wants its own change. `_find_merge_
+      method_conflicts` is the logic; the work is calling it from a
+      read-only path and deciding the severity ([GAP]: nothing can merge,
+      and `repo setup` will not delete a ruleset to fix it).
 
 - [ ] **Patch-equivalence is invisible to `repo cleanup`, so those branches
       are reported as unmerged forever.** A branch whose *content* landed

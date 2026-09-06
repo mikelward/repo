@@ -1984,11 +1984,13 @@ class SetupCmdTest(unittest.TestCase):
         }
 
     def test_a_second_ruleset_under_the_managed_name_is_reported(self):
-        # GitHub does not make the name unique, so this run writes the
-        # first and the other keeps applying -- including whatever
-        # stricter rule or bypass actor it carries. Reported rather than
-        # resolved: deciding between two rulesets that disagree is its own
-        # change (see TODO.md), and picking one silently is the problem.
+        # GitHub does not make the name unique, so this run writes one
+        # and leaves the other. Reported, not resolved: the standard is a
+        # FLOOR (maintainer, 2026-09-06), so an extra is not a half-done
+        # repository and there is nothing to reconcile. The note reports
+        # what the name lookup found and points at it -- enforcement,
+        # scope and rules were never read, so it claims nothing about
+        # what the extra does (Codex review, mikelward/repo#44).
         fake = FakeGh()
         self._ruleset_with_scope(fake, list(_HARDENED_SCOPE))
         fake.legacy_ruleset_ids = []
@@ -1999,7 +2001,14 @@ class SetupCmdTest(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertIn("more than one ruleset is named 'main'", err)
         self.assertIn("writes id 7 and leaves id 8 alone", err)
+        self.assertIn("Worth reading id 8 to see what it says", err)
+        self.assertNotIn("aggregate", err)
+        self.assertNotIn("held to at least", err)
+        self.assertNotIn("reconcile", err.lower())
         self.assertEqual(fake.puts, [])
+        # Never deleted: proving an extra adds nothing needs the per-field
+        # strictness comparison _comparable_ruleset exists to avoid, and
+        # getting it wrong deletes a ruleset holding the branch up.
         self.assertEqual(fake.deleted_rulesets, [])
 
     def test_a_duplicate_appearing_before_the_write_is_reported_even_when_quiet(self):
