@@ -1139,6 +1139,30 @@ class DuplicateRulesetAuditTest(unittest.TestCase):
         code, out, err = _run(fake, [REPO])
         self.assertEqual(code, 0, err)
         self.assertIn("[CHECK] more than one ruleset is named 'main'", out)
+        # [CHECK], and the audit still passes: under the floor model the
+        # extra cannot lower what the branch enforces, so nothing is
+        # missing to fail over (maintainer, 2026-09-06).
+        # Names the id the others are measured against, not "the managed
+        # one": with an inherited ruleset in the list too, the reader has
+        # to be able to tell which (Codex review, mikelward/repo#44).
+        # A name lookup establishes that the rulesets EXIST, nothing
+        # about what they do: enforcement, scope and rules were never
+        # read, so "they all apply" is not available to claim (Codex
+        # review, mikelward/repo#44).
+        self.assertIn("Worth reading the others to see what they say", out)
+        # And says what it did not do, so a [CHECK] is not read as an
+        # all-clear on what the extras carry (Codex review,
+        # mikelward/repo#44).
+        self.assertIn("this audit does not read their rules", out)
+        self.assertNotIn("aggregate", out)
+        self.assertNotIn("held to at least", out)
+        # Direction only. Whether the branch is at or above the standard
+        # is a coverage question the checks above answer from the
+        # effective rules; asserting it from a name lookup would
+        # contradict them for a ruleset that excludes main (Codex review,
+        # mikelward/repo#44).
+        self.assertNotIn("held to at least", out)
+        self.assertNotIn("Reconcile them by hand", out)
         self.assertIn("ids 1, 77", out)
         self.assertIn("inherited from the organization and not changeable here: 77", out)
         self.assertIn("`repo setup` writes 1", out)
@@ -1171,13 +1195,64 @@ class DuplicateRulesetAuditTest(unittest.TestCase):
         code, out, err = _run(fake, [REPO])
         self.assertEqual(code, 0, err)
         self.assertIn("`repo setup` writes none of them", out)
+        # The note says setup writes none of THESE and stops there. It
+        # must not predict what setup writes instead: that depends on
+        # state this lookup never asked about, and two attempts at it
+        # were each wrong on a path they had not accounted for (Codex
+        # review, mikelward/repo#44).
+        note = out.split("[CHECK] more than one ruleset")[1].split("\n")[0]
+        self.assertNotIn("cannot", note)
+        self.assertNotIn("held to at least", note)
+        self.assertNotIn("beside them", note)
+        self.assertNotIn("aggregate", note)
+
+    def test_an_owned_legacy_ruleset_beside_inherited_ones_is_not_mispredicted(self):
+        # Every 'main' is inherited AND the repository owns a legacy-named
+        # ruleset: _resolve_ruleset falls through to the legacy lookup and
+        # ADOPTS that one, so a note claiming setup adds a new ruleset
+        # would be wrong -- and audit_legacy_rulesets says what really
+        # happens a few lines later (Codex review, mikelward/repo#44).
+        fake = FakeGh()
+        fake.ruleset_ids = ["3", "4", "9"]
+        for rid in ("3", "4"):
+            fake.ruleset_objects[rid] = _covering_ruleset(name="main")
+            fake.ruleset_objects[rid]["id"] = int(rid)
+        fake.ruleset_objects["9"] = _covering_ruleset(name="merge gates")
+        fake.ruleset_objects["9"]["id"] = 9
+        fake.repo_owned_ruleset_ids = ["9"]
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("`repo setup` writes none of them", out)
+        note = out.split("[CHECK] more than one ruleset")[1].split("\n")[0]
+        self.assertNotIn("adds a repository-owned", note)
+        # The adoption is reported, by the check whose job that is.
+        self.assertIn("`repo setup` adopts it", out)
+
+    def test_an_inactive_duplicate_is_not_claimed_to_apply(self):
+        # A disabled ruleset enforces nothing, and this check is a name
+        # lookup that never read enforcement -- so the note must report
+        # what it found and point at it, not assert that both apply
+        # (Codex review, mikelward/repo#44).
+        fake = FakeGh()
+        fake.ruleset_ids = ["1", "2"]
+        fake.ruleset_objects["1"] = _covering_ruleset(name="main")
+        fake.ruleset_objects["1"]["id"] = 1
+        fake.ruleset_objects["2"] = _covering_ruleset(name="main")
+        fake.ruleset_objects["2"]["id"] = 2
+        fake.ruleset_objects["2"]["enforcement"] = "disabled"
+        fake.repo_owned_ruleset_ids = ["1", "2"]
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        note = out.split("[CHECK] more than one ruleset")[1].split("\n")[0]
+        self.assertIn("Worth reading the others to see what they say", note)
+        self.assertNotIn("apply", note)
+        self.assertNotIn("aggregate", note)
 
     def test_a_second_one_under_the_same_name_is_a_check_not_a_gap(self):
-        # Nothing here resolves it -- `repo setup` writes the first and
-        # says it is leaving the other alone, because what to do when the
-        # two disagree is undecided. So it neither passes nor fails the
-        # audit: a [FIX] would claim setup closes it, and a [GAP] would
-        # fail every repository over a state no command can fix.
+        # Neither passes nor fails the audit. The standard is a FLOOR
+        # (maintainer, 2026-09-06), so an extra cannot lower what the
+        # branch enforces: a [GAP] would fail over nothing missing, and a
+        # [FIX] would claim `repo setup` closes it, which it does not.
         fake = FakeGh()
         fake.ruleset_ids = ["1", "2"]
         for rid in ("1", "2"):
