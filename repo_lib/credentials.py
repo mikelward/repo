@@ -285,7 +285,7 @@ def workflow_entries(repo, ref=None):
             "api",
             f"repos/{repo}/contents/.github/workflows{_ref_suffix(ref)}",
             "--jq",
-            '.[] | "\\(.name) \\(.sha)"',
+            r'.[] | "\(.name) \(.sha)"',
         ]
     )
     if succeeded:
@@ -1278,7 +1278,7 @@ def _branch_policy_patterns(repo, listed):
                 "--paginate",
                 f"repos/{repo}/environments/{listed}/deployment-branch-policies",
                 "--jq",
-                '.branch_policies[] | "\(.type // "branch") \(.name)"',
+                r'.branch_policies[] | "\(.type // "branch") \(.name)"',
             ]
         ).splitlines()
     except gh.GhError as e:
