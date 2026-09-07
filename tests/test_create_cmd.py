@@ -357,6 +357,14 @@ class ScaffoldFlagTest(unittest.TestCase):
     incidentally (FakeGh's scaffold steps all succeed by default) -- these
     cover the scaffold's own content and its failure modes specifically."""
 
+    def test_scaffolded_ci_workflow_name_is_lowercase(self):
+        # The generated ci.yml pins the fleet's lowercase `name: ci`; the
+        # other scaffold tests check only paths and counts, so without this a
+        # regression back to `name: CI` would ship unnoticed.
+        rendered = scaffold._CI_YML.format(default_branch=json.dumps("main"))
+        self.assertIn("name: ci\n", rendered)
+        self.assertNotIn("name: CI", rendered)
+
     def test_scaffold_pushes_every_file_across_the_bootstrap_and_real_commit(self):
         fake = FakeGh(self_login="mikelward")
         status, out, err = run_repo_create(fake, ["--private", "mikelward/newthing"])
