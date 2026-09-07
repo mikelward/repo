@@ -43,7 +43,7 @@ one that has stopped biting.
   without a parser. The maintainer chose the parser (2026-09-05). It is
   declared in `pyproject.toml`, so `uv run ./repo ...` installs it on its
   own; `./repo` checks for it first and names the install otherwise, and
-  `test.yml` installs it before `make test`. Anything else is still a
+  `ci.yml` installs it before `make test`. Anything else is still a
   conversation about the tradeoff, not a quiet `pip install`.
 - `argparse` for option parsing (handles `--flag value` and `--flag=value`
   both, for free). `subprocess` for shelling out to `gh`. Prefer real data
