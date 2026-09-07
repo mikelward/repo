@@ -544,89 +544,89 @@ def _comparable_ruleset(body):
 
 
 def _plan_legacy_deletion(repo, ruleset_name, existing, adopted_legacy, target_body):
-    """(deletable, blocked): the legacy-named rulesets this run may delete
-    outright, and the ones it must leave with the reason why.
+    """(deletable, differing): every legacy-named ruleset this run will
+    delete once the standard one is written, and which of them hold
+    something the standard one will not.
 
-    A legacy ruleset is deletable exactly when its content is identical to
-    what the standard ruleset will hold once this run has written it (see
-    _comparable_ruleset) -- so deleting it removes nothing the surviving
-    one does not already say. Compared against the TARGET body rather than
-    the standard ruleset's current state because the two land in the same
-    run: what has to still be true afterwards is the end state.
+    A legacy name is this tool's own former name for the standard ruleset
+    (LEGACY_RULESET_NAMES). Converging on one ruleset is the whole point
+    of the rename, so all of them go -- not only the ones that came out
+    byte-identical (maintainer, 2026-09-07).
+
+    Identity used to be the gate, because "is A at least as strict as B"
+    was reimplemented per field five times over and each round of review
+    found a field the last one missed (see TODO.md), and a false "adds
+    nothing" deletes a ruleset that was holding the branch up. What made
+    that unrecoverable was that GitHub hands back no copy of a deleted
+    ruleset. It does now: the body is recorded before the delete (see
+    apply_ruleset's `record`), so restoring one is a POST of the JSON in
+    the log. With the cost recoverable, the subset question stops being
+    load-bearing -- and no comparison this module can get wrong decides
+    anything.
+
+    `differing` is only for what the plan SAYS. Getting it incomplete
+    costs a vaguer warning, never a wrong deletion, so the whole-object
+    equality test is fine here where it was not fine as a gate.
 
     Nothing is planned when this run is itself adopting a legacy ruleset
     (it is becoming the standard one, not being superseded by it) or when
-    there is no standard ruleset yet.
-
-    The merge-method conflict scan needs no "skip the one that is about to
-    go": a deletable ruleset is identical to the target, and the target
-    always allows rebase, so a ruleset this plans to delete can never be
-    one the scan flags."""
+    there is no standard ruleset yet."""
     if adopted_legacy or not existing or not target_body:
         return [], []
     wanted = _comparable_ruleset(target_body)
-    deletable, blocked = [], []
+    deletable, differing = [], []
     for legacy_name, legacy_id in find_legacy_rulesets(repo, ruleset_name):
         try:
             raw = gh.run(["api", f"repos/{repo}/rulesets/{legacy_id}"])
         except gh.GhError as e:
             error_lines(
                 f"could not read ruleset '{legacy_name}' (id {legacy_id}) on {repo} to "
-                "tell whether it is superseded. Refusing to guess in either direction: "
-                "deleting one that still carries something is how protection is lost, "
-                "and leaving it silently is how a duplicate goes unnoticed.",
+                "tell what it holds. Refusing to delete a ruleset this run could not "
+                "read: the recorded body is what makes the deletion reversible, and "
+                "there would be nothing to record.",
                 e.stderr,
             )
             raise RulesetError()
-        if _comparable_ruleset(json.loads(raw)) == wanted:
-            deletable.append((legacy_name, legacy_id))
-        else:
-            blocked.append((legacy_name, legacy_id))
-    return deletable, blocked
+        deletable.append((legacy_name, legacy_id))
+        if _comparable_ruleset(json.loads(raw)) != wanted:
+            differing.append((legacy_name, legacy_id))
+    return deletable, differing
 
 
-def _still_superseded(repo, ruleset_name, survivor_id, legacy_name, legacy_id):
-    """Whether deleting `legacy_id` is STILL safe, asked immediately
-    before the delete rather than from the plan's own snapshot.
+def _still_deletable(repo, ruleset_name, survivor_id, legacy_name, legacy_id):
+    """The legacy ruleset's body if deleting it is STILL safe, else None --
+    asked immediately before the delete rather than from the plan's own
+    snapshot, and returning the body so the caller records exactly what it
+    is about to remove rather than a copy read a round trip earlier.
 
-    Two things the earlier answer cannot cover. An administrator editing
-    the duplicate between the plan and the delete -- a window that spans
-    the survivor's own write, so it is a network round trip wide, not an
-    instant (Codex review, mikelward/repo#31) -- would otherwise have it
-    deleted on a reading that no longer holds. And the plan compares
-    against the body this run MEANT to write, where what matters is the
-    body GitHub actually stored: a field it normalized or defaulted on the
-    way in would make the survivor differ from the target, and the
-    duplicate is only redundant against what is really there.
+    What the fresh read has to establish is no longer "is it identical",
+    which stopped deciding anything (see _plan_legacy_deletion). It is
+    that the two rulesets are still the two this run reasoned about. An
+    administrator renaming the duplicate to `ruleset_name` -- and the
+    survivor away from it -- inside this window, which spans the
+    survivor's own write and so is a network round trip wide rather than
+    an instant, would otherwise have the newly canonical ruleset deleted
+    and the repository left with nothing under that name at all (Codex
+    review, mikelward/repo#31). Names are the whole check now, and they
+    have to be read rather than assumed for exactly that reason.
 
-    So both sides are re-read and compared as they now are. A failed read
-    is not "unchanged": it returns False, and the caller reports the
-    duplicate as kept rather than deleting on an answer it could not
-    get.
-
-    Their NAMES are checked separately, because _comparable_ruleset
-    deliberately drops the name -- that is what lets a duplicate be
-    recognized as identical to a survivor called something else. Content
-    equality therefore says nothing about which of the two is the standard
-    ruleset, so a rename landing in this window would otherwise go
-    unnoticed: an administrator renaming the duplicate to `ruleset_name`
-    (and the survivor away from it) would have the newly canonical one
-    deleted and the repository left with no ruleset under that name at all
-    (Codex review, mikelward/repo#31)."""
+    A failed read is not "unchanged": it returns None, and the caller
+    reports the duplicate as kept rather than deleting on an answer it
+    could not get -- and with nothing to record, which is the same
+    objection _plan_legacy_deletion makes about an unreadable ruleset."""
     try:
         survivor = json.loads(gh.run(["api", f"repos/{repo}/rulesets/{survivor_id}"]))
         candidate = json.loads(gh.run(["api", f"repos/{repo}/rulesets/{legacy_id}"]))
     except gh.GhError as e:
         error_lines(
             f"could not re-read '{ruleset_name}' (id {survivor_id}) and '{legacy_name}' "
-            f"(id {legacy_id}) on {repo} to confirm the duplicate is still redundant. "
-            "Not deleting it.",
+            f"(id {legacy_id}) on {repo} to confirm which is which. Not deleting it.",
             e.stderr,
         )
-        return False
+        return None
     if survivor.get("name") != ruleset_name or candidate.get("name") != legacy_name:
-        return False
-    return _comparable_ruleset(candidate) == _comparable_ruleset(survivor)
+        return None
+    return candidate
 
 
 def _report_duplicate_standard(repo, ruleset_name, existing, extras):
@@ -646,19 +646,64 @@ def _report_duplicate_standard(repo, ruleset_name, existing, extras):
         )
 
 
-def _report_blocked_legacy(repo, ruleset_name, blocked):
-    """Says so for each legacy-named ruleset left in place. Rulesets
-    aggregate, so one sitting beside the standard one is not broken --
-    only redundant, or carrying something the standard one does not, which
-    is exactly what a human has to look at."""
-    for legacy_name, legacy_id in blocked:
-        message = (
-            f"{repo}: note -- '{legacy_name}' (id {legacy_id}) is still there beside "
-            f"'{ruleset_name}' and is not identical to it, so this did not delete it. "
-            "Rulesets aggregate, so both apply; check what it carries that the other "
-            "does not, then delete it by hand."
+def _record_deleted_ruleset(record, repo, legacy_name, legacy_id, body):
+    """Write the ruleset about to be deleted where it can be read back.
+
+    `record` is the caller's log writer (setup_cmd's `_Log.write`), which
+    keeps this out of the terminal: it is a wall of JSON, and #45's whole
+    point was that the terminal says what changed while the file holds the
+    record. With no log -- `--no-log`, or a caller that passes nothing --
+    it goes to stdout instead, because the operator opted out of the file,
+    not out of being able to undo this.
+
+    Raises OSError if it cannot be written, which the caller turns into
+    "not deleting it": an unrecorded delete is the unrecoverable one.
+
+    The GitHub-generated fields go (_VOLATILE_FIELDS -- id, node_id,
+    source, the timestamps, _links), because what is recorded has to be
+    what a POST accepts: the same read-only fields the update path already
+    strips before a PUT would have this rejected, so a record advertised
+    as restorable would not have restored anything (Codex review,
+    mikelward/repo#46). The name stays, unlike in _comparable_ruleset --
+    that drops it to compare two rulesets, where this is recreating one."""
+    payload = json.dumps(
+        {k: v for k, v in body.items() if k not in _VOLATILE_FIELDS},
+        indent=2,
+        sort_keys=True,
+    )
+    text = (
+        f"--- deleting ruleset '{legacy_name}' (id {legacy_id}) on {repo}; "
+        f"POST this back to repos/{repo}/rulesets to restore it ---\n{payload}\n"
+    )
+    if record is None:
+        # Same durability as the log's own write_now: print() can return
+        # with the bytes still in Python's buffer, and a full disk or a
+        # broken pipe would then surface after the ruleset is already gone
+        # (Codex review, mikelward/repo#46). Any failure propagates as the
+        # OSError the caller turns into "not deleting it".
+        print(text, end="")
+        sys.stdout.flush()
+    else:
+        record(text)
+
+
+def _report_differing_legacy(repo, ruleset_name, differing):
+    """Says so for each legacy-named ruleset that is about to be deleted
+    while holding something the standard one will not.
+
+    Deleting it is still right -- converging on one ruleset is the point,
+    and rulesets aggregate, so leaving it means both apply forever. But
+    "identical" and "merely superseded" are different facts about what the
+    repository loses, and the operator is owed the difference. The body is
+    recorded before the delete, so this points at that rather than asking
+    anyone to have memorized it."""
+    for legacy_name, legacy_id in differing:
+        error(
+            f"{repo}: note -- '{legacy_name}' (id {legacy_id}) is NOT identical to "
+            f"'{ruleset_name}'; deleting it drops whatever it held that the other does "
+            "not. Its full body is recorded first, so it can be restored by POSTing "
+            f"that JSON back to repos/{repo}/rulesets."
         )
-        error(message)
 
 
 def _check_ruleset_ownership(repo, ruleset_id, ruleset_name):
@@ -1293,6 +1338,7 @@ def _describe_plan(
     checks_removed=(),
     newly_enforced=None,
     full=False,
+    differing=(),
 ):
     lines = []
     if existing_id and not needs_write:
@@ -1368,10 +1414,16 @@ def _describe_plan(
     note = _bypass_actor_note(bypass_actors)
     if note:
         lines.append(note)
+    differing_ids = {legacy_id for _n, legacy_id in differing}
     for legacy_name, legacy_id in deletions:
         lines.append(
             f"  would delete the superseded ruleset '{legacy_name}' (id {legacy_id}) -- "
-            f"identical to what '{ruleset_name}' will hold"
+            + (
+                f"NOT identical to what '{ruleset_name}' will hold; its full body is "
+                "recorded first"
+                if legacy_id in differing_ids
+                else f"identical to what '{ruleset_name}' will hold"
+            )
         )
     return lines
 
@@ -1415,6 +1467,7 @@ def apply_ruleset(
     refuse_if_widens_scope=False,
     verify_scaffold_before_requiring_checks=None,
     quiet=False,
+    record=None,
 ):
     """Runs the whole repo-rules port against `repo`. Returns 0 on success
     (including "nothing to change" and a clean --dry-run), 1 if any step
@@ -1479,6 +1532,11 @@ def apply_ruleset(
     is set instead, and the others left absent, when this refuses over the
     never-reported-check guard without force -- the one refusal reason that
     isn't a real problem with the request, only something to wait out.
+
+    record: where the body of a ruleset this deletes is written before it
+    goes, so the deletion can be undone (see _record_deleted_ruleset). A
+    callable taking one string -- setup_cmd hands it the run's log writer.
+    None sends it to stdout instead.
 
     skip_confirm: True skips this function's own interactive _confirm()
     unconditionally, independent of `force`. The two are different
@@ -1624,7 +1682,7 @@ def apply_ruleset(
         return 1
 
     try:
-        deletions, blocked = _plan_legacy_deletion(
+        deletions, differing = _plan_legacy_deletion(
             repo, ruleset_name, existing, adopted_legacy, target_body
         )
     except RulesetError:
@@ -1658,7 +1716,6 @@ def apply_ruleset(
         if not quiet:
             print(f"{repo}: ruleset '{ruleset_name}' (id {existing}) {NO_OP_MESSAGE}")
             _report_excluded_hardened(repo, ruleset_name, target_body, default_branch)
-            _report_blocked_legacy(repo, ruleset_name, blocked)
             if note:
                 print(note)
         return 0
@@ -1678,6 +1735,7 @@ def apply_ruleset(
         checks_added,
         checks_removed,
         newly_enforced,
+        differing=differing,
     )
     if report is not None:
         # The same plan rendered in full, for a caller that shows the
@@ -1702,6 +1760,7 @@ def apply_ruleset(
             checks_removed,
             newly_enforced,
             full=True,
+            differing=differing,
         )
 
     if dry_run:
@@ -1709,7 +1768,7 @@ def apply_ruleset(
             print(line)
         _report_excluded_hardened(repo, ruleset_name, target_body, default_branch)
         _report_duplicate_standard(repo, ruleset_name, existing, duplicates)
-        _report_blocked_legacy(repo, ruleset_name, blocked)
+        _report_differing_legacy(repo, ruleset_name, differing)
         return 0
 
     if not (force or skip_confirm) and not _confirm(repo, ruleset_name, plan_lines):
@@ -1789,7 +1848,7 @@ def apply_ruleset(
             return 1
 
     try:
-        fresh_deletions, fresh_blocked = _plan_legacy_deletion(
+        fresh_deletions, fresh_differing = _plan_legacy_deletion(
             repo, ruleset_name, fresh_existing, fresh_adopted_legacy, fresh_target_body
         )
     except RulesetError:
@@ -1864,12 +1923,38 @@ def apply_ruleset(
 
     delete_failed = False
     for legacy_name, legacy_id in fresh_deletions:
-        if not _still_superseded(repo, ruleset_name, fresh_existing, legacy_name, legacy_id):
+        body = _still_deletable(repo, ruleset_name, fresh_existing, legacy_name, legacy_id)
+        if body is None:
             error(
-                f"{repo}: not deleting '{legacy_name}' (id {legacy_id}) -- it is no longer "
-                f"identical to '{ruleset_name}' (id {fresh_existing}), or one of the two has "
-                "been renamed since this run planned the deletion. Nothing is unprotected; "
+                f"{repo}: not deleting '{legacy_name}' (id {legacy_id}) -- it or "
+                f"'{ruleset_name}' (id {fresh_existing}) has been renamed since this run "
+                "planned the deletion, or could not be re-read. Nothing is unprotected; "
                 "rerun to re-check."
+            )
+            delete_failed = True
+            continue
+        # The body goes down BEFORE the DELETE, and a failure to record it
+        # cancels the delete. GitHub hands back no copy of a deleted
+        # ruleset, so this record is the only thing that makes the
+        # deletion reversible -- and deleting without it would be exactly
+        # the unrecoverable loss that kept this to identical rulesets
+        # until now (see _plan_legacy_deletion).
+        if _comparable_ruleset(body) != _comparable_ruleset(fresh_target_body):
+            # From the body about to go, not the plan's `differing`: an
+            # administrator adding a rule to an until-then identical
+            # duplicate after the preview would otherwise have it deleted
+            # under a plan that called it identical, and the quiet apply
+            # path suppresses the plan's own note anyway (Codex review,
+            # mikelward/repo#46). Not gated on quiet, for the same reason
+            # _report_duplicate_standard is not: this reads state the
+            # preview could not have seen.
+            _report_differing_legacy(repo, ruleset_name, [(legacy_name, legacy_id)])
+        try:
+            _record_deleted_ruleset(record, repo, legacy_name, legacy_id, body)
+        except OSError as e:
+            error(
+                f"{repo}: not deleting '{legacy_name}' (id {legacy_id}) -- its body could "
+                f"not be recorded ({e}), and deleting it unrecorded is not reversible."
             )
             delete_failed = True
             continue
@@ -1878,16 +1963,17 @@ def apply_ruleset(
         except gh.GhError as e:
             error_lines(
                 f"could not delete the superseded ruleset '{legacy_name}' (id {legacy_id}) "
-                f"on {repo}. It is identical to '{ruleset_name}', so nothing is unprotected "
-                "-- but the duplicate is still there. Delete it by hand, or rerun.",
+                f"on {repo}. '{ruleset_name}' is in place, so the branch is protected -- but "
+                "the duplicate is still there and still applies. Delete it by hand, or rerun.",
                 e.stderr,
             )
             delete_failed = True
             continue
         print(
             f"{repo}: deleted the superseded ruleset '{legacy_name}' (id {legacy_id}) -- "
-            f"it was identical to '{ruleset_name}'"
+            f"'{ruleset_name}' is the one ruleset now"
         )
+
     # NOT gated on quiet, unlike the two around it. quiet means "the
     # preview already said this about state that has not changed" -- but
     # this list comes from the fresh lookup, and a second ruleset created
@@ -1898,8 +1984,6 @@ def apply_ruleset(
     # repository that already had one, which is a repository that needs
     # the reminder anyway.
     _report_duplicate_standard(repo, ruleset_name, fresh_existing, fresh_duplicates)
-    if not quiet:
-        _report_blocked_legacy(repo, ruleset_name, fresh_blocked)
     if delete_failed:
         return 1
     return 0

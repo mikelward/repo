@@ -351,13 +351,51 @@
       rulesets identical in `target_body` and nothing else distinguishes
       "this is the standard one" from "this is about to become it".
 
-- [x] **Delete a superseded legacy ruleset, rather than only reporting
-      it.** `repo setup` now deletes one whose content is identical to
-      what the standard ruleset will hold once this run has written it,
-      and reports any that is not. The comparison is whole-object
-      equality (`_comparable_ruleset`: everything GitHub reports except
-      the fields identifying that copy, and its name) rather than "is A
-      at least as strict as B", which had been reimplemented field by
+- [x] **Delete EVERY legacy-named ruleset, not only an identical one.**
+      Converging on one ruleset is the point of the rename, so a
+      leftover under a legacy name goes whatever it holds (maintainer,
+      2026-09-07); rulesets aggregate, so leaving it means both apply
+      forever. Its full body is written to the run's log immediately
+      before the delete (`_record_deleted_ruleset`), which is what makes
+      this safe: GitHub hands back no copy of a deleted ruleset, so
+      recording it turns the one unrecoverable outcome into a POST of
+      the JSON in the log. A failure to record cancels that deletion.
+      The plan and the run both say when the one going is NOT identical
+      to what survives, so what is being dropped is stated rather than
+      implied.
+
+      **A duplicate that rules out rebase still refuses the run**, as it
+      did before: `_find_merge_method_conflicts` sees it, the write is
+      declined, and the deletion that would have fixed it never happens.
+      Waiving the scan for a ruleset about to be deleted was tried and
+      taken out again -- the waiver is only sound if the delete succeeds,
+      so it needs the write undone when the delete fails, and that
+      compensating write is a transaction GitHub does not offer: it can
+      be stale, can fail itself, and cannot un-delete a ruleset that
+      already went when a second one fails (Codex review,
+      mikelward/repo#46). Delete the duplicate by hand and rerun. Worth
+      revisiting only with an approach that needs no rollback.
+
+      **Two narrower gaps in the recovery record, also deferred** (Codex
+      review, mikelward/repo#46). An edit landing between
+      `_still_deletable`'s read and the DELETE leaves the record one
+      revision stale: the DELETE names an id with no version
+      precondition, and GitHub's rulesets API offers no conditional
+      delete to bind it to the body that was read. And `write_now`
+      fsyncs the log file but not its directory entry, so a power loss
+      between GitHub accepting the DELETE and that metadata landing
+      could take a newly created log with it. Both leave the record
+      slightly weaker than "exactly what was deleted, always"; neither
+      touches the case it exists for, which is an operator wanting the
+      ruleset back. The directory fsync is a few lines if it ever
+      matters; the stale-snapshot window needs an API feature that does
+      not exist.
+
+      The equality test it replaced (`_comparable_ruleset`) survives as
+      the source of that "not identical" note, where being one field
+      short costs a vaguer message rather than a wrong deletion. It was
+      the gate rather than "is A at least as strict as B", which had
+      been reimplemented field by
       field and found one item short five times in a row -- an unmanaged
       rule type, a ref the other did not cover, a stricter managed
       parameter, a required check bound to a specific App via
@@ -372,20 +410,19 @@
       happens AFTER the write, because what makes the duplicate safe to
       delete is that the survivor holds everything it held -- true only
       once the write has landed -- and a failed delete fails the step.
-      Immediately before each delete, `_still_superseded` re-reads BOTH
-      rulesets and compares them as they now are (Codex review,
-      mikelward/repo#31): the plan's own reading is a network round trip
-      old by then, since the survivor's write sits between, and it
-      compares against the body this run meant to write rather than the
-      one GitHub actually stored. A read it cannot make keeps the
-      duplicate rather than counting as "unchanged", and both names are
-      checked alongside the content: equality deliberately ignores the
-      name, so it says nothing about which of the two is the standard
-      ruleset, and a rename landing in that window would otherwise delete
-      whichever one had just become canonical.
-      The merge-method conflict scan needed no "skip the one that is
-      about to go": a deletable ruleset is identical to the target, and
-      the target always allows rebase, so the scan can never flag one.
+      Immediately before each delete, `_still_deletable` re-reads both
+      rulesets and returns the candidate's body, which is what gets
+      recorded -- so the record is the ruleset actually removed, not the
+      copy the plan read a network round trip earlier (Codex review,
+      mikelward/repo#31). What that fresh read establishes is no longer
+      "still identical", which decides nothing now, but that the two are
+      still the two this run reasoned about: a rename landing in that
+      window -- the duplicate becoming `main`, the survivor becoming
+      something else -- would otherwise delete whichever had just become
+      canonical and leave nothing under the name. A read it cannot make
+      keeps the duplicate, with the same reasoning as an unreadable one
+      in the plan: no body read means nothing to record, so the delete
+      would be the unrecoverable kind.
 
 - [x] **`repo audit` reports a surviving legacy ruleset.** `repo setup`
       notes one on every run, which is how the fleet found them, but that
@@ -460,17 +497,17 @@
       just as unmergeable and go unreported (Codex review,
       mikelward/repo#44).
 
-      **Deleting an extra once it adds nothing beyond the standard is
-      deliberately NOT done.** It reads as the tidy finish, and it needs
-      exactly the comparison this module already retreated from: "is A at
-      least as strict as B", per field, which was reimplemented five times
-      and was one field short every time (see `_comparable_ruleset`). The
-      legacy path can use equality because equality cannot be incomplete;
-      a subset test cannot, and here a false "adds nothing" deletes a
-      ruleset that was holding the branch up. Tidiness is not worth that
-      failure mode. If it is ever revisited, the safe slice is an extra
-      whose *scope* provably excludes the default branch -- no strictness
-      comparison needed at all.
+      **Deleting an extra -- one under a name this tool never used -- is
+      still NOT done**, and it is a different question from the legacy
+      path below. A legacy name is this tool's own former name, so
+      deleting one is finishing a rename it started; an extra is
+      somebody's ruleset, and nothing here knows what it is for. The
+      legacy delete no longer needs a strictness comparison at all (the
+      body is recorded first, so it is reversible), but that does not
+      transfer: recording something before deleting it makes an intended
+      deletion undoable, not an unintended one right. If it is ever
+      revisited, the safe slice is an extra whose *scope* provably
+      excludes the default branch -- no strictness comparison needed.
 
 - [ ] **A widening can name a ref the ruleset already covers.**
       `_widen_include` compares refs literally (`ref not in include`), so
