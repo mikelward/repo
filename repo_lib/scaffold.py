@@ -351,7 +351,7 @@ lint-title no
 """
 
 _CI_YML = """\
-name: CI
+name: ci
 
 on:
   push:
