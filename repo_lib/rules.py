@@ -763,6 +763,28 @@ def _excluded_hardened_refs(exclude, default_branch):
     return named, _has_glob(exclude)
 
 
+def _effective_scope_added(scope_added, exclude, default_branch):
+    """(covered, unevaluated): which of the refs a widening adds the
+    ruleset will actually govern, and whether a glob exclusion makes that
+    unanswerable.
+
+    An exclusion outranks an include, so a widening that adds
+    refs/heads/master to a ruleset already excluding it changes the
+    include list and protects nothing. Claiming otherwise would put the
+    plan at odds with _report_excluded_hardened, which says on the same
+    run that the branch stays open (Codex review, mikelward/repo#45)."""
+    exclude = list(exclude or [])
+    if "~ALL" in exclude:
+        return [], False
+    excluded = set(_normalize_refs(exclude, default_branch))
+    covered = [
+        ref
+        for ref in scope_added
+        if _normalize_refs([ref], default_branch)[0] not in excluded
+    ]
+    return covered, _has_glob(exclude)
+
+
 def _report_excluded_hardened(repo, ruleset_name, target_body, default_branch):
     """Says so when a ruleset's exclusions still keep one of the hardened
     refs out. Reported, never fixed: deleting an exclusion somebody wrote
@@ -955,6 +977,90 @@ _VOLATILE_FIELDS = (
 )
 
 
+def _enforced_lines(target_rules, indent="  "):
+    """Every managed protection the ruleset holds once this write lands,
+    in the wording _describe_plan uses.
+
+    The resulting state, not the delta -- what a create prints (there
+    everything is new, so the state IS the change), what --verbose and the
+    log print for an update, and what a scope widening makes newly
+    effective on the refs it adds. Derived from the body about to be
+    written rather than restated as a fixed list, so it stays true of a
+    ruleset carrying something this module did not put there."""
+    now = {r.get("type"): (r.get("parameters") or {}) for r in target_rules or []}
+    sc = now.get("required_status_checks") or {}
+    pr = now.get("pull_request")
+    lines = []
+    contexts = [
+        entry.get("context")
+        for entry in sc.get("required_status_checks") or []
+        if entry.get("context")
+    ]
+    if contexts:
+        lines.append(f"{indent}required checks: " + ", ".join(contexts))
+    if pr is not None and pr.get("required_review_thread_resolution"):
+        lines.append(f"{indent}review conversations must be resolved")
+    if sc.get("strict_required_status_checks_policy"):
+        lines.append(f"{indent}the branch must be up to date with the base")
+    if pr is not None and pr.get("allowed_merge_methods"):
+        lines.append(f"{indent}rebase is the only merge method")
+    if "required_linear_history" in now:
+        lines.append(f"{indent}commit history must be linear")
+    if "non_fast_forward" in now:
+        lines.append(f"{indent}force pushes are blocked")
+    # A rule this module does not manage -- required_signatures,
+    # required_deployments, whatever else a hand-made ruleset carried --
+    # is preserved by an update and becomes effective on every ref the
+    # write covers, this one's widening included. Naming it without
+    # describing it is the honest half: the reader needs to know it is
+    # there, and this module has no wording for a rule it never writes
+    # (Codex review, mikelward/repo#45).
+    unmanaged = sorted(t for t in now if t and t not in MANAGED_RULE_TYPES)
+    if unmanaged:
+        lines.append(
+            f"{indent}plus rules this tool does not manage, kept as they are: "
+            + ", ".join(unmanaged)
+        )
+    return lines
+
+
+def _newly_enforced(original_rules, target_rules):
+    """The managed protections this write actually adds, in the wording
+    _describe_plan uses.
+
+    An update's plan used to recite every rule the ruleset would end up
+    holding, most of which it already held. That buried the one or two
+    lines that were the change (maintainer, 2026-09-07). A create still
+    lists everything, because on a create everything is new.
+    """
+    was = {r.get("type"): (r.get("parameters") or {}) for r in original_rules or []}
+    now = {r.get("type"): (r.get("parameters") or {}) for r in target_rules or []}
+    added = []
+    if "pull_request" in now and "pull_request" not in was:
+        added.append("a pull request is required before merging")
+    pr_was, pr_now = was.get("pull_request") or {}, now.get("pull_request") or {}
+    if pr_now.get("required_review_thread_resolution") and not pr_was.get(
+        "required_review_thread_resolution"
+    ):
+        added.append("review conversations must be resolved")
+    if pr_now.get("allowed_merge_methods") != pr_was.get("allowed_merge_methods"):
+        added.append("rebase is the only merge method")
+    sc_was, sc_now = was.get("required_status_checks") or {}, now.get(
+        "required_status_checks"
+    ) or {}
+    if sc_now.get("strict_required_status_checks_policy") and not sc_was.get(
+        "strict_required_status_checks_policy"
+    ):
+        added.append("the branch must be up to date with the base")
+    for rule_type, description in (
+        ("required_linear_history", "commit history must be linear"),
+        ("non_fast_forward", "force pushes are blocked"),
+    ):
+        if rule_type in now and rule_type not in was:
+            added.append(description)
+    return added
+
+
 def _build_update_body(repo, existing_id, checks, ruleset_name):
     """UPDATE does not build a body from scratch: it fetches the existing
     ruleset and edits only the managed rules inside it (plus the ref_name
@@ -1070,7 +1176,22 @@ def _build_update_body(repo, existing_id, checks, ruleset_name):
     # separate call, so the rename and the rules land in one write.
     target["name"] = ruleset_name
     checks_added = [c for c in checks if c not in existing_contexts]
-    return target != original, target, has_pull_request, scope_added, checks_added
+    # A context the ruleset requires today and `checks` does not is about
+    # to stop being required. That is the plan line an operator most needs
+    # to see before saying yes: everything else here tightens the gate,
+    # and this is the one that loosens it (Codex review,
+    # mikelward/repo#45).
+    checks_removed = sorted(c for c in existing_contexts if c not in checks)
+    newly_enforced = _newly_enforced(original.get("rules"), new_rules)
+    return (
+        target != original,
+        target,
+        has_pull_request,
+        scope_added,
+        checks_added,
+        checks_removed,
+        newly_enforced,
+    )
 
 
 def _plan_write(repo, existing_id, checks, ruleset_name):
@@ -1094,11 +1215,27 @@ def _plan_write(repo, existing_id, checks, ruleset_name):
     ruleset does not require today -- rides along for the same reason, and
     is every check for a ruleset being created fresh."""
     if existing_id:
-        changed, target, had_pull_request, scope_added, checks_added = _build_update_body(
-            repo, existing_id, checks, ruleset_name
+        (
+            changed,
+            target,
+            had_pull_request,
+            scope_added,
+            checks_added,
+            checks_removed,
+            newly_enforced,
+        ) = _build_update_body(repo, existing_id, checks, ruleset_name)
+        return (
+            changed,
+            target,
+            not had_pull_request,
+            scope_added,
+            checks_added,
+            checks_removed,
+            newly_enforced,
         )
-        return changed, target, not had_pull_request, scope_added, checks_added
-    return True, _create_body(ruleset_name, checks), True, [], list(checks)
+    # A create enforces all of it for the first time, so the plan lists
+    # everything rather than a diff -- None means "list them all".
+    return True, _create_body(ruleset_name, checks), True, [], list(checks), [], None
 
 
 def _bypass_actor_note(bypass_actors):
@@ -1152,6 +1289,10 @@ def _describe_plan(
     target_body=None,
     needs_write=True,
     deletions=(),
+    checks_added=(),
+    checks_removed=(),
+    newly_enforced=None,
+    full=False,
 ):
     lines = []
     if existing_id and not needs_write:
@@ -1175,13 +1316,55 @@ def _describe_plan(
         lines.append(_scope_line(scope_added))
     else:
         lines.append(f"{repo}: would create ruleset '{ruleset_name}' on {default_branch}, main and master")
-    if needs_write:
-        lines.append("  required checks: " + ", ".join(checks))
-        lines.append("  review conversations must be resolved")
-        lines.append("  the branch must be up to date with the base")
-        lines.append("  rebase is the only merge method")
-        lines.append("  commit history must be linear")
-        lines.append("  force pushes are blocked")
+    if needs_write and newly_enforced is None:
+        # A create: all of it is new, so listing it is the change.
+        lines += _enforced_lines((target_body or {}).get("rules"))
+    elif needs_write:
+        # An update: only what this write actually adds. Reciting rules the
+        # ruleset already holds buried the one or two lines that were the
+        # change (maintainer, 2026-09-07).
+        if checks_added:
+            lines.append("  would newly require: " + ", ".join(checks_added))
+        if checks_removed:
+            lines.append(
+                "  would NO LONGER require: " + ", ".join(checks_removed)
+            )
+        lines += [f"  {added}" for added in newly_enforced]
+        if scope_added:
+            # Widening the scope enforces the rules the ruleset ALREADY
+            # holds on refs they did not cover before, so nothing appears
+            # in the delta above and the branches become protected all the
+            # same. "also targeting master" alone does not say that master
+            # is about to start requiring these (Codex review,
+            # mikelward/repo#45).
+            ref_name = ((target_body or {}).get("conditions") or {}).get("ref_name") or {}
+            covered, unevaluated = _effective_scope_added(
+                scope_added, ref_name.get("exclude"), default_branch
+            )
+            if covered:
+                # Only the refs the exclusions leave alone: a ref added to
+                # the include list and excluded in the same ruleset gets
+                # nothing, and _report_excluded_hardened says so.
+                lines.append(
+                    "  newly effective on "
+                    + ", ".join(covered)
+                    + (
+                        " (unless a pattern in the exclusions covers them)"
+                        if unevaluated
+                        else ""
+                    )
+                    + ":"
+                )
+                lines += _enforced_lines((target_body or {}).get("rules"), indent="    ")
+        if full:
+            # The full rendering is the short plan PLUS the resulting
+            # state, never the state instead of it. Swapping one for the
+            # other silently dropped "would NO LONGER require" -- the one
+            # line that reports protection being weakened -- from
+            # --verbose and from the log, which is where an operator is
+            # most likely to be reading (Codex review, mikelward/repo#45).
+            lines.append("  after this write the ruleset holds:")
+            lines += _enforced_lines((target_body or {}).get("rules"), indent="    ")
     note = _bypass_actor_note(bypass_actors)
     if note:
         lines.append(note)
@@ -1288,7 +1471,10 @@ def apply_ruleset(
     require today, so a caller can hold back a write whose new requirement
     nothing can satisfy yet. report["scope_added"] -- the refs the write
     would newly target, since a ruleset's existing rules become newly
-    effective on a branch its scope newly covers. report["needs_write"], report["deletions"], report["existing_id"]
+    effective on a branch its scope newly covers. report["bypass_note"] --
+    set on the no-op return, the one thing an already-compliant ruleset
+    still has to say, so a caller that hides idle steps does not hide it.
+    report["needs_write"], report["deletions"], report["existing_id"]
     (also fingerprint[0]), report["fingerprint"]. report["never_reported"]
     is set instead, and the others left absent, when this refuses over the
     never-reported-check guard without force -- the one refusal reason that
@@ -1425,9 +1611,15 @@ def apply_ruleset(
         return 1
 
     try:
-        needs_write, target_body, introduces_pr_protection, scope_added, checks_added = _plan_write(
-            repo, existing, checks, ruleset_name
-        )
+        (
+            needs_write,
+            target_body,
+            introduces_pr_protection,
+            scope_added,
+            checks_added,
+            checks_removed,
+            newly_enforced,
+        ) = _plan_write(repo, existing, checks, ruleset_name)
     except RulesetError:
         return 1
 
@@ -1454,11 +1646,19 @@ def apply_ruleset(
         # ruleset is the steady state, so the no-op return is where a real
         # apply usually ends up (Codex review, mikelward/repo#33).
         _report_duplicate_standard(repo, ruleset_name, existing, duplicates)
+        note = _bypass_actor_note((target_body or {}).get("bypass_actors") or [])
+        if report is not None:
+            # Computed outside the quiet guard and reported structurally:
+            # a caller that drops a step's section when the step has
+            # nothing to do would otherwise drop this note with it,
+            # leaving "nothing to change" standing alone over a ruleset
+            # anyone on that list can override (Codex review,
+            # mikelward/repo#45).
+            report["bypass_note"] = note
         if not quiet:
             print(f"{repo}: ruleset '{ruleset_name}' (id {existing}) {NO_OP_MESSAGE}")
             _report_excluded_hardened(repo, ruleset_name, target_body, default_branch)
             _report_blocked_legacy(repo, ruleset_name, blocked)
-            note = _bypass_actor_note((target_body or {}).get("bypass_actors") or [])
             if note:
                 print(note)
         return 0
@@ -1475,7 +1675,34 @@ def apply_ruleset(
         target_body,
         needs_write,
         deletions,
+        checks_added,
+        checks_removed,
+        newly_enforced,
     )
+    if report is not None:
+        # The same plan rendered in full, for a caller that shows the
+        # abbreviated one on the terminal and keeps the complete one for
+        # --verbose and its log. Rendered here rather than reconstructed
+        # there: plan_lines is already the delta, and nothing downstream
+        # can recover the rules it left out (Codex review,
+        # mikelward/repo#45).
+        report["plan_lines_full"] = _describe_plan(
+            repo,
+            existing,
+            default_branch,
+            checks,
+            ruleset_name,
+            target_body.get("bypass_actors") or [],
+            adopted_legacy,
+            scope_added,
+            target_body,
+            needs_write,
+            deletions,
+            checks_added,
+            checks_removed,
+            newly_enforced,
+            full=True,
+        )
 
     if dry_run:
         for line in plan_lines:
@@ -1523,6 +1750,8 @@ def apply_ruleset(
             fresh_introduces_pr_protection,
             fresh_scope_added,
             fresh_checks_added,
+            _fresh_checks_removed,
+            _fresh_newly_enforced,
         ) = _plan_write(repo, fresh_existing, checks, ruleset_name)
     except RulesetError:
         error(f"could not re-read ruleset '{ruleset_name}' to write it")

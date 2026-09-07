@@ -84,15 +84,17 @@ file, so without a snapshot an edit during the confirmation prompt would
 silently change what gets written.
 """
 
+import datetime
 import io
 import json
+import os
 import re
 import sys
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
 from typing import Optional
 
-from repo_lib import apps, credentials, gh, rules, scaffold, secrets_cmd
+from repo_lib import apps, common, credentials, gh, rules, scaffold, secrets_cmd
 from repo_lib.common import error, error_lines
 
 # The lookaheads reject `.` and `..` components: made of allowed
@@ -120,6 +122,21 @@ def add_arguments(parser):
         "--verbose",
         action="store_true",
         help="show the full plan (not just what changed) and per-step progress",
+    )
+    parser.add_argument(
+        "--log",
+        metavar="FILE",
+        help=(
+            "where to write this run's full record -- every step's plan, "
+            "including the parts the terminal leaves out, and what each one "
+            "actually did (default: a timestamped file under "
+            "$XDG_STATE_HOME/repo, or ~/.local/state/repo). Appended to, "
+            "never truncated. Not written by --dry-run, which prints its "
+            "plan and changes nothing"
+        ),
+    )
+    parser.add_argument(
+        "--no-log", action="store_true", help="do not write a record of this run to a file"
     )
     parser.add_argument("--no-rules", action="store_true", help="skip the ruleset step")
     parser.add_argument(
@@ -1138,7 +1155,156 @@ def _secret_label(spec):
     return spec.name + (f" --env {spec.env}" if spec.env else "")
 
 
+class _Log:
+    """The run's record, opened on the first thing worth recording.
+
+    Lazy on purpose. Over a fleet, most runs find their repository already
+    in shape and print nothing; eagerly opening a file would leave a
+    directory of empty logs, one per repository per sweep, and a "full
+    record: ..." line on a run whose whole point was to say nothing
+    (maintainer, 2026-09-07). No output, no file, no line.
+
+    A failure to open does NOT stop the run, unlike `repo cleanup`'s log:
+    that one holds the only command that restores a deleted branch, so
+    writing nowhere means deleting with no way back. This one records
+    changes GitHub itself still shows, and refusing to configure a
+    repository because a file could not be opened would be the worse
+    trade. It is reported once and then left alone.
+    """
+
+    def __init__(self, path, header):
+        self.path = path
+        self._header = header
+        self._handle = None
+        self._buffer = []
+        self._armed = False
+        self.truncated = False
+
+    @property
+    def written(self):
+        return self._handle is not None
+
+    def arm(self):
+        """Start writing for real. Called once this run is going to change
+        something.
+
+        Everything before that is buffered rather than written, because a
+        run can print a whole plan and then be declined -- or refused for
+        want of a terminal -- and change nothing at all. Opening the file
+        while printing that plan would leave a log, and a "full record"
+        line, for a run whose answer was no (Codex review,
+        mikelward/repo#45).
+        """
+        if self._armed:
+            return
+        self._armed = True
+        buffered, self._buffer = self._buffer, []
+        for text in buffered:
+            self._write_through(text)
+
+    def write(self, text):
+        if not text:
+            return
+        if not self._armed:
+            self._buffer.append(text)
+            return
+        self._write_through(text)
+
+    def _write_through(self, text):
+        if self.truncated:
+            return
+        if self._handle is None:
+            try:
+                directory = os.path.dirname(self.path)
+                if directory:
+                    os.makedirs(directory, exist_ok=True)
+                self._handle = open(self.path, "a", encoding="utf-8")
+                self._handle.write(self._header)
+            except OSError as e:
+                self.truncated = True
+                error_lines(f"could not open the log at {self.path}:", str(e))
+                error("Carrying on without one -- pass --log FILE to choose another")
+                error("path, or --no-log to stop asking for one.")
+                return
+        try:
+            self._handle.write(text)
+        except (OSError, ValueError) as e:
+            # A record that stopped short must not take the run with it:
+            # the terminal already has this line, and this log is a record
+            # to read later rather than the only copy of anything. It must
+            # not go unsaid either -- the run advertises a full record, and
+            # this one is short of it (Codex review, mikelward/repo#45).
+            self.truncated = True
+            error(f"the log at {self.path} stopped short: {e}")
+
+    def close(self):
+        """Closing is where buffered bytes actually reach the file, so it
+        is a place a write can still fail -- a full filesystem, or a path
+        like /dev/full. Swallowing that would leave `truncated` false and
+        the run announcing a full record for an incomplete file (Codex
+        review, mikelward/repo#45)."""
+        if self._handle is None:
+            return
+        try:
+            self._handle.close()
+        except (OSError, ValueError) as e:
+            self.truncated = True
+            error(f"the log at {self.path} stopped short: {e}")
+
+
+class _Tee:
+    """Writes to the terminal and to the run's log at once.
+
+    The log is a fuller record than the terminal, not a different one: the
+    terminal shows what changed, the log shows that plus the full plan and
+    every progress marker and refusal. `isatty` is delegated because the
+    confirmation prompt and the progress markers ask it what they are
+    talking to.
+    """
+
+    def __init__(self, stream, log):
+        self._stream = stream
+        self._log = log
+
+    def write(self, text):
+        written = self._stream.write(text)
+        self._log.write(text)
+        return written
+
+    def flush(self):
+        self._stream.flush()
+
+    def isatty(self):
+        return self._stream.isatty()
+
+    def fileno(self):
+        return self._stream.fileno()
+
+
 def run(args):
+    if args.dry_run or args.no_log or not OWNER_REPO_RE.match(args.repo):
+        # A dry run changes nothing, so there is nothing to record; a name
+        # this has already rejected is _run's error to report, not a path
+        # to build a log from.
+        return _run(args)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    log = _Log(
+        args.log or common.default_log_path("setup", args.repo, now),
+        f"# repo setup {args.repo} at {now.isoformat()}\n",
+    )
+    try:
+        with redirect_stdout(_Tee(sys.stdout, log)), redirect_stderr(_Tee(sys.stderr, log)):
+            return _run(args, log=log)
+    finally:
+        log.close()
+        if log.written:
+            if log.truncated:
+                error(f"partial record (it stopped short): {log.path}")
+            else:
+                error(f"full record: {log.path}")
+
+
+def _run(args, log=None):
     if not OWNER_REPO_RE.match(args.repo):
         error(f"'{args.repo}' is not OWNER/REPO")
         raise SystemExit(2)
@@ -1170,7 +1336,19 @@ def run(args):
     # and nothing more.
     _progress(args, f"{repo}: checking fleet credentials")
     credentials_plan = _plan_credentials(repo, credential_specs)
-    credentials_idle = not (credentials_plan.moves or credentials_plan.unfixed or credentials_plan.failed)
+    credentials_idle = not (
+        credentials_plan.moves
+        or credentials_plan.unfixed
+        or credentials_plan.failed
+        # A --credential the caller supplied that this run does nothing
+        # with has no move, so the step reads idle -- and dropping its
+        # section takes the "not set" line saying why with it. A --dry-run
+        # returns before the Apply section that otherwise prints it, so
+        # the section is the only place it appears there (Codex review,
+        # mikelward/repo#45). Deliberately not part of needs_confirmation,
+        # which asks about writes: there is nothing here to agree to.
+        or credentials_plan.always_report
+    )
     _progress(args, f"{repo}: checking auto-merge")
     auto_merge_state, auto_merge_lines = _plan_auto_merge(repo)
     _progress(args, f"{repo}: checking delete-branch-on-merge")
@@ -1501,11 +1679,42 @@ def run(args):
     app_plans = [apps.plan_app_step(repo, repo_owner, slug) for slug in args.app]
     app_plan_has_error = any(p.verdict == "ERROR" for p in app_plans)
 
-    def describe_combined_plan():
+    def describe_combined_plan(full=None):
+        """The plan, one section per step.
+
+        A step with nothing to do is dropped rather than printed as
+        "already allowed" / "nothing to do": the question this plan exists
+        to ask is what will change, and a wall of unchanged state is what
+        buried the answer (maintainer, 2026-09-07). `full` keeps every
+        section -- what --verbose shows on the terminal, and what the log
+        file always records.
+        """
+        if full is None:
+            full = args.verbose
         lines = [f"{repo}:"]
-        if not args.no_rules:
+        ruleset_idle = not (
+            ruleset_report.get("needs_write", True)
+            or ruleset_report.get("deletions")
+            # An already-compliant ruleset still has something to say when
+            # bypass actors can override every rule in it. Dropping the
+            # section as idle would drop that warning too -- the one line
+            # here that reports a gap rather than a state (Codex review,
+            # mikelward/repo#45).
+            or ruleset_report.get("bypass_note")
+            or empty_branch_would_strand_ruleset
+            or scaffold_pending_would_strand_ruleset
+            or ruleset_never_reported
+        )
+        if not args.no_rules and (full or not ruleset_idle):
             lines.append("  ruleset (repo-rules):")
-            lines += [f"    {line}" for line in ruleset_lines]
+            # The captured preview output is already the abbreviated plan,
+            # and nothing here can put back the rules it left out -- so the
+            # full rendering comes from the report, which apply_ruleset
+            # produced alongside it (Codex review, mikelward/repo#45). It
+            # is absent on the paths that never planned a write (a no-op, a
+            # refusal); those have nothing to expand.
+            step_lines = (full and ruleset_report.get("plan_lines_full")) or ruleset_lines
+            lines += [f"    {line}" for line in step_lines]
             if empty_branch_would_strand_ruleset:
                 lines.append(
                     "    SKIPPED: would strand this repository -- its branch has no commits "
@@ -1536,21 +1745,28 @@ def run(args):
         if app_plans:
             lines.append("  App installation membership:")
             lines += [f"    {line}" for line in apps.describe_plan(repo, app_plans)]
-        lines.append("  fleet credentials:")
-        lines += [f"    {line}" for line in credentials_plan.lines]
-        lines += [f"    NOT FIXED: {reason}" for reason in credentials_plan.unfixed]
-        if not credentials_plan.lines and not credentials_plan.unfixed:
-            lines.append("    nothing to do")
-        lines.append("  auto-merge:")
-        lines += [f"    {line}" for line in auto_merge_lines]
-        lines.append("  delete-branch-on-merge:")
-        lines += [f"    {line}" for line in delete_branch_lines]
-        if not args.no_bootstrap:
+        if full or not credentials_idle:
+            lines.append("  fleet credentials:")
+            lines += [f"    {line}" for line in credentials_plan.lines]
+            lines += [f"    NOT FIXED: {reason}" for reason in credentials_plan.unfixed]
+            if not credentials_plan.lines and not credentials_plan.unfixed:
+                lines.append("    nothing to do")
+        if full or auto_merge_state != "allowed":
+            lines.append("  auto-merge:")
+            lines += [f"    {line}" for line in auto_merge_lines]
+        if full or delete_branch_state != "allowed":
+            lines.append("  delete-branch-on-merge:")
+            lines += [f"    {line}" for line in delete_branch_lines]
+        wedged = wedged_branch_warning() if not args.no_bootstrap else None
+        if not args.no_bootstrap and (full or not bootstrap_idle or wedged):
             lines.append("  bootstrap (fleet CI scaffold):")
             lines += [f"    {line}" for line in scaffold.describe_gap_plan(bootstrap_plan)]
-            wedged = wedged_branch_warning()
             if wedged:
                 lines.append(f"    HEADS UP: {wedged}")
+        if len(lines) == 1:
+            # Every section was idle. Say so once rather than printing a
+            # bare repository name with nothing under it.
+            lines.append("  nothing to change")
         return lines
 
     if args.dry_run:
@@ -1660,6 +1876,17 @@ def run(args):
     if show_plan:
         for line in describe_combined_plan():
             error(line)
+    if log is not None and needs_confirmation:
+        # Unconditionally, not just when the terminal was shown the short
+        # version: an interactive run tees its abbreviated plan into the
+        # log, and a record that inherits the terminal's omissions is not
+        # the full record this advertises (Codex review,
+        # mikelward/repo#45). Buffered until the run is armed, so a plan
+        # printed and then declined still writes no file.
+        log.write("\n--- full plan ---\n")
+        for line in describe_combined_plan(full=True):
+            log.write(line + "\n")
+        log.write("--- what happened ---\n")
 
     if needs_confirmation and not args.force:
         if not sys.stdin.isatty():
@@ -1678,6 +1905,29 @@ def run(args):
             raise SystemExit(1)
 
     # ---- Apply ------------------------------------------------------------
+
+    # Past every gate that declines the plan as a whole, and only when
+    # there is something to change: from here the run attempts it, so the
+    # record is worth a file. Everything buffered up to now -- the plan,
+    # any progress markers -- lands with it.
+    #
+    # needs_confirmation is the "a mutation is planned" signal, not merely
+    # "a question will be asked": under --force it is still true when
+    # something will change. Arming unconditionally here meant a verbose
+    # run over an already-compliant repository wrote a file and claimed a
+    # full record, since -v buffers progress markers and the plan whether
+    # or not anything follows (Codex review, mikelward/repo#45).
+    #
+    # A step can still refuse its own write below -- a secret someone else
+    # created since the plan was built, a ruleset whose fingerprint moved,
+    # a scaffold no longer intact -- and such a run writes a log having
+    # changed nothing. That is deliberate, not the no-op case this gate
+    # excludes: it printed a refusal, it exits non-zero, and why a
+    # confirmed change did not happen is exactly what a record is for. The
+    # runs that must leave no file are the quiet ones, where a fleet sweep
+    # would otherwise strew an empty log per repository.
+    if log is not None and needs_confirmation:
+        log.arm()
 
     failed = []
 

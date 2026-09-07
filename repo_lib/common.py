@@ -1,5 +1,6 @@
 """Shared bits every subcommand needs: the program name and error printing."""
 
+import os
 import sys
 
 PROGRAM = "repo"
@@ -22,3 +23,18 @@ def error_lines(prefix, text):
     error(prefix)
     for line in (text or "").splitlines():
         error(f"  {line}")
+
+
+def default_log_path(command, repo, now):
+    """A timestamped file under the XDG state directory -- state, not
+    cache: a run's record of what it changed is not something another
+    program is entitled to clear.
+
+    Shared so `repo cleanup` and `repo setup` write to one directory with
+    one naming convention, rather than each inventing its own.
+    """
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(
+        os.path.expanduser("~"), ".local", "state"
+    )
+    stamp = now.strftime("%Y%m%dT%H%M%SZ")
+    return os.path.join(base, "repo", f"{command}-{repo.replace('/', '-')}-{stamp}.log")

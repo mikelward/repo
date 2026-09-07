@@ -51,8 +51,9 @@ repo list [--owner OWNER] [--include-forks] [--include-archived]
 repo create (--private|--public) [--no-scaffold] OWNER/REPO
 repo secrets --name NAME [--env ENV] --file PATH [--force] OWNER/REPO...
 repo setup [--dry-run] [--force] [-v|--verbose] [--no-rules] [--no-bootstrap]
-           [--rule CHECK]... [--secret NAME[@ENV]=PATH]...
-           [--credential NAME=PATH]... [--app SLUG]... OWNER/REPO
+           [--log FILE] [--no-log] [--rule CHECK]...
+           [--secret NAME[@ENV]=PATH]... [--credential NAME=PATH]...
+           [--app SLUG]... OWNER/REPO
 repo audit [--branch NAME] OWNER/REPO [CHECK...]
 repo cleanup [--dry-run] [--force] [--older-than DAYS]
              [--log FILE] OWNER/REPO
@@ -89,6 +90,18 @@ review, mikelward/repo#14) -- so on the first pull request opened after
 the scaffold lands, not on the one adding it. Only the placeholder's replacement with real project
 jobs is left undone (see `repo_lib/scaffold.py`'s own docstring for the
 full split between what's generated and what isn't).
+`repo setup` is quiet: the terminal gets what is changing and what is
+wrong, not a recital of everything already in place. A step with nothing
+to do is not mentioned, and an update to an existing ruleset names only
+the checks and protections it adds -- a create still lists all of them,
+because there everything is new. `--verbose` restores the full plan and
+per-step progress markers. A run that changes something also writes the
+full record -- every section, including the ones the terminal drops -- to
+a timestamped file under `$XDG_STATE_HOME/repo` (`--log FILE` to choose
+the path, `--no-log` to skip it), and names that path at the end. A run
+that changes nothing writes no file: over a fleet, a log per repository
+per sweep saying nothing happened is the same noise somewhere else.
+
 `repo setup` composes four steps -- the required-checks
 branch ruleset (named `main`, with linear history required, force pushes
 blocked, plus a standalone warning when a repository has an actual

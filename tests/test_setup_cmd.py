@@ -1122,10 +1122,22 @@ def _secret_file(tmpdir, name, content=b"sekrit"):
     return path
 
 
-def _run(fake, argv, isatty=False):
+def _run(fake, argv, isatty=False, log_dir=None):
     """Runs `repo setup <argv>` against `fake`, returning (exit_code,
-    stdout, stderr)."""
+    stdout, stderr).
+
+    The run's log goes to a temporary directory, never the real
+    $XDG_STATE_HOME: a suite that wrote there would leave a file per test
+    in the developer's own state directory. `log_dir` points it somewhere
+    a test can then read.
+    """
     out, err = StringIO(), StringIO()
+    with tempfile.TemporaryDirectory() as state:
+        with patch.dict(os.environ, {"XDG_STATE_HOME": log_dir or state}):
+            return _run_captured(fake, argv, isatty, out, err)
+
+
+def _run_captured(fake, argv, isatty, out, err):
     with patch("repo_lib.gh.run", fake.run), patch("repo_lib.gh.try_run", fake.try_run), patch(
         "repo_lib.gh.run_with_input", fake.run_with_input
     ), patch("shutil.which", return_value="/usr/bin/gh"), patch(
@@ -1773,6 +1785,56 @@ class SetupCmdTest(unittest.TestCase):
         self.assertIn("already matches; nothing to do", out)
         self.assertIn("1 bypass actor(s)", out)
         self.assertIn("repo audit", out)
+
+    def test_the_bypass_note_survives_the_quiet_default(self):
+        # The section for a step with nothing to do is dropped, and this
+        # ruleset has nothing to do -- but the note is the one line here
+        # that reports a gap rather than a state, so "nothing to change"
+        # standing alone over a ruleset anyone on that list can override
+        # is worse than the recital it replaced (Codex review,
+        # mikelward/repo#45). Same fixture as the -v test above, run
+        # without it.
+        fake = FakeGh()
+        fake.check_runs = {fake.default_head_sha: ["lanes"]}
+        fake.existing_ruleset_id = "7"
+        fake.all_ruleset_ids = ["7"]
+        fake.ruleset_objects["7"] = {
+            "id": 7,
+            "name": "main",
+            "enforcement": "active",
+            "bypass_actors": [{"actor_id": 1, "actor_type": "Team"}],
+            "conditions": {"ref_name": {"include": list(_HARDENED_SCOPE), "exclude": []}},
+            "rules": [
+                {
+                    "type": "required_status_checks",
+                    "parameters": {
+                        "strict_required_status_checks_policy": True,
+                        "required_status_checks": [{"context": "lanes"}],
+                    },
+                },
+                {
+                    "type": "pull_request",
+                    "parameters": {
+                        "required_review_thread_resolution": True,
+                        "allowed_merge_methods": ["rebase"],
+                        "required_approving_review_count": 0,
+                        "dismiss_stale_reviews_on_push": False,
+                        "require_code_owner_review": False,
+                        "require_last_push_approval": False,
+                    },
+                },
+                {"type": "required_linear_history"},
+                {"type": "non_fast_forward"},
+            ],
+        }
+        code, out, err = _run(fake, ["--dry-run", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.posts, [])
+        self.assertIn("1 bypass actor(s)", out)
+        self.assertIn("repo audit", out)
+        # The other steps are still dropped -- this keeps one section, not
+        # the recital.
+        self.assertNotIn("auto-merge:", out)
 
     def test_dry_run_makes_no_writes(self):
         fake = FakeGh()
@@ -3280,6 +3342,347 @@ class CombinedPlanTest(unittest.TestCase):
         self.assertIn("branch literally named 'master'", err)
 
 
+def _rules_with(contexts):
+    """A ruleset body already holding every managed rule, requiring
+    `contexts` -- so a plan against it has at most one thing to say."""
+    return [
+        {
+            "type": "required_status_checks",
+            "parameters": {
+                "strict_required_status_checks_policy": True,
+                "required_status_checks": [{"context": c} for c in contexts],
+            },
+        },
+        {
+            "type": "pull_request",
+            "parameters": {
+                "required_review_thread_resolution": True,
+                "allowed_merge_methods": ["rebase"],
+                "required_approving_review_count": 0,
+                "dismiss_stale_reviews_on_push": False,
+                "require_code_owner_review": False,
+                "require_last_push_approval": False,
+            },
+        },
+        {"type": "required_linear_history"},
+        {"type": "non_fast_forward"},
+    ]
+
+
+class UpdatePlanTest(unittest.TestCase):
+    """An update's plan names what the write adds, not everything the
+    ruleset will end up holding."""
+
+    def _existing(self, contexts):
+        fake = FakeGh()
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+        fake.existing_ruleset_id = "1"
+        fake.all_ruleset_ids = ["1"]
+        fake.ruleset_objects["1"] = {
+            "id": 1,
+            "name": "main",
+            "enforcement": "active",
+            "target": "branch",
+            "conditions": {
+                "ref_name": {
+                    "include": ["~DEFAULT_BRANCH", "refs/heads/main", "refs/heads/master"],
+                    "exclude": [],
+                }
+            },
+            "rules": _rules_with(contexts),
+        }
+        return fake
+
+    def test_an_update_names_only_the_added_check(self):
+        fake = self._existing(("lanes", "codex"))
+        code, out, err = _run(
+            fake,
+            ["--dry-run", "--rule", "lanes", "--rule", "codex", "--rule", "zizmor", REPO],
+        )
+        plan = out + err
+        self.assertIn("would newly require: zizmor", plan)
+        # Rules the ruleset already holds are not restated.
+        self.assertNotIn("review conversations must be resolved", plan)
+        self.assertNotIn("force pushes are blocked", plan)
+        self.assertNotIn("commit history must be linear", plan)
+        self.assertNotIn("rebase is the only merge method", plan)
+
+    def test_an_update_names_a_protection_it_adds(self):
+        # Same ruleset, but without the linear-history rule: that one line
+        # is the change, and it is the line that shows.
+        fake = self._existing(("lanes", "codex", "zizmor"))
+        fake.ruleset_objects["1"]["rules"] = [
+            r for r in fake.ruleset_objects["1"]["rules"]
+            if r["type"] != "required_linear_history"
+        ]
+        code, out, err = _run(
+            fake,
+            ["--dry-run", "--rule", "lanes", "--rule", "codex", "--rule", "zizmor", REPO],
+        )
+        plan = out + err
+        self.assertIn("commit history must be linear", plan)
+        self.assertNotIn("force pushes are blocked", plan)
+        self.assertNotIn("would newly require", plan)
+
+    def test_an_update_names_a_check_it_stops_requiring(self):
+        # Everything else in this plan tightens the gate; dropping a
+        # required check is the one line that loosens it, so it is the one
+        # an operator most needs before saying yes (Codex review,
+        # mikelward/repo#45).
+        fake = self._existing(("lanes", "old-check"))
+        code, out, err = _run(fake, ["--dry-run", "--rule", "lanes", REPO])
+        plan = out + err
+        self.assertIn("would NO LONGER require: old-check", plan)
+
+    def test_verbose_expands_an_update_to_every_rule(self):
+        # The terminal gets the delta; --verbose and the log are supposed
+        # to hold the whole picture, and the captured short plan cannot be
+        # expanded back into it -- so the full rendering comes from the
+        # report (Codex review, mikelward/repo#45).
+        fake = self._existing(("lanes", "codex"))
+        code, out, err = _run(
+            fake,
+            ["--dry-run", "-v", "--rule", "lanes", "--rule", "codex", "--rule", "zizmor", REPO],
+        )
+        plan = out + err
+        self.assertIn("would update ruleset 'main'", plan)
+        self.assertIn("required checks: lanes, codex, zizmor", plan)
+        self.assertIn("review conversations must be resolved", plan)
+        self.assertIn("commit history must be linear", plan)
+        self.assertIn("force pushes are blocked", plan)
+
+    def test_widening_the_scope_names_what_becomes_enforced_there(self):
+        # The rules do not change, so the delta is empty -- but master
+        # starts being protected all the same, and "also targeting
+        # master" alone does not say by what (Codex review,
+        # mikelward/repo#45).
+        fake = self._existing(("lanes",))
+        fake.ruleset_objects["1"]["conditions"]["ref_name"]["include"] = ["refs/heads/main"]
+        code, out, err = _run(fake, ["--dry-run", "--rule", "lanes", REPO])
+        plan = out + err
+        self.assertIn("scope: also targeting", plan)
+        self.assertIn("newly effective on", plan)
+        self.assertIn("required checks: lanes", plan)
+        self.assertIn("force pushes are blocked", plan)
+        # Still an update, and still no delta to report about the rules.
+        self.assertNotIn("would newly require", plan)
+
+    def test_the_full_plan_still_names_a_check_it_stops_requiring(self):
+        # The full rendering is the short plan PLUS the resulting state,
+        # not the state instead of it -- swapping one for the other
+        # dropped the one line that reports protection being weakened
+        # from --verbose and from the log (Codex review,
+        # mikelward/repo#45).
+        fake = self._existing(("lanes", "old-check"))
+        code, out, err = _run(fake, ["--dry-run", "-v", "--rule", "lanes", REPO])
+        plan = out + err
+        self.assertIn("would NO LONGER require: old-check", plan)
+        # ...and the resulting state is there too, under its own heading.
+        self.assertIn("after this write the ruleset holds:", plan)
+        self.assertIn("required checks: lanes", plan)
+        self.assertNotIn("required checks: lanes, old-check", plan)
+
+    def test_a_preserved_unmanaged_rule_is_named_in_the_scope_block(self):
+        # An update keeps a rule type this module never writes, and a
+        # widening makes it effective on the refs it adds -- so the plan
+        # has to say it is there. Named, not described: this module has no
+        # wording for a rule it does not manage (Codex review,
+        # mikelward/repo#45).
+        fake = self._existing(("lanes",))
+        fake.ruleset_objects["1"]["conditions"]["ref_name"]["include"] = ["refs/heads/main"]
+        fake.ruleset_objects["1"]["rules"].append({"type": "required_signatures"})
+        code, out, err = _run(fake, ["--dry-run", "--rule", "lanes", REPO])
+        plan = out + err
+        self.assertIn("newly effective on", plan)
+        self.assertIn("plus rules this tool does not manage", plan)
+        self.assertIn("required_signatures", plan)
+
+    def test_an_excluded_ref_is_not_claimed_as_newly_protected(self):
+        # An exclusion outranks an include, so widening the include list
+        # to cover master protects nothing while master is excluded --
+        # and _report_excluded_hardened says exactly that on the same
+        # run (Codex review, mikelward/repo#45).
+        fake = self._existing(("lanes",))
+        fake.ruleset_objects["1"]["conditions"]["ref_name"] = {
+            "include": ["refs/heads/main"],
+            "exclude": ["refs/heads/master"],
+        }
+        code, out, err = _run(fake, ["--dry-run", "--rule", "lanes", REPO])
+        plan = out + err
+        self.assertIn("scope: also targeting", plan)
+        self.assertIn("excludes refs/heads/master", plan)
+        # ~DEFAULT_BRANCH is still genuinely newly covered; master is not.
+        self.assertIn("newly effective on ~DEFAULT_BRANCH:", plan)
+        self.assertNotIn("newly effective on ~DEFAULT_BRANCH, refs/heads/master", plan)
+
+    def test_a_create_still_lists_every_rule(self):
+        # On a create all of it is new, so the list *is* the change.
+        fake = FakeGh()
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+        code, out, err = _run(fake, ["--dry-run", REPO])
+        plan = out + err
+        self.assertIn("would create ruleset 'main'", plan)
+        self.assertIn("review conversations must be resolved", plan)
+        self.assertIn("force pushes are blocked", plan)
+
+
+class RunLogTest(unittest.TestCase):
+    """The terminal says what changed; the log keeps the full record."""
+
+    def _read_log(self, state):
+        directory = os.path.join(state, "repo")
+        names = os.listdir(directory)
+        self.assertEqual(len(names), 1, names)
+        with open(os.path.join(directory, names[0]), encoding="utf-8") as f:
+            return f.read()
+
+    def test_the_log_keeps_the_full_plan_the_terminal_leaves_out(self):
+        with tempfile.TemporaryDirectory() as state:
+            fake = FakeGh()
+            fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+            code, out, err = _run(fake, ["--force", REPO], log_dir=state)
+            self.assertEqual(code, 0, err)
+            logged = self._read_log(state)
+        # The terminal got what changed, not the plan.
+        self.assertIn(f"{REPO}: created ruleset", out)
+        self.assertNotIn("ruleset (repo-rules):", err)
+        # The log got both, plus a header naming the run.
+        self.assertIn(f"# repo setup {REPO} at ", logged)
+        self.assertIn("ruleset (repo-rules):", logged)
+        self.assertIn(f"{REPO}: created ruleset", logged)
+        # ...including the sections the terminal drops as idle.
+        self.assertIn("auto-merge:", logged)
+        self.assertIn("full record: ", err)
+
+    def test_a_run_that_changes_nothing_writes_no_log(self):
+        # Over a fleet most runs find the repository in shape. A file per
+        # repository per sweep, each saying nothing happened, is the same
+        # noise in a different place.
+        with tempfile.TemporaryDirectory() as state:
+            fake = FakeGh()
+            fake.workflow_files = ["ci.yml"]
+            code, out, err = _run(fake, ["--no-rules", REPO], log_dir=state)
+            self.assertEqual(code, 0, err)
+            self.assertEqual(err, "")
+            self.assertFalse(os.path.exists(os.path.join(state, "repo")))
+
+    def test_a_declined_run_writes_no_log(self):
+        # The plan is printed before the question, and printing it goes
+        # through the log. A run answered "no" changed nothing, so it must
+        # leave no file and claim no record (Codex review,
+        # mikelward/repo#45).
+        with tempfile.TemporaryDirectory() as state:
+            fake = FakeGh()
+            fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+            # Not a terminal and no --force: refused after showing the plan.
+            code, _, err = _run(fake, [REPO], log_dir=state)
+            self.assertEqual(code, 1)
+            self.assertNotIn("full record", err)
+            self.assertFalse(os.path.exists(os.path.join(state, "repo")))
+            self.assertEqual(fake.posts, [])
+
+    def test_a_refused_write_still_writes_the_log(self):
+        # The arm gate is "a mutation is planned", not "a mutation
+        # succeeded". A step that refuses its own write at the last
+        # instant -- here a secret someone else created since the plan was
+        # built -- changed nothing, and the record of WHY is exactly what
+        # the file is for (Codex review, mikelward/repo#45).
+        with tempfile.TemporaryDirectory() as state, tempfile.TemporaryDirectory() as tmp:
+            path = _secret_file(tmp, "value.txt")
+            fake = FakeGh()
+            fake.secret_names_after_recheck = {"TOKEN"}
+            code, _, err = _run(
+                fake,
+                ["--force", "--no-rules", "--secret", f"TOKEN={path}", REPO],
+                log_dir=state,
+            )
+            self.assertEqual(code, 1)
+            self.assertEqual(fake.written_secrets, [])
+            logged = self._read_log(state)
+        self.assertIn("refusing to overwrite", logged)
+        self.assertIn("full record: ", err)
+
+    def test_an_interactive_run_still_logs_the_full_plan(self):
+        # The terminal gets the short plan to answer; teeing that alone
+        # would leave the log inheriting the terminal's omissions, which is
+        # not the full record this advertises.
+        with tempfile.TemporaryDirectory() as state:
+            fake = FakeGh()
+            fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+            with patch("builtins.input", return_value="y"):
+                code, out, err = _run(fake, [REPO], isatty=True, log_dir=state)
+            self.assertEqual(code, 0, err)
+            logged = self._read_log(state)
+        # The terminal was asked with the short plan...
+        self.assertNotIn("auto-merge:", err)
+        # ...and the log kept the full one anyway.
+        self.assertIn("--- full plan ---", logged)
+        self.assertIn("auto-merge:", logged)
+
+    def test_a_verbose_no_op_run_writes_no_log(self):
+        # -v buffers the progress markers and the full plan whether or not
+        # anything follows, so arming unconditionally at Apply wrote a file
+        # for a run that changed nothing (Codex review, mikelward/repo#45).
+        with tempfile.TemporaryDirectory() as state:
+            fake = FakeGh()
+            fake.workflow_files = ["ci.yml"]
+            fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+            # The ruleset step is ON and already compliant, so the run goes
+            # all the way to Apply with nothing to do -- the case a
+            # `--no-rules` early return would never reach.
+            fake.existing_ruleset_id = "1"
+            fake.all_ruleset_ids = ["1"]
+            fake.ruleset_objects["1"] = {
+                "id": 1,
+                "name": "main",
+                "enforcement": "active",
+                "target": "branch",
+                "conditions": {
+                    "ref_name": {
+                        "include": [
+                            "~DEFAULT_BRANCH",
+                            "refs/heads/main",
+                            "refs/heads/master",
+                        ],
+                        "exclude": [],
+                    }
+                },
+                "rules": _rules_with(("lanes", "codex", "zizmor")),
+            }
+            code, out, err = _run(fake, ["--force", "-v", REPO], log_dir=state)
+            self.assertEqual(code, 0, err)
+            self.assertEqual(fake.puts, [])
+            self.assertEqual(fake.posts, [])
+            self.assertNotIn("full record", err)
+            self.assertFalse(os.path.exists(os.path.join(state, "repo")))
+
+    def test_a_log_that_cannot_be_written_is_not_called_full(self):
+        # /dev/full accepts the open and fails the write, and the failure
+        # can surface as late as close(), where the buffer is flushed.
+        fake = FakeGh()
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+        code, _, err = _run(fake, ["--force", "--log", "/dev/full", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("stopped short", err)
+        self.assertNotIn("full record", err)
+
+    def test_no_log_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as state:
+            fake = FakeGh()
+            fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+            code, _, err = _run(fake, ["--force", "--no-log", REPO], log_dir=state)
+            self.assertEqual(code, 0, err)
+            self.assertNotIn("full record", err)
+            self.assertFalse(os.path.exists(os.path.join(state, "repo")))
+
+    def test_a_dry_run_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as state:
+            fake = FakeGh()
+            fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+            _run(fake, ["--dry-run", REPO], log_dir=state)
+            self.assertFalse(os.path.exists(os.path.join(state, "repo")))
+
+
 class VerbosityTest(unittest.TestCase):
     """Quiet by default (only what changed); -v restores the full plan
     audit trail and per-step progress markers. See _progress's docstring
@@ -4140,7 +4543,7 @@ class LanesCredentialStepTest(unittest.TestCase):
         fake.env_policies = {"lanes": ["main"]}
         # Alongside another step, so the combined plan is shown at all.
         fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
-        code, out, err = _run(fake, ["--dry-run", REPO])
+        code, out, err = _run(fake, ["--dry-run", "-v", REPO])
         self.assertEqual(code, 0, err)
         self.assertIn("lanes: the credential lives in the 'lanes' environment", out)
         self.assertIn("lanes: environment 'lanes' admits only the trusted base branch", out)
@@ -4822,7 +5225,7 @@ class CredentialsStepTest(unittest.TestCase):
         self.assertEqual(err, "")
         # Alongside another step, the section says so.
         fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
-        code, out, err = _run(fake, ["--dry-run", REPO])
+        code, out, err = _run(fake, ["--dry-run", "-v", REPO])
         self.assertEqual(code, 0, err)
         self.assertIn("  fleet credentials:\n    nothing to do\n", out)
         self.assertEqual(fake.written_secrets, [])
@@ -4973,6 +5376,29 @@ class CredentialsStepTest(unittest.TestCase):
         )
         self.assertEqual(fake.written_secrets, [])
 
+    def test_a_dry_run_still_reports_a_credential_nothing_uses(self):
+        # The sibling test above covers the real run, which prints this
+        # from the Apply section. A --dry-run returns before Apply, so the
+        # combined plan is the only place the line can appear -- and the
+        # step has no move, so it reads idle and its section was dropped
+        # (Codex review, mikelward/repo#45).
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _secret_file(tmp, "pat.txt")
+            fake = FakeGh()
+            fake.workflow_files = ["ci.yml"]
+            code, out, err = _run(
+                fake,
+                ["--dry-run", "--no-rules", "--credential", f"NPM_UPDATE_PAT={path}", REPO],
+            )
+        plan = out + err
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "npm-update: NPM_UPDATE_PAT not set -- no workflow here calls mikelward/npm-update",
+            plan,
+        )
+        self.assertNotIn("nothing to change", plan)
+        self.assertEqual(fake.written_secrets, [])
+
     def test_a_second_mention_no_caller_resolves_in_a_read_file_holds_the_move_back(self):
         # The readable caller does not vouch for a mention beside it that
         # resolves to no caller -- one that is not a job's `uses:`.
@@ -5037,7 +5463,7 @@ class CredentialsStepTest(unittest.TestCase):
         fake = self._consumer()
         fake.env_secret_names = {"gradle-update": {"GRADLE_UPDATE_PAT"}}
         fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
-        code, out, err = _run(fake, ["--dry-run", REPO])
+        code, out, err = _run(fake, ["--dry-run", "-v", REPO])
         self.assertEqual(code, 0, err)
         self.assertIn("gradle-update: the credential lives in the 'gradle-update' environment", out)
         self.assertNotIn("NOT FIXED", out)
@@ -5518,7 +5944,7 @@ class AutoMergeStepTest(unittest.TestCase):
         self.assertEqual(err, "")
         self.assertEqual(fake.patches, [])
         fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
-        code, out, err = _run(fake, ["--dry-run", REPO])
+        code, out, err = _run(fake, ["--dry-run", "-v", REPO])
         self.assertEqual(code, 0, err)
         self.assertIn("  auto-merge:\n    already allowed\n", out)
 
@@ -5589,7 +6015,7 @@ class DeleteBranchOnMergeStepTest(unittest.TestCase):
         self.assertEqual(err, "")
         self.assertEqual(fake.patches, [])
         fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
-        code, out, err = _run(fake, ["--dry-run", REPO])
+        code, out, err = _run(fake, ["--dry-run", "-v", REPO])
         self.assertEqual(code, 0, err)
         self.assertIn("  delete-branch-on-merge:\n    already allowed\n", out)
 
