@@ -1210,6 +1210,39 @@ class _Log:
             return
         self._write_through(text)
 
+    def write_now(self, text):
+        """Write `text` and get it onto disk, raising OSError if it did
+        not land.
+
+        `write` deliberately swallows a failure -- a record that stopped
+        short must not take the run with it. That is exactly wrong for the
+        one caller whose write is a precondition rather than a note:
+        rules.py records a ruleset's body here before deleting it, and
+        GitHub hands back no copy afterwards, so a silently skipped write
+        would turn "recorded, therefore reversible" into an irreversible
+        delete (Codex review, mikelward/repo#46).
+
+        Arms the log first: this is only ever called from a run that is
+        mutating, and buffering the record would leave it unwritten if the
+        process died between here and the delete. Flushed for the same
+        reason -- what makes the deletion safe is the bytes being down,
+        not the call having returned.
+        """
+        self.arm()
+        if self.truncated:
+            raise OSError(f"the log at {self.path} is not being written")
+        self._write_through(text)
+        # _write_through reports and sets `truncated` rather than raising;
+        # for this caller that flag IS the failure signal.
+        if self.truncated or self._handle is None:
+            raise OSError(f"could not write to the log at {self.path}")
+        try:
+            self._handle.flush()
+            os.fsync(self._handle.fileno())
+        except (OSError, ValueError) as e:
+            self.truncated = True
+            raise OSError(f"could not flush the log at {self.path}: {e}") from e
+
     def _write_through(self, text):
         if self.truncated:
             return
@@ -2296,6 +2329,16 @@ def _run(args, log=None):
                 # that suppresses the plan dump above -- see _progress's
                 # docstring for the quiet/verbose split.
                 quiet=not args.verbose,
+                # A deleted ruleset's body goes into the run's log, not
+                # onto the terminal: it is a wall of JSON, and it is the
+                # only copy GitHub will ever hand back. write_now, not
+                # write: this one raises rather than carrying on, so a log
+                # that cannot be written cancels the deletion instead of
+                # letting it happen unrecorded. With no log (--no-log)
+                # apply_ruleset falls back to stdout, since the operator
+                # opted out of the file rather than out of being able to
+                # undo the deletion.
+                record=None if log is None else log.write_now,
             )
             != 0
         ):

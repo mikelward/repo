@@ -226,6 +226,14 @@ class FakeGh:
         self._ruleset_object_reads = {}
         self.ruleset_objects_after_change = {}  # rid -> replacement object
         self.ruleset_content_change_threshold = 1
+        # Truthier than a read count for the window that matters: the gap
+        # between the plan's read of a ruleset and the delete spans the
+        # survivor's own PUT, so keying the swap on that PUT says "inside
+        # the window" without depending on how many reads either side of
+        # it happens to make.
+        self.change_rulesets_after_put = False
+        self.ruleset_read_fails_after_put = set()
+        self._ruleset_put_done = False
         # rid -> read count after which reads of that id fail, for the
         # "could not tell" half of a recheck (as distinct from "changed").
         self.ruleset_read_fails_after = {}
@@ -637,8 +645,13 @@ class FakeGh:
             self._ruleset_object_reads[rid] = self._ruleset_object_reads.get(rid, 0) + 1
             if self._ruleset_object_reads[rid] > self.ruleset_read_fails_after.get(rid, 1 << 30):
                 raise gh.GhError("gh: HTTP 500: Internal Server Error\n")
+            if self._ruleset_put_done and rid in self.ruleset_read_fails_after_put:
+                raise gh.GhError("gh: HTTP 500: Internal Server Error\n")
             if (
-                self._ruleset_object_reads[rid] > self.ruleset_content_change_threshold
+                (
+                    self._ruleset_object_reads[rid] > self.ruleset_content_change_threshold
+                    or (self.change_rulesets_after_put and self._ruleset_put_done)
+                )
                 and rid in self.ruleset_objects_after_change
             ):
                 obj = self.ruleset_objects_after_change[rid]
@@ -1005,6 +1018,8 @@ class FakeGh:
         body = json.loads(input_bytes.decode())
         if method == "PUT":
             self.puts.append((args, body))
+            if _RULESET_ONE_RE.match(endpoint):
+                self._ruleset_put_done = True
             m = _ENV_ONE_RE.match(endpoint)
             if m:
                 env = m.group(2)
@@ -2159,9 +2174,10 @@ class SetupCmdTest(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertEqual(sorted(fake.deleted_rulesets), ["10", "9"])
 
-    def test_a_second_ruleset_sharing_a_legacy_name_is_still_reported(self):
-        # The kept half of the same case: neither is deleted, and both
-        # are named rather than one standing in for the pair.
+    def test_both_of_a_differing_pair_are_named_not_just_one(self):
+        # Two rulesets can share a legacy name. Both go, and both are
+        # named -- one standing in for the pair would leave a reader
+        # thinking a single body was recorded when two were.
         fake = FakeGh()
         self._matching_pair(fake, legacy_rules=[{"type": "required_signatures"}])
         fake.legacy_ruleset_ids = ["9", "10"]
@@ -2169,49 +2185,102 @@ class SetupCmdTest(unittest.TestCase):
         fake.ruleset_objects["10"] = dict(fake.ruleset_objects["9"], id=10)
         code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
         self.assertEqual(code, 0, err)
-        self.assertEqual(fake.deleted_rulesets, [])
-        self.assertIn("(id 9) is still there", err)
-        self.assertIn("(id 10) is still there", err)
+        self.assertEqual(sorted(fake.deleted_rulesets), ["10", "9"])
+        self.assertIn("(id 9) is NOT identical", err)
+        self.assertIn("(id 10) is NOT identical", err)
 
-    def test_a_legacy_ruleset_that_differs_is_reported_not_deleted(self):
-        # The whole reason this is an equality test and not a
-        # field-by-field "is the survivor at least as strict": an
-        # unmanaged rule type the survivor does not carry would be lost,
-        # and so would four other things each found only after the
-        # previous was fixed (see TODO.md).
+    def test_a_difference_appearing_after_the_preview_is_still_reported(self):
+        # The plan called this duplicate identical, and the quiet apply
+        # path prints the plan's note nowhere -- so the note has to come
+        # from the body actually about to be deleted (Codex review,
+        # mikelward/repo#46).
+        fake = FakeGh()
+        self._matching_pair(fake)
+        fake.ruleset_objects["1"]["rules"] = [
+            r for r in fake.ruleset_objects["1"]["rules"] if r["type"] != "non_fast_forward"
+        ]
+        changed = dict(fake.ruleset_objects["9"])
+        changed["rules"] = [*changed["rules"], {"type": "required_signatures"}]
+        fake.ruleset_objects_after_change["9"] = changed
+        fake.ruleset_content_change_threshold = 1 << 30
+        fake.change_rulesets_after_put = True
+        code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.deleted_rulesets, ["9"])
+        self.assertIn("(id 9) is NOT identical to 'main'", err)
+
+    def test_a_dry_run_names_the_deletion_and_that_it_differs(self):
         fake = FakeGh()
         self._matching_pair(fake, legacy_rules=[{"type": "required_signatures"}])
-        code, out, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        code, out, err = _run(fake, ["--dry-run", "--rule", "lanes", REPO])
+        plan = out + err
         self.assertEqual(code, 0, err)
         self.assertEqual(fake.deleted_rulesets, [])
-        self.assertIn("'merge gates' (id 9) is still there beside 'main'", err)
-        self.assertIn("not identical", err)
+        self.assertIn("would delete the superseded ruleset 'merge gates' (id 9)", plan)
+        self.assertIn("NOT identical to what 'main' will hold", plan)
 
-    def test_a_legacy_ruleset_covering_a_ref_the_survivor_does_not_is_kept(self):
-        # Scope is part of the comparison, not just the rules: a legacy
-        # ruleset reaching a branch the standard one does not is
-        # protecting something, whatever its rules say.
+    def test_without_a_log_the_body_goes_to_the_terminal(self):
+        # --no-log is opting out of the file, not out of being able to
+        # undo the deletion -- so the record has to land somewhere.
+        fake = FakeGh()
+        self._matching_pair(fake, legacy_rules=[{"type": "required_signatures"}])
+        code, out, err = _run(fake, ["--force", "--no-log", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.deleted_rulesets, ["9"])
+        self.assertIn("required_signatures", out + err)
+        self.assertIn("POST this back", out + err)
+
+    def test_a_legacy_ruleset_that_differs_is_deleted_and_recorded(self):
+        # Identity used to be the gate. It no longer is: converging on one
+        # ruleset is the point, so a legacy-named one goes whatever it
+        # holds (maintainer, 2026-09-07). What that costs is stated rather
+        # than hidden -- the note says it is NOT identical, and the body
+        # goes into the record so it can be POSTed back.
+        fake = FakeGh()
+        self._matching_pair(fake, legacy_rules=[{"type": "required_signatures"}])
+        with tempfile.TemporaryDirectory() as state:
+            code, out, err = _run(fake, ["--force", "--rule", "lanes", REPO], log_dir=state)
+            logged = _only_log(state)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.deleted_rulesets, ["9"])
+        self.assertIn("'merge gates' (id 9) is NOT identical to 'main'", err)
+        # The body is the log's job -- a wall of JSON on the terminal is
+        # what the quieting exists to prevent.
+        self.assertIn("required_signatures", logged)
+        self.assertIn("POST this back", logged)
+        self.assertNotIn("required_signatures", out)
+
+    def test_a_legacy_ruleset_covering_a_ref_the_survivor_does_not_is_deleted(self):
+        # Scope differences are part of what "not identical" covers, and
+        # the recorded body is what makes losing refs/heads/release
+        # reversible rather than silent.
         fake = FakeGh()
         self._matching_pair(
             fake,
             legacy_scope={"ref_name": {"include": [*_HARDENED_SCOPE, "refs/heads/release"], "exclude": []}},
         )
-        code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        with tempfile.TemporaryDirectory() as state:
+            code, out, err = _run(fake, ["--force", "--rule", "lanes", REPO], log_dir=state)
+            logged = _only_log(state)
         self.assertEqual(code, 0, err)
-        self.assertEqual(fake.deleted_rulesets, [])
-        self.assertIn("is still there beside 'main'", err)
+        self.assertEqual(fake.deleted_rulesets, ["9"])
+        self.assertIn("NOT identical", err)
+        self.assertIn("refs/heads/release", logged)
 
-    def test_a_legacy_ruleset_with_a_bypass_actor_the_survivor_lacks_is_kept(self):
-        # Deleting this one would let that actor past every remaining
-        # gate, which is the opposite of what removing a duplicate is
-        # supposed to do.
+    def test_a_legacy_ruleset_with_a_bypass_actor_is_deleted(self):
+        # Removing a bypass actor is a tightening, not a loss -- but it is
+        # still a difference, so it is reported and recorded like any
+        # other.
         fake = FakeGh()
         self._matching_pair(fake)
         fake.ruleset_objects["9"]["bypass_actors"] = [{"actor_id": 5, "actor_type": "Team"}]
-        code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        with tempfile.TemporaryDirectory() as state:
+            code, out, err = _run(fake, ["--force", "--rule", "lanes", REPO], log_dir=state)
+            logged = _only_log(state)
         self.assertEqual(code, 0, err)
-        self.assertEqual(fake.deleted_rulesets, [])
-        self.assertIn("is still there beside 'main'", err)
+        self.assertEqual(fake.deleted_rulesets, ["9"])
+        self.assertIn("NOT identical", err)
+        self.assertIn('"actor_id": 5', logged)
 
     def test_the_deletion_happens_after_the_write_that_makes_it_safe(self):
         # What makes the duplicate safe to delete is that the SURVIVOR
@@ -2238,13 +2307,12 @@ class SetupCmdTest(unittest.TestCase):
         )
         self.assertLess(put_index, delete_index)
 
-    def test_a_duplicate_edited_during_the_write_is_not_deleted(self):
-        # The plan reads the duplicate before the survivor's own write, so
-        # the window between that read and the delete is a network round
-        # trip wide -- an administrator editing the duplicate inside it
-        # would otherwise have it deleted on a reading that no longer
-        # holds (Codex review, mikelward/repo#31). Simulated by swapping
-        # the duplicate's content in after its first read.
+    def test_a_duplicate_edited_during_the_write_is_deleted_as_it_now_is(self):
+        # An edit landing in the window no longer holds the delete back --
+        # every legacy-named ruleset goes (maintainer, 2026-09-07). What
+        # the edit must not do is make the RECORD stale: the body written
+        # down has to be the one actually removed, or restoring from it
+        # would silently drop the edit.
         fake = FakeGh()
         self._matching_pair(fake)
         fake.ruleset_objects["1"]["rules"] = [
@@ -2253,42 +2321,48 @@ class SetupCmdTest(unittest.TestCase):
         changed = dict(fake.ruleset_objects["9"])
         changed["rules"] = [*changed["rules"], {"type": "required_signatures"}]
         fake.ruleset_objects_after_change["9"] = changed
-        # The seventh read of the duplicate is the one _still_superseded
-        # makes, right before the delete; everything before it -- the
-        # plan, the merge-method scans, the fingerprint recompute -- sees
-        # the unchanged object, so this lands in exactly the window the
-        # earlier checks cannot cover.
-        fake.ruleset_content_change_threshold = 6
-        code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
-        self.assertEqual(code, 1)
-        self.assertEqual(fake.deleted_rulesets, [])
-        self.assertIn("no longer identical", err)
-        # The survivor's own write still happened -- the duplicate going
-        # is the part that was unsafe, not the protection being written.
-        self.assertEqual(len(fake.puts), 1)
+        # Only after the survivor's own PUT, which is what makes this the
+        # window the plan's earlier read cannot cover.
+        fake.ruleset_content_change_threshold = 1 << 30
+        fake.change_rulesets_after_put = True
+        with tempfile.TemporaryDirectory() as state:
+            code, out, err = _run(fake, ["--force", "--rule", "lanes", REPO], log_dir=state)
+            logged = _only_log(state)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.deleted_rulesets, ["9"])
+        # The body recorded is the one actually removed, read fresh right
+        # before the delete -- not the copy the plan saw.
+        self.assertIn("required_signatures", logged)
 
-    def test_a_rename_in_that_window_keeps_the_duplicate_too(self):
-        # Content equality deliberately ignores the name -- that is what
-        # lets a duplicate be recognized as identical to a survivor called
-        # something else -- so it says nothing about WHICH of the two is
-        # the standard ruleset. An administrator renaming the duplicate to
-        # 'main' in this window would otherwise have the newly canonical
-        # one deleted (Codex review, mikelward/repo#31).
+    def test_a_rename_in_that_window_keeps_the_duplicate(self):
+        # The one thing the fresh read still has to establish: an
+        # administrator renaming the duplicate to 'main' in this window
+        # would otherwise have the newly canonical ruleset deleted and the
+        # repository left with nothing under that name (Codex review,
+        # mikelward/repo#31).
         fake = FakeGh()
         self._matching_pair(fake)
+        fake.ruleset_objects["1"]["rules"] = [
+            r for r in fake.ruleset_objects["1"]["rules"] if r["type"] != "non_fast_forward"
+        ]
         fake.ruleset_objects_after_change["9"] = dict(fake.ruleset_objects["9"], name="main")
-        fake.ruleset_content_change_threshold = 6
+        fake.ruleset_content_change_threshold = 1 << 30
+        fake.change_rulesets_after_put = True
         code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
         self.assertEqual(code, 1)
         self.assertEqual(fake.deleted_rulesets, [])
         self.assertIn("renamed", err)
 
     def test_a_failed_re_read_before_the_delete_keeps_the_duplicate(self):
-        # "Could not tell" is not "unchanged": a read this cannot make
-        # must never be the reason a ruleset is deleted.
+        # "Could not tell" is not "safe to delete" -- and with no body
+        # read there is nothing to record, so the delete would be the
+        # unrecoverable kind.
         fake = FakeGh()
         self._matching_pair(fake)
-        fake.ruleset_read_fails_after["9"] = 6
+        fake.ruleset_objects["1"]["rules"] = [
+            r for r in fake.ruleset_objects["1"]["rules"] if r["type"] != "non_fast_forward"
+        ]
+        fake.ruleset_read_fails_after_put.add("9")
         code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
         self.assertEqual(code, 1)
         self.assertEqual(fake.deleted_rulesets, [])
@@ -3526,15 +3600,20 @@ class UpdatePlanTest(unittest.TestCase):
         self.assertIn("force pushes are blocked", plan)
 
 
+def _only_log(state):
+    """The single log file a run wrote under `state`, as text."""
+    directory = os.path.join(state, "repo")
+    names = os.listdir(directory)
+    assert len(names) == 1, names
+    with open(os.path.join(directory, names[0]), encoding="utf-8") as f:
+        return f.read()
+
+
 class RunLogTest(unittest.TestCase):
     """The terminal says what changed; the log keeps the full record."""
 
     def _read_log(self, state):
-        directory = os.path.join(state, "repo")
-        names = os.listdir(directory)
-        self.assertEqual(len(names), 1, names)
-        with open(os.path.join(directory, names[0]), encoding="utf-8") as f:
-            return f.read()
+        return _only_log(state)
 
     def test_the_log_keeps_the_full_plan_the_terminal_leaves_out(self):
         with tempfile.TemporaryDirectory() as state:

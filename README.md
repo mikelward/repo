@@ -98,7 +98,9 @@ because there everything is new. `--verbose` restores the full plan and
 per-step progress markers. A run that changes something also writes the
 full record -- every section, including the ones the terminal drops -- to
 a timestamped file under `$XDG_STATE_HOME/repo` (`--log FILE` to choose
-the path, `--no-log` to skip it), and names that path at the end. A run
+the path, `--no-log` to skip it), and names that path at the end -- plus
+the full body of any ruleset it deletes, since GitHub hands back no copy
+of one and that record is what makes the deletion reversible. A run
 that changes nothing writes no file: over a fleet, a log per repository
 per sweep saying nothing happened is the same noise somewhere else.
 
@@ -109,8 +111,9 @@ blocked, plus a standalone warning when a repository has an actual
 used before it, is adopted and updated in place -- renamed where needed --
 rather than gaining a second one beside it, since rulesets aggregate and
 two of them are only ever confusing, and where both names exist the older
-one is deleted when its content is identical to what the surviving one
-will hold, and reported when it is not; an existing ruleset's own scope is
+one is deleted -- whatever it holds, with its full body written to the
+run's log first so it can be POSTed back, and with a note when it was not
+identical to what survives; an existing ruleset's own scope is
 widened to cover all three refs, never narrowed or replaced -- and an
 exclusion that carves one of them back out is reported rather than
 deleted, since removing one somebody wrote is a narrowing decision this
