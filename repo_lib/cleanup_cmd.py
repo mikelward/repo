@@ -113,7 +113,7 @@ import shlex
 import sys
 from urllib.parse import quote
 
-from repo_lib import gh
+from repo_lib import common, gh
 from repo_lib.common import error, error_lines, status
 
 # The lookaheads reject `.` and `..` components: made of allowed
@@ -893,15 +893,10 @@ def _clear_progress():
 
 
 def _default_log_path(repo, now):
-    """A timestamped file under the XDG state directory -- state, not
-    cache: the restore commands are the only record of what a run deleted,
-    so a directory something else is entitled to clear would be the wrong
-    home for them."""
-    base = os.environ.get("XDG_STATE_HOME") or os.path.join(
-        os.path.expanduser("~"), ".local", "state"
-    )
-    stamp = now.strftime("%Y%m%dT%H%M%SZ")
-    return os.path.join(base, "repo", f"cleanup-{repo.replace('/', '-')}-{stamp}.log")
+    """Where this run's record goes when --log was not given. The naming
+    and directory are shared with `repo setup`; the reason a failure to
+    open it stops this command and not that one is in _open_log."""
+    return common.default_log_path("cleanup", repo, now)
 
 
 def _open_log(path):

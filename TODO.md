@@ -472,6 +472,29 @@
       whose *scope* provably excludes the default branch -- no strictness
       comparison needed at all.
 
+- [ ] **A widening can name a ref the ruleset already covers.**
+      `_widen_include` compares refs literally (`ref not in include`), so
+      a ruleset including `refs/heads/main` on a repository whose default
+      branch *is* `main` still gets `~DEFAULT_BRANCH` appended, and the
+      inverse when the token is there and the literal ref is added. Two
+      separable consequences (Codex review, mikelward/repo#45):
+
+      The **plan overstates**: `scope_added` carries that token, and
+      `_effective_scope_added` filters it against the ruleset's own
+      exclusions but not against what the include list already reaches,
+      so `newly effective on ~DEFAULT_BRANCH` can name a branch already
+      protected. Display only, and the fix is contained -- normalize the
+      ORIGINAL include list and drop from `covered` anything it already
+      covers.
+
+      The **write is redundant**: the appended token makes `target !=
+      original`, so `needs_write` goes true and a PUT happens for a scope
+      that is unchanged in effect. That predates the plan work and
+      changes what the tool WRITES rather than what it prints, so it
+      wants its own change and its own tests -- including what an
+      already-`~DEFAULT_BRANCH` ruleset should do when the default branch
+      is later renamed, where the literal entry is not redundant at all.
+
 ## repo cleanup
 
 - [ ] **`repo audit` cannot see an unmergeable branch.**
