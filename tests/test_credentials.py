@@ -301,22 +301,110 @@ class LanesIndirectTest(unittest.TestCase):
 
 
 class LanesCalledWorkflowsTest(unittest.TestCase):
-    """A job-level `uses:` this reader cannot follow can hold the lanes
-    step that publishes, and the caller names neither the action nor either
-    secret -- so the pair read as used by nothing and was deleted (Codex,
-    mikelward/repo#36)."""
+    """A job-level `uses:` this reader cannot follow can hold the lanes step
+    that publishes. An EXTERNAL call carries the pair only when it forwards
+    secrets that could reach it; a SAME-repository call reaches this
+    repository's `lanes` environment directly, so it is held whatever it
+    forwards (Codex, mikelward/repo#36, #50)."""
 
-    def test_an_external_call_is_reported(self):
+    REPO = "owner/repo"
+
+    def test_an_external_call_inheriting_secrets_is_reported(self):
         text = (
             "name: ci\non: pull_request\njobs:\n  ci:\n"
             "    uses: some-org/shared/.github/workflows/ci.yml@main\n    secrets: inherit\n"
         )
-        self.assertEqual(credentials.lanes_called_workflows({"ci.yml": text}), ["ci.yml"])
+        self.assertEqual(
+            credentials.lanes_called_workflows({"ci.yml": text}, self.REPO), ["ci.yml"]
+        )
 
-    def test_an_external_call_passing_nothing_is_reported_too(self):
-        # The called job's own `environment: lanes` reaches the pair
-        # whatever the caller passes, so the call is the signal rather than
-        # the `secrets:` beside it.
+    def test_an_external_call_forwarding_the_pair_by_name_is_reported(self):
+        text = (
+            "name: ci\non: pull_request\njobs:\n  ci:\n"
+            "    uses: some-org/shared/.github/workflows/ci.yml@main\n    secrets:\n"
+            "      app-id: ${{ secrets.LANES_APP_ID }}\n"
+            "      app-private-key: ${{ secrets.LANES_APP_PRIVATE_KEY }}\n"
+        )
+        self.assertEqual(
+            credentials.lanes_called_workflows({"ci.yml": text}, self.REPO), ["ci.yml"]
+        )
+
+    def test_an_external_call_forwarding_any_secret_is_reported(self):
+        # The mapping's contents are not parsed for the pair's name: a value
+        # can compute it at runtime, so any forwarding mapping is "cannot
+        # tell" and held, even one that names no App secret literally (Codex,
+        # mikelward/repo#50).
+        text = (
+            "name: ci\non: pull_request\njobs:\n  ci:\n"
+            "    uses: some-org/shared/.github/workflows/ci.yml@main\n    secrets:\n"
+            "      npm-token: ${{ secrets.NPM_TOKEN }}\n"
+        )
+        self.assertEqual(
+            credentials.lanes_called_workflows({"ci.yml": text}, self.REPO), ["ci.yml"]
+        )
+
+    def test_an_external_call_forwarding_a_computed_secret_reference_is_reported(self):
+        # `secrets[format('LANES_{0}', 'APP_ID')]` forwards the pair though no
+        # string contains LANES_APP_ID contiguously; a literal search would
+        # miss it, so the whole mapping is held (Codex, mikelward/repo#50).
+        text = (
+            "name: ci\non: pull_request\njobs:\n  ci:\n"
+            "    uses: some-org/shared/.github/workflows/ci.yml@main\n    secrets:\n"
+            "      app-id: ${{ secrets[format('LANES_{0}', 'APP_ID')] }}\n"
+        )
+        self.assertEqual(
+            credentials.lanes_called_workflows({"ci.yml": text}, self.REPO), ["ci.yml"]
+        )
+
+    def test_an_external_call_passing_nothing_is_not_reported(self):
+        # No `secrets: inherit` and no `secrets:` block, so the called
+        # workflow -- in another repository -- receives none of the caller's
+        # secrets and its own environment is not this repository's. The pair
+        # cannot publish there. This is the scaffold's codex-review-check.yml
+        # shape, which held an otherwise-unused pair from cleanup purely by
+        # calling mikelward/codex-review.
+        text = (
+            "name: codex-review-check\non: pull_request\njobs:\n  codex-review-check:\n"
+            "    uses: mikelward/codex-review/.github/workflows/check-consumer.yml@main\n"
+        )
+        self.assertEqual(credentials.lanes_called_workflows({"crc.yml": text}, self.REPO), [])
+
+    def test_an_external_call_with_an_empty_secrets_mapping_is_not_reported(self):
+        # An empty mapping forwards nothing, like a missing key.
+        text = (
+            "name: ci\non: pull_request\njobs:\n  ci:\n"
+            "    uses: some-org/shared/.github/workflows/ci.yml@main\n    secrets: {}\n"
+        )
+        self.assertEqual(credentials.lanes_called_workflows({"ci.yml": text}, self.REPO), [])
+
+    def test_a_same_repo_fully_qualified_call_passing_nothing_is_reported(self):
+        # A pinned call into this repository can reach a job there declaring
+        # `environment: lanes`, which reads this repository's own environment
+        # secrets directly -- no forwarding -- and the pinned `@ref` may not
+        # be the copy this reader has. Held conservatively (Codex,
+        # mikelward/repo#50).
+        text = (
+            "name: ci\non: pull_request\njobs:\n  ci:\n"
+            "    uses: owner/repo/.github/workflows/inner.yml@v1\n"
+        )
+        self.assertEqual(
+            credentials.lanes_called_workflows({"ci.yml": text}, self.REPO), ["ci.yml"]
+        )
+
+    def test_a_same_repo_call_is_matched_case_insensitively(self):
+        # GitHub owner and repository names are case-insensitive.
+        text = (
+            "name: ci\non: pull_request\njobs:\n  ci:\n"
+            "    uses: Owner/Repo/.github/workflows/inner.yml@v1\n"
+        )
+        self.assertEqual(
+            credentials.lanes_called_workflows({"ci.yml": text}, self.REPO), ["ci.yml"]
+        )
+
+    def test_an_unknown_repo_keeps_every_call_conservative(self):
+        # Without a repo to compare against, an external call cannot be told
+        # from a same-repo one, so the flagging (delete-holding) direction
+        # wins -- even for a call that forwards nothing.
         text = (
             "name: ci\non: pull_request\njobs:\n  ci:\n"
             "    uses: some-org/shared/.github/workflows/ci.yml@main\n"
@@ -330,14 +418,14 @@ class LanesCalledWorkflowsTest(unittest.TestCase):
             "name: ci\non: pull_request\njobs:\n  ci:\n"
             "    uses: ./.github/workflows/inner.yml\n    secrets: inherit\n"
         )
-        self.assertEqual(credentials.lanes_called_workflows({"ci.yml": text}), [])
+        self.assertEqual(credentials.lanes_called_workflows({"ci.yml": text}, self.REPO), [])
 
     def test_a_step_level_uses_is_not_a_call(self):
         text = (
             "name: ci\non: pull_request\njobs:\n  ci:\n    steps:\n"
             "      - uses: actions/checkout@v4\n"
         )
-        self.assertEqual(credentials.lanes_called_workflows({"ci.yml": text}), [])
+        self.assertEqual(credentials.lanes_called_workflows({"ci.yml": text}, self.REPO), [])
 
 
 class DefaultBranchPinTest(unittest.TestCase):
