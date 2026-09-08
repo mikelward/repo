@@ -712,7 +712,7 @@ def _plan_credentials(repo, specs):
         )
         return plan
 
-    rested_state = credentials.lanes_state(texts)
+    rested_state = credentials.lanes_state(texts, repo)
     # How each field of that state reads when it is the one that moved. The
     # comparison is wholesale (see `credentials.lanes_state`); this is only
     # the wording, so a reason names what changed rather than "something".
@@ -769,7 +769,7 @@ def _plan_credentials(repo, specs):
         branch's copies filed as this one's. A rename after every read is
         nobody's to catch without a transaction, and the next run
         replans."""
-        state_now = credentials.lanes_state(reread())
+        state_now = credentials.lanes_state(reread(), repo)
         default_now = credentials.default_branch(repo)
         if default_now != default:
             return f"the default branch is now '{default_now}', not '{default}'"
@@ -785,7 +785,7 @@ def _plan_credentials(repo, specs):
         # them -- noise on the many to protect the few, and `unused` has
         # nothing to delete when no copy exists anyway.
         at_stake = [n for n in (app_id, app_key) if n in repo_secrets or n in env_secrets or n in given]
-        called = credentials.lanes_called_workflows(texts) if at_stake else []
+        called = credentials.lanes_called_workflows(texts, repo) if at_stake else []
         if called:
             # A job-level `uses:` this reader cannot follow can hold the
             # lanes step that publishes: the caller names neither the

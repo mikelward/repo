@@ -1064,24 +1064,83 @@ def lanes_indirect(texts):
     return sorted(named)
 
 
-def lanes_called_workflows(texts):
-    """The workflows calling a reusable workflow this reader cannot read --
-    a job-level `uses:` naming something outside this repository.
+def _call_forwards_secrets(secrets):
+    """Whether a reusable-workflow call's `secrets:` value forwards any secret
+    to the called workflow -- `secrets: inherit`, or a non-empty `secrets:`
+    mapping.
+
+    The mapping's CONTENTS are deliberately not parsed for the pair's name. A
+    value can compute that name at runtime -- `secrets[format('LANES_{0}',
+    'APP_ID')]` forwards the pair though no string contains `LANES_APP_ID`
+    contiguously -- so a literal search would miss it and read the call as
+    unrelated, and `repo setup --force` would then delete a credential that
+    is in use, which GitHub never gives back (Codex, mikelward/repo#50). So
+    any forwarding mapping is "cannot tell" and held. Enumerating which
+    mapping entries name the pair is the one-more-case pattern this module's
+    history warns against; not looking at all is the design that has no next
+    case.
+
+    A missing `secrets:` and an empty mapping forward nothing. The called
+    job's own `environment:` is not a channel for the CALLER's pair on a call
+    to a DIFFERENT repository: that workflow resolves its environment secrets
+    in its own repository, not the caller's. So for an external call whether
+    it forwards any secret is the whole question. A same-repository call is
+    handled separately (see `_is_external_call`), because there the
+    environment is this repository's own."""
+    if isinstance(secrets, str):
+        return secrets.strip().lower() == "inherit"
+    if isinstance(secrets, dict):
+        return bool(secrets)
+    return False
+
+
+def _is_external_call(uses, repo):
+    """Whether a job-level `uses:` names a reusable workflow in a DIFFERENT
+    repository than `repo` ('owner/name'), the only case where the caller's
+    App pair can reach the called workflow solely through forwarded secrets.
+
+    A call into `repo` itself -- the fully-qualified
+    `owner/name/.github/workflows/x.yml@ref` form -- can reach a job there
+    that declares `environment: lanes` and reads THIS repository's
+    environment secrets directly, no forwarding involved, and a pinned
+    `@ref` may not even be the branch copy this reader has (Codex,
+    mikelward/repo#50). So a same-repository call is treated conservatively,
+    like the unqualified case before it. An unknown `repo` (None) is treated
+    as not-external for the same reason -- the direction that keeps flagging.
+    A local `./` call never reaches here; its file is read directly."""
+    if repo is None:
+        return False
+    return not uses.strip().lower().startswith(f"{repo.lower()}/")
+
+
+def lanes_called_workflows(texts, repo=None):
+    """The workflows calling a reusable workflow this reader cannot read that
+    could still carry the App pair -- a job-level `uses:` that is either a
+    same-repository call (which can read this repository's `lanes`
+    environment directly) or an external call forwarding any secret (see
+    `_is_external_call` and `_call_forwards_secrets`).
 
     The called workflow's own file is not among `texts`, so a lanes step in
-    it is invisible here: the caller names neither the action nor either
-    secret, every reader comes back empty, and the pair read as used by
-    nothing. `repo setup --force` then deleted both copies and the values
-    with them, since GitHub never gives a secret back (Codex,
-    mikelward/repo#36). The pair reaches such a job through `secrets:
-    inherit`, through a `secrets:` block naming it, or through the called
-    job's own `environment: lanes` -- and the last of those is invisible in
-    the caller whatever it passes, so the call itself is the signal rather
-    than what accompanies it.
+    it is invisible here. When such a call could carry the pair, the caller
+    may still name neither the action nor either secret directly, every
+    other reader comes back empty, and the pair reads as used by nothing.
+    `repo setup --force` then deleted both copies and the values with them,
+    since GitHub never gives a secret back (Codex, mikelward/repo#36). So it
+    holds the delete.
 
-    A LOCAL call (`./.github/workflows/x.yml`) is not one of these: that
-    file is read directly, so its lanes step counts as a publisher on its
-    own account.
+    An EXTERNAL call that forwards NOTHING is not one of these: with no
+    `secrets: inherit` and no `secrets:` block at all, a workflow in another
+    repository receives none of the caller's secrets, and its own
+    environment is not this repository's, so the pair cannot publish there
+    whatever it does. Flagging it anyway held the pair on the strength of an
+    unrelated call -- the scaffold's `codex-review-check.yml` calls
+    `mikelward/codex-review` and passes no secrets, and that alone kept an
+    otherwise-unused pair from being cleaned up. An external call that
+    forwards ANY secret is held (cannot tell): see `_call_forwards_secrets`.
+
+    A LOCAL call (`./.github/workflows/x.yml`) is not one of these either:
+    that file is read directly, so its lanes step counts as a publisher on
+    its own account.
 
     This holds the unused DELETE, not the move. The two differ in what a
     wrong answer costs: setup has the value it writes, handed in on the
@@ -1104,7 +1163,12 @@ def lanes_called_workflows(texts):
             continue
         for job in _jobs(document).values():
             uses = job.get("uses")
-            if isinstance(uses, str) and not uses.strip().startswith("./"):
+            if not isinstance(uses, str) or uses.strip().startswith("./"):
+                continue
+            # A same-repository call reaches this repository's environment
+            # directly; only a genuinely external one is gated on whether it
+            # forwards the pair.
+            if not _is_external_call(uses, repo) or _call_forwards_secrets(job.get("secrets")):
                 calling.append(name)
                 break
     return sorted(calling)
@@ -1217,7 +1281,7 @@ def lanes_unread(texts):
     return sorted(unread)
 
 
-def lanes_state(texts):
+def lanes_state(texts, repo=None):
     """Everything both commands read out of the workflows about the lanes
     credential, as one comparable value.
 
@@ -1234,7 +1298,7 @@ def lanes_state(texts):
     return {
         "unread": tuple(lanes_unread(texts)),
         "indirect": tuple(lanes_indirect(texts)),
-        "called workflows": tuple(lanes_called_workflows(texts)),
+        "called workflows": tuple(lanes_called_workflows(texts, repo)),
         "incomplete": tuple(lanes_incomplete(texts)),
         "foreign": tuple(lanes_foreign(texts)),
         "publishers": tuple(sorted(lanes_publishers(texts).items())),

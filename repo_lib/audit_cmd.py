@@ -617,7 +617,7 @@ def audit_secrets(repo, ok, fix):
     # workflow, so raising this where the pair is absent would report on
     # the many to protect the few.
     called = (
-        credentials.lanes_called_workflows(texts)
+        credentials.lanes_called_workflows(texts, repo)
         if not publishers
         and not incomplete
         and not foreign
