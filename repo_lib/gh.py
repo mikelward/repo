@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import time
 
-from repo_lib.common import error
+from repo_lib.common import error, warn
 
 
 class GhError(Exception):
@@ -70,7 +70,7 @@ def _run_subprocess_retrying_secondary_rate_limit(argv, **kwargs):
         stderr_text = proc.stderr if isinstance(proc.stderr, str) else proc.stderr.decode(errors="replace")
         if attempt == _RATE_LIMIT_RETRY_ATTEMPTS or not _is_secondary_rate_limit(stderr_text):
             return proc
-        error(
+        warn(
             f"hit GitHub's secondary rate limit -- waiting {delay}s before retrying "
             f"({attempt}/{_RATE_LIMIT_RETRY_ATTEMPTS}): {stderr_text.strip()}"
         )
@@ -133,7 +133,7 @@ def token_scopes():
     try:
         raw = run(["api", "-i", "user"])
     except GhError as e:
-        error(f"could not check this gh token's OAuth scopes (continuing without that check): {e.stderr.strip()}")
+        warn(f"could not check this gh token's OAuth scopes (continuing without that check): {e.stderr.strip()}")
         return None
     headers, _, _ = raw.partition("\n\n")
     for line in headers.splitlines():

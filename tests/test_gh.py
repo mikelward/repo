@@ -235,14 +235,16 @@ class GhWrapperTest(unittest.TestCase):
         # network, GitHub down) must not be silently indistinguishable
         # from the routine "this token doesn't use scopes" case -- a
         # caller falling through to the same opaque 404 this exists to
-        # diagnose would otherwise never see it was reported at all.
+        # diagnose would otherwise never see it was reported at all. It is
+        # a warning, not an error: the check is skipped and the run
+        # continues.
         with patch(
             "subprocess.run",
             return_value=FakeCompletedProcess(1, stderr="gh: HTTP 401: Bad credentials\n"),
-        ), patch("repo_lib.gh.error") as mock_error:
+        ), patch("repo_lib.gh.warn") as mock_warn:
             self.assertIsNone(gh.token_scopes())
-        mock_error.assert_called_once()
-        self.assertIn("Bad credentials", mock_error.call_args.args[0])
+        mock_warn.assert_called_once()
+        self.assertIn("Bad credentials", mock_warn.call_args.args[0])
 
     def test_require_gh_raises_when_gh_is_missing(self):
         with patch("shutil.which", return_value=None):

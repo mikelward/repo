@@ -9,5 +9,14 @@ description = "Fleet-management CLI for GitHub repositories"
 requires-python = ">=3.9"
 dependencies = ["PyYAML>=6"]
 
+# Optional: a checkbox picker for `repo cleanup`. Deliberately not a required
+# dependency -- the tool stays PyYAML-only out of the box and falls back to a
+# plain-text prompt without it (which is what the test suite drives). Enable
+# with `uv run --extra tui ./repo ...` (uv reads this extra from the
+# checkout) or `python3 -m pip install prompt_toolkit` -- not
+# `pip install 'repo[tui]'`, since `repo` is never published as a package.
+[project.optional-dependencies]
+tui = ["prompt_toolkit>=3"]
+
 [tool.uv]
 package = false

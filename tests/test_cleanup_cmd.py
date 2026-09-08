@@ -1194,17 +1194,21 @@ class WidgetPickerTest(CleanupTestCase):
         self.assertIn("could not show the selection dialog", err.getvalue())
         self.assertIn("no default_values", err.getvalue())
 
-    def test_an_absent_library_is_not_an_error(self):
+    def test_an_absent_library_is_a_warning_naming_the_extra_not_an_error(self):
         # `repo` runs from a checkout with no install step, and that has to
         # keep being true: not installed is the documented fallback, not a
-        # failure.
+        # failure. It is a warning, not an error, and it names the optional
+        # extra so the fallback isn't a silent surprise.
         entries = [{"name": "claude/a", "why": "merged by PR #1"}]
         with _every_stream_a_terminal() as err, patch.dict(
             sys.modules, {"prompt_toolkit": None, "prompt_toolkit.shortcuts": None}
         ):
             result = cleanup_cmd._select_widgets(entries, "t")
         self.assertIs(result, cleanup_cmd._NO_PICKER)
-        self.assertEqual(err.getvalue(), "")
+        msg = err.getvalue()
+        self.assertIn("warning:", msg)
+        self.assertIn("prompt_toolkit", msg)
+        self.assertNotIn("error:", msg)
 
     def test_no_terminal_means_no_dialog(self):
         # The widget path needs a real terminal at both ends; without one it
@@ -1286,7 +1290,9 @@ class RevalidationTest(CleanupTestCase):
         code, out, err, log = self.invoke(fake, [REPO, "--force"])
         self.assertEqual(code, 1)
         self.assertEqual(fake.deleted(), [])
-        self.assertIn("was NOT deleted", err)
+        # A safety refusal that fails the run is warned, not left as routine
+        # unprefixed output that scrolls past unnoticed.
+        self.assertIn("warning: claude/done was NOT deleted", err)
         self.assertIn("it moved to ccc", err)
 
     def test_a_branch_protected_during_the_prompt_is_refused(self):
@@ -1488,8 +1494,8 @@ class LogFileTest(CleanupTestCase):
         # restore command in them is the half that outlives the terminal.
         code, out, err, log = self.invoke(self._merged(), [REPO, "--force"])
         self.assertEqual(code, 0)
-        self.assertIn("Merged branches on owner/repo, to delete (1):", err)
-        self.assertIn("Merged branches on owner/repo, to delete (1):", log)
+        self.assertIn("Merged branches on owner/repo, safe to delete (1):", err)
+        self.assertIn("Merged branches on owner/repo, safe to delete (1):", log)
         self.assertIn("gh api --method POST", log)
         self.assertNotIn("gh api --method POST", err)
         self.assertNotIn("deleted claude/done (was bbb)", err)
@@ -1583,7 +1589,7 @@ class LogFileTest(CleanupTestCase):
                 fake, [REPO, "--dry-run", "--log", path]
             )
             self.assertFalse(os.path.exists(path))
-        self.assertIn("Merged branches on owner/repo, to delete (1):", out)
+        self.assertIn("Merged branches on owner/repo, safe to delete (1):", out)
         self.assertEqual(fake.deleted(), [])
 
     def test_a_log_that_cannot_be_opened_stops_the_run(self):
@@ -1832,7 +1838,7 @@ class LogFileTest(CleanupTestCase):
             )
         # Nothing failed except the record itself, and that is enough.
         self.assertEqual(fake.deleted(), [])
-        self.assertIn("could not be written", err)
+        self.assertIn("error: could not write the previous line", err)
         self.assertEqual(code, 1)
 
     def test_declining_an_offer_survives_an_unwritable_log(self):
@@ -1864,7 +1870,7 @@ class LogFileTest(CleanupTestCase):
             )
         # Declining the first did not abandon the second.
         self.assertEqual(fake.deleted(), ["claude/b"])
-        self.assertIn("could not be written", err)
+        self.assertIn("error: could not write the previous line", err)
 
     def test_a_failure_closing_the_log_is_reported_not_raised(self):
         # Closing flushes, so it is the last place a full disk can bite --
@@ -1998,7 +2004,9 @@ class UsageTest(CleanupTestCase):
         fake = FakeGh(branches=[("main", "aaa", True)])
         code, out, err, log = self.invoke(fake, [REPO, "--include-unmerged", "--force"])
         self.assertEqual(code, 0)
-        self.assertIn("no longer needed", err)
+        # A deprecation notice on a run that succeeds is a warning, not an
+        # error -- the flag is accepted and the command exits 0.
+        self.assertIn("warning: --include-unmerged is accepted", err)
     def test_a_dry_run_may_use_include_unmerged_without_a_terminal(self):
         # Nothing is asked and nothing is written, so the terminal
         # requirement would only block a legitimate `| less`.
@@ -2067,7 +2075,7 @@ class ConfirmationTest(CleanupTestCase):
         # --force skips the question, not the record of what it touched.
         fake = self._one_merged()
         code, out, err, log = self.invoke(fake, [REPO, "--force"])
-        self.assertIn("Merged branches on owner/repo, to delete (1):", log)
+        self.assertIn("Merged branches on owner/repo, safe to delete (1):", log)
 
     def test_a_dry_run_writes_nothing(self):
         fake = self._one_merged()
@@ -2194,7 +2202,10 @@ class NothingToDoTest(CleanupTestCase):
         fake = FakeGh(branches=[("main", "aaa", True)])
         code, out, err, log = self.invoke(fake, [REPO])
         self.assertEqual(code, 0)
-        self.assertIn("No merged branches to delete", log)
+        # The merged set is always a labeled block, even at zero, so it reads
+        # as "section 1: merged (none)" ahead of anything to weigh.
+        self.assertIn("safe to delete (0):", log)
+        self.assertIn("(none)", log)
         self.assertEqual(fake.deleted(), [])
 
 

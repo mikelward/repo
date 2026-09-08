@@ -1,28 +1,41 @@
-"""Shared bits every subcommand needs: the program name and error printing."""
+"""Shared bits every subcommand needs: leveled output and the state-log path.
+
+Three levels, all on stderr so a redirected stdout stays exactly the
+command's own result:
+
+- `error` -- a failure the user must see; prefixed `error:`.
+- `warn`  -- a caveat or fallback the command carries on past; `warning:`.
+- `info`  -- routine progress or a result note; no level prefix.
+
+Only `error`/`warn` carry a prefix: the program name led every line before,
+which buried the one word that said whether a line was a problem.
+"""
 
 import os
 import sys
 
-PROGRAM = "repo"
-
 
 def error(message):
-    print(f"{PROGRAM}: {message}", file=sys.stderr)
+    print(f"error: {message}", file=sys.stderr)
 
 
-def status(message):
-    """A progress line, not a result: stderr, so a redirected stdout stays
-    exactly the command's own output. Not gated on isatty -- it is one line,
-    and a fleet loop's log is better for having it."""
-    print(f"{PROGRAM}: {message}", file=sys.stderr)
+def warn(message):
+    print(f"warning: {message}", file=sys.stderr)
 
 
-def error_lines(prefix, text):
-    """Print `prefix`, then every line of `text` indented -- for relaying a
-    gh error message without losing its own line breaks."""
-    error(prefix)
+def info(message):
+    """Routine progress or a result note. Not gated on isatty -- it is one
+    line, and a fleet loop's log is better for having it."""
+    print(message, file=sys.stderr)
+
+
+def error_lines(headline, text):
+    """`headline` as an error, then each line of `text` indented under it --
+    for relaying a gh error message without losing its own line breaks. Only
+    the headline carries the level prefix."""
+    error(headline)
     for line in (text or "").splitlines():
-        error(f"  {line}")
+        print(f"  {line}", file=sys.stderr)
 
 
 def default_log_path(command, repo, now):

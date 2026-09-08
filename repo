@@ -23,7 +23,7 @@ try:
     import yaml  # noqa: F401
 except ImportError:
     sys.exit(
-        "repo: PyYAML is not installed, and the workflow reader needs it. Run this as\n"
+        "error: PyYAML is not installed, and the workflow reader needs it. Run this as\n"
         "`uv run ./repo ...`, which installs it into a project environment, or install it\n"
         "yourself: `uv pip install pyyaml`, `python3 -m pip install pyyaml`, or your\n"
         "distribution's package (`python3-yaml` on Debian and Ubuntu)."

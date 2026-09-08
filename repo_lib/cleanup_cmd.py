@@ -114,7 +114,7 @@ import sys
 from urllib.parse import quote
 
 from repo_lib import common, gh
-from repo_lib.common import error, error_lines, status
+from repo_lib.common import error, error_lines, info, warn
 
 # The lookaheads reject `.` and `..` components: made of allowed
 # characters, but as path segments spliced into `repos/{repo}/...` they
@@ -592,11 +592,14 @@ def _describe_plan(repo, plan, default_branch, older_than, offer_unmerged):
     deletable, offerable, kept, skipped, failed = plan
     lines = []
 
+    # Always a labeled first block, even when empty: the merged set is the
+    # safe one, so seeing it explicitly (with "(none)" when there is nothing)
+    # is what tells the reader the unmerged block below is the one to weigh.
+    lines.append(f"Merged branches on {repo}, safe to delete ({len(deletable)}):")
     if deletable:
-        lines.append(f"Merged branches on {repo}, to delete ({len(deletable)}):")
         lines.extend(_grouped_lines(deletable))
     else:
-        lines.append(f"No merged branches to delete on {repo}.")
+        lines.append("  (none)")
 
     if offerable:
         lines.append("")
@@ -666,6 +669,11 @@ def _select_widgets(entries, title):
     try:
         from prompt_toolkit.shortcuts import checkboxlist_dialog
     except ImportError:
+        # A terminal, but the picker's optional extra isn't installed. Say so
+        # once and name it, rather than silently dropping to the text prompt
+        # and leaving the user wondering where the checkbox list went.
+        warn("install prompt_toolkit (or run with `uv run --extra tui`) for a "
+             "checkbox picker; using the text prompt for now.")
         return _NO_PICKER
     by_name = {e["name"]: e for e in entries}
     try:
@@ -681,7 +689,7 @@ def _select_widgets(entries, title):
         # and the deletions. Broad on purpose -- prompt_toolkit raises its
         # own types for an unsupported terminal, and an older release may
         # not accept default_values at all (TypeError).
-        error(f"could not show the selection dialog ({e}); asking in plain text.")
+        warn(f"could not show the selection dialog ({e}); asking in plain text.")
         return _NO_PICKER
     if chosen is None:
         return None
@@ -716,9 +724,9 @@ def _select_prompts(entries, title):
     This is the path the tests drive, so the two-stage behavior is covered
     whether or not prompt_toolkit is installed anywhere.
     """
-    error(title)
+    info(title)
     for line in _grouped_lines(entries):
-        error(line)
+        info(line)
     answer = _ask(f"Delete [A]ll {len(entries)}, [s]elect one by one, or [n]one? ")
     if answer is None:
         return None
@@ -727,7 +735,7 @@ def _select_prompts(entries, title):
     if answer in ("n", "no", "none"):
         return []
     if answer not in ("s", "select"):
-        error(f"'{answer}' is not one of a, s or n; nothing selected.")
+        warn(f"'{answer}' is not one of a, s or n; nothing selected.")
         return []
     chosen = []
     for entry in entries:
@@ -735,7 +743,7 @@ def _select_prompts(entries, title):
         if reply is None:
             # No more input: keep what was already chosen and stop asking
             # questions nobody is there to answer.
-            error("no more input; leaving the remaining branches alone.")
+            info("no more input; leaving the remaining branches alone.")
             break
         if reply in ("y", "yes"):
             chosen.append(entry)
@@ -1048,8 +1056,8 @@ def run(args):
         error("--older-than cannot be negative")
         raise SystemExit(2)
     if args.include_unmerged:
-        error("--include-unmerged is accepted but no longer needed: an interactive")
-        error("run asks about unmerged branches anyway. It will be removed later.")
+        warn("--include-unmerged is accepted but no longer needed: an interactive")
+        warn("run asks about unmerged branches anyway. It will be removed later.")
 
     gh.require_gh()
 
@@ -1059,7 +1067,7 @@ def run(args):
     # Printed BEFORE the first call rather than after it, so it appears at
     # once; the caller's spelling is used for the same reason, since the
     # canonical name is what the first call is still fetching.
-    status(f"Checking {repo}...")
+    info(f"Checking {repo}...")
 
     # Every later call uses the canonical name, not the caller's spelling:
     # pull requests report canonically, so a renamed repository invoked by
@@ -1138,19 +1146,23 @@ def run(args):
             try:
                 log(line)
             except OSError as e:
-                error(f"  (and it could not be written to {log_path}: {e})")
+                # A real failure, not routine: it feeds unwritten_lines and
+                # the run exits nonzero, so it carries the error level even
+                # though the line it follows was info.
+                error(f"could not write the previous line to {log_path}: {e}")
                 unwritten_lines.append(e)
 
-        def both(line):
-            """A line the terminal needs AND the log has to keep: an error
+        def both(line, level=info):
+            """A line the terminal needs AND the log has to keep: an outcome
             read once on a scrolling terminal is not a record.
 
-            The terminal comes first, and the log write is allowed to fail:
-            these run after branches have been deleted, so a full disk here
-            must not take the report down with it (Codex review,
-            mikelward/repo#23).
+            `level` is the terminal level -- info for a routine outcome, warn
+            for a safety refusal the reader must not mistake for one. The
+            terminal comes first, and the log write is allowed to fail: these
+            run after branches have been deleted, so a full disk here must
+            not take the report down with it (Codex review, mikelward/repo#23).
             """
-            error(line)
+            level(line)
             log_best_effort(line)
 
         # Written unconditionally -- including under --force -- so an
@@ -1179,8 +1191,8 @@ def run(args):
         # stream -- two lines a branch, and the restore command in it is
         # the half that has to outlive the terminal.
         for line in lines:
-            print(line, file=sys.stderr)
-        error(f"full record: {log_path}")
+            info(line)
+        info(f"full record: {log_path}")
 
         # Relayed before the confirmation gate, so declining it -- or any
         # later exit -- cannot swallow them.
@@ -1261,18 +1273,20 @@ def run(args):
             chosen.extend(picked)
 
         if chosen:
-            error("")
-            error("Each deletion writes the full SHA and the command that recreates")
-            error(f"the branch from it to {log_path}.")
+            info("")
+            info("Each deletion writes the full SHA and the command that recreates")
+            info(f"the branch from it to {log_path}.")
             for i, entry in enumerate(chosen, 1):
                 _progress(i, len(chosen))
                 delete_checked(entry)
             _clear_progress()
 
         for name, reason in refused:
-            both(f"{name} was NOT deleted -- {reason}")
-            both("  It was left alone rather than deleted on a plan that no longer")
-            both("  describes it. Re-run to see it classified as it now stands.")
+            # A safety refusal that makes the run exit nonzero -- warn so it
+            # reads as a caveat the user must see, not routine output.
+            both(f"{name} was NOT deleted -- {reason}", level=warn)
+            both("  It was left alone rather than deleted on a plan that no longer", level=warn)
+            both("  describes it. Re-run to see it classified as it now stands.", level=warn)
         for name, err in errors:
             error_lines(f"could not delete {name}:", err)
             log_best_effort(f"could not delete {name}: {err}")
@@ -1281,11 +1295,11 @@ def run(args):
             # calling it a failure to delete would tell the reader the
             # opposite of what happened.
             error_lines(f"{name} was deleted, but not fully recorded:", err)
-            error("  Its restore command was synced before the delete, so the way")
-            error("  back is in the log even though the outcome line is not.")
+            info("  Its restore command was synced before the delete, so the way")
+            info("  back is in the log even though the outcome line is not.")
 
         if deleted:
-            error(
+            info(
                 f"deleted {len(deleted)}; the command restoring each is in {log_path}"
             )
 
