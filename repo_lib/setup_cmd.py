@@ -95,7 +95,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from repo_lib import apps, common, credentials, gh, rules, scaffold, secrets_cmd
-from repo_lib.common import error, error_lines
+from repo_lib.common import error, error_lines, info, warn
 
 # The lookaheads reject `.` and `..` components: made of allowed
 # characters, but as path segments spliced into `repos/{repo}/...` they
@@ -111,7 +111,7 @@ def _progress(args, message):
     the difference visible without also dumping the full plan by default
     (see show_plan, on the combined-plan dump below, for that split)."""
     if args.verbose:
-        error(message)
+        info(message)
 
 
 def add_arguments(parser):
@@ -1254,10 +1254,13 @@ class _Log:
                 self._handle = open(self.path, "a", encoding="utf-8")
                 self._handle.write(self._header)
             except OSError as e:
+                # Recoverable: setup carries on and can still succeed, so this
+                # is a warning, not an error -- like the short-write and close
+                # failures below.
                 self.truncated = True
-                error_lines(f"could not open the log at {self.path}:", str(e))
-                error("Carrying on without one -- pass --log FILE to choose another")
-                error("path, or --no-log to stop asking for one.")
+                warn(f"could not open the log at {self.path}: {e}")
+                warn("Carrying on without one -- pass --log FILE to choose another")
+                warn("path, or --no-log to stop asking for one.")
                 return
         try:
             self._handle.write(text)
@@ -1268,7 +1271,7 @@ class _Log:
             # not go unsaid either -- the run advertises a full record, and
             # this one is short of it (Codex review, mikelward/repo#45).
             self.truncated = True
-            error(f"the log at {self.path} stopped short: {e}")
+            warn(f"the log at {self.path} stopped short: {e}")
 
     def close(self):
         """Closing is where buffered bytes actually reach the file, so it
@@ -1282,7 +1285,7 @@ class _Log:
             self._handle.close()
         except (OSError, ValueError) as e:
             self.truncated = True
-            error(f"the log at {self.path} stopped short: {e}")
+            warn(f"the log at {self.path} stopped short: {e}")
 
 
 class _Tee:
@@ -1332,9 +1335,9 @@ def run(args):
         log.close()
         if log.written:
             if log.truncated:
-                error(f"partial record (it stopped short): {log.path}")
+                warn(f"partial record (it stopped short): {log.path}")
             else:
-                error(f"full record: {log.path}")
+                info(f"full record: {log.path}")
 
 
 def _run(args, log=None):
@@ -1834,7 +1837,7 @@ def _run(args, log=None):
         # steps proceed past, and apply_step already reports it as a
         # failure the normal way.
         for line in describe_combined_plan():
-            error(line)
+            info(line)
         error(f"the preview above failed; nothing was changed on {repo}.")
         raise SystemExit(1)
 
@@ -1908,7 +1911,7 @@ def _run(args, log=None):
     show_plan = args.verbose or (needs_confirmation and not args.force)
     if show_plan:
         for line in describe_combined_plan():
-            error(line)
+            info(line)
     if log is not None and needs_confirmation:
         # Unconditionally, not just when the terminal was shown the short
         # version: an interactive run tees its abbreviated plan into the
@@ -1934,7 +1937,7 @@ def _run(args, log=None):
         except EOFError:
             answer = ""
         if answer.strip().lower() not in ("y", "yes"):
-            error(f"not confirmed; nothing was changed on {repo}.")
+            info(f"not confirmed; nothing was changed on {repo}.")
             raise SystemExit(1)
 
     # ---- Apply ------------------------------------------------------------
@@ -2089,7 +2092,7 @@ def _run(args, log=None):
                     # review, mikelward/repo#42).
                     wedged = wedged_branch_warning()
                     if wedged:
-                        error(f"{repo}: heads up -- {wedged}")
+                        warn(f"{repo}: heads up -- {wedged}")
                 else:
                     bootstrap_completed_sha = outcome.branch_sha
                     if bootstrap_plan.missing:
@@ -2648,7 +2651,7 @@ def _run(args, log=None):
         # Skipped when show_plan already printed all of credentials_plan
         # .lines (a superset), so this doesn't double it.
         for line in credentials_plan.always_report:
-            error(line)
+            info(line)
     if credentials_plan.failed:
         # The read failure is in credentials_plan.lines -- shown already
         # if show_plan printed the combined plan above, but quiet mode

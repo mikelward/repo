@@ -24,7 +24,7 @@ import json
 import re
 
 from repo_lib import gh
-from repo_lib.common import error, error_lines
+from repo_lib.common import error, error_lines, warn
 
 # The lookahead rejects `.` and `..`: made of allowed characters, but as a
 # path segment spliced into `orgs/{owner}` they would address a different
@@ -104,9 +104,9 @@ def run(args):
             # individual account instead. Only this specific failure may
             # fall through to the public-only endpoint.
             endpoint = f"users/{owner}/repos"
-            error(f"note: '{owner}' is not an organization gh can see -- only its")
-            error("public repositories can be listed. There is no API that lists")
-            error("somebody else's private repos, whatever credentials are used.")
+            warn(f"'{owner}' is not an organization gh can see -- only its")
+            warn("public repositories can be listed. There is no API that lists")
+            warn("somebody else's private repos, whatever credentials are used.")
         else:
             # Any OTHER probe failure (403/SSO, a transient 5xx, network) is
             # NOT proof that owner is an individual account -- reading it

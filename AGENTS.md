@@ -45,6 +45,12 @@ one that has stopped biting.
   own; `./repo` checks for it first and names the install otherwise, and
   `ci.yml` installs it before `make test`. Anything else is still a
   conversation about the tradeoff, not a quiet `pip install`.
+- One *optional* extra, `prompt_toolkit`, for `repo cleanup`'s checkbox
+  picker (the tradeoff discussed and approved 2026-09-08). It is declared
+  under `[project.optional-dependencies] tui`, never required: without it
+  `cleanup` falls back to the plain-text prompt and says so. The required
+  footprint stays PyYAML-only -- a *second required* dependency is still the
+  conversation above.
 - `argparse` for option parsing (handles `--flag value` and `--flag=value`
   both, for free). `subprocess` for shelling out to `gh`. Prefer real data
   structures (lists, dicts, dataclasses) over string-encoding a collection

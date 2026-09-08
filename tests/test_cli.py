@@ -1,4 +1,6 @@
+import io
 import unittest
+from contextlib import redirect_stderr
 
 from repo_lib.cli import build_parser, main
 
@@ -8,6 +10,19 @@ class CliTest(unittest.TestCase):
         with self.assertRaises(SystemExit) as cm:
             build_parser().parse_args([])
         self.assertEqual(cm.exception.code, 2)
+
+    def test_a_usage_error_leads_with_the_error_level(self):
+        # argparse's default is "{prog}: error: ..."; the parser leads with
+        # the error: level instead, matching every other diagnostic. A
+        # subparser's own usage error inherits it too.
+        err = io.StringIO()
+        with redirect_stderr(err), self.assertRaises(SystemExit):
+            build_parser().parse_args(["cleanup"])  # missing required repo
+        # argparse still prints the usage block; the error line itself (the
+        # last non-empty line) leads with the level.
+        last = [line for line in err.getvalue().splitlines() if line.strip()][-1]
+        self.assertTrue(last.startswith("error: "), err.getvalue())
+        self.assertIn("repo cleanup", last)
 
     def test_unknown_command_is_a_usage_error(self):
         with self.assertRaises(SystemExit) as cm:

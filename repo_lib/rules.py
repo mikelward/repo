@@ -38,7 +38,7 @@ import sys
 import urllib.parse
 
 from repo_lib import gh
-from repo_lib.common import error, error_lines
+from repo_lib.common import error, error_lines, info, warn
 
 DEFAULT_RULESET_NAME = "main"
 # Names this tool used before DEFAULT_RULESET_NAME settled. A repository
@@ -639,7 +639,7 @@ def _report_duplicate_standard(repo, ruleset_name, existing, extras):
     nothing about what it does -- this lookup filters by name and never
     reads enforcement, scope or rules."""
     for rid in extras:
-        error(
+        warn(
             f"{repo}: note -- more than one ruleset is named '{ruleset_name}'; this run "
             f"writes id {existing} and leaves id {rid} alone. Worth "
             f"reading id {rid} to see what it says."
@@ -698,7 +698,7 @@ def _report_differing_legacy(repo, ruleset_name, differing):
     recorded before the delete, so this points at that rather than asking
     anyone to have memorized it."""
     for legacy_name, legacy_id in differing:
-        error(
+        warn(
             f"{repo}: note -- '{legacy_name}' (id {legacy_id}) is NOT identical to "
             f"'{ruleset_name}'; deleting it drops whatever it held that the other does "
             "not. Its full body is recorded first, so it can be restored by POSTing "
@@ -841,14 +841,14 @@ def _report_excluded_hardened(repo, ruleset_name, target_body, default_branch):
     ref_name = ((target_body or {}).get("conditions") or {}).get("ref_name") or {}
     named, unevaluated = _excluded_hardened_refs(ref_name.get("exclude"), default_branch)
     if named:
-        error(
+        warn(
             f"{repo}: ruleset '{ruleset_name}' excludes {', '.join(named)}, so it does not "
             "protect that branch whatever its include list says. An exclusion is never edited "
             "here -- remove it by hand, or delete the branch it names. `repo audit` reports "
             "this as a gap."
         )
     if unevaluated:
-        error(
+        warn(
             f"{repo}: ruleset '{ruleset_name}' has a pattern in its exclusions, so whether it "
             "still covers the default branch, refs/heads/main and refs/heads/master cannot be "
             "checked here without reimplementing GitHub's ref matching. Check it by hand."
@@ -1448,7 +1448,7 @@ def _confirm(repo, ruleset_name, plan_lines):
     except EOFError:
         answer = ""
     if answer.strip().lower() not in ("y", "yes"):
-        error(f"not confirmed; leaving {repo}'s ruleset '{ruleset_name}' unchanged.")
+        info(f"not confirmed; leaving {repo}'s ruleset '{ruleset_name}' unchanged.")
         return False
     return True
 
@@ -1635,10 +1635,13 @@ def apply_ruleset(
         error("check that did not finish.")
         return 1
     if missing:
-        error(f"never reported on {repo}: {describe_missing(missing)}")
         if force:
-            error("(--force given; a merge will block until each one reports)")
+            # Not a refusal: the run proceeds and the required check simply
+            # blocks merges until each one reports, so this is a caveat.
+            warn(f"never reported on {repo}: {describe_missing(missing)}")
+            warn("(--force given; a merge will block until each one reports)")
         else:
+            error(f"never reported on {repo}: {describe_missing(missing)}")
             error("Add the check first. Pass --force to require it anyway.")
             # Distinct from every other reason this function refuses: there
             # is nothing wrong with the repository or the request, only a
@@ -2020,9 +2023,9 @@ def check_master_branch(repo, quiet=False):
         name = result.strip()
         if name == "master":
             if not quiet:
-                error(f"{repo} has a branch literally named 'master' -- this can bypass a")
-                error("ruleset scoped only to the default branch. Delete it, or confirm the")
-                error("ruleset above also targets refs/heads/master.")
+                warn(f"{repo} has a branch literally named 'master' -- this can bypass a")
+                warn("ruleset scoped only to the default branch. Delete it, or confirm the")
+                warn("ruleset above also targets refs/heads/master.")
             return "exists", None
         if name:
             # A different name means the request was redirected off a
@@ -2032,13 +2035,13 @@ def check_master_branch(repo, quiet=False):
         # finding here, never quietly folded into a clean result.
         detail = f"gh: repos/{repo}/branches/master returned no branch name\n"
         if not quiet:
-            error(f"could not check whether {repo} has a branch named 'master':")
-            error(f"  {detail.strip()}")
+            warn(f"could not check whether {repo} has a branch named 'master':")
+            warn(f"  {detail.strip()}")
         return "error", detail
     if "HTTP 404" in result:
         return "absent", None
     if not quiet:
-        error(f"could not check whether {repo} has a branch named 'master':")
+        warn(f"could not check whether {repo} has a branch named 'master':")
         for line in result.splitlines():
-            error(f"  {line}")
+            warn(f"  {line}")
     return "error", result

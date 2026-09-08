@@ -21,8 +21,20 @@ from repo_lib import (
 PROGRAM = "repo"
 
 
+class _Parser(argparse.ArgumentParser):
+    """An ArgumentParser whose usage errors lead with the `error:` level,
+    like every other diagnostic, rather than argparse's default
+    `{prog}: error: {message}`. Subparsers inherit this class, so a
+    subcommand's own usage error (`repo cleanup` with no repo) leads with
+    it too."""
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(2, f"error: {self.prog}: {message}\n")
+
+
 def build_parser():
-    parser = argparse.ArgumentParser(prog=PROGRAM)
+    parser = _Parser(prog=PROGRAM)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     create_parser = subparsers.add_parser(

@@ -10,7 +10,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from unittest.mock import patch
 
-from repo_lib import apps, gh, rules, scaffold
+from repo_lib import apps, gh, rules, scaffold, setup_cmd
 from repo_lib.cli import main
 
 REPO = "owner/repo"
@@ -7172,7 +7172,7 @@ class BootstrapStepTest(unittest.TestCase):
         self.assertIn("bootstrap", err)
         self.assertNotIn("skipping the ruleset step", err)
         self.assertIn("already matches; nothing to do", out)
-        failed_line = next(line for line in err.splitlines() if line.startswith("repo: failed on:"))
+        failed_line = next(line for line in err.splitlines() if line.startswith("error: failed on:"))
         self.assertNotIn("ruleset", failed_line)
 
     def test_a_bootstrap_failure_blocks_an_update_that_newly_adds_pull_request_protection(self):
@@ -7199,7 +7199,7 @@ class BootstrapStepTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("skipping the ruleset step", err)
         self.assertIn("require a pull request for the first time", err)
-        failed_line = next(line for line in err.splitlines() if line.startswith("repo: failed on:"))
+        failed_line = next(line for line in err.splitlines() if line.startswith("error: failed on:"))
         self.assertIn("ruleset", failed_line)
         self.assertEqual(fake.puts, [])  # no PUT to the ruleset either
 
@@ -8053,6 +8053,25 @@ class BootstrapStepTest(unittest.TestCase):
         self.assertIn("add .github/zizmor.yml", out)
         self.assertEqual(fake.posts, [])
         self.assertEqual(fake.patches, [])
+
+
+class LogOpenFailureTest(unittest.TestCase):
+    def test_an_unwritable_log_warns_and_carries_on(self):
+        # Opening the setup log can fail (an unwritable directory), and the
+        # run carries on and can still succeed -- so this is a warning, not
+        # an error, and it must not raise.
+        with tempfile.TemporaryDirectory() as d:
+            not_a_dir = os.path.join(d, "afile")
+            open(not_a_dir, "w").close()
+            log = setup_cmd._Log(os.path.join(not_a_dir, "sub", "setup.log"), "header\n")
+            err = StringIO()
+            with redirect_stderr(err):
+                log.arm()
+                log.write("a line")  # best-effort: must not raise
+                log.close()
+            msg = err.getvalue()
+        self.assertIn("warning: could not open the log", msg)
+        self.assertNotIn("error:", msg)
 
 
 if __name__ == "__main__":

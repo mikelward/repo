@@ -19,6 +19,9 @@ class EntryPointTest(unittest.TestCase):
             [sys.executable, "-S", REPO, "--help"], capture_output=True, text=True, check=False
         )
         self.assertEqual(result.returncode, 1, result.stderr)
+        # Carries the same error: level as every other failure, even though
+        # it runs before repo_lib.common can be imported.
+        self.assertTrue(result.stderr.startswith("error: "), result.stderr)
         self.assertIn("PyYAML is not installed", result.stderr)
         self.assertIn("uv run ./repo", result.stderr)
         self.assertIn("python3 -m pip install pyyaml", result.stderr)

@@ -42,7 +42,7 @@ import re
 import sys
 
 from repo_lib import gh
-from repo_lib.common import error, error_lines
+from repo_lib.common import error, error_lines, info
 
 # GitHub's own rule for a secret name: letters, digits, underscores; cannot
 # start with a digit; the GITHUB_ prefix is reserved (case-insensitive).
@@ -184,7 +184,7 @@ def _confirm():
     except EOFError:
         confirmed = ""
     if confirmed.strip().lower() not in ("y", "yes"):
-        error("not confirmed; no secrets were changed.")
+        info("not confirmed; no secrets were changed.")
         return False
     return True
 
@@ -320,7 +320,7 @@ def run(args):
         # Every repo failed the read phase -- nothing left to confirm or
         # write, so (same reasoning as --dry-run) no need for a value.
         for line in _describe_plan(args.name, env, plan):
-            error(line)
+            info(line)
         raise SystemExit(1)
 
     if file_given:
@@ -346,7 +346,7 @@ def run(args):
     # (and the rest of the plan) in its own output, not just silently
     # applied. --force skips the *question*, not the audit trail.
     for line in _describe_plan(args.name, env, plan):
-        print(line, file=sys.stderr)
+        info(line)
 
     if not args.force and not _confirm():
         raise SystemExit(1)
