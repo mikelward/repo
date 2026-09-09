@@ -627,6 +627,167 @@
 
 ## Decisions needing review
 
+- **Binding the `lanes` check to the App: how the verify side recognizes it, and
+  what gates the bind** (maintainer-directed, 2026-09-09 -- "make repo setup do
+  these steps", approach A chosen in chat). `repo setup` now requires `lanes`
+  from the LANES App (an `integration_id` on the ruleset entry), so a same-repo
+  pull request cannot forge a `lanes` status via the ambient token. Three
+  choices, each reversible:
+  - *Verify via installations, not a constant.* The Statuses REST API hides the
+    App that created a status (it surfaces the `{slug}[bot]` user, not the id),
+    so a bound status check cannot be recognized from `app.id` the way a check
+    run can. `_collect_reported` resolves the bound id -> slug through the
+    owner's App installations (`apps.app_slug_for_id`) and matches the creator
+    login. The alternative was a hard-coded `LANES_APP_SLUG` constant (no
+    network call, but the App's identity baked into the tool); approach A keeps
+    the App's identity out of the source, consistent with the id only ever
+    arriving from the credential. Reversible: `app_slug_for_id` is one function
+    and the lazy block in `_collect_reported` is where a constant lookup would
+    go instead. Cost: one `user/installations` read (and one per-status read)
+    per bound entry still unsatisfied after the check-run scan -- lazy, so the
+    ordinary path pays nothing; well inside the API rate limit.
+  - *Gate the bind on a default-branch status publisher, id from the credential
+    value.* setup binds only once `credentials.lanes_status_publishers` sees the
+    default branch publishing the status as the App, and only when handed
+    `LANES_APP_ID` (its value is the id). So the cutover self-sequences: an
+    ambient consumer stays unbound (not wedged), a run after the migrated
+    workflow lands binds. The alternative -- bind as soon as the pair is placed
+    -- would wedge every merge until the App became the producer. Reversible:
+    the decision is the one block before `_plan_credentials`'s `return plan`,
+    and `_bind_checks` in setup_cmd.
+  - *Write the binding AFTER the credential move settles the pair* (maintainer
+    chose option A, 2026-09-09, over reordering the whole apply). The ordinary
+    ruleset step requires `lanes` unbound (preserving any existing binding); a
+    SECOND `apply_ruleset` adds the binding, run only once this run's credential
+    move has succeeded. Codex found (mikelward/repo#52, twice in the same
+    mechanism) that binding in the ruleset step -- which runs before the moves
+    -- leaves `lanes` bound to an unusable credential if a move then fails. With
+    the write deferred, and apply_ruleset's never-reported guard holding it
+    until the App has actually posted, this is the intended two-run migration:
+    run 1 places the pair, a later run binds. A binding held because the App has
+    not published yet is not a failure -- exit 0, the check stays unbound, rerun
+    later. Reversible: the binding preview/apply are two self-contained blocks in
+    setup_cmd's `_run`; removing them falls back to requiring `lanes` unbound.
+    The alternative (B, reorder the apply so moves precede the ruleset write)
+    was one ruleset write but touched the fingerprint contract.
+  - *Re-point converges, it does not refuse* (maintainer, 2026-09-09: "run
+    `repo setup` and it eventually lands correct, safely, with as few manual
+    steps as necessary"). Codex round 3 (mikelward/repo#52) found that
+    re-pointing to a *different* App B before B publishes overwrites the
+    credential to B while the ruleset still requires A, blocking merges.
+    Refusing it (making re-point a manual migration) was rejected as against
+    the standing goal; instead the run proceeds -- it converges by being rerun
+    once B publishes (the same two-run shape) -- and warns loudly that merges
+    are BLOCKED in the window, since that is not benign like a first bind's
+    deferral. The block is inherent (B cannot publish until its key is placed,
+    and placing it is what opens the window), so the honest answer is a clear
+    warning, not a refusal or a deadlocking hold. Reversible: `repoint_from`
+    detection is one read and one plan line. The same round's P2 (the deferred
+    write omitted `expected_fingerprint`, a race across the credential-move
+    window) is fixed by capturing the binding's fingerprint right after the
+    main apply and pinning the deferred write to it.
+    Round 4 (mikelward/repo#52) added the one exception to "converges, does not
+    refuse": a re-point to an App that does NOT cover the repo can never converge
+    (B cannot publish until it is installed, and a bare rerun cannot install it),
+    so that case HOLDS the credential move rather than switching -- App A keeps
+    publishing and stays bound, no wedge -- and says to add the App
+    (`repo setup --app <slug>`) then rerun. The convergence promise stands; the
+    hold is what keeps a switch that cannot converge from wedging every merge.
+    Reversible: `repoint_to_uncovered` is one coverage read and one guard at the
+    top of the credential-move loop (`repoint_to_uncovered` in setup_cmd's `_run`).
+    Round 5 (mikelward/repo#52) extended the hold to `repoint_unknown` (the
+    effective-rules read failed, so the bind MIGHT be a re-point; holding an
+    uncovered App there costs only a rerun, never a wedge).
+  - *Declined: multi-ruleset conflicts.* Codex round 4 (mikelward/repo#52) also
+    flagged that a `lanes` binding in a ruleset `repo setup` does not manage
+    (org-level or inherited) would survive our rebind and keep the old App
+    required (P1), and that `repo audit` recommends `repo setup` for such an
+    entry it cannot edit (P2). Declined: this account has no organization and
+    cannot create org- or user-level rulesets (maintainer, 2026-09-10), so every
+    `lanes` binding lives in the per-repo ruleset setup manages -- no foreign
+    ruleset survives the rebind or misdirects audit. GitHub's effective-rules
+    endpoint also does not attribute an entry to a ruleset, so a reliable
+    foreign-binding detector is not possible without heuristics; and audit's
+    wrong-App guidance already offers "or repoint the ruleset entry by hand" for
+    exactly the case setup cannot fix. Revisit if org-level rulesets ever enter
+    the fleet. Reversible: nothing was built.
+  - *Declined: absent-vs-selected install in the coverage message* (Codex round 5
+    P2, mikelward/repo#52). Audit's/setup's coverage-gap line says "add the App
+    to <repo> (`repo setup --app <slug>`)", which cannot repair a wholly-absent
+    owner installation (`--app` adds a repo to an existing installation; it does
+    not install the App). Declined: the LANES App is installed on all of the
+    owner's repos in one setting (maintainer, 2026-09-10), so the line does not
+    fire here, and the reachable case would be "installed, this repo excluded
+    from a `selected` install", for which `--app` is exactly right. Distinguishing
+    absent from selected needs an extra "installed on the owner at all" signal
+    threaded through `app_covers_repo`. Revisit if the fleet ever uses a selected
+    or per-repo install.
+  - *Maintainer's call: bind while a lanes hardening gap is open?* (Codex round 5
+    P2, mikelward/repo#52). `lanes_credential_failed` holds the binding whenever
+    ANY lanes-labeled failure or `unfixed` is open, not only an actual pair-move
+    failure. Codex noted a case where that is over-broad: a job publishing
+    `lanes` as the App (pair settled) beside a separate ambient `gate` step
+    records a `lanes` `unfixed` ("hand that step the pair too"), which then holds
+    a binding whose pair is in place. Narrowing it to bind-despite-a-
+    hardening-gap was TRIED and reverted: keying off the absence of a failure
+    tag bound `lanes` when a HELD move (a protected-env policy that drops its
+    writes) left the pair unplaced -- a wedge (Codex round 5 P1). A correct
+    narrow rule needs a positive signal that THIS App's pair is in the
+    environment, which GitHub's APIs cannot give (secret values are never
+    returned; the Statuses API hides the creating App). So the conservative
+    hold stands -- bind only once the lanes state is fully clean -- and whether
+    to bind while a hardening gap remains is the maintainer's call, not one to
+    settle by inference. Reversible either way: it is the one
+    `lanes_credential_failed` predicate in setup_cmd's `_run`.
+  - *Descoped (follow-up): Re-point / rotate the lanes App binding* (maintainer
+    chose "descope then follow up", 2026-09-10; Codex rounds 4-6 P1s F/H,
+    mikelward/repo#52). The credential switch (the `lanes` environment move) and
+    the check binding (the ruleset `integration_id`) are two separate writes,
+    and setup cannot verify which App's pair the environment holds (GitHub never
+    returns a secret's value; the Statuses API hides the creating App). So
+    automating a RE-POINT -- moving an existing binding from App A to App B --
+    kept opening windows where "publisher = B, requirement = A" until a rerun:
+    a failed post-apply fingerprint capture; an over-optimistic `--app` coverage
+    preview; a suspended install read as covering. Codex advised against patching
+    each as an isolated exception, and one such patch regressed a held-move
+    case. So re-point is descoped OUT of this PR: when `lanes` is already bound
+    to a DIFFERENT App -- or its current binding can't be read -- setup REFUSES,
+    switching neither the credential nor the binding, leaving the working App in
+    place (`refuse_repoint` in setup_cmd's `_run`). First bind (currently
+    unbound) and an idempotent rerun (already bound to the same App) are
+    unaffected. **Follow-up:** re-add re-point/rotation with a design where the
+    credential switch and the binding commit together, so the publisher never
+    leads the requirement (bind only after positively confirming this run wrote
+    the pair, or gate the switch on a captured binding transaction). Reversible:
+    the follow-up replaces `refuse_repoint` and re-adds the switch path.
+  - *Accepted: rerun-converging windows in the split credential/binding
+    mechanism* (maintainer, 2026-09-10; mikelward/repo#52). One narrow window
+    remains on the FIRST-bind path and is documented rather than fixed: a run
+    supplying only `LANES_APP_ID` while the env already holds the old key
+    overwrites just the id and still records the binding (setup_cmd
+    `_plan_credentials`, at `plan.lanes_binding`) -- a mismatched pair the App
+    can't authenticate with until a rerun supplies both halves. setup can't
+    detect it (no secret values), it takes an operator supplying half a
+    credential, and it converges on a rerun with the full pair (the standing
+    "fine to require multiple runs" rule). The class-deleting fix rides with the
+    re-point follow-up above. A second window of the same class (Codex round,
+    2026-09-10, L): the deferred binding write is pinned to a fingerprint of the
+    computed TARGET (App B) body, which `_build_update_body` produces identically
+    whether `lanes` is currently unbound or bound to some App A -- so an admin
+    binding `lanes` to A after the pre-move reread but before the deferred write
+    is not caught, and a first-bind run overwrites A with B (ending consistent:
+    publisher B, requirement B) or, if that write then fails, lands in the
+    already-accepted failed-capture window. It needs a concurrent admin bind
+    during the run and converges on a rerun. The robust fix -- capture the
+    observed SOURCE binding and make it part of the deferred transaction, so the
+    write aborts if the source drifted -- is the same atomic switch+bind
+    redesign as the re-point follow-up above, not a separate patch.
+  - *Deferred:* `repo audit` does not yet actively flag "the default branch
+    publishes `lanes` as the App but the ruleset requires it unbound" as a
+    `[FIX]` -- it verifies a binding that exists, but does not nag to add one.
+    Cheap to add later (the audit already reads both the ruleset bindings and
+    the workflow publishers); left out of this change to keep it focused.
+
 - **Whether a half-failed restriction should restore the open policy at all**
   (flagged for the maintainer, 2026-09-05). `restrict_environment` is a PUT
   (switch to custom mode) then a POST (name the default branch). When the POST
