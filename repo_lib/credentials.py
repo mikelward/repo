@@ -50,6 +50,10 @@ COMMIT_ARTIFACT_WORKFLOW = "mikelward/ci-commit-artifact/"
 LANES_APP_ID = "LANES_APP_ID"
 LANES_APP_PRIVATE_KEY = "LANES_APP_PRIVATE_KEY"
 LANES_ENV = "lanes"
+# The required status-check context mikelward/lanes posts -- the name a
+# ruleset requires, distinct from the environment above though spelled the
+# same. `repo setup` binds this check to the App once the App publishes it.
+LANES_CHECK = "lanes"
 # The `uses:` value (before its `@ref`) of a mikelward/lanes step. The
 # action, not a reusable workflow: a step's `uses:` carries no secrets,
 # so the environment declaration on the job is what reaches it a credential.

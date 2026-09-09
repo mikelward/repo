@@ -259,9 +259,14 @@ class FakeGh:
                     continue
                 if want_owner is not None and account.lower() != want_owner:
                     continue
-                if "[.id, .repository_selection]" in (jq or ""):
-                    # app_covers_repo: --jq '... | [.id, .repository_selection] | @tsv'.
-                    out_lines.append(f"{i + 1}\t{selection}\n")
+                if "repository_selection" in (jq or ""):
+                    # app_covers_repo: --jq '... |
+                    # [.id, .repository_selection, (.suspended_at != null)] | @tsv'.
+                    # Optional 6th tuple element marks the installation suspended.
+                    suspended = entry[5] if len(entry) > 5 else False
+                    out_lines.append(
+                        f"{i + 1}\t{selection}\t{'true' if suspended else 'false'}\n"
+                    )
                 else:
                     # app_slug_for_id: --jq '... | .app_slug'.
                     out_lines.append(f"{slug}\n")
@@ -907,17 +912,17 @@ class AuditCmdTest(unittest.TestCase):
         code, out, err = _run(fake, [REPO])
         self.assertEqual(code, 1, err)
         # The name DOES report, just never from App 42 -- saying it "never
-        # reported" reads as false to someone watching lanes run. The remedy
-        # is to re-point the binding: `repo setup` does it when handed the
-        # App's credentials (the supplied binding wins over the existing
-        # entry), so the guidance names that rather than a bare rerun.
+        # reported" reads as false to someone watching lanes run. The remedy is
+        # to re-point the binding BY HAND: `repo setup` does not re-point an
+        # existing binding to a different App (descope; a tracked follow-up), so
+        # the guidance names the manual workflow rather than a rerun.
         self.assertIn(
             "required but never reported by the App it is bound to: "
             "'lanes' (needs App 42)",
             out,
         )
-        self.assertIn("rerun `repo setup` with the App's credentials", out)
-        self.assertIn("repoint the ruleset entry", out)
+        self.assertIn("re-point the ruleset entry", out)
+        self.assertIn("does not re-point an existing binding", out)
         self.assertNotIn("required but never reported: 'lanes'", out)
 
     def test_missing_names_containing_spaces_stay_separable(self):
@@ -1114,6 +1119,32 @@ class AuditCmdTest(unittest.TestCase):
         ]
         fake.check_runs = {fake.default_head_sha: [("lanes", 42), "codex", "zizmor"]}
         fake.installations = [(42, "lanes-app", REPO.split("/", 1)[0], "selected", ("owner/other",))]
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 1, err)
+        self.assertIn(
+            "required but bound to an App that does not cover this repo "
+            "(it can never report): 'lanes' (App 42)",
+            out,
+        )
+        self.assertNotIn("every required check has reported", out)
+
+    def test_bound_gate_bound_to_a_suspended_install_is_a_coverage_gap(self):
+        # The bound App reported `lanes` historically, and its installation is
+        # still "all repositories" -- but it has been SUSPENDED, so it cannot
+        # act and can never report again. Coverage must treat a suspended
+        # installation as not covering, so audit reports the gap rather than
+        # calling the binding healthy (Codex, mikelward/repo#52).
+        fake = FakeGh()
+        fake.effective_rules = [
+            _pull_request_rule(),
+            _status_checks_rule([("lanes", 42), "codex", "zizmor"]),
+            {"type": "required_linear_history", "parameters": {}},
+            {"type": "non_fast_forward", "parameters": {}},
+            {"type": "deletion", "parameters": {}},
+        ]
+        fake.check_runs = {fake.default_head_sha: [("lanes", 42), "codex", "zizmor"]}
+        # Installed "all repositories" on this owner, but suspended (6th element).
+        fake.installations = [(42, "lanes-app", REPO.split("/", 1)[0], "all", (), True)]
         code, out, err = _run(fake, [REPO])
         self.assertEqual(code, 1, err)
         self.assertIn(

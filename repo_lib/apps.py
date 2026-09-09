@@ -118,9 +118,16 @@ def app_slug_for_id(owner, app_id):
 
 def app_covers_repo(owner, app_id, repo):
     """True if the App with numeric id `app_id`, installed on `owner`'s
-    account, can currently act on `repo` -- installed "all repositories", or a
-    "selected" installation whose member list includes it. False if it is not
-    installed on `owner` at all, or a selected install excludes `repo`.
+    account, can currently act on `repo` -- an ACTIVE installation that is
+    either "all repositories" or a "selected" one whose member list includes it.
+    False if it is not installed on `owner` at all, a selected install excludes
+    `repo`, or the installation is suspended.
+
+    A suspended installation keeps its `repository_selection` but cannot act, so
+    it can never publish the status -- counting it as coverage would let setup
+    bind `lanes` to an App that then blocks every merge, and audit report the
+    binding as healthy, so `suspended_at` is checked explicitly (Codex,
+    mikelward/repo#52).
 
     This is the liveness/coverage question the binding precondition turns on,
     kept separate from the evidence scan (see app_slug_for_id). Binding a
@@ -140,14 +147,19 @@ def app_covers_repo(owner, app_id, repo):
     jq = (
         f".installations[] | select(.app_id == {numeric} and "
         '(.account.login | ascii_downcase) == '
-        f'("{owner}" | ascii_downcase)) | [.id, .repository_selection] | @tsv'
+        f'("{owner}" | ascii_downcase)) | '
+        "[.id, .repository_selection, (.suspended_at != null)] | @tsv"
     )
     out = gh.run(["api", "user/installations", "--paginate", "--jq", jq])
     for line in out.splitlines():
         line = line.strip()
         if not line:
             continue
-        install_id, selection = line.split("\t", 1)
+        install_id, selection, suspended = line.split("\t", 2)
+        if suspended == "true":
+            # Suspended: it holds a repository_selection but cannot act, so it
+            # never publishes here and does not count as coverage.
+            return False
         if selection != "selected":
             # "all repositories" (any non-selected scope) covers every repo in
             # the account, this one included.

@@ -348,6 +348,12 @@ class CredentialsPlan:
     # to prevent (Codex, mikelward/repo#13).
     always_report: list = field(default_factory=list)
     failed: bool = False  # a read failed; `lines` carries the error
+    # The numeric App id to bind the `lanes` required check to, or None to
+    # leave it unbound. Set only when the default branch actually publishes the
+    # `lanes` status as the App AND this run was handed the App id (as the
+    # LANES_APP_ID credential value), so the ruleset step can require the check
+    # from that App rather than any producer of the name.
+    lanes_binding: Optional[int] = None
 
 
 def _plan_credentials(repo, specs):
@@ -675,6 +681,22 @@ def _plan_credentials(repo, specs):
     label = credentials.LANES_ENV
     action = credentials.LANES_ACTION
     listed, env_secrets = held[label]
+    # A supplied App id must be a positive integer -- it is both the secret
+    # value the pair authenticates with and the `integration_id` the check is
+    # bound to. A non-decimal one (a mis-pointed --credential file, say), or 0
+    # (which `_bind_checks` would drop as falsey), would otherwise be written
+    # as the credential while the binding is silently omitted, exiting 0 with
+    # `lanes` unbound (Codex, mikelward/repo#52). Refuse the pair instead, so
+    # the malformed value is neither placed nor allowed to skip the binding.
+    if app_id in given and given[app_id].value:
+        _supplied_app_id = given[app_id].value.decode(errors="replace").strip()
+        if not (_supplied_app_id.isascii() and _supplied_app_id.isdigit() and int(_supplied_app_id) > 0):
+            plan.unfixed.append(
+                f"{label}: the supplied {app_id} is not a positive integer App id, so the pair "
+                f"cannot authenticate as the App or bind the `{credentials.LANES_CHECK}` check -- "
+                f"fix the --credential value and rerun; {app_id}, {app_key} left as is"
+            )
+            return plan
     publishers = credentials.lanes_publishers(texts)
     unread = credentials.lanes_unread(texts)
     incomplete = credentials.lanes_incomplete(texts)
@@ -1119,7 +1141,115 @@ def _plan_credentials(repo, specs):
             f"produces -- hand the pair to the `init` and gate steps too (mikelward/lanes's "
             f"README, \"Trusted publishing\")"
         )
+
+    # Bind the `lanes` required check to the App once the default branch
+    # actually publishes the status as the App -- until then any producer of
+    # the name counts, so that a same-repo pull request cannot mint its own
+    # `lanes` status via the ambient token and satisfy the gate. The id comes
+    # from the LANES_APP_ID value this run was handed (the same number the
+    # workflow authenticates with); without it a NEW binding cannot be
+    # established -- an existing one is preserved by the ruleset step -- so the
+    # bind waits for a run that supplies the credential.
+    #
+    # This only records the id to bind to; the binding itself is written by a
+    # SECOND ruleset update, after this run's credential move has settled the
+    # pair (see _run). Binding in the ruleset step, which runs before the
+    # moves, would leave `lanes` required from an App the workflow cannot
+    # authenticate as if a later move failed -- blocking every merge (Codex,
+    # mikelward/repo#52). The App can only have published after an earlier run
+    # placed the pair, so requiring the App to have reported (apply_ruleset's
+    # never-reported guard) also keeps this to the natural two-run cadence:
+    # one run places the pair, a later one binds.
+    # Accepted, rerun-converging window (maintainer, 2026-09-10; see TODO
+    # "Accepted: rerun-converging windows in the split credential/binding
+    # mechanism"). If a run supplies only LANES_APP_ID (not the key) while the
+    # environment already holds both names, the move overwrites just the id and
+    # keeps the old key, and this still records a binding to the new App -- a
+    # mismatched pair the App cannot authenticate with until a rerun supplies
+    # both halves. setup cannot detect it: GitHub never returns a secret's
+    # value, so it cannot tell whose key the environment holds. Left as an
+    # operator-slip window a rerun with the full pair converges; the class-
+    # deleting fix (atomic credential+binding, or a two-write design that never
+    # leaves publisher != required) is a tracked follow-up (Codex,
+    # mikelward/repo#52).
+    status_pubs = credentials.lanes_status_publishers(credentials.on_default_branch(texts))
+    if status_pubs and app_id in given and given[app_id].value:
+        supplied_id = given[app_id].value.decode(errors="replace").strip()
+        if supplied_id.isdigit():
+            # A GitHub App id is numeric; the ruleset's integration_id is a
+            # number, so bind to the int, not the file's text.
+            plan.lanes_binding = int(supplied_id)
+
     return plan
+
+
+def _bind_checks(checks, lanes_binding):
+    """`checks` with the `lanes` entry bound to the App when lanes_binding is
+    a numeric id, else the names untouched. Only the ruleset step reads this;
+    every other step in setup_cmd keeps reasoning over the bare names, since a
+    scaffold pull request publishes a check by name regardless of what App the
+    ruleset binds it to."""
+    if not lanes_binding:
+        return list(checks)
+    return [
+        (credentials.LANES_CHECK, lanes_binding) if c == credentials.LANES_CHECK else c
+        for c in checks
+    ]
+
+
+def _binding_app_will_cover(repo, repo_owner, app_id, app_plans):
+    """Whether the App `app_id` covers `repo` -- now, or by the time the
+    binding is written. The binding's coverage precondition (see the Apply
+    section) is enforced AFTER the --app step, so an App this run is about to
+    add to the repo (`app_plans`) will cover it by then even if it does not
+    yet. The dry-run previews this so `--dry-run`'s exit status matches the
+    real run rather than pessimistically flagging a plan that would succeed
+    (Codex, mikelward/repo#52). Raises gh.GhError (can't-tell) rather than
+    guessing on a read failure, exactly as app_covers_repo does."""
+    if apps.app_covers_repo(repo_owner, app_id, repo):
+        return True
+    # A planned --app step covers it too, but only a fresh ADD: this run adds
+    # the repo to an existing (active) installation, so it covers by binding
+    # time. An ALREADY_MEMBER/ALREADY_ALL verdict is NOT taken as coverage here
+    # -- app_covers_repo above already returned False for this App, so an
+    # "already covers" plan can only mean the installation is suspended (or a
+    # read raced), which does not cover (Codex, mikelward/repo#52). Match plans
+    # by slug: an App not installed on the owner at all has no slug (and --app
+    # only adds a repo to an existing installation, never creates one).
+    slug = apps.app_slug_for_id(repo_owner, app_id)
+    if slug is None:
+        return False
+    return any(plan.slug == slug and plan.verdict == "ADD" for plan in app_plans)
+
+
+def _lanes_repoint_state(repo, target_binding):
+    """Read `lanes`'s current required-check binding and classify it against
+    `target_binding` (the App this run would switch the credential to).
+    Returns `(repoint_from, repoint_unknown)`: `repoint_from` is the App id
+    `lanes` is already bound to when that is a DIFFERENT App than the target
+    (a re-point), else None; `repoint_unknown` is True when the binding could
+    not be read. A first bind (unbound) and an idempotent rerun (already bound
+    to the target App) yield `(None, False)`.
+
+    Shared by the plan-time snapshot and the apply-time recheck right before
+    the credential move, so a re-point that appears only after the plan is
+    built is still refused -- the credential switch is otherwise unprotected
+    while the binding it depends on is fingerprinted only against the computed
+    target, not the source (Codex J, mikelward/repo#52)."""
+    repoint_from = None
+    try:
+        for context, integration_id in rules.effective_required_checks(
+            repo, credentials.default_branch(repo)
+        ):
+            if (
+                context == credentials.LANES_CHECK
+                and integration_id
+                and integration_id != target_binding
+            ):
+                repoint_from = integration_id
+    except (rules.RulesetError, credentials.ReadError):
+        return None, True
+    return repoint_from, False
 
 
 def _bootstrap_default_branch(repo):
@@ -1427,6 +1557,18 @@ def _run(args, log=None):
     # and nothing more.
     _progress(args, f"{repo}: checking fleet credentials")
     credentials_plan = _plan_credentials(repo, credential_specs)
+    # The main ruleset step requires `checks` with `lanes` UNBOUND (an existing
+    # App binding is preserved, never stripped). When the credential step found
+    # the default branch publishes `lanes` as the App and was handed the id, a
+    # SECOND ruleset update binds it -- run only after this run's credential
+    # move has settled the pair, so a failed move can never leave `lanes`
+    # required from an App the workflow cannot authenticate as (Codex,
+    # mikelward/repo#52).
+    bound_checks = _bind_checks(checks, credentials_plan.lanes_binding)
+    want_binding = (
+        credentials_plan.lanes_binding is not None
+        and credentials.LANES_CHECK in checks
+    )
     credentials_idle = not (
         credentials_plan.moves
         or credentials_plan.unfixed
@@ -1629,6 +1771,74 @@ def _run(args, log=None):
             if not ruleset_never_reported:
                 ruleset_preview_failed = True
 
+    # The lanes App binding is a SECOND ruleset update, previewed here as its
+    # own action and written (see the Apply section) only after this run's
+    # credential move has settled the pair. Its never-reported guard is the
+    # same one every required check gets: an App that has not published `lanes`
+    # yet holds the binding, and the plan says to rerun once it has.
+    binding_lines = []
+    binding_report = {}
+    binding_needs_write = False
+    binding_never_reported = None
+    binding_preview_failed = False
+    if want_binding and not args.no_rules:
+        bbuf = io.StringIO()
+        with redirect_stdout(bbuf):
+            bcode = rules.apply_ruleset(
+                repo, bound_checks, dry_run=True, force=args.force, report=binding_report
+            )
+        if bcode == 2:
+            raise SystemExit(2)
+        binding_lines = bbuf.getvalue().splitlines()
+        binding_needs_write = bcode == 0 and bool(binding_report.get("needs_write"))
+        if bcode != 0:
+            binding_never_reported = binding_report.get("never_reported")
+            if not binding_never_reported:
+                binding_preview_failed = True
+
+    # setup does not re-point an existing `lanes` binding to a DIFFERENT App
+    # (descope, maintainer 2026-09-10). The ruleset step preserves any existing
+    # binding, so moving it would take a second write here -- but switching the
+    # credential to App B while the ruleset still requires App A leaves the
+    # publisher and the requirement disagreeing until a later run rebinds, a
+    # window that a failed capture or an over-optimistic `--app` coverage
+    # preview can turn into wedged merges (Codex E/F/H, mikelward/repo#52).
+    # Automating a re-point safely means coupling the switch and the binding so
+    # the publisher never leads the requirement -- a tracked follow-up (see TODO
+    # "Re-point / rotate the lanes App binding"). For now, when `lanes` is
+    # already bound to another App -- or its current binding can't be read --
+    # this run REFUSES: it does not switch the credential and does not bind,
+    # leaving the working App A in place. A first bind (currently unbound) and an
+    # idempotent rerun (already bound to the same App) are unaffected. Detected
+    # whenever a bind is wanted, not only on the deferred path, so a re-point to
+    # an App that has already reported is refused too.
+    lanes_move_planned = any(
+        name in (credentials.LANES_APP_ID, credentials.LANES_APP_PRIVATE_KEY)
+        for move in credentials_plan.moves
+        for name, *_ in move.writes
+    )
+    repoint_from = None
+    repoint_unknown = False
+    if credentials_plan.lanes_binding is not None and (
+        (want_binding and not args.no_rules) or lanes_move_planned
+    ):
+        repoint_from, repoint_unknown = _lanes_repoint_state(
+            repo, credentials_plan.lanes_binding
+        )
+    refuse_repoint = (
+        want_binding and not args.no_rules and (repoint_from is not None or repoint_unknown)
+    )
+    # The re-point safety for the lanes CREDENTIAL move is independent of
+    # whether this run edits the ruleset: `--no-rules` still runs the move, and
+    # switching the credential to a different App than `lanes` is bound to wedges
+    # merges either way -- the requirement keeps naming the old App while the new
+    # one publishes. So refuse the switch on a re-point whenever a lanes move is
+    # planned, not only on the binding path that `refuse_repoint` gates (Codex K,
+    # mikelward/repo#52).
+    refuse_credential_repoint = lanes_move_planned and (
+        repoint_from is not None or repoint_unknown
+    )
+
     # --no-bootstrap means bootstrap_plan stays None, so nothing above has
     # checked whether the branch has any commits -- needed here because a
     # ruleset that first requires pull requests would strand a branch with
@@ -1770,6 +1980,28 @@ def _run(args, log=None):
     app_plans = [apps.plan_app_step(repo, repo_owner, slug) for slug in args.app]
     app_plan_has_error = any(p.verdict == "ERROR" for p in app_plans)
 
+    # The binding's coverage precondition, PREVIEWED here so `--dry-run`'s exit
+    # status and plan match the real run: setup refuses to bind `lanes` to an
+    # App that does not cover the repo (a hard, non-`--force` failure applied in
+    # the Apply section), and the preview must reflect that -- including a
+    # planned --app addition that would cover it by binding time (Codex,
+    # mikelward/repo#52). Gated on `binding_needs_write`, exactly as the Apply
+    # section's precondition is: coverage is only a precondition for a binding
+    # this run would actually write, so the preview flags it only then, and
+    # dry-run and real run agree. Standing drift on an already-bound repo whose
+    # App lost coverage is `repo audit`'s to report, not a bind this run is
+    # making (Codex, mikelward/repo#52).
+    binding_uncovered = False
+    binding_coverage_unreadable = False
+    if want_binding and not args.no_rules and binding_needs_write:
+        try:
+            binding_uncovered = not _binding_app_will_cover(
+                repo, repo_owner, credentials_plan.lanes_binding, app_plans
+            )
+        except gh.GhError:
+            binding_uncovered = True
+            binding_coverage_unreadable = True
+
     def describe_combined_plan(full=None):
         """The plan, one section per step.
 
@@ -1795,6 +2027,10 @@ def _run(args, log=None):
             or empty_branch_would_strand_ruleset
             or scaffold_pending_would_strand_ruleset
             or ruleset_never_reported
+            # The App binding rides in this same section.
+            or binding_needs_write
+            or binding_never_reported
+            or binding_uncovered
         )
         if not args.no_rules and (full or not ruleset_idle):
             lines.append("  ruleset (repo-rules):")
@@ -1828,6 +2064,49 @@ def _run(args, log=None):
                     "reported on this repo yet; rerun once they have (--force adds the "
                     "ruleset anyway, blocking every merge until then)"
                 )
+            if refuse_repoint:
+                # setup does not re-point an existing binding to a different App
+                # (see refuse_repoint); it leaves the working App in place.
+                if repoint_from is not None:
+                    lines.append(
+                        f"    HELD: `{credentials.LANES_CHECK}` is already bound to App {repoint_from}; "
+                        f"setup does not re-point it to App {credentials_plan.lanes_binding} -- leaving "
+                        f"the existing binding and credential as they are. Re-pointing/rotation is a "
+                        f"follow-up; do it by hand for now."
+                    )
+                else:
+                    lines.append(
+                        f"    HELD: the current `{credentials.LANES_CHECK}` binding could not be read, so "
+                        f"setup neither switches the credential nor binds (it may already be bound to a "
+                        f"different App). Rerun once it is readable."
+                    )
+            elif binding_uncovered:
+                # Coverage fails regardless of published/needs-write state, so
+                # this replaces the would-bind / waits lines rather than adding
+                # to them: binding is impossible until the App covers the repo.
+                if binding_coverage_unreadable:
+                    lines.append(
+                        f"    the App binding CANNOT be written: could not read whether App "
+                        f"{credentials_plan.lanes_binding} covers {repo}. Rerun once it is readable."
+                    )
+                else:
+                    lines.append(
+                        f"    the App binding CANNOT be written: App {credentials_plan.lanes_binding} "
+                        f"is not installed on {repo_owner} or does not cover {repo}, so binding "
+                        f"`{credentials.LANES_CHECK}` to it would block every merge. Add the App to "
+                        f"{repo} (`repo setup --app <slug>`), then rerun to bind."
+                    )
+            elif binding_needs_write:
+                lines += [f"    {line}" for line in binding_lines]
+                lines.append(
+                    "    (the App binding is written after the credential is settled)"
+                )
+            elif binding_never_reported:
+                lines.append(
+                    f"    the App binding waits: {rules.describe_missing(binding_never_reported)} "
+                    "not yet published by the App it would be bound to; rerun once it has "
+                    "(the check stays required, unbound, until then)"
+                )
         if secret_previews:
             lines.append("  secrets (repo-secrets):")
             for spec, _entry, desc_lines in secret_previews:
@@ -1840,6 +2119,16 @@ def _run(args, log=None):
             lines.append("  fleet credentials:")
             lines += [f"    {line}" for line in credentials_plan.lines]
             lines += [f"    NOT FIXED: {reason}" for reason in credentials_plan.unfixed]
+            if refuse_repoint or refuse_credential_repoint:
+                # The write lines above describe the switch the plan would make;
+                # this run holds it (see the ruleset section, or -- under
+                # --no-rules, where refuse_credential_repoint is the only signal
+                # -- here), so say so rather than leaving the section promising a
+                # write that is held.
+                lines.append(
+                    f"    HELD: the `{credentials.LANES_CHECK}` credential switch above is not made "
+                    f"this run -- setup does not re-point an existing binding to a different App"
+                )
             if not credentials_plan.lines and not credentials_plan.unfixed:
                 lines.append("    nothing to do")
         if full or auto_merge_state != "allowed":
@@ -1879,11 +2168,19 @@ def _run(args, log=None):
             or empty_branch_would_strand_ruleset
             or scaffold_pending_would_strand_ruleset
             or ruleset_never_reported
+            or binding_preview_failed
+            or binding_uncovered
+            or refuse_repoint
+            or refuse_credential_repoint
+            # A binding held because the App has not published `lanes` yet is
+            # the expected run-1 state of the two-run cadence, not a failure:
+            # the pair is placed, the check stays required (unbound), and a
+            # later run binds it. So it does not fail the (dry) run.
         ):
             raise SystemExit(1)
         return 0
 
-    if ruleset_preview_failed or secrets_preview_failed:
+    if ruleset_preview_failed or secrets_preview_failed or binding_preview_failed:
         # App-plan errors do NOT gate this: an App-plan ERROR is a genuine
         # per-step runtime outcome (no installation found, a listing call
         # that failed), not a usage-shaped problem with the whole plan --
@@ -1935,9 +2232,14 @@ def _run(args, log=None):
         and not empty_branch_would_strand_ruleset
         and (ruleset_report.get("needs_write", True) or bool(ruleset_report.get("deletions")))
     )
+    # The App binding is a ruleset write too; when the main ruleset step is
+    # otherwise idle, this is what makes the run ask about it (and print the
+    # plan) rather than binding silently.
+    binding_needs_mutation = not args.no_rules and binding_needs_write
     apps_need_mutation = any(p.verdict == "ADD" for p in app_plans)
     needs_confirmation = (
         ruleset_needs_mutation
+        or binding_needs_mutation
         or bool(secret_previews)
         or apps_need_mutation
         or bool(credentials_plan.moves)
@@ -2402,6 +2704,50 @@ def _run(args, log=None):
         ):
             failed.append("ruleset")
 
+    # Capture the binding write's fingerprint now, against the ruleset as the
+    # main step just left it, so the deferred write below -- which runs after
+    # the credential moves, a window an administrator could edit the ruleset in
+    # -- refuses if it drifts, the same protection the main write above has
+    # from its own preview fingerprint (Codex, mikelward/repo#52). Only when
+    # the binding will actually be written and the main step succeeded.
+    binding_apply_fingerprint = None
+    binding_wanted_this_run = (
+        want_binding
+        and not args.no_rules
+        and binding_needs_write
+        and "ruleset" not in failed
+        # A re-point is refused (see refuse_repoint): setup does not change an
+        # existing binding to a different App, so it does not bind here either.
+        and not refuse_repoint
+    )
+    if binding_wanted_this_run:
+        _binding_apply_report = {}
+        with redirect_stdout(io.StringIO()):
+            _binding_capture_code = rules.apply_ruleset(
+                repo, bound_checks, dry_run=True, force=args.force, report=_binding_apply_report
+            )
+        # Only a clean capture yields a fingerprint to pin the deferred write
+        # to; a failed one (a transient read, say) leaves it None, and the
+        # write below is SKIPPED rather than run unpinned -- an unpinned write
+        # is the very race this capture exists to close (Codex,
+        # mikelward/repo#52). The binding just waits for a rerun, like any
+        # other deferral.
+        #
+        # Accepted, rerun-converging window (maintainer, 2026-09-10; see TODO
+        # "Accepted: rerun-converging windows in the split credential/binding
+        # mechanism"). On a RE-POINT (the ruleset already binds `lanes` to App
+        # A, this run supplies App B, which has reported) a failed capture skips
+        # the binding AFTER the credential move below has already switched the
+        # publisher to B -- so `lanes` is required from A while B publishes,
+        # blocking merges until a rerun rebinds. The move runs before the bind
+        # on purpose (a failed move must not leave a live binding to an
+        # unusable App), so closing this specific window means the class-
+        # deleting redesign (never let the publisher lead the requirement), a
+        # tracked follow-up -- not another isolated exception (Codex,
+        # mikelward/repo#52).
+        if _binding_capture_code == 0:
+            binding_apply_fingerprint = _binding_apply_report.get("fingerprint")
+
     for spec, entry, _desc_lines in secret_previews:
         _repo, state, env_state = entry
         if state == "error":
@@ -2443,6 +2789,53 @@ def _run(args, log=None):
             failed.append(f"app:{plan.slug}")
 
     for move in credentials_plan.moves:
+        lanes_move = any(
+            name in (credentials.LANES_APP_ID, credentials.LANES_APP_PRIVATE_KEY)
+            for name, *_ in move.writes
+        )
+        if lanes_move and credentials_plan.lanes_binding is not None:
+            # Re-read the `lanes` binding immediately before switching the
+            # credential -- the plan-time snapshot can go stale if an admin binds
+            # `lanes` to another App after the ruleset apply above but before this
+            # move. The binding write is fingerprint-protected against a
+            # concurrent change; the credential switch is not, so without this
+            # recheck the run could switch the credential to App B while `lanes`
+            # now requires App A, wedging merges (Codex J, mikelward/repo#52).
+            # Mirrors --secret's recheck-before-write. Gated on the move, not on
+            # whether this run edits rules: `--no-rules` runs the move too, so the
+            # safety must cover it (Codex K). Holds on the plan-time refusal
+            # (refuse_credential_repoint) as well: a plan that already HELD the
+            # switch keeps holding even if the reread now reads clean.
+            move_repoint_from, move_repoint_unknown = _lanes_repoint_state(
+                repo, credentials_plan.lanes_binding
+            )
+            if (
+                refuse_credential_repoint
+                or move_repoint_from is not None
+                or move_repoint_unknown
+            ):
+                # `lanes` is already bound to a different App (or its binding can't
+                # be read), and switching the credential to a new App while the
+                # ruleset still requires the old one wedges merges. setup does not
+                # re-point (a tracked follow-up); hold the move so the working App
+                # stays in place (Codex E/F/H/J/K).
+                held_from = (
+                    move_repoint_from if move_repoint_from is not None else repoint_from
+                )
+                if held_from is not None:
+                    error(
+                        f"{move.label} not switched: `{credentials.LANES_CHECK}` is already bound to App "
+                        f"{held_from}; setup does not re-point it to App {credentials_plan.lanes_binding}"
+                        " -- re-point by hand for now"
+                    )
+                else:
+                    error(
+                        f"{move.label} not switched: could not read the current "
+                        f"`{credentials.LANES_CHECK}` binding, so setup does not switch the credential "
+                        "(it may already be bound to a different App) -- rerun once it is readable"
+                    )
+                failed.append(f"credential:{move.label}")
+                continue
         # The caller is re-read right before the move -- same reason
         # --secret rechecks before its write: the confirmation prompt above
         # can have sat for any length of time. Before the writes as well as
@@ -2720,6 +3113,93 @@ def _run(args, log=None):
             for line in credentials_plan.lines:
                 error(line)
         failed.append("credentials")
+
+    # The lanes App binding: a SECOND ruleset write, now that this run's
+    # credential move has settled the pair. Held back if the pair did not
+    # settle this run (a failed move, or the whole credentials step failing),
+    # if the main ruleset step was skipped or failed, or if the App has not
+    # published `lanes` yet (the preview's never-reported hold) -- in each case
+    # the check stays required but unbound, and a later run binds it once the
+    # credential is in place and the App has reported. Writing it here, after
+    # the moves, rather than in the ruleset step above (which runs first) is
+    # what keeps a failed move from leaving `lanes` bound to an App the
+    # workflow cannot authenticate as (Codex, mikelward/repo#52).
+    # Any lanes-labeled failure OR finding holds the binding. GitHub never
+    # returns a secret's value, so setup cannot positively confirm that the
+    # `lanes` environment holds THIS App's pair -- only that some lanes issue is
+    # open. So it stays conservative: bind `lanes` to the App only once the lanes
+    # credential state is fully clean (no failure, no `unfixed`). Narrowing this
+    # to "bind despite an unrelated hardening finding" needs a positive
+    # per-App settlement signal the Statuses/secrets APIs cannot give, and the
+    # attempt wedged a held move (a protected-env policy drops the writes but
+    # records only an `unfixed`, leaving no failure tag) -- so it is left to the
+    # maintainer whether to bind while a lanes hardening gap remains open
+    # (Codex, mikelward/repo#52; see TODO).
+    lanes_credential_failed = any(
+        tag in failed
+        for tag in (
+            "credentials",
+            f"credential:{credentials.LANES_ENV}",
+            f"credential:{credentials.LANES_APP_ID}",
+            f"credential:{credentials.LANES_APP_PRIVATE_KEY}",
+        )
+    )
+    if binding_wanted_this_run and not lanes_credential_failed:
+        owner = repo.split("/", 1)[0]
+        # Coverage precondition, checked BEFORE the binding write and NOT
+        # --force-overridable: binding `lanes` to an App that is not installed
+        # on the owner or does not cover this repo would wedge every merge, and
+        # no amount of --force makes an uninstalled App able to report. This is
+        # the liveness question, kept distinct from the never-reported
+        # (evidence) hold the ruleset write itself applies -- entangling the two
+        # is what let --force override coverage and drew four review rounds
+        # (Codex, mikelward/repo#52).
+        try:
+            covered = apps.app_covers_repo(owner, credentials_plan.lanes_binding, repo)
+        except gh.GhError as e:
+            error_lines(
+                f"{repo}: could not tell whether App {credentials_plan.lanes_binding} covers this "
+                f"repo (needed before binding `{credentials.LANES_CHECK}`):",
+                e.stderr,
+            )
+            covered = None
+        if covered is not True:
+            if covered is False:
+                error(
+                    f"{repo}: the `{credentials.LANES_CHECK}` App binding was not written -- App "
+                    f"{credentials_plan.lanes_binding} is not installed on {owner} or does not cover "
+                    f"{repo}, so binding `{credentials.LANES_CHECK}` to it would block every merge. "
+                    f"Add the App to {repo} (`repo setup --app <slug>`), then rerun to bind."
+                )
+            failed.append("ruleset-binding")
+        elif binding_apply_fingerprint is None:
+            # The capture above failed, so there is no confirmed state to pin
+            # the write to. Running it unpinned is exactly the race the capture
+            # closes, so skip it and record a failure -- the binding waits for
+            # a rerun (Codex, mikelward/repo#52).
+            error(
+                f"{repo}: the `{credentials.LANES_CHECK}` App binding was not written -- could not "
+                "read the ruleset to pin the write against a confirmed state. Rerun `repo setup` to "
+                "bind it (the check stays required, unbound, until then)."
+            )
+            failed.append("ruleset-binding")
+        else:
+            # expected_fingerprint pins the write to the state captured right
+            # after the main apply, so an edit during the credential-move
+            # window is refused rather than silently rewritten (Codex,
+            # mikelward/repo#52).
+            if (
+                rules.apply_ruleset(
+                    repo,
+                    bound_checks,
+                    dry_run=False,
+                    force=args.force,
+                    skip_confirm=True,
+                    expected_fingerprint=binding_apply_fingerprint,
+                )
+                != 0
+            ):
+                failed.append("ruleset-binding")
 
     if auto_merge_state == "enable":
         try:

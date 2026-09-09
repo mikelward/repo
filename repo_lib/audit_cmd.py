@@ -1067,9 +1067,9 @@ def run(args):
             if wrong_app:
                 gap(
                     "required but never reported by the App it is bound to: "
-                    f"{rules.describe_missing(wrong_app)} -- rerun `repo setup` with "
-                    "the App's credentials configured (it re-points the binding to "
-                    "the App it places), or repoint the ruleset entry by hand"
+                    f"{rules.describe_missing(wrong_app)} -- re-point the ruleset entry "
+                    "to the publishing App by hand; `repo setup` does not re-point an "
+                    "existing binding to a different App (a tracked follow-up)"
                 )
             if not unseen and not uncovered:
                 ok(

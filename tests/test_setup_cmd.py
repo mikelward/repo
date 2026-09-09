@@ -321,6 +321,13 @@ class FakeGh:
         self.installations = []  # (slug, id, selection, account)
         self.install_members = {}  # install_id -> set(full_name)
         self.install_add_fails = set()  # install_ids whose membership PUT fails
+        # App id -> (slug, repository_selection) for the id-keyed lookups the
+        # binding coverage precondition (app_covers_repo) and status-creator
+        # resolution (app_slug_for_id) use. Absent id => not installed on the
+        # owner (coverage False / slug None). A "selected" selection reads its
+        # repo list from install_members[str(app_id)].
+        self.app_coverage = {}
+        self.app_coverage_fails = None  # gh stderr for the id-keyed installs read, or None
 
         # -- bootstrap/scaffold step state --
         # Fake content for the two external template sources -- what it
@@ -818,6 +825,24 @@ class FakeGh:
             raise gh.GhError(f"gh: HTTP 404: Not Found (.../{endpoint})\n")
 
         if _USER_INSTALLATIONS_RE.match(endpoint):
+            aid_m = re.search(r"app_id == (\d+)", jq or "")
+            if aid_m:
+                # Id-keyed lookups: app_covers_repo (projects
+                # [.id, .repository_selection]) and app_slug_for_id (.app_slug).
+                if self.app_coverage_fails is not None:
+                    raise gh.GhError(self.app_coverage_fails)
+                cover = self.app_coverage.get(int(aid_m.group(1)))
+                if cover is None:
+                    return ""  # not installed on the owner
+                cslug, cselection = cover[0], cover[1]
+                # Optional third element marks the installation suspended.
+                csuspended = bool(cover[2]) if len(cover) > 2 else False
+                if "repository_selection" in (jq or ""):
+                    return (
+                        f"{aid_m.group(1)}\t{cselection}\t"
+                        f"{'true' if csuspended else 'false'}\n"
+                    )
+                return f"{cslug}\n"
             slug_m = _INSTALL_SLUG_JQ_RE.search(jq or "")
             owner_m = _INSTALL_OWNER_JQ_RE.search(jq or "")
             slug = slug_m.group(1) if slug_m else ""
@@ -5340,6 +5365,789 @@ class LanesCredentialStepTest(unittest.TestCase):
         self.assertIn("LANES_APP_ID not set: the environment was not restricted", err)
         self.assertEqual(fake.written_secrets, [])
         self.assertEqual(fake.deleted_secrets, [])
+
+    def _ruleset_requiring(self, fake, status_checks):
+        fake.existing_ruleset_id = "7"
+        fake.all_ruleset_ids = ["7"]
+        fake.ruleset_objects["7"] = {
+            "id": 7,
+            "name": "main",
+            "enforcement": "active",
+            "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+            "rules": [
+                {
+                    "type": "required_status_checks",
+                    "parameters": {
+                        "strict_required_status_checks_policy": True,
+                        "required_status_checks": status_checks,
+                    },
+                },
+                {
+                    "type": "pull_request",
+                    "parameters": {
+                        "required_review_thread_resolution": True,
+                        "allowed_merge_methods": ["rebase"],
+                        "required_approving_review_count": 0,
+                        "dismiss_stale_reviews_on_push": False,
+                        "require_code_owner_review": False,
+                        "require_last_push_approval": False,
+                    },
+                },
+                {"type": "required_linear_history", "parameters": {}},
+                {"type": "non_fast_forward", "parameters": {}},
+            ],
+        }
+
+    def test_a_supplied_id_binds_the_lanes_check_once_the_app_publishes(self):
+        # The default branch publishes `lanes` as the App (the init step holds
+        # the pair), the pair is already usable in the environment, and
+        # --credential hands the id -- so the ruleset requires `lanes` FROM that
+        # App, not any producer of the name.
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = self._publisher()
+            # Pair already placed and the environment already restricted, so the
+            # credential step is idle and only the ruleset write happens.
+            fake.env_secret_names = {"lanes": set(self.PAIR)}
+            fake.env_policies = {"lanes": ["main"]}
+            self._ruleset_requiring(
+                fake,
+                [{"context": "lanes"}, {"context": "codex"}, {"context": "zizmor"}],
+            )
+            # The App has posted `lanes` (here as a check run carrying its id),
+            # so requiring it from the App does not wedge the merge. It is also
+            # installed and covers this repo -- the binding's coverage
+            # precondition (app_covers_repo), which --force does not override.
+            fake.check_runs = {fake.default_head_sha: [("lanes", 12345), "codex", "zizmor"]}
+            fake.app_coverage = {12345: ("lanes-app", "all")}
+            code, out, err = _run(
+                fake,
+                [
+                    "--force",
+                    "--credential", f"LANES_APP_ID={app_id}",
+                    "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                    REPO,
+                ],
+            )
+        self.assertEqual(code, 0, err)
+        # The binding is a second ruleset write, after the credential is
+        # settled -- it is the last ruleset PUT this run makes.
+        checks_rule = next(
+            r for r in fake.puts[-1][1]["rules"] if r["type"] == "required_status_checks"
+        )
+        self.assertEqual(
+            checks_rule["parameters"]["required_status_checks"],
+            [
+                {"context": "lanes", "integration_id": 12345},
+                {"context": "codex"},
+                {"context": "zizmor"},
+            ],
+        )
+
+    def test_force_does_not_bind_to_an_app_that_does_not_cover_the_repo(self):
+        # The coverage precondition is NOT --force-overridable: binding `lanes`
+        # to an App that is not installed on / does not cover this repo would
+        # wedge every merge, and no amount of --force makes an uninstalled App
+        # able to report. The documented fleet command always passes --force,
+        # so this is the path that matters (Codex, mikelward/repo#52).
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = self._publisher()
+            fake.env_secret_names = {"lanes": set(self.PAIR)}
+            fake.env_policies = {"lanes": ["main"]}
+            self._ruleset_requiring(
+                fake,
+                [{"context": "lanes"}, {"context": "codex"}, {"context": "zizmor"}],
+            )
+            fake.check_runs = {fake.default_head_sha: [("lanes", 12345), "codex", "zizmor"]}
+            fake.app_coverage = {}  # App 12345 is not installed on the owner
+            code, out, err = _run(
+                fake,
+                [
+                    "--force",
+                    "--credential", f"LANES_APP_ID={app_id}",
+                    "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                    REPO,
+                ],
+            )
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("is not installed on", out + err)
+        # No ruleset write bound `lanes` to the App -- it stays required but
+        # unbound, --force notwithstanding.
+        for _url, body in fake.puts:
+            checks_rule = next(
+                (r for r in body["rules"] if r["type"] == "required_status_checks"), None
+            )
+            if checks_rule is None:
+                continue
+            for entry in checks_rule["parameters"]["required_status_checks"]:
+                self.assertNotIn("integration_id", entry)
+
+    def test_a_suspended_installation_does_not_count_as_coverage(self):
+        # A suspended installation keeps its `repository_selection` but cannot
+        # act, so it can never publish `lanes` -- binding to it would wedge every
+        # merge. The coverage precondition must treat it as not covering, exactly
+        # like an absent install, rather than reading "all repositories" and
+        # binding anyway (Codex, mikelward/repo#52).
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = self._publisher()
+            fake.env_secret_names = {"lanes": set(self.PAIR)}
+            fake.env_policies = {"lanes": ["main"]}
+            self._ruleset_requiring(
+                fake,
+                [{"context": "lanes"}, {"context": "codex"}, {"context": "zizmor"}],
+            )
+            fake.check_runs = {fake.default_head_sha: [("lanes", 12345), "codex", "zizmor"]}
+            # Installed "all repositories" but SUSPENDED -> cannot publish here.
+            fake.app_coverage = {12345: ("lanes-app", "all", True)}
+            code, out, err = _run(
+                fake,
+                [
+                    "--force",
+                    "--credential", f"LANES_APP_ID={app_id}",
+                    "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                    REPO,
+                ],
+            )
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("is not installed on", out + err)
+        # No ruleset write bound `lanes` to the suspended App.
+        for _url, body in fake.puts:
+            checks_rule = next(
+                (r for r in body["rules"] if r["type"] == "required_status_checks"), None
+            )
+            if checks_rule is None:
+                continue
+            for entry in checks_rule["parameters"]["required_status_checks"]:
+                self.assertNotIn("integration_id", entry)
+
+    def test_binding_skipped_when_coverage_cannot_be_read(self):
+        # A failed installations read during the coverage precondition is
+        # can't-tell: skip the binding and fail, never bind on unconfirmed
+        # coverage -- the same fail-closed discipline the fingerprint capture
+        # keeps (Codex, mikelward/repo#52).
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = self._publisher()
+            fake.env_secret_names = {"lanes": set(self.PAIR)}
+            fake.env_policies = {"lanes": ["main"]}
+            self._ruleset_requiring(
+                fake,
+                [{"context": "lanes"}, {"context": "codex"}, {"context": "zizmor"}],
+            )
+            fake.check_runs = {fake.default_head_sha: [("lanes", 12345), "codex", "zizmor"]}
+            fake.app_coverage_fails = "gh: HTTP 500: boom\n"
+            code, out, err = _run(
+                fake,
+                [
+                    "--force",
+                    "--credential", f"LANES_APP_ID={app_id}",
+                    "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                    REPO,
+                ],
+            )
+        self.assertNotEqual(code, 0, out)
+        for _url, body in fake.puts:
+            checks_rule = next(
+                (r for r in body["rules"] if r["type"] == "required_status_checks"), None
+            )
+            if checks_rule is None:
+                continue
+            for entry in checks_rule["parameters"]["required_status_checks"]:
+                self.assertNotIn("integration_id", entry)
+
+    def test_dry_run_flags_a_binding_to_an_app_that_does_not_cover(self):
+        # --dry-run must mirror the real run's coverage precondition: if the
+        # App does not cover the repo, the binding cannot be written, so the
+        # dry run says so and exits nonzero rather than approving a plan the
+        # real run would reject (Codex, mikelward/repo#52).
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = self._publisher()
+            fake.env_secret_names = {"lanes": set(self.PAIR)}
+            fake.env_policies = {"lanes": ["main"]}
+            self._ruleset_requiring(
+                fake,
+                [{"context": "lanes"}, {"context": "codex"}, {"context": "zizmor"}],
+            )
+            fake.check_runs = {fake.default_head_sha: [("lanes", 12345), "codex", "zizmor"]}
+            fake.app_coverage = {}  # App 12345 is not installed on the owner
+            code, out, err = _run(
+                fake,
+                [
+                    "--dry-run",
+                    "--credential", f"LANES_APP_ID={app_id}",
+                    "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                    REPO,
+                ],
+            )
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("App binding CANNOT be written", out)
+        self.assertEqual(fake.puts, [])  # a dry run writes nothing
+
+    def test_dry_run_counts_a_planned_app_install_as_coverage(self):
+        # The coverage precondition is enforced AFTER the --app step, so an App
+        # this run will add to the repo covers it by binding time. The dry-run
+        # preview must count that planned addition, not flag a plan that would
+        # succeed (Codex, mikelward/repo#52). App 12345 is installed on the
+        # owner as a "selected" install NOT yet including this repo, and --app
+        # will add it.
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = self._publisher()
+            fake.env_secret_names = {"lanes": set(self.PAIR)}
+            fake.env_policies = {"lanes": ["main"]}
+            self._ruleset_requiring(
+                fake,
+                [{"context": "lanes"}, {"context": "codex"}, {"context": "zizmor"}],
+            )
+            fake.check_runs = {fake.default_head_sha: [("lanes", 12345), "codex", "zizmor"]}
+            # Installed "selected", not yet covering this repo -> app_covers_repo
+            # is False now, but --app lanes-app will ADD it.
+            fake.app_coverage = {12345: ("lanes-app", "selected")}
+            fake.installations = [("lanes-app", "88", "selected", REPO.split("/", 1)[0])]
+            fake.install_members = {"88": set()}  # repo not a member yet -> ADD
+            code, out, err = _run(
+                fake,
+                [
+                    "--dry-run",
+                    "--app", "lanes-app",
+                    "--credential", f"LANES_APP_ID={app_id}",
+                    "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                    REPO,
+                ],
+            )
+        # Planned coverage counts, so the binding is NOT flagged uncovered.
+        self.assertNotIn("App binding CANNOT be written", out)
+
+    def test_dry_run_does_not_flag_coverage_for_an_already_bound_check(self):
+        # Coverage is a precondition for a binding this run would WRITE, so both
+        # the dry-run preview and the real run gate the check on
+        # binding_needs_write. An already-bound `lanes` whose App has since lost
+        # coverage is no longer a binding this run makes -- the real run writes
+        # nothing and never checks coverage, so the dry-run must not flag it
+        # either (they were asymmetric before). Standing drift like this is
+        # `repo audit`'s to report, not `setup`'s to fail on (Codex,
+        # mikelward/repo#52).
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = self._publisher()
+            fake.env_secret_names = {"lanes": set(self.PAIR)}
+            fake.env_policies = {"lanes": ["main"]}
+            # A fully compliant ruleset -- hardened scope, and `lanes` ALREADY
+            # bound to App 12345 -- so there is no ruleset write this run and
+            # binding_needs_write is False (Codex's narrow case: a ruleset that
+            # already matches, binding included).
+            fake.existing_ruleset_id = "7"
+            fake.all_ruleset_ids = ["7"]
+            fake.ruleset_objects["7"] = {
+                "id": 7,
+                "name": "main",
+                "enforcement": "active",
+                "conditions": {"ref_name": {"include": list(_HARDENED_SCOPE), "exclude": []}},
+                "rules": [
+                    {
+                        "type": "required_status_checks",
+                        "parameters": {
+                            "strict_required_status_checks_policy": True,
+                            "required_status_checks": [
+                                {"context": "lanes", "integration_id": 12345}
+                            ],
+                        },
+                    },
+                    {
+                        "type": "pull_request",
+                        "parameters": {
+                            "required_review_thread_resolution": True,
+                            "allowed_merge_methods": ["rebase"],
+                            "required_approving_review_count": 0,
+                            "dismiss_stale_reviews_on_push": False,
+                            "require_code_owner_review": False,
+                            "require_last_push_approval": False,
+                        },
+                    },
+                    {"type": "required_linear_history"},
+                    {"type": "non_fast_forward"},
+                ],
+            }
+            fake.check_runs = {fake.default_head_sha: [("lanes", 12345)]}
+            fake.app_coverage = {}  # App 12345 no longer covers the repo
+            code, out, err = _run(
+                fake,
+                [
+                    "--dry-run", "--rule", "lanes",
+                    "--credential", f"LANES_APP_ID={app_id}",
+                    "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                    REPO,
+                ],
+            )
+        self.assertEqual(code, 0, out + err)
+        self.assertNotIn("App binding CANNOT be written", out)
+        self.assertEqual(fake.puts, [])  # a dry run writes nothing
+
+    def test_no_binding_when_the_pair_move_fails(self):
+        # The binding is written only after the credential move settles the
+        # pair. If the move fails (here the environment restriction), the check
+        # must be left required but UNBOUND -- binding it to an App whose
+        # credential did not land would block every merge (Codex,
+        # mikelward/repo#52). A later run binds it once the pair is settled.
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = self._publisher()
+            fake.secret_names = set(self.PAIR)  # repo-level copies, being placed this run
+            fake.restrict_fails = {"lanes"}  # the pair's move cannot settle
+            self._ruleset_requiring(
+                fake,
+                [{"context": "lanes"}, {"context": "codex"}, {"context": "zizmor"}],
+            )
+            fake.check_runs = {fake.default_head_sha: [("lanes", 12345), "codex", "zizmor"]}
+            code, out, err = _run(
+                fake,
+                [
+                    "--force",
+                    "--credential", f"LANES_APP_ID={app_id}",
+                    "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                    REPO,
+                ],
+            )
+        self.assertEqual(code, 1, err)
+        # No ruleset PUT this run binds lanes to the App.
+        for _url, body in fake.puts:
+            for rule in body.get("rules") or []:
+                if rule["type"] == "required_status_checks":
+                    for c in rule["parameters"]["required_status_checks"]:
+                        if c["context"] == "lanes":
+                            self.assertNotIn("integration_id", c)
+
+    def test_binding_deferred_until_the_app_has_published(self):
+        # The App publishes `lanes` on the default branch and the pair is in
+        # place, but the App has not actually posted a `lanes` status yet (only
+        # some other producer has). Binding now would require a check the App
+        # has never reported, so it is deferred -- not a failure: the pair is
+        # placed, `lanes` stays required (unbound), and a later run binds it.
+        # This is the two-run cadence's run 1.
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = self._publisher()
+            fake.env_secret_names = {"lanes": set(self.PAIR)}
+            fake.env_policies = {"lanes": ["main"]}
+            self._ruleset_requiring(
+                fake,
+                [{"context": "lanes"}, {"context": "codex"}, {"context": "zizmor"}],
+            )
+            # `lanes` reports (so the unbound requirement holds), but from
+            # App 7, not the 12345 the binding would name. App 12345 is
+            # installed and covers this repo (so it's the deferral, not a
+            # coverage failure) -- it just has not posted a `lanes` status yet.
+            fake.check_runs = {fake.default_head_sha: [("lanes", 7), "codex", "zizmor"]}
+            fake.app_coverage = {12345: ("lanes-app", "all")}
+            # --dry-run so the deferral shows without --force (which would
+            # waive the never-reported guard and force the binding through).
+            code, out, err = _run(
+                fake,
+                [
+                    "--dry-run",
+                    "--credential", f"LANES_APP_ID={app_id}",
+                    "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                    REPO,
+                ],
+            )
+        # Deferral is not a failure: the pair is placed and the check stays
+        # required (unbound) until a later run binds it.
+        self.assertEqual(code, 0, err)
+        self.assertIn("App binding waits", out)
+        self.assertEqual(fake.puts, [])
+
+    _EFFECTIVE_LANES_BOUND_55 = [
+        {
+            "type": "required_status_checks",
+            "parameters": {
+                "required_status_checks": [
+                    {"context": "lanes", "integration_id": 55},
+                    {"context": "codex"},
+                    {"context": "zizmor"},
+                ]
+            },
+        }
+    ]
+
+    def test_dry_run_flags_a_refused_re_point(self):
+        # setup does not re-point an existing binding to a different App
+        # (descope): the effective rules already bind `lanes` to App 55 and this
+        # run supplies App 12345, so --dry-run says the switch is HELD and exits
+        # nonzero rather than approving a switch the real run refuses (Codex
+        # E/F/H, mikelward/repo#52).
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = self._publisher()
+            fake.env_secret_names = {"lanes": set(self.PAIR)}
+            fake.env_policies = {"lanes": ["main"]}
+            self._ruleset_requiring(
+                fake,
+                [{"context": "lanes", "integration_id": 55}, {"context": "codex"}, {"context": "zizmor"}],
+            )
+            fake.effective_rules = self._EFFECTIVE_LANES_BOUND_55
+            fake.check_runs = {fake.default_head_sha: [("lanes", 12345), "codex", "zizmor"]}
+            fake.app_coverage = {12345: ("lanes-app", "all")}
+            code, out, err = _run(
+                fake,
+                [
+                    "--dry-run",
+                    "--credential", f"LANES_APP_ID={app_id}",
+                    "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                    REPO,
+                ],
+            )
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("HELD", out)
+        self.assertIn("App 55", out)
+        self.assertIn("does not re-point", out)
+        self.assertEqual(fake.written_secrets, [])
+
+    def test_already_bound_to_the_same_app_is_not_a_re_point(self):
+        # Idempotent: when `lanes` is already bound to the SAME App this run
+        # supplies (12345), it is not a re-point -- the run is not refused
+        # (descope, Codex #52).
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = self._publisher()
+            fake.env_secret_names = {"lanes": set(self.PAIR)}
+            fake.env_policies = {"lanes": ["main"]}
+            self._ruleset_requiring(
+                fake,
+                [{"context": "lanes", "integration_id": 12345}, {"context": "codex"}, {"context": "zizmor"}],
+            )
+            fake.effective_rules = [
+                {
+                    "type": "required_status_checks",
+                    "parameters": {
+                        "required_status_checks": [
+                            {"context": "lanes", "integration_id": 12345},
+                            {"context": "codex"},
+                            {"context": "zizmor"},
+                        ]
+                    },
+                }
+            ]
+            fake.check_runs = {fake.default_head_sha: [("lanes", 12345), "codex", "zizmor"]}
+            fake.app_coverage = {12345: ("lanes-app", "all")}
+            code, out, err = _run(
+                fake,
+                [
+                    "--force",
+                    "--credential", f"LANES_APP_ID={app_id}",
+                    "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                    REPO,
+                ],
+            )
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("does not re-point", out + err)
+        self.assertNotIn("not switched", err)
+
+    def test_a_re_point_to_a_different_app_is_refused(self):
+        # setup does not re-point: `lanes` is already bound to App 55 and this
+        # run supplies App 12345, so the run REFUSES -- it does not switch the
+        # credential and does not bind, leaving App 55 in place. Re-point/rotate
+        # is a tracked follow-up (descope; Codex E/F/H, mikelward/repo#52).
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = self._publisher()
+            fake.env_secret_names = {"lanes": set(self.PAIR)}
+            fake.env_policies = {"lanes": ["main"]}
+            self._ruleset_requiring(
+                fake,
+                [{"context": "lanes", "integration_id": 55}, {"context": "codex"}, {"context": "zizmor"}],
+            )
+            fake.effective_rules = self._EFFECTIVE_LANES_BOUND_55
+            fake.check_runs = {fake.default_head_sha: [("lanes", 12345), "codex", "zizmor"]}
+            fake.app_coverage = {12345: ("lanes-app", "all")}
+            with patch("builtins.input", return_value="y"):
+                code, out, err = _run(
+                    fake,
+                    [
+                        "--credential", f"LANES_APP_ID={app_id}",
+                        "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                        REPO,
+                    ],
+                    isatty=True,
+                )
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("not switched", err)
+        # The credential is NOT rotated to 12345, and lanes is NOT re-bound to it.
+        written = [w[:3] for w in fake.written_secrets]
+        self.assertNotIn(("LANES_APP_ID", REPO, "lanes"), written)
+        for _url, body in fake.puts:
+            checks_rule = next(
+                (r for r in body["rules"] if r["type"] == "required_status_checks"), None
+            )
+            if checks_rule is None:
+                continue
+            for entry in checks_rule["parameters"]["required_status_checks"]:
+                if entry.get("context") == "lanes":
+                    self.assertNotEqual(entry.get("integration_id"), 12345)
+
+    def test_an_unreadable_current_binding_refuses_the_switch(self):
+        # If the effective-rules read fails, setup cannot tell a first bind from
+        # a re-point, so it REFUSES conservatively -- it does not switch the
+        # credential or bind (descope; Codex E/F/H, mikelward/repo#52).
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = self._publisher()
+            fake.env_secret_names = {"lanes": set(self.PAIR)}
+            fake.env_policies = {"lanes": ["main"]}
+            self._ruleset_requiring(
+                fake,
+                [{"context": "lanes"}, {"context": "codex"}, {"context": "zizmor"}],
+            )
+            fake.check_runs = {fake.default_head_sha: [("lanes", 12345), "codex", "zizmor"]}
+            fake.app_coverage = {12345: ("lanes-app", "all")}
+            fake.effective_rules_read_fails = True
+            with patch("builtins.input", return_value="y"):
+                code, out, err = _run(
+                    fake,
+                    [
+                        "--credential", f"LANES_APP_ID={app_id}",
+                        "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                        REPO,
+                    ],
+                    isatty=True,
+                )
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("not switched", err)
+        written = [w[:3] for w in fake.written_secrets]
+        self.assertNotIn(("LANES_APP_ID", REPO, "lanes"), written)
+
+    def test_a_re_point_appearing_only_at_apply_time_holds_the_switch(self):
+        # Finding J: the plan-time refuse_repoint snapshot reads `lanes` as a
+        # first bind, but between the ruleset apply and the credential move an
+        # admin binds it to App 55. The apply-time recheck immediately before
+        # the switch catches that transition and holds the credential move --
+        # the switch is otherwise unprotected while the binding it depends on is
+        # fingerprinted only against the target App, not the source (Codex J,
+        # mikelward/repo#52).
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = self._publisher()
+            fake.env_secret_names = {"lanes": set(self.PAIR)}
+            fake.env_policies = {"lanes": ["main"]}
+            self._ruleset_requiring(
+                fake,
+                [{"context": "lanes"}, {"context": "codex"}, {"context": "zizmor"}],
+            )
+            fake.effective_rules = [
+                {
+                    "type": "required_status_checks",
+                    "parameters": {
+                        "required_status_checks": [
+                            {"context": "lanes"},
+                            {"context": "codex"},
+                            {"context": "zizmor"},
+                        ]
+                    },
+                }
+            ]
+            fake.check_runs = {fake.default_head_sha: [("lanes", 12345), "codex", "zizmor"]}
+            fake.app_coverage = {12345: ("lanes-app", "all")}
+            calls = []
+
+            def staged(repo, target):
+                # Plan time: unbound (first bind). Apply time: App 55 appeared.
+                calls.append(target)
+                return (None, False) if len(calls) == 1 else (55, False)
+
+            with patch("repo_lib.setup_cmd._lanes_repoint_state", side_effect=staged):
+                with patch("builtins.input", return_value="y"):
+                    code, out, err = _run(
+                        fake,
+                        [
+                            "--credential", f"LANES_APP_ID={app_id}",
+                            "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                            REPO,
+                        ],
+                        isatty=True,
+                    )
+        # The apply-time recheck must run: called at plan time and again before
+        # the move.
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("not switched", err)
+        self.assertIn("App 55", err)
+        written = [w[:3] for w in fake.written_secrets]
+        self.assertNotIn(("LANES_APP_ID", REPO, "lanes"), written)
+
+    def test_no_rules_still_refuses_a_re_pointing_credential_switch(self):
+        # Finding K: --no-rules skips the ruleset writes but still runs the
+        # credential move. When `lanes` is bound to App 55 and this run supplies
+        # App 12345, switching the credential would leave the workflow publishing
+        # as 12345 while the untouched requirement still names 55 -- wedging every
+        # merge. The re-point safety is a property of the credential move, not of
+        # the ruleset step, so it must hold the switch under --no-rules too (Codex
+        # K, mikelward/repo#52).
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = self._publisher()
+            fake.env_secret_names = {"lanes": set(self.PAIR)}
+            fake.env_policies = {"lanes": ["main"]}
+            self._ruleset_requiring(
+                fake,
+                [{"context": "lanes", "integration_id": 55}, {"context": "codex"}, {"context": "zizmor"}],
+            )
+            fake.effective_rules = self._EFFECTIVE_LANES_BOUND_55
+            fake.check_runs = {fake.default_head_sha: [("lanes", 12345), "codex", "zizmor"]}
+            fake.app_coverage = {12345: ("lanes-app", "all")}
+            with patch("builtins.input", return_value="y"):
+                code, out, err = _run(
+                    fake,
+                    [
+                        "--no-rules",
+                        "--credential", f"LANES_APP_ID={app_id}",
+                        "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                        REPO,
+                    ],
+                    isatty=True,
+                )
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("not switched", err)
+        self.assertIn("App 55", err)
+        written = [w[:3] for w in fake.written_secrets]
+        self.assertNotIn(("LANES_APP_ID", REPO, "lanes"), written)
+
+    def test_dry_run_no_rules_flags_a_re_pointing_credential_switch(self):
+        # The --no-rules re-point hold (Finding K) is previewed by --dry-run too,
+        # so the dry run's exit status matches the real run rather than approving
+        # a switch it would refuse.
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = self._publisher()
+            fake.env_secret_names = {"lanes": set(self.PAIR)}
+            fake.env_policies = {"lanes": ["main"]}
+            self._ruleset_requiring(
+                fake,
+                [{"context": "lanes", "integration_id": 55}, {"context": "codex"}, {"context": "zizmor"}],
+            )
+            fake.effective_rules = self._EFFECTIVE_LANES_BOUND_55
+            fake.check_runs = {fake.default_head_sha: [("lanes", 12345), "codex", "zizmor"]}
+            fake.app_coverage = {12345: ("lanes-app", "all")}
+            code, out, err = _run(
+                fake,
+                [
+                    "--dry-run",
+                    "--no-rules",
+                    "--credential", f"LANES_APP_ID={app_id}",
+                    "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                    REPO,
+                ],
+            )
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("HELD", out)
+        self.assertEqual(fake.written_secrets, [])
+
+    def test_binding_skipped_when_the_fingerprint_capture_fails(self):
+        # If the ruleset state can't be captured after the main apply (a
+        # transient read failure), the deferred binding write must be SKIPPED,
+        # not run unpinned -- an unpinned write is the race the capture exists
+        # to close. It fails the run and waits for a rerun (Codex,
+        # mikelward/repo#52).
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = self._publisher()
+            fake.env_secret_names = {"lanes": set(self.PAIR)}
+            fake.env_policies = {"lanes": ["main"]}
+            # Missing zizmor, so the main apply does a real PUT; the App (12345)
+            # has published, so the binding is wanted.
+            self._ruleset_requiring(fake, [{"context": "lanes"}, {"context": "codex"}])
+            fake.check_runs = {fake.default_head_sha: [("lanes", 12345), "codex", "zizmor"]}
+            # Ruleset reads fail after the main PUT -> the capture fails.
+            fake.ruleset_read_fails_after_put = {"7"}
+            code, out, err = _run(
+                fake,
+                [
+                    "--force",
+                    "--credential", f"LANES_APP_ID={app_id}",
+                    "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                    REPO,
+                ],
+            )
+        self.assertEqual(code, 1, err)
+        self.assertIn("App binding was not written", err)
+        for _url, body in fake.puts:
+            for rule in body.get("rules") or []:
+                if rule["type"] == "required_status_checks":
+                    for c in rule["parameters"]["required_status_checks"]:
+                        if c["context"] == "lanes":
+                            self.assertNotIn("integration_id", c)
+
+    def test_a_non_numeric_app_id_is_refused_not_silently_unbound(self):
+        # A malformed LANES_APP_ID (a mis-pointed file, say) must fail the run,
+        # not be written as the credential while the binding is silently
+        # skipped (Codex, mikelward/repo#52). The pair is left as is.
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"not-a-number")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = self._publisher()
+            fake.secret_names = set(self.PAIR)
+            code, out, err = _run(
+                fake,
+                [
+                    "--force", "--no-rules",
+                    "--credential", f"LANES_APP_ID={app_id}",
+                    "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                    REPO,
+                ],
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("not a positive integer App id", err)
+        self.assertEqual(fake.written_secrets, [])
+
+    def test_no_app_publisher_leaves_the_lanes_check_unbound(self):
+        # The consumer still runs the ambient gate (classify only, no `app-id`),
+        # so nothing publishes `lanes` as the App yet. The pair is placed for
+        # the coming migration, but the check must stay unbound -- binding it to
+        # an App that is not yet the producer would wedge every merge.
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = self._publisher(self.AMBIENT)
+            fake.secret_names = set(self.PAIR)
+            # Missing zizmor, so a ruleset write happens -- and it must add
+            # zizmor while leaving `lanes` unbound.
+            self._ruleset_requiring(fake, [{"context": "lanes"}, {"context": "codex"}])
+            fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+            code, out, err = _run(
+                fake,
+                [
+                    "--force",
+                    "--credential", f"LANES_APP_ID={app_id}",
+                    "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                    REPO,
+                ],
+            )
+        self.assertEqual(code, 0, err)
+        checks_rule = next(
+            r for r in fake.puts[0][1]["rules"] if r["type"] == "required_status_checks"
+        )
+        self.assertEqual(
+            checks_rule["parameters"]["required_status_checks"],
+            [{"context": "lanes"}, {"context": "codex"}, {"context": "zizmor"}],
+        )
 
 
 class CredentialsStepTest(unittest.TestCase):
