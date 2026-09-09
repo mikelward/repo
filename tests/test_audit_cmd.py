@@ -22,6 +22,9 @@ _MASTER_BRANCH_RE = re.compile(r"^repos/([^/]+/[^/]+)/branches/master$")
 _COMMITS_HEAD_RE = re.compile(r"^repos/([^/]+/[^/]+)/commits\?per_page=1(?:&sha=(.+))?$")
 _CHECK_RUNS_RE = re.compile(r"^repos/([^/]+/[^/]+)/commits/([^/]+)/check-runs$")
 _STATUS_RE = re.compile(r"^repos/([^/]+/[^/]+)/commits/([^/]+)/status$")
+_STATUSES_RE = re.compile(r"^repos/([^/]+/[^/]+)/commits/([^/]+)/statuses$")
+_INSTALLATIONS_RE = re.compile(r"^user/installations$")
+_INSTALL_REPOS_RE = re.compile(r"^user/installations/(\d+)/repositories$")
 _PULLS_RE = re.compile(r"^repos/([^/]+/[^/]+)/pulls\?state=(open|closed)&.*$")
 _REPO_SECRETS_RE = re.compile(r"^repos/([^/]+/[^/]+)/actions/secrets$")
 _ENVIRONMENTS_RE = re.compile(r"^repos/([^/]+/[^/]+)/environments$")
@@ -132,6 +135,19 @@ class FakeGh:
         self.check_runs = {"abc123": ["lanes", "codex", "zizmor"]}
         self.check_runs_fails = None  # gh stderr text, or None
         self.statuses = {}
+        # sha -> [(context, creator_login), ...] for the plural /statuses
+        # endpoint, which (unlike /status) carries each status's bot user.
+        self.status_creators = {}
+        # Installations visible to the caller, for the id -> slug resolution an
+        # App-bound status check verifies through. Each entry is (app_id,
+        # app_slug) -- installed on this repo's owner, "all repositories" -- or
+        # extended with (app_id, app_slug, account_login) to model one on
+        # another account, (..., repository_selection) to model a "selected"
+        # install, and (..., (covered_repo, ...)) to list what a selected one
+        # covers. The synthetic installation id is the entry's 1-based index.
+        self.installations = []
+        self.installations_fails = None  # gh stderr text, or None
+        self.install_repos_fails = None  # listing a selected install's repos
         self.open_prs = []
         self.closed_prs = []
         # The secrets audit. Names only, as the API itself answers.
@@ -216,6 +232,52 @@ class FakeGh:
             return "".join(
                 json.dumps(c) + "\n" for c in self.statuses.get(m.group(2), [])
             )
+
+        m = _STATUSES_RE.match(endpoint)
+        if m:
+            # Models --jq '.[] | [.context, (.creator.login // "")]'.
+            return "".join(
+                json.dumps([ctx, login]) + "\n"
+                for ctx, login in self.status_creators.get(m.group(2), [])
+            )
+
+        if _INSTALLATIONS_RE.match(endpoint):
+            if self.installations_fails is not None:
+                raise gh.GhError(self.installations_fails)
+            # Models the --jq selecting on both app_id and the account login.
+            mm = re.search(r"app_id == (\d+)", jq or "")
+            want = int(mm.group(1)) if mm else None
+            om = re.search(r'== \("([^"]+)" \| ascii_downcase\)', jq or "")
+            want_owner = om.group(1).lower() if om else None
+            default_owner = REPO.split("/", 1)[0]
+            out_lines = []
+            for i, entry in enumerate(self.installations):
+                app_id, slug = entry[0], entry[1]
+                account = entry[2] if len(entry) > 2 else default_owner
+                selection = entry[3] if len(entry) > 3 else "all"
+                if app_id != want:
+                    continue
+                if want_owner is not None and account.lower() != want_owner:
+                    continue
+                if "[.id, .repository_selection]" in (jq or ""):
+                    # app_covers_repo: --jq '... | [.id, .repository_selection] | @tsv'.
+                    out_lines.append(f"{i + 1}\t{selection}\n")
+                else:
+                    # app_slug_for_id: --jq '... | .app_slug'.
+                    out_lines.append(f"{slug}\n")
+            return "".join(out_lines)
+
+        m = _INSTALL_REPOS_RE.match(endpoint)
+        if m:
+            if self.install_repos_fails is not None:
+                raise gh.GhError(self.install_repos_fails)
+            idx = int(m.group(1)) - 1
+            covered = ()
+            if 0 <= idx < len(self.installations):
+                entry = self.installations[idx]
+                covered = entry[4] if len(entry) > 4 else ()
+            # Models --jq '.repositories[].full_name'.
+            return "".join(f"{full_name}\n" for full_name in covered)
 
         m = _PULLS_RE.match(endpoint)
         if m:
@@ -839,17 +901,22 @@ class AuditCmdTest(unittest.TestCase):
             {"type": "deletion", "parameters": {}},
         ]
         fake.check_runs = {fake.default_head_sha: [("lanes", 7), "codex", "zizmor"]}
+        # App 42 IS installed and covers this repo, so this is a wrong-App gate
+        # (it can report, just hasn't from 42), not a coverage gap.
+        fake.installations = [(42, "lanes-app")]
         code, out, err = _run(fake, [REPO])
         self.assertEqual(code, 1, err)
         # The name DOES report, just never from App 42 -- saying it "never
-        # reported" reads as false to someone watching lanes run, and
-        # `repo setup` would not fix it: _build_update_body reuses the
-        # existing entry by context, stale binding included.
+        # reported" reads as false to someone watching lanes run. The remedy
+        # is to re-point the binding: `repo setup` does it when handed the
+        # App's credentials (the supplied binding wins over the existing
+        # entry), so the guidance names that rather than a bare rerun.
         self.assertIn(
             "required but never reported by the App it is bound to: "
             "'lanes' (needs App 42)",
             out,
         )
+        self.assertIn("rerun `repo setup` with the App's credentials", out)
         self.assertIn("repoint the ruleset entry", out)
         self.assertNotIn("required but never reported: 'lanes'", out)
 
@@ -905,6 +972,7 @@ class AuditCmdTest(unittest.TestCase):
             {"type": "deletion", "parameters": {}},
         ]
         fake.check_runs = {fake.default_head_sha: [("lanes", 7)]}
+        fake.installations = [(42, "lanes-app")]  # 42 covers the repo -> wrong-App, not uncovered
         code, out, err = _run(fake, [REPO, "lanes"])
         self.assertEqual(code, 1, err)
         self.assertIn(
@@ -928,9 +996,213 @@ class AuditCmdTest(unittest.TestCase):
             {"type": "deletion", "parameters": {}},
         ]
         fake.check_runs = {fake.default_head_sha: [("lanes", 42), "codex", "zizmor"]}
+        # The check run matches App 42 by id, but the bound gate also confirms
+        # the App still covers the repo -- installed "all repositories" here.
+        fake.installations = [(42, "lanes-app")]
         code, out, err = _run(fake, [REPO])
         self.assertEqual(code, 0, err)
         self.assertIn("[ok] every required check has reported", out)
+
+    def test_bound_gate_satisfied_by_a_status_the_app_posted_is_ok(self):
+        # The App publishes `lanes` as a commit STATUS, whose creating App the
+        # Statuses API hides -- so satisfaction is recognized by resolving the
+        # bound id (42) to its slug and matching the status's {slug}[bot] login.
+        fake = FakeGh()
+        fake.effective_rules = [
+            _pull_request_rule(),
+            _status_checks_rule([("lanes", 42), "codex", "zizmor"]),
+            {"type": "required_linear_history", "parameters": {}},
+            {"type": "non_fast_forward", "parameters": {}},
+            {"type": "deletion", "parameters": {}},
+        ]
+        # No lanes CHECK RUN; it is a status. codex/zizmor report as usual.
+        fake.check_runs = {fake.default_head_sha: ["codex", "zizmor"]}
+        fake.statuses = {fake.default_head_sha: ["lanes"]}
+        fake.status_creators = {fake.default_head_sha: [("lanes", "lanes-app[bot]")]}
+        fake.installations = [(42, "lanes-app")]
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[ok] every required check has reported", out)
+
+    def test_bound_gate_status_from_a_different_bot_does_not_satisfy(self):
+        # A `lanes` status posted by some other bot must not satisfy a gate
+        # bound to App 42 -- GitHub will not accept it, so neither does audit.
+        fake = FakeGh()
+        fake.effective_rules = [
+            _pull_request_rule(),
+            _status_checks_rule([("lanes", 42), "codex", "zizmor"]),
+            {"type": "non_fast_forward", "parameters": {}},
+            {"type": "deletion", "parameters": {}},
+        ]
+        fake.check_runs = {fake.default_head_sha: ["codex", "zizmor"]}
+        fake.statuses = {fake.default_head_sha: ["lanes"]}
+        fake.status_creators = {fake.default_head_sha: [("lanes", "someone-else[bot]")]}
+        fake.installations = [(42, "lanes-app")]
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 1, err)
+        self.assertIn(
+            "required but never reported by the App it is bound to: "
+            "'lanes' (needs App 42)",
+            out,
+        )
+
+    def test_bound_gate_bound_to_an_app_on_another_account_is_a_coverage_gap(self):
+        # `user/installations` spans every account the caller can see. An App
+        # with the bound id installed only on some OTHER account cannot publish
+        # here, so the bound gate is unsatisfiable -- reported as a coverage gap
+        # (it can never report), not as "hasn't reported yet" (Codex,
+        # mikelward/repo#52).
+        fake = FakeGh()
+        fake.effective_rules = [
+            _pull_request_rule(),
+            _status_checks_rule([("lanes", 42)]),
+            {"type": "non_fast_forward", "parameters": {}},
+            {"type": "deletion", "parameters": {}},
+        ]
+        fake.check_runs = {fake.default_head_sha: ["codex"]}
+        # Installed on a different account, not on this repo's owner, so it
+        # never posted `lanes` here and app_covers_repo reads it as absent.
+        fake.installations = [(42, "lanes-app", "someone-else")]
+        code, out, err = _run(fake, [REPO, "lanes"])
+        self.assertEqual(code, 1, err)
+        self.assertIn(
+            "required but bound to an App that does not cover this repo "
+            "(it can never report): 'lanes' (App 42)",
+            out,
+        )
+
+    def test_bound_gate_reads_a_later_check_run_on_a_pr_head(self):
+        # The bound App published as a CHECK RUN on a pull request head (its id
+        # is on the run directly), not as a status on the default head. That is
+        # evidence the App reported; with the App installed and covering the
+        # repo, the gate is satisfied. (The evidence scan itself needs no
+        # installations read for a check run -- coverage is the separate
+        # precondition that does; Codex, mikelward/repo#52.)
+        fake = FakeGh()
+        fake.effective_rules = [
+            _pull_request_rule(),
+            _status_checks_rule([("lanes", 42), "codex", "zizmor"]),
+            {"type": "required_linear_history", "parameters": {}},
+            {"type": "non_fast_forward", "parameters": {}},
+            {"type": "deletion", "parameters": {}},
+        ]
+        fake.check_runs = {
+            fake.default_head_sha: ["codex", "zizmor"],  # no lanes on the default head
+            "prhead1": [("lanes", 42), "codex", "zizmor"],  # lanes as a check run, with its id
+        }
+        fake.open_prs = ["prhead1"]
+        fake.installations = [(42, "lanes-app")]  # installed, covers the repo
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[ok] every required check has reported", out)
+
+    def test_bound_gate_seen_but_uncovered_is_still_a_coverage_gap(self):
+        # The bound App reported `lanes` historically (a check run carries its
+        # id), so evidence satisfies the entry -- but the App has since been
+        # dropped from a "selected" install that no longer includes this repo,
+        # so it can never report again and the gate is silently broken.
+        # Coverage is checked for EVERY bound entry, not just unseen ones, so
+        # audit catches it despite the historical evidence (Codex,
+        # mikelward/repo#52).
+        fake = FakeGh()
+        fake.effective_rules = [
+            _pull_request_rule(),
+            _status_checks_rule([("lanes", 42), "codex", "zizmor"]),
+            {"type": "required_linear_history", "parameters": {}},
+            {"type": "non_fast_forward", "parameters": {}},
+            {"type": "deletion", "parameters": {}},
+        ]
+        fake.check_runs = {fake.default_head_sha: [("lanes", 42), "codex", "zizmor"]}
+        fake.installations = [(42, "lanes-app", REPO.split("/", 1)[0], "selected", ("owner/other",))]
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 1, err)
+        self.assertIn(
+            "required but bound to an App that does not cover this repo "
+            "(it can never report): 'lanes' (App 42)",
+            out,
+        )
+        self.assertNotIn("every required check has reported", out)
+
+    def test_bound_gate_when_installations_unreadable_is_cant_tell(self):
+        # A failed installations read is can't-tell, never "never reported":
+        # the same discipline every other read in the scan holds to.
+        fake = FakeGh()
+        fake.effective_rules = [
+            _pull_request_rule(),
+            _status_checks_rule([("lanes", 42)]),
+            {"type": "non_fast_forward", "parameters": {}},
+            {"type": "deletion", "parameters": {}},
+        ]
+        fake.check_runs = {fake.default_head_sha: ["codex"]}
+        fake.statuses = {fake.default_head_sha: ["lanes"]}
+        fake.installations_fails = "gh: HTTP 500: boom\n"
+        code, out, err = _run(fake, [REPO, "lanes"])
+        self.assertEqual(code, 1, err)
+        self.assertNotIn("never reported", out + err)
+
+    def test_bound_gate_ignores_a_selected_install_missing_this_repo(self):
+        # The App is installed on the owner, but as a "selected" install whose
+        # repo list does NOT include this repo -- so it cannot publish here and
+        # `lanes` has never reported. app_covers_repo reads that as not covered,
+        # so it is a coverage gap (it can never report), the more serious cause
+        # (Codex, mikelward/repo#52).
+        fake = FakeGh()
+        fake.effective_rules = [
+            _pull_request_rule(),
+            _status_checks_rule([("lanes", 42)]),
+            {"type": "non_fast_forward", "parameters": {}},
+            {"type": "deletion", "parameters": {}},
+        ]
+        fake.check_runs = {fake.default_head_sha: ["codex"]}
+        # Installed on this owner, but "selected" and covering some OTHER repo.
+        fake.installations = [(42, "lanes-app", REPO.split("/", 1)[0], "selected", ("owner/other",))]
+        code, out, err = _run(fake, [REPO, "lanes"])
+        self.assertEqual(code, 1, err)
+        self.assertIn(
+            "required but bound to an App that does not cover this repo "
+            "(it can never report): 'lanes' (App 42)",
+            out,
+        )
+
+    def test_bound_gate_satisfied_by_a_selected_install_covering_this_repo(self):
+        # The same "selected" install, but its repo list DOES include this
+        # repo -- the App can publish here, so its status satisfies the gate.
+        fake = FakeGh()
+        fake.effective_rules = [
+            _pull_request_rule(),
+            _status_checks_rule([("lanes", 42), "codex", "zizmor"]),
+            {"type": "required_linear_history", "parameters": {}},
+            {"type": "non_fast_forward", "parameters": {}},
+            {"type": "deletion", "parameters": {}},
+        ]
+        fake.check_runs = {fake.default_head_sha: ["codex", "zizmor"]}
+        fake.statuses = {fake.default_head_sha: ["lanes"]}
+        fake.status_creators = {fake.default_head_sha: [("lanes", "lanes-app[bot]")]}
+        fake.installations = [(42, "lanes-app", REPO.split("/", 1)[0], "selected", (REPO,))]
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[ok] every required check has reported", out)
+
+    def test_bound_gate_when_selected_install_repos_unreadable_is_cant_tell(self):
+        # The coverage check for an unseen bound entry lists a "selected"
+        # install's repositories; a failure there is a read like any other, so
+        # can't-tell (exit nonzero), never a definite gap. `lanes` is unseen
+        # (nothing published it), so the coverage check runs and its repos read
+        # fails (Codex, mikelward/repo#52).
+        fake = FakeGh()
+        fake.effective_rules = [
+            _pull_request_rule(),
+            _status_checks_rule([("lanes", 42)]),
+            {"type": "non_fast_forward", "parameters": {}},
+            {"type": "deletion", "parameters": {}},
+        ]
+        fake.check_runs = {fake.default_head_sha: ["codex"]}
+        fake.installations = [(42, "lanes-app", REPO.split("/", 1)[0], "selected", (REPO,))]
+        fake.install_repos_fails = "gh: HTTP 500: boom\n"
+        code, out, err = _run(fake, [REPO, "lanes"])
+        self.assertEqual(code, 1, err)
+        self.assertNotIn("never reported", out + err)
+        self.assertNotIn("does not cover this repo", out + err)
 
     # ---- master branch check --------------------------------------------
 

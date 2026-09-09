@@ -62,6 +62,127 @@ class AppPlan:
     install_id: Optional[str] = None
 
 
+def _positive_int(value):
+    """`value` as a positive int, or None if it is not one. Both id-keyed
+    lookups below refuse to splice anything but digits into their --jq
+    program, and treat a non-integer / non-positive id (nothing GitHub would
+    mint) as "no such App" rather than reaching the API."""
+    try:
+        numeric = int(str(value))
+    except (TypeError, ValueError):
+        return None
+    return numeric if numeric > 0 else None
+
+
+def app_slug_for_id(owner, app_id):
+    """The slug of the GitHub App whose numeric id is `app_id`, as installed
+    on `owner`'s account, or None if no installation of it is visible there.
+
+    This answers only "which App is this id", for matching a status's
+    `{slug}[bot]` creator back to the bound `integration_id` -- the Statuses
+    REST API surfaces the bot user, not the id, so evidence that the bound App
+    posted a status is recognized by that login. It is deliberately NOT a
+    coverage check: whether the App can still publish to a given repo is a
+    separate, current-state question (`app_covers_repo`), kept out of the
+    evidence scan so "has it reported" and "can it still publish" don't get
+    entangled -- four review rounds of coverage findings came from entangling
+    them (Codex, mikelward/repo#52).
+
+    Filters on the target account, not the id alone: `user/installations`
+    spans every account the caller can see, and the same App installed on
+    another account must not answer here. Lets a gh read failure propagate
+    rather than reporting and returning None: the caller must tell "not
+    installed here" (a real gap) from "could not read" (can't-tell), and only
+    a raised error carries the second. A non-integer / non-positive `app_id`
+    returns None without reaching the API."""
+    numeric = _positive_int(app_id)
+    if numeric is None:
+        return None
+    if not SLUG_RE.match(owner or ""):
+        # `owner` is spliced into the --jq text below; anything outside the
+        # slug character class cannot be, so refuse rather than guess -- a
+        # fail-closed "not resolvable", never a wrong match.
+        return None
+    jq = (
+        f".installations[] | select(.app_id == {numeric} and "
+        '(.account.login | ascii_downcase) == '
+        f'("{owner}" | ascii_downcase)) | .app_slug'
+    )
+    out = gh.run(["api", "user/installations", "--paginate", "--jq", jq])
+    for line in out.splitlines():
+        line = line.strip()
+        if line:
+            return line
+    return None
+
+
+def app_covers_repo(owner, app_id, repo):
+    """True if the App with numeric id `app_id`, installed on `owner`'s
+    account, can currently act on `repo` -- installed "all repositories", or a
+    "selected" installation whose member list includes it. False if it is not
+    installed on `owner` at all, or a selected install excludes `repo`.
+
+    This is the liveness/coverage question the binding precondition turns on,
+    kept separate from the evidence scan (see app_slug_for_id). Binding a
+    required check to an App that cannot publish here would wedge every merge,
+    so setup refuses it -- and, unlike "has not reported yet", that refusal is
+    NOT `--force`-overridable, since no amount of forcing makes an uninstalled
+    App able to report (Codex, mikelward/repo#52).
+
+    Lets a gh read failure propagate (can't-tell); the caller must tell that
+    from a definite "not covered". A non-integer / non-positive id returns
+    False."""
+    numeric = _positive_int(app_id)
+    if numeric is None:
+        return False
+    if not SLUG_RE.match(owner or ""):
+        return False
+    jq = (
+        f".installations[] | select(.app_id == {numeric} and "
+        '(.account.login | ascii_downcase) == '
+        f'("{owner}" | ascii_downcase)) | [.id, .repository_selection] | @tsv'
+    )
+    out = gh.run(["api", "user/installations", "--paginate", "--jq", jq])
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        install_id, selection = line.split("\t", 1)
+        if selection != "selected":
+            # "all repositories" (any non-selected scope) covers every repo in
+            # the account, this one included.
+            return True
+        return _installation_covers(install_id, repo)
+    return False
+
+
+def _installation_covers(install_id, repo):
+    """True if `repo` is among the repositories a "selected" installation
+    (`install_id`) can act on.
+
+    Lets a gh read failure propagate rather than returning False:
+    app_slug_for_id's caller must tell "not covered here" -- a real gap --
+    from "the member list could not be read", which is can't-tell, and only a
+    raised error carries the second, exactly as app_slug_for_id itself does.
+    Same case-insensitive full-name compare plan_app_step uses."""
+    if not str(install_id).isdigit():
+        # `install_id` is GitHub's own numeric installation id, spliced into
+        # the URL below; anything else cannot be, so fail closed rather than
+        # guess -- never a wrong match.
+        return False
+    out = gh.run(
+        [
+            "api",
+            "--paginate",
+            f"user/installations/{install_id}/repositories",
+            "--jq",
+            ".repositories[].full_name",
+        ]
+    )
+    members = [line.strip() for line in out.splitlines() if line.strip()]
+    return any(member.lower() == (repo or "").lower() for member in members)
+
+
 def resolve_installation(slug, repo_owner):
     """The (install_id, repository_selection) of the one installation of
     `slug` on `repo_owner`'s account, or None if it could not be resolved
