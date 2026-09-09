@@ -244,7 +244,45 @@ credential nothing uses.) A publishing job that does not declare the
 environment holds the move back; once the pair is settled, an open `lanes`
 environment is restricted to the default branch (re-sending its wait timer and
 reviewers, which the API would otherwise reset), and a policy someone set to
-anything else is reported, never rewritten. Across a fleet:
+anything else is reported, never rewritten.
+
+Once the default branch actually publishes the `lanes` status as the App --
+an `init`/`gate`/`attest` step holding the pair -- and the run is handed
+`LANES_APP_ID`, `repo setup` requires the `lanes` check *from that App* (an
+`integration_id` binding) rather than from any producer of the name, so a
+same-repo pull request cannot mint its own `lanes` status through the ambient
+token and satisfy the gate. The id is read from the supplied `LANES_APP_ID`
+value -- the same number the workflow authenticates with, so there is no
+wrong-id risk and no App lookup. The binding is written by a **second ruleset
+update, after this run's credential move has settled the pair**: the ordinary
+ruleset step (which runs first) requires `lanes` unbound -- preserving any
+binding already there, never stripping it -- and only once the move succeeds
+is the binding applied, so a failed move never leaves `lanes` required from an
+App the workflow cannot authenticate as. This makes it a **two-run
+migration, the runs any time apart**: one run places the pair (the check
+stays unbound), and a later run -- once the App has actually published `lanes`
+-- binds it. A run where the App has not published yet defers the binding and
+says so rather than failing; the check stays required, unbound, until then.
+Re-pointing an existing binding to a *different* App (one is already bound and
+a different `LANES_APP_ID` is supplied) is **not** automated: `repo setup`
+refuses it -- switching neither the credential nor the binding, leaving the
+working App in place -- rather than opening a window where the publisher and
+the requirement disagree. Move it by hand for now (re-point the ruleset entry,
+then rotate the credential); a safe automated re-point/rotation, where the
+switch and the binding commit together, is a tracked follow-up. The deferred
+first-bind write is pinned to the state captured right after the main update,
+so an edit during the credential move is refused rather than silently
+rewritten.
+`repo audit` verifies a bound `lanes` the same way GitHub enforces it: the
+Statuses API hides the creating App, so it matches the status's `{slug}[bot]`
+creator, resolving the slug from the ruleset's `integration_id` through the
+account's App installations (a check run carries the id directly). Whether that
+App can still publish here -- installed on the owner, and covering this repo --
+is a separate precondition, kept out of that evidence scan: `repo setup` refuses
+to bind `lanes` to an App that does not cover the repo -- a hard failure
+`--force` does NOT override, since binding to an App that cannot report would
+wedge every merge -- and `repo audit` reports such a binding as its own gap.
+Across a fleet:
 `repo list | xargs -n1 repo setup --force --credential NPM_UPDATE_PAT=pat.txt --credential GRADLE_UPDATE_PAT=pat.txt --credential RUST_UPDATE_PAT=pat.txt --credential CI_COMMIT_ARTIFACT_TOKEN=token.txt --credential LANES_APP_ID=app-id.txt --credential LANES_APP_PRIVATE_KEY=app.pem`.
 `repo cleanup` deletes the branches a repository has finished with. It exists
 because this fleet used to leave GitHub's "automatically delete head branches"
