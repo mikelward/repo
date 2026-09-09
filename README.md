@@ -231,12 +231,17 @@ one flag that places it). It refuses -- and says so, as
 (an environment secret reaches a called workflow only through
 `secrets: inherit`, so the move would hand the workflow nothing) or when the
 environment holds nothing and no value was given (GitHub never returns a
-secret's value, so a move needs it handed in). The lanes App pair moves the
-same way, held back by a publishing job that does not declare the
-environment; once the pair is settled, an open `lanes` environment is
-restricted to the default branch (re-sending its wait timer and reviewers,
-which the API would otherwise reset), and a policy someone set to anything
-else is reported, never rewritten. Across a fleet:
+secret's value, so a move needs it handed in). The lanes App pair is the
+exception to *left unset*: a consumer cannot publish the status as the App
+until the pair is already in its environment, so a supplied `--credential`
+places the pair even when no workflow publishes as the App yet -- provisioning
+ahead of the workflow migration. (A lanes pair present but *not* supplied on
+this run, with no publisher, is still deleted as unused, like any other
+credential nothing uses.) A publishing job that does not declare the
+environment holds the move back; once the pair is settled, an open `lanes`
+environment is restricted to the default branch (re-sending its wait timer and
+reviewers, which the API would otherwise reset), and a policy someone set to
+anything else is reported, never rewritten. Across a fleet:
 `repo list | xargs -n1 repo setup --force --credential NPM_UPDATE_PAT=pat.txt --credential GRADLE_UPDATE_PAT=pat.txt --credential RUST_UPDATE_PAT=pat.txt --credential CI_COMMIT_ARTIFACT_TOKEN=token.txt --credential LANES_APP_ID=app-id.txt --credential LANES_APP_PRIVATE_KEY=app.pem`.
 `repo cleanup` deletes the branches a repository has finished with. It exists
 because this fleet used to leave GitHub's "automatically delete head branches"
