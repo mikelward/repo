@@ -778,48 +778,79 @@ def _plan_credentials(repo, specs):
                 return changed_reason[field](state_now[field])
         return None
 
+    # A pair handed in on this run via --credential is an explicit instruction
+    # to place it, even where nothing publishes as the App yet: provisioning
+    # ahead of a consumer's workflow migration, since the init/finalize jobs
+    # cannot authenticate until the pair is already in the environment. So a
+    # supplied pair does not take the unused path below -- that path deletes env
+    # copies and declines to set a supplied value, and would turn
+    # `repo setup --credential` into a no-op or a delete of a value GitHub never
+    # returns. The unused path is for a stray the operator did NOT supply
+    # (Codex, mikelward/repo#50).
+    supplied_pair = [name for name in (app_id, app_key) if name in given]
     if not publishers:
         # Only where there is something to lose. Every repository here
         # calls some reusable workflow, so raising this wherever one
         # appears would report a credential that is not present on most of
         # them -- noise on the many to protect the few, and `unused` has
         # nothing to delete when no copy exists anyway.
+        at_repo = [n for n in (app_id, app_key) if n in repo_secrets]
         at_stake = [n for n in (app_id, app_key) if n in repo_secrets or n in env_secrets or n in given]
         called = credentials.lanes_called_workflows(texts, repo) if at_stake else []
-        if called:
+        if called and (not supplied_pair or at_repo):
             # A job-level `uses:` this reader cannot follow can hold the
             # lanes step that publishes: the caller names neither the
             # action nor either secret, so every reader came back empty and
             # the pair was deleted as unused -- the called workflow broken
-            # and the values gone (Codex, mikelward/repo#36). Only the
-            # delete is held. A move made wrongly can be undone from the
-            # value the operator handed in; a delete made wrongly cannot,
-            # and holding the move too would keep the credential out of
-            # every repository here, since they all call something.
+            # and the values gone (Codex, mikelward/repo#36).
+            #
+            # For an UNSUPPLIED pair, hold whatever copies exist: the unused
+            # path below would otherwise delete a provisioned environment
+            # pair too, the irreversible foot-gun this change exists to close.
+            # For a SUPPLIED pair, hold only when a REPOSITORY copy exists to
+            # be stranded: such a call forwards this repository's repo/org
+            # secrets (via `secrets: inherit` or a secrets mapping), which is
+            # where an external workflow reads them, so writing the pair into
+            # the environment and deleting those copies would strand it. With
+            # no repository copy, placement strands nothing, so a supplied
+            # pair provisions freely even beside a forwarding call (Codex,
+            # mikelward/repo#51).
             line = (
                 f"{label}: {credentials.workflow_labels(called)} calls a reusable workflow this "
                 f"cannot read, which may be what publishes; {app_id}, {app_key} left as is"
             )
             plan.unfixed.append(line)
+            for name in supplied_pair:
+                extra = (
+                    f"{label}: {name} not set -- a reusable workflow this cannot read may forward "
+                    f"the pair, so the repository copies are kept rather than moved"
+                )
+                plan.lines.append(extra)
+                plan.always_report.append(extra)
             return plan
 
-        # The same whole-state comparison, the default branch included:
-        # the plan rested on there being no publisher AND nothing held back
-        # by a finding, and a delete is what it authorizes, so any of those
-        # moving refuses -- a rename among them, since which copies count
-        # as the default's is what "no publisher" was read from.
-        still_no_publisher = lanes_changed
+        if not supplied_pair:
+            # The same whole-state comparison, the default branch included:
+            # the plan rested on there being no publisher AND nothing held
+            # back by a finding, and a delete is what it authorizes, so any
+            # of those moving refuses -- a rename among them, since which
+            # copies count as the default's is what "no publisher" was read
+            # from.
+            still_no_publisher = lanes_changed
 
-        unused(
-            label,
-            (app_id, app_key),
-            listed,
-            env_secrets,
-            f"no workflow here publishes the lanes status as the App (a {action} step taking "
-            f"`app-id`), so nothing uses it",
-            still_no_publisher,
-        )
-        return plan
+            unused(
+                label,
+                (app_id, app_key),
+                listed,
+                env_secrets,
+                f"no workflow here publishes the lanes status as the App (a {action} step taking "
+                f"`app-id`), so nothing uses it",
+                still_no_publisher,
+            )
+            return plan
+        # Supplied, no reusable-call risk: fall through to the placement and
+        # environment-restriction path below, provisioning ahead of the
+        # workflow migration.
 
     # Only the default branch's publishers hold the move back. A branch copy
     # of a publishing workflow runs from its branch, which the restricted
@@ -832,7 +863,19 @@ def _plan_credentials(repo, specs):
     on_default = credentials.on_default_branch
 
     undeclared = sorted(name for name, declares in on_default(publishers).items() if not declares)
-    if not on_default(publishers):
+    if not publishers:
+        # Reached only with a supplied pair (the guard above returns for an
+        # unsupplied one): nothing publishes as the App yet, and the operator
+        # has handed the credential in to provision ahead of the consumer's
+        # workflow migration. Place and restrict it now so the init/finalize
+        # jobs can authenticate once that workflow lands; `move` below writes
+        # the supplied value because `undeclared` is empty, so `inherits` is
+        # True and no by-name-caller objection applies.
+        plan.lines.append(
+            f"{label}: no workflow here publishes the lanes status as the App yet; placing the "
+            f"supplied credential in the '{listed or label}' environment for the migration"
+        )
+    elif not on_default(publishers):
         # A publisher only on a branch -- the pull request adopting lanes,
         # ordinarily -- keeps the pair, as a branch-only batch caller keeps
         # its credential (Codex, mikelward/repo#13): the move and the

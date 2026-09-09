@@ -3834,6 +3834,13 @@ class LanesCredentialStepTest(unittest.TestCase):
     )
     PAIR = {"LANES_APP_ID", "LANES_APP_PRIVATE_KEY"}
 
+    # A consumer still on the ambient gate: it runs the lanes action but hands
+    # it no `app-id`, so nothing publishes the status as the App.
+    AMBIENT = (
+        "jobs:\n  classify:\n    steps:\n      - uses: mikelward/lanes@main\n"
+        "        with:\n          mode: classify\n"
+    )
+
     def _publisher(self, text=PUBLISHER):
         fake = FakeGh()
         fake.workflow_files = ["ci.yml"]
@@ -3890,6 +3897,138 @@ class LanesCredentialStepTest(unittest.TestCase):
         self.assertLess(put_env, restrict)
         self.assertLess(restrict, write)
         self.assertLess(write, delete)
+
+    def test_a_supplied_pair_is_placed_even_with_no_app_publisher(self):
+        # Provisioning ahead of the workflow migration: the consumer still
+        # runs the ambient gate (no `app-id` anywhere), so nothing publishes
+        # as the App yet -- but --credential is an explicit instruction to
+        # place the pair so the init/finalize jobs can authenticate once the
+        # migrated workflow lands. It must be set and the environment
+        # restricted, never routed to the unused path (Codex,
+        # mikelward/repo#50).
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = self._publisher(self.AMBIENT)
+            code, out, err = _run(
+                fake,
+                [
+                    "--force", "-v", "--no-rules",
+                    "--credential", f"LANES_APP_ID={app_id}",
+                    "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                    REPO,
+                ],
+            )
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "lanes: no workflow here publishes the lanes status as the App yet; placing the "
+            "supplied credential in the 'lanes' environment for the migration",
+            err,
+        )
+        self.assertIn("lanes: set LANES_APP_ID in environment 'lanes' (new)", err)
+        self.assertIn("lanes: set LANES_APP_PRIVATE_KEY in environment 'lanes' (new)", err)
+        self.assertEqual(
+            [w[:3] for w in fake.written_secrets],
+            [("LANES_APP_ID", REPO, "lanes"), ("LANES_APP_PRIVATE_KEY", REPO, "lanes")],
+        )
+        self.assertEqual(fake.restricted, [("lanes", "main")])
+        # Never the unused path: not declined, not deleted.
+        self.assertNotIn("nothing uses it", err)
+        self.assertNotIn("not set", err)
+
+    def test_a_supplied_pair_already_in_the_environment_is_kept_not_deleted(self):
+        # conf's case: the pair was provisioned into the restricted lanes
+        # environment weeks ago, the workflow is not migrated yet, and
+        # re-running setup with --credential must KEEP it. Deleting a value
+        # GitHub never returns as "unused" is the foot-gun this fixes
+        # (Codex, mikelward/repo#50).
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = self._publisher(self.AMBIENT)
+            fake.env_secret_names = {"lanes": set(self.PAIR)}
+            fake.env_policies = {"lanes": ["main"]}
+            code, out, err = _run(
+                fake,
+                [
+                    "--force", "-v", "--no-rules",
+                    "--credential", f"LANES_APP_ID={app_id}",
+                    "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                    REPO,
+                ],
+            )
+        self.assertEqual(code, 0, err)
+        self.assertNotIn(("LANES_APP_ID", "lanes"), fake.deleted_secrets)
+        self.assertNotIn(("LANES_APP_PRIVATE_KEY", "lanes"), fake.deleted_secrets)
+        self.assertNotIn("nothing uses it", err)
+        self.assertNotIn("not set", err)
+
+    def test_a_supplied_pair_is_held_when_a_reusable_call_could_forward_it(self):
+        # An external reusable call with `secrets: inherit` may forward the
+        # pair to a workflow that reads THIS repository's repo/org secrets, so
+        # supplying --credential must NOT delete those repository copies to
+        # move the pair into the environment -- the cannot-read guard holds
+        # even for a supplied pair (Codex, mikelward/repo#51).
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = FakeGh()
+            fake.workflow_files = ["ci.yml"]
+            fake.workflow_texts = {
+                "ci.yml": "jobs:\n  ci:\n    uses: some-org/shared/.github/workflows/ci.yml@main\n    secrets: inherit\n"
+            }
+            fake.secret_names = set(self.PAIR)
+            code, out, err = _run(
+                fake,
+                [
+                    "--force", "--no-rules",
+                    "--credential", f"LANES_APP_ID={app_id}",
+                    "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                    REPO,
+                ],
+            )
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "calls a reusable workflow this cannot read, which may be what publishes", err
+        )
+        self.assertIn(
+            "LANES_APP_ID not set -- a reusable workflow this cannot read may forward the pair", err
+        )
+        # The repository copies feeding that workflow are kept, and nothing
+        # is written into the environment.
+        self.assertEqual(fake.deleted_secrets, [])
+        self.assertEqual(fake.written_secrets, [])
+
+    def test_a_supplied_pair_provisions_beside_a_forwarding_call_with_no_copy(self):
+        # A forwarding reusable call, but the repository and environment hold
+        # neither secret: there is nothing to strand, so a supplied pair is
+        # placed and the environment restricted rather than held (Codex,
+        # mikelward/repo#51).
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = FakeGh()
+            fake.workflow_files = ["ci.yml"]
+            fake.workflow_texts = {
+                "ci.yml": "jobs:\n  ci:\n    uses: some-org/shared/.github/workflows/ci.yml@main\n    secrets: inherit\n"
+            }
+            code, out, err = _run(
+                fake,
+                [
+                    "--force", "-v", "--no-rules",
+                    "--credential", f"LANES_APP_ID={app_id}",
+                    "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                    REPO,
+                ],
+            )
+        self.assertEqual(code, 0, err)
+        self.assertEqual(
+            [w[:3] for w in fake.written_secrets],
+            [("LANES_APP_ID", REPO, "lanes"), ("LANES_APP_PRIVATE_KEY", REPO, "lanes")],
+        )
+        self.assertEqual(fake.restricted, [("lanes", "main")])
+        self.assertNotIn("left as is", err)
+        self.assertNotIn("not set", err)
 
     def test_an_open_environment_already_holding_the_pair_is_restricted(self):
         fake = self._publisher()
