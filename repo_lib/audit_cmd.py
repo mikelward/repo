@@ -98,7 +98,7 @@ import json
 import re
 import urllib.parse
 
-from repo_lib import credentials, gh, rules
+from repo_lib import apps, credentials, gh, rules
 from repo_lib.common import error, error_lines
 
 # Same shape as setup_cmd.py's/secrets_cmd.py's own OWNER_REPO_RE -- kept
@@ -1005,6 +1005,30 @@ def run(args):
         # asked about blocks merges exactly as hard, and is likelier to be
         # the one nothing produces.
         if required_entries:
+            # Coverage -- can the bound App still publish here at all -- is a
+            # separate, current-state question from evidence ("has it
+            # reported"), which `_collect_reported` deliberately leaves to us
+            # (entangling them drew several review rounds; Codex,
+            # mikelward/repo#52). Checked for EVERY bound entry, not just the
+            # unseen ones: an App that reported historically but has since been
+            # removed is satisfied by that evidence yet can never report again,
+            # so the gate is silently broken -- audit must catch that too.
+            owner = repo.split("/", 1)[0]
+            uncovered = []
+            for context, integration_id in required_entries:
+                if integration_id is None:
+                    continue
+                try:
+                    covers = apps.app_covers_repo(owner, integration_id, repo)
+                except gh.GhError as e:
+                    error_lines(
+                        f"could not tell whether the App bound to '{context}' covers {repo}:",
+                        e.stderr,
+                    )
+                    raise SystemExit(1)
+                if not covers:
+                    uncovered.append((context, integration_id))
+            uncovered_contexts = {context for context, _ in uncovered}
             try:
                 unseen = rules.never_reported(repo, required_entries, ref=branch)
             except rules.RulesetError as e:
@@ -1013,13 +1037,28 @@ def run(args):
                     e.detail,
                 )
                 raise SystemExit(1)
-            # Two different faults with two different fixes. `repo setup`
-            # reuses an existing entry by context (_build_update_body), so
-            # it carries a stale integration_id straight through -- naming
-            # it as the remedy for a wrong-App gate sends the user to a
-            # command that completes and changes nothing.
-            wrong_app = [i for i in unseen if rules.bound_to_another_app(i)]
-            absent = [i for i in unseen if not rules.bound_to_another_app(i)]
+            # An uncovered entry is reported as a coverage gap below; drop it
+            # from the evidence buckets so the same entry is not double-reported
+            # (an uncovered App also never reports, so it lands in both).
+            reportable = [i for i in unseen if i[0] not in uncovered_contexts]
+            # Two different faults with two different fixes. A binding supplied
+            # to `repo setup` now wins over the existing entry
+            # (_build_update_body), so a rerun with the App's credentials
+            # configured re-points the entry to the App it places -- the
+            # supported recovery. A bare rerun with no binding supplied still
+            # preserves whatever is there and would change nothing, so it is
+            # not the remedy on its own.
+            wrong_app = [i for i in reportable if rules.bound_to_another_app(i)]
+            absent = [i for i in reportable if not rules.bound_to_another_app(i)]
+            if uncovered:
+                named = ", ".join(
+                    f"'{context}' (App {integration_id})" for context, integration_id in uncovered
+                )
+                gap(
+                    "required but bound to an App that does not cover this repo "
+                    f"(it can never report): {named} -- add the App to {repo} "
+                    "(`repo setup --app <slug>`), then rerun `repo setup` to bind"
+                )
             if absent:
                 gap(
                     f"required but never reported: {rules.describe_missing(absent)} -- "
@@ -1028,10 +1067,11 @@ def run(args):
             if wrong_app:
                 gap(
                     "required but never reported by the App it is bound to: "
-                    f"{rules.describe_missing(wrong_app)} -- repoint the ruleset "
-                    "entry; `repo setup` preserves the existing binding"
+                    f"{rules.describe_missing(wrong_app)} -- rerun `repo setup` with "
+                    "the App's credentials configured (it re-points the binding to "
+                    "the App it places), or repoint the ruleset entry by hand"
                 )
-            if not unseen:
+            if not unseen and not uncovered:
                 ok(
                     "every required check has reported: "
                     + rules.quoted(c for c, _ in required_entries)

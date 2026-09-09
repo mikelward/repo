@@ -37,7 +37,7 @@ import re
 import sys
 import urllib.parse
 
-from repo_lib import gh
+from repo_lib import apps, gh
 from repo_lib.common import error, error_lines, info, warn
 
 DEFAULT_RULESET_NAME = "main"
@@ -210,6 +210,33 @@ def _collect_reported(repo, wanted, ref=None):
     names = set()
     app_pairs = set()
 
+    # This answers only "has the bound App reported this check" -- evidence,
+    # not liveness. A check RUN carries its App's id directly (below); the App
+    # publishes `lanes` as a commit STATUS, and the Statuses REST API hides the
+    # creating App -- it surfaces the bot user `{slug}[bot]`, not the
+    # integration_id -- so a status the App posted is recognized by matching
+    # that login, resolved from the id via the owner's installs. Whether that
+    # App can STILL publish here (coverage) is a separate precondition on the
+    # binding (apps.app_covers_repo), kept out of this scan on purpose: four
+    # coverage findings came from entangling the two (Codex, mikelward/repo#52).
+    # The status resolution stays lazy -- only for a bound entry still
+    # unsatisfied after the check-run scan, and only where this SHA carries a
+    # status for it -- so the ordinary path costs no extra calls.
+    owner = repo.split("/", 1)[0]
+    bound = {(context, iid) for context, iid in wanted if iid is not None}
+    login_for = {}
+
+    def bot_login(iid):
+        if iid not in login_for:
+            try:
+                slug = apps.app_slug_for_id(owner, iid)
+            except gh.GhError as e:
+                # A failed read is can't-tell, never "the App never posted":
+                # the same discipline the scans below hold to.
+                raise RulesetError(f"resolving the App with id {iid} on {owner}:\n{e.stderr}")
+            login_for[iid] = f"{slug}[bot]" if slug else None
+        return login_for[iid]
+
     def scan(sha):
         try:
             out = gh.run(
@@ -242,7 +269,46 @@ def _collect_reported(repo, wanted, ref=None):
             )
         except gh.GhError as e:
             raise RulesetError(f"reading commit statuses for {sha}:\n{e.stderr}")
-        names.update(_json_lines(out))
+        status_contexts = set(_json_lines(out))
+        names.update(status_contexts)
+        # Only a bound entry the check-run scan did not already satisfy, AND
+        # that this SHA actually carries a status for, needs the status's
+        # creator resolved. Gating on a status being present here matters: the
+        # login lookup reads `user/installations`, and if that is unavailable a
+        # blanket resolution would abort the whole scan -- even when a later
+        # pull request's check run carries the App's id directly and would
+        # satisfy the binding with no installation lookup at all (Codex,
+        # mikelward/repo#52). The combined /status endpoint drops the creator;
+        # the per-status list below carries it.
+        pending = [
+            (context, iid)
+            for context, iid in bound
+            if (context, iid) not in app_pairs and context in status_contexts
+        ]
+        want_logins = {iid: bot_login(iid) for _context, iid in pending}
+        if not any(want_logins.values()):
+            return
+        try:
+            out = gh.run(
+                [
+                    "api",
+                    "--paginate",
+                    f"repos/{repo}/commits/{sha}/statuses",
+                    "--jq",
+                    '.[] | [.context, (.creator.login // "")] | @json',
+                ]
+            )
+        except gh.GhError as e:
+            raise RulesetError(f"reading commit status creators for {sha}:\n{e.stderr}")
+        for line in out.splitlines():
+            if not line.strip():
+                continue
+            context, login = json.loads(line)
+            if not login:
+                continue
+            for entry_context, iid in pending:
+                if entry_context == context and want_logins.get(iid) == login:
+                    app_pairs.add((context, iid))
 
     def satisfied():
         return all(_entry_satisfied(e, names, app_pairs) for e in wanted)
@@ -979,6 +1045,52 @@ def _validate_merge_method_scope(repo, existing_id, default_branch):
         raise RulesetError()
 
 
+def _as_entries(checks):
+    """Normalize a `checks` argument into (context, integration_id-or-None)
+    pairs, order preserved. Each item is either a bare context name (a name
+    off the command line, unbound: any producer counts) or an already-normalized
+    (context, integration_id) pair -- so this is idempotent and every internal
+    consumer can normalize its own input without caring which form reached it."""
+    entries = []
+    for c in checks:
+        if isinstance(c, str):
+            entries.append((c, None))
+        else:
+            context, integration_id = c
+            entries.append((context, integration_id or None))
+    return entries
+
+
+def _check_entry(context, integration_id):
+    """One `required_status_checks` entry. An integration_id binds the
+    requirement to a single GitHub App -- only a check that App itself
+    produced satisfies it -- and is omitted entirely when None, since GitHub
+    treats a present-but-null integration_id differently from an absent one."""
+    entry = {"context": context}
+    if integration_id is not None:
+        entry["integration_id"] = integration_id
+    return entry
+
+
+def _context_label(context, integration_id):
+    """A required check for a plan line, naming the App it is bound to when it
+    is -- so restricting a check to one App reads as the enforcement change it
+    is, not a bare `lanes` that the ruleset already required by name."""
+    return f"{context} (App {integration_id})" if integration_id else context
+
+
+def _binding_map(target_body):
+    """context -> integration_id for the required checks in a ruleset body,
+    so a plan line can name the App a check is being bound to."""
+    mapping = {}
+    for rule in (target_body or {}).get("rules") or []:
+        if rule.get("type") == "required_status_checks":
+            for entry in (rule.get("parameters") or {}).get("required_status_checks") or []:
+                if entry.get("context"):
+                    mapping[entry["context"]] = entry.get("integration_id")
+    return mapping
+
+
 def _create_body(ruleset_name, checks):
     return {
         "name": ruleset_name,
@@ -990,7 +1102,10 @@ def _create_body(ruleset_name, checks):
                 "type": "required_status_checks",
                 "parameters": {
                     "strict_required_status_checks_policy": True,
-                    "required_status_checks": [{"context": c} for c in checks],
+                    "required_status_checks": [
+                        _check_entry(context, integration_id)
+                        for context, integration_id in _as_entries(checks)
+                    ],
                 },
             },
             {
@@ -1037,7 +1152,7 @@ def _enforced_lines(target_rules, indent="  "):
     pr = now.get("pull_request")
     lines = []
     contexts = [
-        entry.get("context")
+        _context_label(entry.get("context"), entry.get("integration_id"))
         for entry in sc.get("required_status_checks") or []
         if entry.get("context")
     ]
@@ -1140,13 +1255,19 @@ def _build_update_body(repo, existing_id, checks, ruleset_name):
     for field in _VOLATILE_FIELDS:
         original.pop(field, None)
 
-    wanted_contexts = [{"context": c} for c in checks]
-    # Contexts the ruleset requires TODAY, so the caller can be told which
-    # of `checks` this write would newly require -- a distinction that
-    # matters to a caller holding back a write until something that can
-    # satisfy the new requirement exists (setup_cmd.py's pending-scaffold
-    # gate, Codex review, mikelward/repo#42).
+    entries = _as_entries(checks)
+    wanted_contexts = [
+        _check_entry(context, integration_id) for context, integration_id in entries
+    ]
+    # Contexts the ruleset requires TODAY, and the App each is bound to, so the
+    # caller can be told which of `checks` this write would newly require -- a
+    # distinction that matters to a caller holding back a write until something
+    # that can satisfy the new requirement exists (setup_cmd.py's
+    # pending-scaffold gate, Codex review, mikelward/repo#42). Binding an
+    # already-required check to an App is a new requirement too: nothing may
+    # have reported it AS that App yet.
     existing_contexts = set()
+    existing_binding = {}
     has_status_checks = False
     has_pull_request = False
     has_linear_history = False
@@ -1161,8 +1282,17 @@ def _build_update_body(repo, existing_id, checks, ruleset_name):
                 h.get("context"): h for h in params.get("required_status_checks") or []
             }
             existing_contexts = set(have_by_context)
+            existing_binding = {
+                context: (h.get("integration_id") or None)
+                for context, h in have_by_context.items()
+            }
+            # An explicit binding in `checks` wins (it sets or re-points the
+            # App); an unbound wanted entry preserves whatever the ruleset
+            # already had, so a bare command-line name never strips an
+            # existing App binding off a check.
             params["required_status_checks"] = [
-                have_by_context.get(w["context"], dict(w)) for w in wanted_contexts
+                w if "integration_id" in w else have_by_context.get(w["context"], w)
+                for w in wanted_contexts
             ]
             params["strict_required_status_checks_policy"] = True
             rule["parameters"] = params
@@ -1220,13 +1350,23 @@ def _build_update_body(repo, existing_id, checks, ruleset_name):
     # Adopting a legacy-named ruleset renames it here rather than in a
     # separate call, so the rename and the rules land in one write.
     target["name"] = ruleset_name
-    checks_added = [c for c in checks if c not in existing_contexts]
+    # Newly required: a context the ruleset does not require today, OR one it
+    # requires but not yet bound to the App this write binds it to -- both are
+    # requirements nothing may have satisfied AS asked yet, which is what the
+    # never-reported hold reads this for.
+    def _newly_required(context, integration_id):
+        if context not in existing_contexts:
+            return True
+        return integration_id is not None and existing_binding.get(context) != integration_id
+
+    checks_added = [c for c, iid in entries if _newly_required(c, iid)]
     # A context the ruleset requires today and `checks` does not is about
     # to stop being required. That is the plan line an operator most needs
     # to see before saying yes: everything else here tightens the gate,
     # and this is the one that loosens it (Codex review,
     # mikelward/repo#45).
-    checks_removed = sorted(c for c in existing_contexts if c not in checks)
+    wanted_names = {c for c, _ in entries}
+    checks_removed = sorted(c for c in existing_contexts if c not in wanted_names)
     newly_enforced = _newly_enforced(original.get("rules"), new_rules)
     return (
         target != original,
@@ -1280,7 +1420,15 @@ def _plan_write(repo, existing_id, checks, ruleset_name):
         )
     # A create enforces all of it for the first time, so the plan lists
     # everything rather than a diff -- None means "list them all".
-    return True, _create_body(ruleset_name, checks), True, [], list(checks), [], None
+    return (
+        True,
+        _create_body(ruleset_name, checks),
+        True,
+        [],
+        [context for context, _ in _as_entries(checks)],
+        [],
+        None,
+    )
 
 
 def _bypass_actor_note(bypass_actors):
@@ -1370,7 +1518,11 @@ def _describe_plan(
         # ruleset already holds buried the one or two lines that were the
         # change (maintainer, 2026-09-07).
         if checks_added:
-            lines.append("  would newly require: " + ", ".join(checks_added))
+            binding = _binding_map(target_body)
+            lines.append(
+                "  would newly require: "
+                + ", ".join(_context_label(c, binding.get(c)) for c in checks_added)
+            )
         if checks_removed:
             lines.append(
                 "  would NO LONGER require: " + ", ".join(checks_removed)
@@ -1606,12 +1758,13 @@ def apply_ruleset(
     preview, or anything from `error()`: quiet means "nothing happened
     here", not "don't say what did"."""
     checks = list(checks) if checks else list(DEFAULT_CHECKS)
+    entries = _as_entries(checks)
 
-    for check in checks:
-        if not check:
+    for context, _integration_id in entries:
+        if not context:
             error("empty check name")
             return 2
-        if not _valid_no_control_chars(check, f"check name '{check}'"):
+        if not _valid_no_control_chars(context, f"check name '{context}'"):
             return 2
     if not _valid_no_control_chars(ruleset_name, "the ruleset name"):
         return 2
@@ -1625,9 +1778,11 @@ def apply_ruleset(
         return 1
 
     try:
-        # Names off the command line carry no App binding, so every entry
-        # is unbound: any producer of that context counts.
-        missing = never_reported(repo, [(c, None) for c in checks])
+        # A bound entry is satisfied only by the App it names, an unbound one by
+        # any producer of that context -- never_reported and _collect_reported
+        # read the binding, so an App-bound `lanes` that nothing has yet posted
+        # AS that App is held back here exactly like a name nothing reports.
+        missing = never_reported(repo, entries)
     except RulesetError as e:
         error_lines(f"could not read which checks have reported on {repo}:", e.detail)
         error("Refusing to guess: an incomplete answer here either rejects a valid")
@@ -1680,7 +1835,7 @@ def apply_ruleset(
             checks_added,
             checks_removed,
             newly_enforced,
-        ) = _plan_write(repo, existing, checks, ruleset_name)
+        ) = _plan_write(repo, existing, entries, ruleset_name)
     except RulesetError:
         return 1
 
@@ -1814,7 +1969,7 @@ def apply_ruleset(
             fresh_checks_added,
             _fresh_checks_removed,
             _fresh_newly_enforced,
-        ) = _plan_write(repo, fresh_existing, checks, ruleset_name)
+        ) = _plan_write(repo, fresh_existing, entries, ruleset_name)
     except RulesetError:
         error(f"could not re-read ruleset '{ruleset_name}' to write it")
         return 1
@@ -1892,12 +2047,12 @@ def apply_ruleset(
                 f"{repo}: adopted the ruleset named '{fresh_adopted_legacy}' and renamed "
                 f"it '{ruleset_name}' ({_scope_result(fresh_scope_added)}; its bypass actors "
                 f"and any other rules are unchanged); "
-                f"required checks: {', '.join(checks)}"
+                f"required checks: {', '.join(context for context, _ in entries)}"
             )
         else:
             print(
                 f"{repo}: updated ruleset '{ruleset_name}' ({_scope_result(fresh_scope_added)}); "
-                f"required checks: {', '.join(checks)}"
+                f"required checks: {', '.join(context for context, _ in entries)}"
             )
     else:
         try:
@@ -1910,7 +2065,7 @@ def apply_ruleset(
             return 1
         print(
             f"{repo}: created ruleset '{ruleset_name}' on {default_branch}, main and master; "
-            f"required checks: {', '.join(checks)}"
+            f"required checks: {', '.join(context for context, _ in entries)}"
         )
 
     # After the write, never before: what makes a legacy ruleset safe to
