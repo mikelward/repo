@@ -329,8 +329,10 @@ one that has stopped biting.
   picked the push up.
 - **Address Codex comments automatically -- don't wait to be asked.** Read
   each one, decide whether it's a real issue or a false positive, and if
-  it's real, fix it in the same PR. Fold the fix into the commit it
-  belongs to (rebase / `--fixup`) rather than tacking on an "address
+  it's real, fix it in the same PR -- the one exception being a real
+  finding that's genuinely out of scope for this PR, which you defer
+  instead (see *Deferring a finding* below). Fold the fix into the commit
+  it belongs to (rebase / `--fixup`) rather than tacking on an "address
   review" commit. Group several small fixes into one commit when they
   share a topic.
 - **Judge every review comment on merit, whoever wrote it.** Verify the
@@ -354,6 +356,14 @@ one that has stopped biting.
   anything still to do stays open. When you think a comment is a false
   positive, say *why* on the thread (one or two sentences). Acknowledgment
   noise is fine and preferred over silence.
+- **Deferring a real-but-out-of-scope finding.** Don't ask the maintainer
+  to merge past it: note the follow-up in `TODO.md`, commit and push that
+  first, reply on the thread citing the sha, and resolve -- resolving a
+  deferred thread is the exception to "anything still to do stays open"
+  above. A finding with no thread (top-level comment or review body) still
+  gets the `TODO.md` record, the push, and the reply -- only the resolve is
+  skipped. The push re-triggers Codex; `@codex review` only for the
+  five-minute-silence case. Escalate only if the re-review re-raises it.
 - **`resolve_review_thread` works -- pass the `PRRT_*` thread node ID**
   from `pull_request_read` / `get_review_comments`
   (`review_threads[].id`) as `threadId`. A comment's `PRRC_*` node ID
@@ -376,7 +386,8 @@ one that has stopped biting.
   Findings arrive as review comments, as a top-level comment, or as a
   review -- read `get_review_comments`, `get_comments` and `get_reviews`
   to the last page, since all three page oldest first -- and they block
-  the merge until fixed or rebutted; an acknowledgment is not an answer.
+  the merge until fixed, rebutted, or deferred (see *Deferring a finding*
+  above); an acknowledgment is not an answer.
   Nothing from Codex since the push, five minutes on, means it never
   picked it up -- comment `@codex review`, once. The `codex` commit status
   (`get_status`, a separate surface from check runs) is the authoritative
