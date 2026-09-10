@@ -2711,6 +2711,15 @@ def _run(args, log=None):
     # from its own preview fingerprint (Codex, mikelward/repo#52). Only when
     # the binding will actually be written and the main step succeeded.
     binding_apply_fingerprint = None
+    # The source `lanes` binding as it stood when the fingerprint was captured,
+    # re-verified right before the deferred write. The fingerprint pins the
+    # TARGET body (App B), which `_build_update_body` produces identically
+    # whether `lanes` is currently unbound or bound to another App -- so a
+    # concurrent bind between capture and the deferred write is invisible to it.
+    # Folding the observed source into the transaction closes that window (Codex
+    # L, mikelward/repo#52). (repoint_from, unknown) relative to the target, or
+    # None when there is nothing to bind this run.
+    binding_source_snapshot = None
     binding_wanted_this_run = (
         want_binding
         and not args.no_rules
@@ -2747,6 +2756,13 @@ def _run(args, log=None):
         # mikelward/repo#52).
         if _binding_capture_code == 0:
             binding_apply_fingerprint = _binding_apply_report.get("fingerprint")
+            # Read the source binding as it stands now, to compare against right
+            # before the write. An unreadable source here (unknown) leaves no
+            # baseline to pin to, so the write is skipped below just like a
+            # failed fingerprint capture.
+            binding_source_snapshot = _lanes_repoint_state(
+                repo, credentials_plan.lanes_binding
+            )
 
     for spec, entry, _desc_lines in secret_previews:
         _repo, state, env_state = entry
@@ -3172,15 +3188,30 @@ def _run(args, log=None):
                     f"Add the App to {repo} (`repo setup --app <slug>`), then rerun to bind."
                 )
             failed.append("ruleset-binding")
-        elif binding_apply_fingerprint is None:
-            # The capture above failed, so there is no confirmed state to pin
-            # the write to. Running it unpinned is exactly the race the capture
-            # closes, so skip it and record a failure -- the binding waits for
-            # a rerun (Codex, mikelward/repo#52).
+        elif binding_apply_fingerprint is None or binding_source_snapshot is None or binding_source_snapshot[1]:
+            # No confirmed state to pin the write to: the fingerprint capture
+            # failed, or the source binding could not be read (no baseline to
+            # detect drift against). Running the write unpinned is exactly the
+            # race the capture closes, so skip it and record a failure -- the
+            # binding waits for a rerun (Codex, mikelward/repo#52).
             error(
                 f"{repo}: the `{credentials.LANES_CHECK}` App binding was not written -- could not "
                 "read the ruleset to pin the write against a confirmed state. Rerun `repo setup` to "
                 "bind it (the check stays required, unbound, until then)."
+            )
+            failed.append("ruleset-binding")
+        elif _lanes_repoint_state(repo, credentials_plan.lanes_binding) != binding_source_snapshot:
+            # The source `lanes` binding drifted since the fingerprint was
+            # captured -- an admin bound (or rebound) it during the credential-
+            # move window. The fingerprint cannot see this (it pins the target
+            # body, not the source), so fold the observed source into the
+            # transaction here: abort rather than silently overwrite the new
+            # binding. The check stays as the admin left it; a rerun re-plans
+            # against the changed state (Codex L, mikelward/repo#52).
+            error(
+                f"{repo}: the `{credentials.LANES_CHECK}` App binding was not written -- its binding "
+                "changed since the ruleset was read this run. Rerun `repo setup` to re-plan against "
+                "the current state."
             )
             failed.append("ruleset-binding")
         else:

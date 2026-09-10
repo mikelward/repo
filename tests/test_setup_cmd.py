@@ -5445,6 +5445,69 @@ class LanesCredentialStepTest(unittest.TestCase):
             ],
         )
 
+    def test_a_source_binding_drift_between_capture_and_write_aborts_the_bind(self):
+        # Finding L: the deferred binding write is pinned to a fingerprint of the
+        # TARGET body (App 12345), which `_build_update_body` produces identically
+        # whether `lanes` is currently unbound or bound to another App -- so a
+        # concurrent bind between the fingerprint capture and the write is
+        # invisible to it. setup re-reads the source binding right before the
+        # write and aborts on drift rather than silently overwriting it (Codex L,
+        # mikelward/repo#52).
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = self._publisher()
+            fake.env_secret_names = {"lanes": set(self.PAIR)}
+            fake.env_policies = {"lanes": ["main"]}
+            self._ruleset_requiring(
+                fake,
+                [{"context": "lanes"}, {"context": "codex"}, {"context": "zizmor"}],
+            )
+            fake.check_runs = {fake.default_head_sha: [("lanes", 12345), "codex", "zizmor"]}
+            fake.app_coverage = {12345: ("lanes-app", "all")}
+            # The source reads clean (unbound) at capture, then a concurrent bind
+            # to App 55 appears before the deferred write. Flip the drift only
+            # once the apply-time coverage check has run -- that is the step
+            # immediately before the write's source recheck, and it happens after
+            # the plan-time coverage preview (call 1) and after the capture.
+            drift = {"on": False}
+            cov_calls = {"n": 0}
+
+            def cover_then_drift(owner, app_id_arg, repo_arg):
+                cov_calls["n"] += 1
+                if cov_calls["n"] >= 2:
+                    drift["on"] = True
+                return True
+
+            def source(repo_arg, target):
+                return (55, False) if drift["on"] else (None, False)
+
+            with patch("repo_lib.setup_cmd._lanes_repoint_state", side_effect=source):
+                with patch("repo_lib.apps.app_covers_repo", side_effect=cover_then_drift):
+                    code, out, err = _run(
+                        fake,
+                        [
+                            "--force",
+                            "--credential", f"LANES_APP_ID={app_id}",
+                            "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                            REPO,
+                        ],
+                    )
+        # The drift path must actually have been exercised.
+        self.assertTrue(drift["on"])
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("changed since the ruleset was read", err)
+        # No ruleset PUT this run may have bound `lanes` to the target App.
+        for _url, body in fake.puts:
+            checks_rule = next(
+                (r for r in body["rules"] if r["type"] == "required_status_checks"), None
+            )
+            if checks_rule is None:
+                continue
+            for entry in checks_rule["parameters"]["required_status_checks"]:
+                if entry.get("context") == "lanes":
+                    self.assertNotEqual(entry.get("integration_id"), 12345)
+
     def test_force_does_not_bind_to_an_app_that_does_not_cover_the_repo(self):
         # The coverage precondition is NOT --force-overridable: binding `lanes`
         # to an App that is not installed on / does not cover this repo would
