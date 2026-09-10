@@ -31,7 +31,8 @@ Two invariants hold on every run, and they outrank every other rule here:
 
 Nothing waits on an operator except what only an operator can settle (see
 *What still needs a person*). Merging the pull requests this tool opens is
-not on that list: it merges its own.
+not on that list: it merges its own, and closes its own where the scaffold
+is complete without them, so none outlives what it was opened for.
 
 **Open branches may break temporarily.** A run may leave an open pull
 request unable to merge for a while -- a newly required check its head
@@ -68,7 +69,18 @@ setup`, always on unless a flag opts the repository out:
   requests get no approver, so widening such a ruleset is refused and
   left to a person. The widening write adds no check of its own for the
   same reason; the checks it would have added wait for the run after,
-  once the ruleset covers the branch. A legacy-named duplicate is adopted or
+  once the ruleset covers the branch. The literal `main` and `master`
+  are a lock against renaming the default branch out from under the
+  ruleset, and they land whatever the default is called. A real branch
+  by the other name beside the default is the branch that lock exists
+  to close, and a ruleset written onto it would enforce there what
+  nothing here can tell that branch satisfies (a check that never runs
+  there blocks every pull request into it, and no rerun or rebase clears
+  that), so while one exists the ruleset step is held for a person --
+  delete or rename the branch, or widen by hand -- and every other step
+  still runs. Read as a Git ref, never through the branches endpoint,
+  which follows a rename's redirect and reports the renamed branch under
+  its old name. A legacy-named duplicate is adopted or
   deleted (recorded first). `--no-rules` opts out; `--rule` names a
   different check set to add.
 - **Fleet credentials in their environments**, each restricted to the
@@ -171,7 +183,15 @@ and delete-branch-on-merge is turned on before the merge where it is
 off, so GitHub deletes the merged branch as part of the merge itself: the
 settings step would enable it later in the same run, too late for this
 merge, and a delete afterwards would be a separate request with no sha
-precondition, racing anyone pushing to the branch. A pull request GitHub blocks with every required check passed is asked,
+precondition, racing anyone pushing to the branch. A pull request GitHub blocks on a required check that has not passed on
+its head, with nothing running there (a run still going, or the codex
+sweep's pending status, is a wait), is reported as needing a person,
+whatever the check is called: nothing says it will ever report -- a
+workflow whose path filter the diff does not match never runs on it,
+the tool's own or a project's customized copy alike, and a check bound
+to an App needs that App's own report, which a head that already ran
+under another does not get again -- and no rerun or rebase changes that.
+One blocked with every required check passed is asked,
 live, what holds it: a review it lacks or an unresolved conversation is
 reported as needing a person, as is a branch requiring signed commits
 (the generated commit is not one); and a block none of those explains is

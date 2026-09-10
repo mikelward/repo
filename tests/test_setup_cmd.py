@@ -24,13 +24,15 @@ _HARDENED_SCOPE = ("~DEFAULT_BRANCH", "refs/heads/main", "refs/heads/master")
 _DEFAULT_BRANCH_RE = re.compile(r"^repos/([^/]+/[^/]+)$")
 _BRANCH_COUNT_RE = re.compile(r"^repos/([^/]+/[^/]+)/branches\?per_page=1$")
 _COMMITS_HEAD_RE = re.compile(r"^repos/([^/]+/[^/]+)/commits\?per_page=1$")
-_CHECK_RUNS_RE = re.compile(r"^repos/([^/]+/[^/]+)/commits/([^/]+)/check-runs$")
+_CHECK_RUNS_RE = re.compile(r"^repos/([^/]+/[^/]+)/commits/([^/]+)/check-runs(?:\?filter=all)?$")
 _STATUS_RE = re.compile(r"^repos/([^/]+/[^/]+)/commits/([^/]+)/status$")
+_STATUSES_LIST_RE = re.compile(r"^repos/([^/]+/[^/]+)/commits/([^/]+)/statuses$")
+_WORKFLOW_RUNS_RE = re.compile(r"^repos/([^/]+/[^/]+)/actions/runs\?head_sha=([^&]+)&per_page=100$")
 _PULLS_RE = re.compile(r"^repos/([^/]+/[^/]+)/pulls\?state=(open|closed)&.*$")
 _RULESETS_LOOKUP_RE = re.compile(r"^repos/([^/]+/[^/]+)/rulesets\?includes_parents=false$")
 _RULESETS_ALL_RE = re.compile(r"^repos/([^/]+/[^/]+)/rulesets\?includes_parents=true$")
 _RULESET_ONE_RE = re.compile(r"^repos/([^/]+/[^/]+)/rulesets/([^/]+)$")
-_MASTER_BRANCH_RE = re.compile(r"^repos/([^/]+/[^/]+)/branches/master$")
+_SIBLING_REF_RE = re.compile(r"^repos/([^/]+/[^/]+)/git/ref/heads/(main|master)$")
 _ACTIONS_SECRETS_RE = re.compile(r"^repos/([^/]+/[^/]+)/actions/secrets$")
 _ENV_SECRETS_RE = re.compile(r"^repos/([^/]+/[^/]+)/environments/([^/]+)/secrets$")
 _ENV_ONE_RE = re.compile(r"^repos/([^/]+/[^/]+)/environments/([^/]+)$")
@@ -72,7 +74,7 @@ _SCAFFOLD_GAP_REF_READ_RE = re.compile(
     r"^repos/([^/]+/[^/]+)/git/ref/heads/(" + re.escape(scaffold.GAP_BRANCH_PREFIX) + r".*)$"
 )
 _SCAFFOLD_GAP_PULLS_RE = re.compile(
-    r"^repos/([^/]+/[^/]+)/pulls\?state=open&per_page=100&base=(.+)$"
+    r"^repos/([^/]+/[^/]+)/pulls\?state=open&per_page=100$"
 )
 _SCAFFOLD_REF_CREATE_RE = re.compile(r"^repos/([^/]+/[^/]+)/git/refs$")
 # GitHub's effective-rules endpoint: what a branch actually enforces
@@ -80,6 +82,12 @@ _SCAFFOLD_REF_CREATE_RE = re.compile(r"^repos/([^/]+/[^/]+)/git/refs$")
 # to say whether its pull request can merge on its own.
 _EFFECTIVE_RULES_RE = re.compile(r"^repos/([^/]+/[^/]+)/rules/branches/(.+)$")
 _SCAFFOLD_PULL_CREATE_RE = re.compile(r"^repos/([^/]+/[^/]+)/pulls$")
+# An earlier run's scaffold pull request: what apply_gaps reads to decide
+# whether to merge it, and the two writes it can make to it.
+_SCAFFOLD_PULL_ONE_RE = re.compile(r"^repos/([^/]+/[^/]+)/pulls/(\d+)$")
+_SCAFFOLD_PULL_MERGE_RE = re.compile(r"^repos/([^/]+/[^/]+)/pulls/(\d+)/merge$")
+_PULL_HEAD_RE = re.compile(r"^prhead(\d+)")
+_ACTIONS_PERMISSIONS_RE = re.compile(r"^repos/([^/]+/[^/]+)/actions/permissions$")
 _SCAFFOLD_REF_WRITE_RE = re.compile(r"^repos/([^/]+/[^/]+)/git/refs/heads/([^/?]+)$")
 _SCAFFOLD_COMMIT_RE = re.compile(r"^repos/([^/]+/[^/]+)/git/commits/([^/?]+)$")
 _SCAFFOLD_TREE_RE = re.compile(r"^repos/([^/]+/[^/]+)/git/trees/([^/?]+)\?recursive=1$")
@@ -103,6 +111,19 @@ _SCAFFOLD_PATHS = (
 )
 
 _OWNERSHIP_JQ = ".enforcement, .target"
+
+
+def _check_run(entry):
+    """A FakeGh.check_runs entry as (name, app id, conclusion). A bare name
+    is an unbound check that passed -- the shape every older fixture uses
+    -- a pair binds it to an App, and a triple says how it concluded
+    (None: still running)."""
+    if isinstance(entry, tuple):
+        if len(entry) == 3:
+            return entry
+        name, app_id = entry
+        return name, app_id, "success"
+    return entry, None, "success"
 
 
 def _parse_api_args(rest):
@@ -171,6 +192,10 @@ class FakeGh:
         self.default_head_fails = False
         self.check_runs = {}
         self.statuses = {}
+        # sha -> [(context, creator login[, state]), ...] for the plural
+        # /statuses endpoint, every status ever posted, NEWEST FIRST as
+        # GitHub lists them; a pair is a success.
+        self.status_creators = {}
         self.open_prs = []
         self.closed_prs = []
         self.existing_ruleset_id = None
@@ -237,9 +262,15 @@ class FakeGh:
         # rid -> read count after which reads of that id fail, for the
         # "could not tell" half of a recheck (as distinct from "changed").
         self.ruleset_read_fails_after = {}
-        self.master_exists = False
-        self.master_error = None
-        self.master_redirect_name = None  # branch a renamed master redirects to
+        # A real branch named main or master beside the default branch
+        # (read as git/ref/heads/<name>: the branches endpoint follows a
+        # rename's 301 and is not what the tool asks).
+        self.sibling_exists = False
+        self.sibling_error = None
+        # After this many sibling reads, the branch exists: a branch
+        # created while the operator was confirming.
+        self.sibling_created_after_reads = None
+        self._sibling_reads = 0
         self.puts = []
         self.posts = []
         self.fail_default_branch = False
@@ -364,6 +395,7 @@ class FakeGh:
         # straight onto an existing branch (Codex review, mikelward/repo#14).
         self.bootstrap_ref_ambiguous_409 = False
         self.bootstrap_ref_fails = False  # a non-404/409 failure reading the ref
+        self.bootstrap_contents_put_fails = False  # the empty-branch bootstrap write
         self._scaffold_ref_reads = 0
         self.bootstrap_ref_sha_after_first_read = None
         self.bootstrap_commit_sha = "deadbeefcommit"
@@ -412,6 +444,65 @@ class FakeGh:
         # step reads.
         self.bootstrap_open_pulls = []
         self.bootstrap_pulls_list_fails = False
+        # number -> overrides for what GET pulls/{n} answers: "state",
+        # "draft", "head_sha", "base_ref", "mergeable", "mergeable_state". The default
+        # (see _pull) is an open, non-draft, mergeable ("clean") pull
+        # request whose head is "prhead<number>" -- with no check runs on
+        # that head unless a test adds them, so the step WAITS by default
+        # rather than merging.
+        self.pulls = {}
+        # number -> overrides applied from the SECOND read of that pull
+        # request on: what changed while the plan waited on confirmation.
+        self.pulls_later = {}
+        self._pull_reads = {}
+        self.pull_read_fails = set()
+        self.pull_merge_fails = set()  # numbers whose merge PUT is refused
+        self.merged_pulls = []  # (number, body) of every merge PUT
+        self.closed_pulls = []  # numbers PATCHed closed
+        self.merged_sha = "mergedsha123"
+        # The login this token acts as, which is what a scaffold pull
+        # request's author has to be for the step to treat it as its own.
+        self.login = "owner"
+        # sha -> the Actions workflow runs from it, as (path, status,
+        # conclusion) triples. A sha with no entry derives one successful
+        # run per scaffold check that passed in check_runs, from its
+        # publisher's path -- the shape every older merge fixture assumes.
+        self.workflow_runs = {}
+        self.workflow_runs_read_fails = False
+        # Whether GitHub Actions is enabled on the repository -- read only
+        # when a scaffold pull request has no check on it at all.
+        self.actions_enabled = True
+        self.actions_permissions_fails = False
+        # What the review-state GraphQL read answers for a pull request:
+        # GitHub's reviewDecision (None where no rule requires a review),
+        # how many review threads are unresolved, and whether it fails.
+        self.review_decision = None
+        self.unresolved_threads = 0
+        # Or the threads themselves, as isResolved flags, paged 100 at a
+        # time the way GitHub pages them; None derives them from
+        # unresolved_threads.
+        self.review_threads = None
+        self.review_state_fails = False
+        self.review_state_reads = 0
+        # What compare/{merged}...{default} answers after a merge: where
+        # the merged commit landed relative to the default branch.
+        self.merge_landed = "identical"
+        # number -> paths the pull request's head tree carries BEYOND the
+        # generated commit (a push onto the branch), or a full override of
+        # its non-directory entries as {path: (sha, mode)}. By default a
+        # head's tree is exactly the base plus the generated changes.
+        self.pull_head_extra_paths = {}
+        self.pull_head_trees = {}
+        # number -> the head commit's parent shas; the default is the one
+        # generated commit on top of the branch's tip.
+        self.pull_head_parents = {}
+        # number -> the head commit's message; the default is the one the
+        # generator would write for the plan.
+        self.pull_head_messages = {}
+        # Paths in UPDATED_PATHS whose blob sha the tree reports as NOT the
+        # template's -- an outdated pinned copy. Every other present path
+        # reports the template's own sha, so "present" means "current".
+        self.bootstrap_outdated_paths = set()
         # What the listing answers from its SECOND call on -- a scaffold
         # pull request somebody opened during the confirmation wait, which
         # only the step's own recheck before writing can see.
@@ -433,6 +524,10 @@ class FakeGh:
         # for the "a rerun rebuilt the same commit" path -- None means the
         # ref genuinely isn't there.
         self.bootstrap_gap_ref_sha = None
+        # branch name -> sha: gap branches that already exist holding that
+        # commit (a ref POST for one 422s, and its read answers the sha),
+        # for the "occupied by another commit, take the next name" case.
+        self.bootstrap_occupied_gap_refs = {}
         self.bootstrap_pull_create_fails = False
         self.bootstrap_pull_create_response = None
         self.bootstrap_pull_number = 42
@@ -508,7 +603,38 @@ class FakeGh:
                 f"X-OAuth-Scopes: {', '.join(self.token_scopes)}\n" if self.token_scopes is not None else ""
             )
             return f"HTTP/2.0 200 OK\n{header}\n{{}}"
+        if args[1] == "graphql":
+            assert any(a.startswith("query=") and "reviewDecision" in a for a in args), args
+            if self.review_state_fails:
+                raise gh.GhError("gh: HTTP 502: Bad Gateway\n")
+            self.review_state_reads += 1
+            flags = self.review_threads
+            if flags is None:
+                flags = [False] * self.unresolved_threads + [True]
+            after = [a for a in args if a.startswith("after=")]
+            start = int(after[0][len("after="):]) if after else 0
+            page = flags[start : start + 100]
+            return json.dumps(
+                {
+                    "data": {
+                        "repository": {
+                            "pullRequest": {
+                                "reviewDecision": self.review_decision,
+                                "reviewThreads": {
+                                    "pageInfo": {
+                                        "hasNextPage": start + 100 < len(flags),
+                                        "endCursor": str(start + 100),
+                                    },
+                                    "nodes": [{"isResolved": f} for f in page],
+                                },
+                            }
+                        }
+                    }
+                }
+            )
         endpoint, method, jq = _parse_api_args(args[1:])
+        if "/compare/" in endpoint and jq == ".status":
+            return self.merge_landed + "\n"
 
         m = _DEFAULT_BRANCH_RE.match(endpoint)
         if m and jq == ".default_branch":
@@ -560,19 +686,72 @@ class FakeGh:
                 raise gh.GhError("gh: HTTP 409: Git Repository is empty.\n")
             return self.default_head_sha + "\n"
 
+        m = _WORKFLOW_RUNS_RE.match(endpoint)
+        if m:
+            if self.workflow_runs_read_fails:
+                raise gh.GhError("gh: HTTP 500: Internal Server Error\n")
+            sha = m.group(2)
+            if sha in self.workflow_runs:
+                runs = self.workflow_runs[sha]
+            else:
+                runs = [
+                    (scaffold.CHECK_PUBLISHERS[name][0], "completed", "success")
+                    for name, _app_id, conclusion in map(_check_run, self.check_runs.get(sha, []))
+                    if name in scaffold.CHECK_PUBLISHERS and conclusion in scaffold._PASSING_CONCLUSIONS
+                ]
+            return "".join(json.dumps(list(run)) + "\n" for run in runs)
+
         m = _CHECK_RUNS_RE.match(endpoint)
         if m:
-            # Models --jq '[.name, .app.id]': an entry may be a bare name
-            # (no App binding) or a (name, app id) pair.
+            if ".status" in (jq or ""):
+                # The scaffold step's own read of a pull request head:
+                # --jq '[.name, .status, .conclusion]'. A conclusion of None
+                # models a run still in progress.
+                return "".join(
+                    json.dumps([name, "completed" if conclusion else "in_progress", conclusion])
+                    + "\n"
+                    for name, _app_id, conclusion in map(_check_run, self.check_runs.get(m.group(2), []))
+                )
+            # Models --jq '[.name, .app.id, .conclusion]': an entry may be
+            # a bare name (no App binding, passed), a (name, app id) pair,
+            # or a (name, app id, conclusion) triple -- see _check_run.
             return "".join(
-                json.dumps(list(n) if isinstance(n, tuple) else [n, None]) + "\n"
-                for n in self.check_runs.get(m.group(2), [])
+                json.dumps(list(_check_run(n))) + "\n" for n in self.check_runs.get(m.group(2), [])
             )
 
         m = _STATUS_RE.match(endpoint)
         if m:
-            contexts = self.statuses.get(m.group(2), [])
-            return "".join(json.dumps(c) + "\n" for c in contexts)
+            # Models --jq '[.context, .state]': a bare context is a passed
+            # status; a (context, state) pair says otherwise.
+            return "".join(
+                json.dumps(list(c) if isinstance(c, tuple) else [c, "success"]) + "\n"
+                for c in self.statuses.get(m.group(2), [])
+            )
+
+        m = _STATUSES_LIST_RE.match(endpoint)
+        if m:
+            # Models --jq '.[] | [.context, (.creator.login // ""), .state]'.
+            return "".join(
+                json.dumps([entry[0], entry[1], entry[2] if len(entry) > 2 else "success"]) + "\n"
+                for entry in self.status_creators.get(m.group(2), [])
+            )
+
+        m = _SCAFFOLD_PULL_ONE_RE.match(endpoint)
+        if m and method is None:
+            number = int(m.group(2))
+            if number in self.pull_read_fails:
+                raise gh.GhError("gh: HTTP 500: Internal Server Error\n")
+            pull = self._pull(number, read=True)
+            return json.dumps(
+                [
+                    pull["state"],
+                    pull["draft"],
+                    pull["head_sha"],
+                    pull["base_ref"],
+                    pull["mergeable"],
+                    pull["mergeable_state"],
+                ]
+            )
 
         m = _EFFECTIVE_RULES_RE.match(endpoint)
         if m:
@@ -588,15 +767,29 @@ class FakeGh:
             pulls = self.bootstrap_open_pulls
             if self._gap_pulls_reads > 1 and self.bootstrap_open_pulls_later is not None:
                 pulls = self.bootstrap_open_pulls_later
+            # A four-tuple is a pull request this token's user opened; a
+            # fifth element names another author.
             return "".join(
-                f"{number} {head_ref} {'true' if same_repo else 'false'} {url}\n"
-                for number, head_ref, same_repo, url in pulls
+                f"{p[0]} {p[1]} {'true' if p[2] else 'false'} "
+                f"{p[4] if len(p) > 4 else self.login} {p[3]}\n"
+                for p in pulls
             )
+
+        if endpoint == "user" and jq == ".login":
+            return self.login + "\n"
+
+        if _ACTIONS_PERMISSIONS_RE.match(endpoint) and jq == ".enabled":
+            if self.actions_permissions_fails:
+                raise gh.GhError("gh: HTTP 403: Resource not accessible by integration\n")
+            return ("true" if self.actions_enabled else "false") + "\n"
 
         m = _PULLS_RE.match(endpoint)
         if m:
             shas = self.open_prs if m.group(2) == "open" else self.closed_prs
-            return "".join(sha + "\n" for sha in shas)
+            # Paged the way GitHub pages: 100 per page, `page=` from 1.
+            page_m = re.search(r"[&?]page=(\d+)", endpoint)
+            page = int(page_m.group(1)) if page_m else 1
+            return "".join(sha + "\n" for sha in shas[(page - 1) * 100 : page * 100])
 
         if _RULESETS_LOOKUP_RE.match(endpoint):
             # A lookup for a legacy name asks a different question, and
@@ -676,18 +869,6 @@ class FakeGh:
                     {"include": ref_name.get("include", []), "exclude": ref_name.get("exclude", [])}
                 ) + "\n"
             return json.dumps(obj)
-
-        if _MASTER_BRANCH_RE.match(endpoint):
-            if self.master_error:
-                raise gh.GhError(self.master_error)
-            if self.master_redirect_name:
-                # GitHub 301s a renamed branch's old name to the new one and
-                # gh follows it, so the call succeeds -- reporting the name
-                # it landed on, not the one asked for.
-                return f"{self.master_redirect_name}\n"
-            if self.master_exists:
-                return "master\n"
-            raise gh.GhError("gh: HTTP 404: Not Found\n")
 
         m = _ACTIONS_SECRETS_RE.match(endpoint)
         if m:
@@ -896,9 +1077,31 @@ class FakeGh:
 
         m = _SCAFFOLD_GAP_REF_READ_RE.match(endpoint)
         if m and method is None and jq is None:
+            if m.group(2) in self.bootstrap_occupied_gap_refs:
+                return json.dumps({"object": {"sha": self.bootstrap_occupied_gap_refs[m.group(2)]}})
             if self.bootstrap_gap_ref_sha is None:
                 raise gh.GhError("gh: HTTP 404: Not Found\n")
             return json.dumps({"object": {"sha": self.bootstrap_gap_ref_sha}})
+
+        m = _SIBLING_REF_RE.match(endpoint)
+        if (
+            m
+            and method is None
+            and jq is None
+            and m.group(2) not in (self.default_branch, self.default_branch_after_bootstrap_plan)
+        ):
+            if self.sibling_error:
+                raise gh.GhError(self.sibling_error)
+            self._sibling_reads += 1
+            exists = self.sibling_exists
+            if (
+                self.sibling_created_after_reads is not None
+                and self._sibling_reads > self.sibling_created_after_reads
+            ):
+                exists = True
+            if exists:
+                return json.dumps({"object": {"sha": "5ib1150000000000000000000000000000000000"}})
+            raise gh.GhError("gh: HTTP 404: Not Found\n")
 
         m = _SCAFFOLD_REF_READ_RE.match(endpoint)
         if m and method is None and jq is None:
@@ -931,7 +1134,50 @@ class FakeGh:
         if m and method is None and jq is None:
             if self.bootstrap_commit_read_fails:
                 raise gh.GhError("gh: HTTP 500: Internal Server Error\n")
+            head = _PULL_HEAD_RE.match(m.group(2))
+            if head:
+                number = int(head.group(1))
+                parents = self.pull_head_parents.get(number, [self.bootstrap_commit_sha])
+                message = self.pull_head_messages.get(number)
+                if message is None:
+                    message = self._generated_message()
+                return json.dumps(
+                    {
+                        "tree": {"sha": f"prtree{number}"},
+                        "parents": [{"sha": p} for p in parents],
+                        "message": message,
+                    }
+                )
             return json.dumps({"tree": {"sha": self.bootstrap_tree_sha}})
+
+        m = _SCAFFOLD_TREE_RE.match(endpoint)
+        if m and m.group(2).startswith("prtree"):
+            number = int(m.group(2)[len("prtree"):])
+            if number in self.pull_head_trees:
+                entries = self.pull_head_trees[number]
+            else:
+                # The generated commit: the base's entries with the
+                # scaffold's own content written over the missing and
+                # outdated paths -- built by the real generator against
+                # this fake, so the shas are the ones the step expects.
+                base = self._all_scaffold_paths() if self.bootstrap_existing_paths is None else self.bootstrap_existing_paths
+                entries = {p: (self._tree_sha(p), "100644") for p in base}
+                for p, content in scaffold.build_scaffold_files(self.default_branch).items():
+                    if p not in entries or (
+                        p in scaffold.UPDATED_PATHS and p in self.bootstrap_outdated_paths
+                    ):
+                        entries[p] = (scaffold._blob_sha(content), "100644")
+                for p in self.pull_head_extra_paths.get(number, ()):
+                    entries[p] = (hashlib.sha1(f"pushed {p}".encode()).hexdigest(), "100644")
+            return json.dumps(
+                {
+                    "tree": [
+                        {"path": p, "type": "blob", "mode": mode, "sha": sha}
+                        for p, (sha, mode) in entries.items()
+                    ],
+                    "truncated": False,
+                }
+            )
 
         m = _SCAFFOLD_TREE_RE.match(endpoint)
         if m:
@@ -942,7 +1188,7 @@ class FakeGh:
             # tree entries always carry one, and plan_gaps now checks it
             # (Codex review, mikelward/repo#14), so an entry missing it
             # would silently stop matching what the fake models as present.
-            entries = [{"path": p, "type": "blob", "mode": "100644"} for p in paths]
+            entries = [{"path": p, "type": "blob", "mode": "100644", "sha": self._tree_sha(p)} for p in paths]
             # bootstrap_occupied_entries lets a test plant a non-regular-
             # file (or an ancestor-of-a-scaffold-path) entry instead of /
             # alongside the blob one -- a bare kind string (e.g.
@@ -959,6 +1205,45 @@ class FakeGh:
             return json.dumps({"tree": entries, "truncated": self.bootstrap_tree_truncated})
 
         raise AssertionError(f"unexpected endpoint: {endpoint} (method={method} jq={jq})")
+
+    def _pull(self, number, read=False):
+        pull = {
+            "state": "open",
+            "draft": False,
+            "head_sha": f"prhead{number}",
+            "base_ref": "main",
+            "mergeable": True,
+            "mergeable_state": "clean",
+        }
+        pull.update(self.pulls.get(number, {}))
+        if read:
+            self._pull_reads[number] = self._pull_reads.get(number, 0) + 1
+        if self._pull_reads.get(number, 0) >= 2:
+            pull.update(self.pulls_later.get(number, {}))
+        return pull
+
+    def _generated_message(self):
+        """The commit message the generator writes for this fake's gap:
+        what a scaffold pull request's head has to carry to be merged."""
+        present = self._all_scaffold_paths() if self.bootstrap_existing_paths is None else self.bootstrap_existing_paths
+        files = scaffold.build_scaffold_files(self.default_branch)
+        missing = {p: c for p, c in files.items() if p not in present}
+        outdated = {
+            p: c
+            for p, c in files.items()
+            if p in present and p in scaffold.UPDATED_PATHS and p in self.bootstrap_outdated_paths
+        }
+        return scaffold._gap_commit_message(missing, outdated)
+
+    def _tree_sha(self, path):
+        """What the tree listing reports as a present scaffold path's blob
+        sha: the template's own for a current pinned copy, something else
+        for one bootstrap_outdated_paths names, and a placeholder for
+        every path the step never compares by content."""
+        name = path.rsplit("/", 1)[-1]
+        if path in scaffold.UPDATED_PATHS and path not in self.bootstrap_outdated_paths:
+            return scaffold._blob_sha(self.template_contents.get(name, ""))
+        return hashlib.sha1(f"present {path}".encode()).hexdigest()
 
     def _all_scaffold_paths(self):
         """Every path build_scaffold_files("main") produces -- kept as its
@@ -1042,6 +1327,18 @@ class FakeGh:
         endpoint, method, _jq = _parse_api_args(args[1:])
         body = json.loads(input_bytes.decode())
         if method == "PUT":
+            m = _SCAFFOLD_PULL_MERGE_RE.match(endpoint)
+            if m:
+                number = int(m.group(2))
+                if number in self.pull_merge_fails:
+                    raise gh.GhError("gh: HTTP 405: Pull Request is not mergeable\n")
+                if body.get("sha") != self._pull(number)["head_sha"]:
+                    raise gh.GhError("gh: HTTP 409: Head branch was modified. Review and try the merge again.\n")
+                self.merged_pulls.append((number, body))
+                self.pulls.setdefault(number, {})["state"] = "closed"
+                # The default branch's tip is the merge now.
+                self._scaffold_ref_current_sha = self.merged_sha
+                return json.dumps({"merged": True, "sha": self.merged_sha, "message": "Pull Request successfully merged"}).encode()
             self.puts.append((args, body))
             if _RULESET_ONE_RE.match(endpoint):
                 self._ruleset_put_done = True
@@ -1071,6 +1368,8 @@ class FakeGh:
                 stored.setdefault("id", int(m.group(2)) if m.group(2).isdigit() else m.group(2))
                 self.ruleset_objects[m.group(2)] = stored
             if _SCAFFOLD_CONTENTS_PUT_RE.match(endpoint):
+                if self.bootstrap_contents_put_fails:
+                    raise gh.GhError("gh: HTTP 500: Internal Server Error\n")
                 # push_initial_commit's own bootstrap write, for a
                 # repository whose branch has no commits yet -- the one
                 # write GitHub allows there, and the only PUT that parses
@@ -1120,7 +1419,10 @@ class FakeGh:
                 return json.dumps({"sha": "newscaffoldcommitsha"}).encode()
             if _SCAFFOLD_REF_CREATE_RE.match(endpoint):
                 self.posts.append((args, body))
-                if self.bootstrap_ref_create_fails:
+                if (
+                    self.bootstrap_ref_create_fails
+                    or body["ref"].removeprefix("refs/heads/") in self.bootstrap_occupied_gap_refs
+                ):
                     raise gh.GhError("gh: HTTP 422: Reference already exists\n")
                 self.created_refs.append(body)
                 return json.dumps({"ref": body["ref"]}).encode()
@@ -1138,6 +1440,12 @@ class FakeGh:
                 ).encode()
             self.posts.append((args, body))
         elif method == "PATCH":
+            m = _SCAFFOLD_PULL_ONE_RE.match(endpoint)
+            if m and body.get("state") == "closed":
+                number = int(m.group(2))
+                self.closed_pulls.append(number)
+                self.pulls.setdefault(number, {})["state"] = "closed"
+                return b"{}"
             if _SCAFFOLD_REF_WRITE_RE.match(endpoint) and self.bootstrap_ref_update_fails:
                 raise gh.GhError("gh: HTTP 422: Reference update failed\n")
             if self.patch_fails:
@@ -1261,7 +1569,10 @@ class SetupCmdTest(unittest.TestCase):
             "target": "branch",
             "enforcement": "active",
             "bypass_actors": [{"actor_id": 1, "actor_type": "Team"}],
-            "conditions": {"ref_name": {"include": ["refs/heads/release"], "exclude": []}},
+            # Covers main by name already, so the widening only adds the
+            # other two refs; a ruleset that does NOT reach main and carries
+            # a check is refused instead (see the widening test).
+            "conditions": {"ref_name": {"include": ["refs/heads/release", "refs/heads/main"], "exclude": []}},
             "rules": [
                 {
                     "type": "required_status_checks",
@@ -1296,7 +1607,7 @@ class SetupCmdTest(unittest.TestCase):
         # thing this step exists to do.
         self.assertEqual(
             body["conditions"]["ref_name"]["include"],
-            ["refs/heads/release", *_HARDENED_SCOPE],
+            ["refs/heads/release", "refs/heads/main", "~DEFAULT_BRANCH", "refs/heads/master"],
         )
         self.assertEqual(body["conditions"]["ref_name"]["exclude"], [])
         # target and bypass_actors are still untouched -- widening the
@@ -1304,8 +1615,11 @@ class SetupCmdTest(unittest.TestCase):
         self.assertEqual(body["target"], "branch")
         self.assertEqual(body["bypass_actors"], [{"actor_id": 1, "actor_type": "Team"}])
         checks_rule = next(r for r in body["rules"] if r["type"] == "required_status_checks")
+        # `old-check` is not in the standard, and stays exactly as it was,
+        # App binding included: the standard is a floor.
         self.assertEqual(
-            checks_rule["parameters"]["required_status_checks"], [{"context": "lanes"}]
+            checks_rule["parameters"]["required_status_checks"],
+            [{"context": "lanes"}, {"context": "old-check", "integration_id": 9}],
         )
         # An already-present required_linear_history/non_fast_forward rule
         # is left alone, not duplicated -- these two take no parameters, so
@@ -1313,7 +1627,7 @@ class SetupCmdTest(unittest.TestCase):
         types = [rule["type"] for rule in body["rules"]]
         self.assertEqual(types.count("required_linear_history"), 1)
         self.assertEqual(types.count("non_fast_forward"), 1)
-        self.assertIn("now also targeting ~DEFAULT_BRANCH, refs/heads/main, refs/heads/master", out)
+        self.assertIn("now also targeting ~DEFAULT_BRANCH, refs/heads/master", out)
         self.assertIn("scope: also targeting ~DEFAULT_BRANCH", err)
         # A preserved bypass actor overrides every rule above, old and new
         # alike -- the plan says so rather than reading as an unqualified
@@ -1885,30 +2199,131 @@ class SetupCmdTest(unittest.TestCase):
         self.assertEqual(fake.puts, [])
         self.assertIn("would create ruleset", out)
 
-    def test_missing_check_blocks_without_force(self):
+
+    def test_a_check_that_has_never_run_is_deferred_not_refused(self):
+        # SPEC.md, *The ladder*: a check is required once it has passed
+        # here, and until then the rest of the ruleset lands without it.
         fake = FakeGh()
-        fake.check_runs = {fake.default_head_sha: []}  # 'lanes' never reported
-        code, _, err = _run(fake, ["--dry-run", "--force", "--rule", "lanes", REPO])
-        # --force still skips the confirmation prompt but NOT the
-        # never-reported guard -- only rerunning without --dry-run and
-        # WITH --force does that (matching repo-rules: --force overrides
-        # the guard, --dry-run alone never applies anything).
-        self.assertEqual(code, 0, err)  # dry-run's own preview succeeded
-        self.assertIn("never reported", err)
+        fake.check_runs = {fake.default_head_sha: []}  # 'lanes' has never run
+        code, out, err = _run(fake, ["--dry-run", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("deferred, not required yet: 'lanes' has never run here", out)
+        self.assertIn("a later run requires it once it has passed", out)
+        self.assertNotIn("never reported", err)
 
-        code, _, err = _run(fake, ["--rule", "lanes", REPO])  # no --force at all
-        self.assertEqual(code, 1)
-        self.assertIn("never reported", err)
-        self.assertEqual(fake.posts, [])
+        code, out, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        ruleset_posts = [b for a, b in fake.posts if a[3] == f"repos/{REPO}/rulesets"]
+        self.assertEqual(len(ruleset_posts), 1)
+        self.assertEqual(ruleset_posts[0]["rules"][0]["parameters"]["required_status_checks"], [])
+        self.assertIn("required checks: none yet", out)
+        self.assertIn("deferred, not required yet: 'lanes' has never run here", out)
 
-    def test_missing_check_allowed_with_force(self):
+
+    def test_force_does_not_require_a_check_that_has_never_passed(self):
+        # --force means "apply without asking" and nothing else (SPEC.md,
+        # *Flags*): it used to waive the never-reported guard, and a guard
+        # the fleet loop's own flag turns off is not a guard.
         fake = FakeGh()
         fake.check_runs = {fake.default_head_sha: []}
         code, out, err = _run(fake, ["--force", "--rule", "never-reported", REPO])
         self.assertEqual(code, 0, err)
-        self.assertIn("never reported", err)
-        self.assertIn("--force given", err)
-        self.assertEqual(len(fake.posts), 1)
+        self.assertNotIn("--force given", err)
+        ruleset_posts = [b for a, b in fake.posts if a[3] == f"repos/{REPO}/rulesets"]
+        self.assertEqual(len(ruleset_posts), 1)
+        self.assertEqual(ruleset_posts[0]["rules"][0]["parameters"]["required_status_checks"], [])
+        self.assertIn("'never-reported' has never run here", out)
+
+    def test_a_check_that_ran_but_never_passed_is_deferred_and_said_so(self):
+        # A check that runs and fails blocks every merge exactly as one
+        # that never runs -- and the reader needs to know which it is, since
+        # one needs a pull request and the other needs a fix.
+        fake = FakeGh()
+        fake.check_runs = {fake.default_head_sha: [("zizmor", None, "failure")]}
+        code, out, err = _run(fake, ["--force", "--rule", "zizmor", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("'zizmor' has run here but never passed", out)
+        ruleset_posts = [b for a, b in fake.posts if a[3] == f"repos/{REPO}/rulesets"]
+        self.assertEqual(ruleset_posts[0]["rules"][0]["parameters"]["required_status_checks"], [])
+
+    def test_a_check_that_passed_on_a_closed_pull_request_counts(self):
+        # "Passed" is read from the default branch head, then open and
+        # closed pull request heads -- the scaffold pull request that first
+        # ran `lanes` is closed (merged) by the run that requires it.
+        fake = FakeGh()
+        fake.check_runs = {"prhead9": ["lanes"]}
+        fake.closed_prs = ["prhead9"]
+        code, out, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        ruleset_posts = [b for a, b in fake.posts if a[3] == f"repos/{REPO}/rulesets"]
+        self.assertEqual(
+            ruleset_posts[0]["rules"][0]["parameters"]["required_status_checks"],
+            [{"context": "lanes"}],
+        )
+        self.assertNotIn("deferred", out)
+
+    def test_a_commits_evidence_is_read_once_per_run(self):
+        # The evidence question is asked several times in one run (the
+        # preview, the write's fresh recompute, the binding's own passes),
+        # and each walk costs two reads per commit -- so a run memoizes
+        # what it read about a commit, and reads it once (Codex review,
+        # mikelward/repo#56). A pass does not un-happen, which is what
+        # makes the memo safe for the length of one run.
+        fake = FakeGh()
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+        code, out, err = _run(fake, ["--force", "--no-bootstrap", REPO])
+        self.assertEqual(code, 0, err)
+        reads = [
+            c for c in fake.calls
+            if c[0] == "api" and any(f"/commits/{fake.default_head_sha}/check-runs" in str(a) for a in c)
+        ]
+        self.assertEqual(len(reads), 1, reads)
+        # And never across runs: the next run reads afresh.
+        fake.check_runs = {fake.default_head_sha: ["lanes", "zizmor"]}
+        fake.calls.clear()
+        code, out, err = _run(fake, ["--dry-run", "--no-bootstrap", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("'codex' has never run here", out)
+
+    def test_a_pass_on_a_pull_request_beyond_the_newest_hundred_still_counts(self):
+        # The only pass is on the 101st most recently updated closed pull
+        # request: the evidence scan pages past the first hundred rather
+        # than reading "never" off a capped listing on every run (Codex
+        # review, mikelward/repo#56).
+        fake = FakeGh()
+        fake.check_runs = {fake.default_head_sha: ["lanes", "zizmor"], "old-pass": ["codex"]}
+        fake.closed_prs = [f"closed{n}" for n in range(100)] + ["old-pass"]
+        code, out, err = _run(fake, ["--force", "--no-bootstrap", REPO])
+        self.assertEqual(code, 0, err)
+        ruleset_posts = [b for a, b in fake.posts if a[3] == f"repos/{REPO}/rulesets"]
+        self.assertEqual(len(ruleset_posts), 1)
+        self.assertEqual(
+            [c["context"] for c in ruleset_posts[0]["rules"][0]["parameters"]["required_status_checks"]],
+            ["lanes", "codex", "zizmor"],
+        )
+        listings = [c[1] for c in fake.calls if c[0] == "api" and "pulls?state=closed" in c[1]]
+        # Two pages per scan (the preview's and the write's own): the second
+        # is read, and nothing past the page that settled it.
+        self.assertTrue(any("page=2" in listing for listing in listings), listings)
+        self.assertFalse(any("page=3" in listing for listing in listings), listings)
+
+        # And the walk is bounded: a pass older than the newest five hundred
+        # is not counted, so a check that never passed does not spend the
+        # hour's API budget on every run (Codex review, mikelward/repo#56).
+        fake = FakeGh()
+        fake.check_runs = {fake.default_head_sha: ["lanes", "zizmor"], "old-pass": ["codex"]}
+        fake.closed_prs = [f"closed{n}" for n in range(500)] + ["old-pass"]
+        code, out, err = _run(fake, ["--force", "--no-bootstrap", REPO])
+        self.assertEqual(code, 0, err)
+        ruleset_posts = [b for a, b in fake.posts if a[3] == f"repos/{REPO}/rulesets"]
+        self.assertEqual(
+            [c["context"] for c in ruleset_posts[0]["rules"][0]["parameters"]["required_status_checks"]],
+            ["lanes", "zizmor"],
+        )
+        self.assertIn("'codex' has never run here", out)
+        listings = [c[1] for c in fake.calls if c[0] == "api" and "pulls?state=closed" in c[1]]
+        self.assertTrue(any("page=5" in listing for listing in listings), listings)
+        self.assertFalse(any("page=6" in listing for listing in listings), listings)
 
     def test_rebase_disabled_blocks_with_a_clear_error(self):
         fake = FakeGh()
@@ -2510,55 +2925,149 @@ class SetupCmdTest(unittest.TestCase):
         self.assertIn("not confirmed", err)
         self.assertEqual(fake.posts, [])
 
-    def test_no_rules_skips_the_ruleset_step_but_still_checks_master(self):
+    def test_no_rules_skips_the_ruleset_step_but_still_checks_for_a_sibling(self):
         fake = FakeGh()
-        fake.master_exists = True
+        fake.sibling_exists = True
         code, _, err = _run(fake, ["--no-rules", "--force", REPO])
         self.assertEqual(code, 0, err)
         self.assertEqual(fake.posts, [])
         self.assertEqual(fake.puts, [])
-        self.assertIn("branch literally named 'master'", err)
+        self.assertIn("has a branch named 'master' beside its default branch 'main'", err)
 
-    def test_master_branch_warning_fires_when_master_exists(self):
+    def test_sibling_branch_holds_the_ruleset_step_for_a_person(self):
+        # A real master beside main is the branch the literal targeting
+        # exists to lock out; a ruleset written onto it would enforce
+        # there what nothing here can tell it satisfies. Held: said in the
+        # preview, no ruleset written, every other step still runs.
         fake = FakeGh()
         fake.check_runs = {fake.default_head_sha: ["lanes"]}
-        fake.master_exists = True
-        code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        fake.sibling_exists = True
+        fake.bootstrap_existing_paths = set()
+        code, out, err = _run(fake, ["--dry-run", "--rule", "lanes", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("not writing ruleset 'main' -- owner/repo has a branch named 'master' beside its default branch 'main'", err)
+        self.assertIn("Delete or rename 'master'", err)
+
+        code, out, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("has a branch named 'master' beside its default branch 'main'", err)
+        self.assertIn("skipping the ruleset step -- held for a person", err)
+        self.assertIn("failed on: ruleset", err)
+        self.assertFalse([p for p in fake.posts if "rulesets" in p[0][3]])
+        self.assertEqual(fake.puts, [])
+        # Held for a person, and only that step: the scaffold pull request
+        # still opens.
+        self.assertIn(f"{REPO}: opened pull request #42", out)
+
+    def test_sibling_branch_does_not_hold_an_already_compliant_ruleset(self):
+        # Nothing to write means nothing to hold: the branch is still said,
+        # and the run exits clean, since the ruleset is at the standard.
+        fake = FakeGh()
+        fake.check_runs = {fake.default_head_sha: ["lanes"]}
+        fake.sibling_exists = True
+        fake.existing_ruleset_id = "7"
+        fake.all_ruleset_ids = ["7"]
+        fake.ruleset_objects["7"] = {
+            "id": 7,
+            "name": "main",
+            "target": "branch",
+            "enforcement": "active",
+            "conditions": {
+                "ref_name": {
+                    "include": ["~DEFAULT_BRANCH", "refs/heads/main", "refs/heads/master"],
+                    "exclude": [],
+                }
+            },
+            "rules": _rules_with(["lanes"]),
+        }
+        code, out, err = _run(fake, ["--force", "-v", "--rule", "lanes", REPO])
         self.assertEqual(code, 0, err)
-        self.assertIn("branch literally named 'master'", err)
-        # It warns; it does not fail the run over an advisory finding.
-        self.assertEqual(code, 0)
+        self.assertIn("already matches; nothing to do", out)
+        self.assertIn("has a branch named 'master' beside its default branch 'main'", err)
+        self.assertNotIn("held for a person", err)
+        self.assertEqual(fake.puts, [])
 
-    def test_no_master_branch_warning_when_master_is_absent(self):
+    def test_sibling_branch_check_is_read_once_per_run(self):
+        # Asked by the advisory check and by each ruleset preview and
+        # write, answered by one read: the answer does not change inside
+        # a run (the write's own last look, below, is the one re-read).
         fake = FakeGh()
         fake.check_runs = {fake.default_head_sha: ["lanes"]}
-        fake.master_exists = False
+        fake.sibling_exists = True
+        code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 1)
+        reads = [c for c in fake.calls if c[:2] == ["api", f"repos/{REPO}/git/ref/heads/master"]]
+        self.assertEqual(len(reads), 1)
+
+    def test_a_sibling_created_during_the_confirmation_wait_holds_the_write(self):
+        # The preview saw no master; one appears before the write. The
+        # write's own last look reads past the run's memo -- like every
+        # other precondition it re-reads there -- and holds (Codex
+        # review, mikelward/repo#56).
+        fake = FakeGh()
+        fake.check_runs = {fake.default_head_sha: ["lanes"]}
+        fake.sibling_created_after_reads = 1
+        code, out, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 1)
+        self.assertNotIn("beside its default branch", out)  # the preview saw none
+        self.assertIn("not writing ruleset 'main' -- owner/repo has a branch named 'master' beside its default branch 'main'", err)
+        self.assertIn("failed on: ruleset", err)
+        self.assertEqual(fake.puts, [])
+        self.assertFalse([p for p in fake.posts if "rulesets" in p[0][3]])
+
+    def test_no_sibling_warning_when_master_is_absent(self):
+        fake = FakeGh()
+        fake.check_runs = {fake.default_head_sha: ["lanes"]}
+        fake.sibling_exists = False
         code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
         self.assertEqual(code, 0, err)
         # Not a bare "master" substring check: the printed plan legitimately
         # mentions master as part of the ruleset's own hardened targeting
         # ("...on main, main and master") -- it's specifically the
         # branch-exists warning that must be absent.
-        self.assertNotIn("branch literally named 'master'", err)
+        self.assertNotIn("beside its default branch", err)
+        self.assertNotIn("held for a person", err)
 
-    def test_renamed_master_does_not_warn(self):
-        # gh follows GitHub's 301 off a renamed master, so the lookup
-        # succeeds with main's record -- not a master branch to warn about.
+    def test_sibling_is_read_as_a_git_ref_never_the_redirecting_branches_endpoint(self):
+        # A repository renamed master -> main keeps a 301 from the old name
+        # on the branches endpoint, and gh follows it, so that endpoint
+        # answers 200 with main's record -- a standing false "master
+        # exists" on exactly the repositories that closed the backdoor by
+        # renaming. The git ref read answers only for a ref that exists.
         fake = FakeGh()
         fake.check_runs = {fake.default_head_sha: ["lanes"]}
-        fake.master_redirect_name = "main"
         code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
         self.assertEqual(code, 0, err)
-        self.assertNotIn("branch literally named 'master'", err)
+        self.assertIn(["api", f"repos/{REPO}/git/ref/heads/master"], fake.calls)
+        self.assertFalse([c for c in fake.calls if c[:2] == ["api", f"repos/{REPO}/branches/master"]])
 
-    def test_master_branch_check_failure_is_reported_but_not_fatal(self):
+    def test_a_master_default_branch_is_not_its_own_sibling(self):
+        # A fork whose default branch is master has no main beside it:
+        # nothing to hold, and the lock there is the literal main.
+        fake = FakeGh()
+        fake.default_branch = "master"
+        fake.check_runs = {fake.default_head_sha: ["lanes"]}
+        code, _, err = _run(fake, ["--force", "--no-bootstrap", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("beside its default branch", err)
+        self.assertNotIn("held for a person", err)
+        self.assertIn(["api", f"repos/{REPO}/git/ref/heads/main"], fake.calls)
+
+    def test_sibling_branch_check_failure_fails_the_ruleset_preview(self):
+        # The advisory check says it could not tell and goes on; the
+        # ruleset step, which would write onto that branch, fails rather
+        # than guessing -- a failed preview, like any other unreadable
+        # precondition of the write, not a hold.
         fake = FakeGh()
         fake.check_runs = {fake.default_head_sha: ["lanes"]}
-        fake.master_error = "gh: HTTP 403: Resource protected by organization SAML enforcement\n"
+        fake.sibling_error = "gh: HTTP 403: Resource protected by organization SAML enforcement\n"
         code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
-        self.assertEqual(code, 0, err)
+        self.assertEqual(code, 1)
         self.assertIn("could not check whether", err)
         self.assertIn("403", err)
+        self.assertIn("the preview above failed", err)
+        self.assertNotIn("held for a person", err)
+        self.assertEqual(fake.puts, [])
 
     def test_empty_check_name_is_a_usage_error_not_a_preview_failure(self):
         # apply_ruleset validates check names before any gh call it makes;
@@ -2570,70 +3079,44 @@ class SetupCmdTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertNotIn("preview", err)
 
-    def test_never_reported_check_blocks_before_any_interactive_confirmation(self):
-        # Codex review: only an explicit --force may waive the
-        # never-reported-check guard -- a plain "yes" to the general
-        # combined-plan confirmation must not silently carry that
-        # authority, since the guard exists specifically to stop someone
-        # from requiring a check that will never report and so block
-        # every future merge. The ruleset preview (which decides whether
-        # the guard blocks or merely warns) is gated on args.force, not a
-        # hardcoded True, so this refuses outright -- BEFORE the
-        # interactive confirmation is ever reached, meaning there is
-        # nothing for a "yes" to override in the first place.
-        fake = FakeGh()
-        fake.check_runs = {fake.default_head_sha: []}  # 'lanes' never reported
-        with patch("builtins.input") as mock_input:
-            code, _, err = _run(fake, ["--rule", "lanes", REPO], isatty=True)
-        self.assertEqual(code, 1)
-        self.assertIn("never reported", err)
-        self.assertIn("Pass --force to require it anyway", err)
-        # The names themselves, not a repr of the records they arrive in.
-        self.assertIn("'lanes'", err)
-        self.assertNotIn("None", err)
-        mock_input.assert_not_called()
-        self.assertEqual(fake.posts, [])
 
-    def test_never_reported_check_still_applies_with_explicit_force(self):
-        # The other half of the same guard: an EXPLICIT --force still
-        # overrides it and applies, same as before this fix.
+    def test_a_never_passed_check_is_deferred_inside_the_confirmed_plan(self):
+        # The deferral is part of the plan the person confirms -- the
+        # ruleset they say yes to is the one written, with the check left
+        # out and named -- not a guard a "yes" could waive.
         fake = FakeGh()
-        fake.check_runs = {fake.default_head_sha: []}
-        code, _, err = _run(fake, ["--force", "--rule", "never-reported", REPO])
+        fake.check_runs = {fake.default_head_sha: []}  # 'lanes' has never run
+        with patch("builtins.input", return_value="y") as mock_input:
+            code, out, err = _run(fake, ["--rule", "lanes", REPO], isatty=True)
         self.assertEqual(code, 0, err)
-        self.assertIn("never reported", err)
-        self.assertIn("--force given", err)
-        self.assertEqual(len(fake.posts), 1)
+        mock_input.assert_called_once()
+        self.assertIn("deferred, not required yet: 'lanes' has never run here", err)  # the plan
+        # The names themselves, not a repr of the records they arrive in.
+        self.assertNotIn("None", err)
+        ruleset_posts = [b for a, b in fake.posts if a[3] == f"repos/{REPO}/rulesets"]
+        self.assertEqual(ruleset_posts[0]["rules"][0]["parameters"]["required_status_checks"], [])
 
-    def test_check_going_missing_between_preview_and_real_apply_is_refused_without_force(self):
-        # Codex review: round 1 fixed the never-reported-check guard at the
-        # PREVIEW call (dry_run=True, force=args.force), so a plain "yes"
-        # can't silently waive it. But the REAL apply call (dry_run=False)
-        # used to pass a hardcoded force=True -- needed so it never tries
-        # to re-read a confirmation from stdin the caller's own prompt
-        # already consumed -- and that hardcoded True was ALSO read by the
-        # guard as "the user authorized overriding this". So a check that
-        # WAS reporting when the preview ran, but had fallen out of the
-        # reported set by the time the real apply's own fresh scan ran
-        # (the default branch advancing to a not-yet-reported commit in
-        # that window, say), got silently downgraded from "block" to "warn
-        # and proceed" even though the user never passed --force and the
-        # confirmed plan never showed it as missing. This simulates that
-        # exact timing: _collect_reported returns the real (fully-
-        # reporting) result on its first call (the preview) and an empty
-        # result on its second (the real apply's own scan) -- distinct from
-        # the existing tests above, which are missing from the START.
+
+
+
+    def test_a_check_falling_out_of_the_passed_set_before_the_real_apply_is_refused(self):
+        # The preview saw `lanes` passed and planned to require it; by the
+        # real apply's own fresh scan nothing has (the default branch
+        # advancing to a commit nothing has reported on yet, say). The
+        # fresh plan defers `lanes`, so its body differs from the one
+        # confirmed, and the fingerprint refuses rather than writing
+        # either body unconfirmed.
         fake = FakeGh()
         fake.check_runs = {fake.default_head_sha: ["lanes"]}
 
         real_collect_reported = rules._collect_reported
         calls = []
 
-        def flaky_collect_reported(repo, wanted, ref=None):
+        def flaky_collect_reported(repo, wanted, **kwargs):
             calls.append(1)
             if len(calls) >= 2:
-                return set(), set()  # (names, app_pairs): nothing reported
-            return real_collect_reported(repo, wanted, ref=ref)
+                return rules._Reported()  # nothing reported
+            return real_collect_reported(repo, wanted, **kwargs)
 
         with patch("repo_lib.rules._collect_reported", side_effect=flaky_collect_reported):
             with patch("builtins.input", return_value="y"):
@@ -2641,7 +3124,7 @@ class SetupCmdTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("failed on:", err)
         self.assertIn("ruleset", err)
-        self.assertIn("never reported", err)
+        self.assertIn("no longer matches what was previewed", err)
         self.assertEqual(fake.posts, [])
         self.assertEqual(fake.puts, [])
 
@@ -2800,11 +3283,11 @@ class SetupCmdTest(unittest.TestCase):
         real_build_update_body = rules._build_update_body
         calls = []
 
-        def flaky_build_update_body(repo, existing_id, checks, ruleset_name):
+        def flaky_build_update_body(repo, existing_id, checks, ruleset_name, **kwargs):
             calls.append(1)
             if len(calls) == 2:
                 fake.ruleset_objects["7"]["rules"][0]["parameters"]["required_status_checks"] = []
-            return real_build_update_body(repo, existing_id, checks, ruleset_name)
+            return real_build_update_body(repo, existing_id, checks, ruleset_name, **kwargs)
 
         with patch("repo_lib.rules._build_update_body", side_effect=flaky_build_update_body):
             code, _, err = _run(fake, ["--force", "--rule", "lanes", REPO])
@@ -3429,16 +3912,17 @@ class CombinedPlanTest(unittest.TestCase):
         self.assertEqual(len(fake.posts), 1)
         self.assertEqual(fake.written_secrets, [("TOKEN", REPO, None, b"sekrit")])
 
-    def test_master_branch_check_runs_alongside_secret_and_app_steps(self):
+    def test_sibling_branch_check_runs_alongside_secret_and_app_steps(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = _secret_file(tmp, "value.txt")
             fake = FakeGh()
             fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
             fake.installations = [("codex", "111", "selected", "owner")]
-            fake.master_exists = True
+            fake.sibling_exists = True
             code, _, err = _run(fake, ["--force", "--secret", f"TOKEN={path}", "--app", "codex", REPO])
-        self.assertEqual(code, 0, err)
-        self.assertIn("branch literally named 'master'", err)
+        self.assertEqual(code, 1, err)
+        self.assertIn("has a branch named 'master' beside its default branch 'main'", err)
+        self.assertIn("skipping the ruleset step -- held for a person", err)
 
 
 def _rules_with(contexts):
@@ -3523,15 +4007,128 @@ class UpdatePlanTest(unittest.TestCase):
         self.assertNotIn("force pushes are blocked", plan)
         self.assertNotIn("would newly require", plan)
 
-    def test_an_update_names_a_check_it_stops_requiring(self):
-        # Everything else in this plan tightens the gate; dropping a
-        # required check is the one line that loosens it, so it is the one
-        # an operator most needs before saying yes (Codex review,
-        # mikelward/repo#45).
+    def test_an_update_keeps_both_bindings_of_a_check_required_from_two_apps(self):
+        # GitHub lets one name be required from two Apps as two entries.
+        # Collapsing them by name dropped one on every update -- the one
+        # thing the floor promises never happens (Codex review,
+        # mikelward/repo#56). Kept by (context, App), whether the name is
+        # beyond the standard or asked for unbound.
+        fake = self._existing(("lanes", "zizmor"))
+        rules_ = fake.ruleset_objects["1"]["rules"]
+        rules_[0]["parameters"]["required_status_checks"] = [
+            {"context": "lanes", "integration_id": 111},
+            {"context": "lanes", "integration_id": 222},
+            {"context": "zizmor"},
+        ]
+        fake.ruleset_objects["1"]["rules"] = [
+            r for r in rules_ if r["type"] != "required_linear_history"
+        ]  # something else to write, so a write happens at all
+        fake.check_runs = {fake.default_head_sha: [("lanes", 111), ("lanes", 222), "zizmor"]}
+        code, out, err = _run(fake, ["--force", "--rule", "zizmor", REPO])
+        self.assertEqual(code, 0, err)
+        checks_rule = next(r for r in fake.puts[-1][1]["rules"] if r["type"] == "required_status_checks")
+        self.assertEqual(
+            checks_rule["parameters"]["required_status_checks"],
+            [
+                {"context": "zizmor"},
+                {"context": "lanes", "integration_id": 111},
+                {"context": "lanes", "integration_id": 222},
+            ],
+        )
+
+        fake = self._existing(("lanes", "zizmor"))
+        rules_ = fake.ruleset_objects["1"]["rules"]
+        rules_[0]["parameters"]["required_status_checks"] = [
+            {"context": "lanes", "integration_id": 111},
+            {"context": "lanes", "integration_id": 222},
+            {"context": "zizmor"},
+        ]
+        fake.ruleset_objects["1"]["rules"] = [
+            r for r in rules_ if r["type"] != "required_linear_history"
+        ]
+        fake.check_runs = {fake.default_head_sha: [("lanes", 111), ("lanes", 222), "zizmor"]}
+        code, out, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        checks_rule = next(r for r in fake.puts[-1][1]["rules"] if r["type"] == "required_status_checks")
+        self.assertEqual(
+            checks_rule["parameters"]["required_status_checks"],
+            [
+                {"context": "lanes", "integration_id": 111},
+                {"context": "lanes", "integration_id": 222},
+                {"context": "zizmor"},
+            ],
+        )
+
+    def test_an_update_keeps_a_check_beyond_the_standard_and_says_so(self):
+        # The standard is a floor: a check the ruleset requires that this
+        # run does not name stays required, exactly as it was. Dropping it
+        # used to be the one plan line that loosened the gate, and with
+        # deferral it could have dropped a working gate while every
+        # replacement was still waiting (Codex security review,
+        # mikelward/repo#56). Named, so the plan still says what the
+        # ruleset requires beyond the standard.
         fake = self._existing(("lanes", "old-check"))
+        fake.ruleset_objects["1"]["rules"] = [
+            r for r in fake.ruleset_objects["1"]["rules"]
+            if r["type"] != "required_linear_history"
+        ]  # something else to write, so a plan is shown at all
         code, out, err = _run(fake, ["--dry-run", "--rule", "lanes", REPO])
         plan = out + err
-        self.assertIn("would NO LONGER require: old-check", plan)
+        self.assertIn("keeps requiring, beyond the standard: old-check", plan)
+        self.assertNotIn("NO LONGER", plan)
+
+        code, out, err = _run(fake, ["--force", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(
+            [e["context"] for e in fake.puts[0][1]["rules"][0]["parameters"]["required_status_checks"]],
+            ["lanes", "old-check"],
+        )
+
+    def test_a_deferred_replacement_never_drops_a_working_gate(self):
+        # The security finding itself: every standard check is deferred
+        # (their workflows are in the scaffold pull request), and the
+        # ruleset requires an App-bound gate of its own. That gate stays,
+        # bound as it was, rather than the write leaving the branch with
+        # no required check at all.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.check_runs = {fake.default_head_sha: []}
+        fake.existing_ruleset_id = "7"
+        fake.all_ruleset_ids = ["7"]
+        fake.ruleset_objects["7"] = {
+            "id": 7,
+            "name": "main",
+            "enforcement": "active",
+            "conditions": {"ref_name": {"include": list(_HARDENED_SCOPE), "exclude": []}},
+            "rules": [
+                {
+                    "type": "required_status_checks",
+                    "parameters": {
+                        "strict_required_status_checks_policy": True,
+                        "required_status_checks": [{"context": "security-scan", "integration_id": 99}],
+                    },
+                },
+                {
+                    "type": "pull_request",
+                    "parameters": {
+                        "required_review_thread_resolution": True,
+                        "allowed_merge_methods": ["rebase"],
+                        "required_approving_review_count": 0,
+                        "dismiss_stale_reviews_on_push": False,
+                        "require_code_owner_review": False,
+                        "require_last_push_approval": False,
+                    },
+                },
+            ],
+        }
+        code, out, err = _run(fake, ["--force", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(fake.puts), 1)
+        self.assertEqual(
+            fake.puts[0][1]["rules"][0]["parameters"]["required_status_checks"],
+            [{"context": "security-scan", "integration_id": 99}],
+        )
+        self.assertIn("'lanes' waits for .github/workflows/ci.yml", out)
 
     def test_verbose_expands_an_update_to_every_rule(self):
         # The terminal gets the delta; --verbose and the log are supposed
@@ -3566,20 +4163,23 @@ class UpdatePlanTest(unittest.TestCase):
         # Still an update, and still no delta to report about the rules.
         self.assertNotIn("would newly require", plan)
 
-    def test_the_full_plan_still_names_a_check_it_stops_requiring(self):
+    def test_the_full_plan_still_names_a_check_kept_beyond_the_standard(self):
         # The full rendering is the short plan PLUS the resulting state,
         # not the state instead of it -- swapping one for the other
-        # dropped the one line that reports protection being weakened
-        # from --verbose and from the log (Codex review,
-        # mikelward/repo#45).
+        # dropped the short plan's own lines from --verbose and from the
+        # log (Codex review, mikelward/repo#45).
         fake = self._existing(("lanes", "old-check"))
+        fake.ruleset_objects["1"]["rules"] = [
+            r for r in fake.ruleset_objects["1"]["rules"]
+            if r["type"] != "required_linear_history"
+        ]  # something to write, so there is a plan to render at all
         code, out, err = _run(fake, ["--dry-run", "-v", "--rule", "lanes", REPO])
         plan = out + err
-        self.assertIn("would NO LONGER require: old-check", plan)
-        # ...and the resulting state is there too, under its own heading.
+        self.assertIn("keeps requiring, beyond the standard: old-check", plan)
+        # ...and the resulting state is there too, under its own heading,
+        # with the kept check in it.
         self.assertIn("after this write the ruleset holds:", plan)
-        self.assertIn("required checks: lanes", plan)
-        self.assertNotIn("required checks: lanes, old-check", plan)
+        self.assertIn("required checks: lanes, old-check", plan)
 
     def test_a_preserved_unmanaged_rule_is_named_in_the_scope_block(self):
         # An update keeps a rule type this module never writes, and a
@@ -5445,6 +6045,39 @@ class LanesCredentialStepTest(unittest.TestCase):
             ],
         )
 
+    def test_a_binding_held_by_a_sibling_branch_holds_the_ruleset_step(self):
+        # The main preview finds the ruleset compliant (nothing to write);
+        # the binding preview would write, and meets a real master beside
+        # main. That hold is the ruleset step's, not something to skip
+        # silently with exit 0 forever (Codex review, mikelward/repo#56).
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = self._publisher()
+            fake.env_secret_names = {"lanes": set(self.PAIR)}
+            fake.env_policies = {"lanes": ["main"]}
+            self._ruleset_requiring(
+                fake,
+                [{"context": "lanes"}, {"context": "codex"}, {"context": "zizmor"}],
+            )
+            fake.check_runs = {fake.default_head_sha: [("lanes", 12345), "codex", "zizmor"]}
+            fake.app_coverage = {12345: ("lanes-app", "all")}
+            fake.sibling_exists = True
+            code, out, err = _run(
+                fake,
+                [
+                    "--force",
+                    "--credential", f"LANES_APP_ID={app_id}",
+                    "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                    REPO,
+                ],
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("has a branch named 'master' beside its default branch 'main'", err)
+        self.assertIn("skipping the ruleset step -- held for a person", err)
+        self.assertIn("failed on: ruleset", err)
+        self.assertEqual(fake.puts, [])
+
     def test_force_does_not_bind_to_an_app_that_does_not_cover_the_repo(self):
         # The coverage precondition is NOT --force-overridable: binding `lanes`
         # to an App that is not installed on / does not cover this repo would
@@ -5751,8 +6384,6 @@ class LanesCredentialStepTest(unittest.TestCase):
             # coverage failure) -- it just has not posted a `lanes` status yet.
             fake.check_runs = {fake.default_head_sha: [("lanes", 7), "codex", "zizmor"]}
             fake.app_coverage = {12345: ("lanes-app", "all")}
-            # --dry-run so the deferral shows without --force (which would
-            # waive the never-reported guard and force the binding through).
             code, out, err = _run(
                 fake,
                 [
@@ -7134,12 +7765,12 @@ class BootstrapStepTest(unittest.TestCase):
         self.assertIn("add .github/workflows/ci.yml", out)
         self.assertNotIn("add .github/workflows/codex-review-listener.yml", out)
         self.assertNotIn("add .github/lanes.conf", out)
-        self.assertIn("open a pull request adding 7 file(s):", out)
+        self.assertIn("open a pull request writing 7 file(s) (add missing fleet ci scaffold files):", out)
         self.assertIn("already present, untouched: 2 file(s)", out)
 
         code, out, err = _run(fake, ["--force", "--no-rules", REPO])
         self.assertEqual(code, 0, err)
-        self.assertIn(f"{REPO}: opened pull request #42 adding 7 fleet CI scaffold file(s)", out)
+        self.assertIn(f"{REPO}: opened pull request #42 writing 7 fleet CI scaffold file(s)", out)
         self.assertIn("https://github.com/owner/repo/pull/42", out)
         blob_paths = {body["encoding"] for _args, body in fake.posts if "encoding" in body}
         self.assertEqual(blob_paths, {"utf-8"})
@@ -7260,25 +7891,59 @@ class BootstrapStepTest(unittest.TestCase):
         )
         self.assertLess(bootstrap_call, ruleset_call)
 
-    def test_a_scaffold_still_in_a_pull_request_holds_back_new_pr_protection(self):
-        # The gap-fill's own ordering answer, now that it goes in as a
-        # pull request: the files are NOT on the branch when the ruleset
-        # step runs, so a ruleset that would first require pull requests
-        # -- and with them `lanes`, `codex` and `zizmor` -- would block
-        # the very pull request installing those checks. It waits for the
-        # merge instead.
+
+    def test_a_scaffold_still_in_a_pull_request_defers_only_the_checks_it_publishes(self):
+        # The gap-fill goes in as a pull request, so its files are NOT on
+        # the branch when the ruleset step runs. The ruleset is written
+        # anyway -- pull-request protection, linear history, force-push
+        # protection -- with the checks the missing files publish deferred
+        # by name, since requiring them would block the very pull request
+        # installing them (SPEC.md, *The ladder*, rung 1).
         fake = FakeGh()
         fake.bootstrap_existing_paths = set()
         fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
         code, out, err = _run(fake, ["--force", REPO])
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 0, err)
         self.assertIn(f"{REPO}: opened pull request #42", out)
-        self.assertIn("skipping the ruleset step", err)
-        self.assertIn("still only in pull request #42", err)
-        self.assertIn("Merge it, then rerun.", err)
-        self.assertIn("failed on: ruleset", err)
-        self.assertFalse(
-            any(len(c) > 3 and c[2] == "POST" and c[3] == f"repos/{REPO}/rulesets" for c in fake.calls)
+        self.assertNotIn("skipping the ruleset step", err)
+        ruleset_posts = [b for a, b in fake.posts if a[3] == f"repos/{REPO}/rulesets"]
+        self.assertEqual(len(ruleset_posts), 1)
+        self.assertEqual(ruleset_posts[0]["rules"][0]["parameters"]["required_status_checks"], [])
+        self.assertEqual({r["type"] for r in ruleset_posts[0]["rules"]}, {
+            "required_status_checks", "pull_request", "required_linear_history", "non_fast_forward",
+        })
+        self.assertIn(
+            "deferred, not required yet: 'lanes' waits for .github/workflows/ci.yml to be on "
+            "'main' -- the pull request this run opens is adding it",
+            out,
+        )
+        self.assertIn("'codex' waits for .github/workflows/codex-review-check.yml", out)
+        self.assertIn("'zizmor' waits for .github/workflows/zizmor.yml", out)
+
+    def test_an_outdated_publisher_being_replaced_defers_its_check_too(self):
+        # Every scaffold file is present, but the pinned copy that
+        # publishes `codex` differs from the template, so the pull request
+        # replaces it. A copy this tool is replacing is not one it vouches
+        # for: `codex` waits for the replacement to land, however the old
+        # copy reported, while `lanes` and `zizmor`, whose publishers are
+        # current, are required now (Codex review, mikelward/repo#56).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set(_SCAFFOLD_PATHS)
+        fake.bootstrap_outdated_paths = {".github/workflows/codex-review-check.yml"}
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+        code, out, err = _run(fake, ["--force", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"{REPO}: opened pull request #42", out)
+        ruleset_posts = [b for a, b in fake.posts if a[3] == f"repos/{REPO}/rulesets"]
+        self.assertEqual(len(ruleset_posts), 1)
+        self.assertEqual(
+            [e["context"] for e in ruleset_posts[0]["rules"][0]["parameters"]["required_status_checks"]],
+            ["lanes", "zizmor"],
+        )
+        self.assertIn(
+            "'codex' waits for .github/workflows/codex-review-check.yml to be on 'main' -- "
+            "the pull request this run opens is replacing it",
+            out,
         )
 
     def test_a_scaffold_pull_request_does_not_hold_back_an_already_protecting_ruleset(self):
@@ -7367,20 +8032,25 @@ class BootstrapStepTest(unittest.TestCase):
         ruleset_posts = [(a, b) for a, b in fake.posts if a[3] == f"repos/{REPO}/rulesets"]
         self.assertEqual(len(ruleset_posts), 1)
 
-    def test_a_failed_gap_that_would_leave_a_check_unpublished_still_holds_back(self):
-        # The other side: no pull request was opened, so a HEAD-published
-        # check is as unreachable as a base-published one -- `lanes` has
-        # nowhere to run from if ci.yml never landed.
+
+    def test_a_failed_gap_that_would_leave_a_check_unpublished_still_defers_it(self):
+        # No pull request was opened, so `lanes` has nowhere to run from
+        # until ci.yml lands: deferred, while `codex` and `zizmor` -- whose
+        # workflows are on the branch -- are required now.
         fake = FakeGh()
         fake.bootstrap_existing_paths = set(_SCAFFOLD_PATHS) - {".github/workflows/ci.yml"}
         fake.bootstrap_pull_create_fails = True
         fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
         code, out, err = _run(fake, ["--force", REPO])
-        self.assertEqual(code, 1)
-        self.assertIn("skipping the ruleset step", err)
+        self.assertEqual(code, 1)  # the bootstrap step did fail
+        self.assertIn("failed on: bootstrap", err)
+        self.assertNotIn("skipping the ruleset step", err)
+        ruleset_posts = [b for a, b in fake.posts if a[3] == f"repos/{REPO}/rulesets"]
         self.assertEqual(
-            [(a, b) for a, b in fake.posts if a[3] == f"repos/{REPO}/rulesets"], []
+            ruleset_posts[0]["rules"][0]["parameters"]["required_status_checks"],
+            [{"context": "codex"}, {"context": "zizmor"}],
         )
+        self.assertIn("'lanes' waits for .github/workflows/ci.yml", out)
 
     def test_a_push_after_a_nonblocking_scaffold_pull_request_blocks_the_ruleset(self):
         # A docs-only gap lets the ruleset through, which means the run
@@ -7405,21 +8075,25 @@ class BootstrapStepTest(unittest.TestCase):
             [(a, b) for a, b in fake.posts if a[3] == f"repos/{REPO}/rulesets"], []
         )
 
-    def test_a_missing_codex_workflow_still_holds_back_the_ruleset(self):
-        # The other side of the same cut: `codex`'s publisher is among
-        # the missing files, and GitHub reads it from the base branch, so
-        # no pull request -- this one included -- can make it report.
+
+    def test_a_missing_codex_workflow_defers_only_codex(self):
+        # `codex`'s publisher is among the missing files, and GitHub reads
+        # it from the base branch, so no pull request -- this one included
+        # -- can make it report: deferred until the scaffold merges. The
+        # other two are required now.
         fake = FakeGh()
         fake.bootstrap_existing_paths = set(_SCAFFOLD_PATHS) - {
             ".github/workflows/codex-review-check.yml"
         }
         fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
         code, out, err = _run(fake, ["--force", REPO])
-        self.assertEqual(code, 1)
-        self.assertIn("skipping the ruleset step", err)
+        self.assertEqual(code, 0, err)
+        ruleset_posts = [b for a, b in fake.posts if a[3] == f"repos/{REPO}/rulesets"]
         self.assertEqual(
-            [(a, b) for a, b in fake.posts if a[3] == f"repos/{REPO}/rulesets"], []
+            ruleset_posts[0]["rules"][0]["parameters"]["required_status_checks"],
+            [{"context": "lanes"}, {"context": "zizmor"}],
         )
+        self.assertIn("'codex' waits for .github/workflows/codex-review-check.yml", out)
 
     def test_a_check_already_required_that_this_pull_request_cannot_report_is_flagged(self):
         # The repository is already wedged -- its ruleset requires `codex`
@@ -7568,8 +8242,11 @@ class BootstrapStepTest(unittest.TestCase):
                 "parameters": {"required_status_checks": [{"context": "codex"}]},
             }
         ]
+        fake.pulls = {11: {"mergeable_state": "blocked"}}  # as GitHub reports a required check unmet
         code, out, err = _run(fake, ["--force", "--no-rules", REPO])
-        self.assertIn("pull request #11 is adding the fleet CI scaffold", out)
+        # Nothing runs `codex` on this head and nothing is pending: held.
+        self.assertIn("needs a person", err)
+        self.assertNotIn("pull request #11 waits", err)
         self.assertIn("this branch already requires 'codex'", err)
         # The wedge is real either way, and stated about the branch.
         self.assertIn("missing from 'main'", err)
@@ -7702,12 +8379,15 @@ class BootstrapStepTest(unittest.TestCase):
         self.assertIn(f"{REPO}: opened pull request #42", out)
         self.assertIn("could not check which checks", err)
 
+
     def test_no_run_reads_what_an_open_scaffold_pull_request_contains(self):
         # The point of the redesign, asserted rather than left implicit:
         # ten review findings came from deriving an answer out of a pull
         # request anyone can change at any moment, and the fix was to stop
-        # deriving one (Codex review, mikelward/repo#42). The fixture has
-        # no route for a pull request's file list, so a call would raise --
+        # deriving one (Codex review, mikelward/repo#42). What IS read is
+        # the pull request's head, mergeability and checks -- to decide
+        # whether to merge it, never what the branch holds -- and the
+        # fixture has no route for its file list, so a call would raise;
         # this checks the calls themselves too, so the guarantee survives
         # a fixture that grows one back.
         fake = FakeGh()
@@ -7717,18 +8397,19 @@ class BootstrapStepTest(unittest.TestCase):
         ]
         code, out, err = _run(fake, ["--force", "--no-rules", REPO])
         self.assertEqual(code, 0, err)
-        self.assertIn("pull request #27 is adding the fleet CI scaffold", out)
+        self.assertIn("pull request #27 waits", err)
         self.assertFalse(
-            [c for c in fake.calls if any("/pulls/" in str(a) for a in c)],
+            [c for c in fake.calls if any("/pulls/27/files" in str(a) for a in c)],
             "the step read an open pull request's contents",
         )
 
-    def test_a_gap_containing_a_publisher_holds_back_even_with_a_pull_request_open(self):
+
+    def test_a_gap_containing_a_publisher_defers_the_check_even_with_a_pull_request_open(self):
         # The gap contains `ci.yml`, so the BRANCH has no way to report
         # `lanes` -- and whether the open pull request would supply it is
         # exactly the question this step stopped asking, because no answer
         # read out of a pull request stays true (Codex review,
-        # mikelward/repo#42).
+        # mikelward/repo#42). `lanes` waits for the merge; the rest lands.
         fake = FakeGh()
         fake.bootstrap_existing_paths = set(_SCAFFOLD_PATHS) - {".github/workflows/ci.yml"}
         fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
@@ -7736,10 +8417,16 @@ class BootstrapStepTest(unittest.TestCase):
             (20, "repo-setup/fleet-ci-scaffold-abc1234", True, "https://github.com/owner/repo/pull/20")
         ]
         code, out, err = _run(fake, ["--force", REPO])
-        self.assertEqual(code, 1)
-        self.assertIn("skipping the ruleset step", err)
+        self.assertEqual(code, 0, err)
+        ruleset_posts = [b for a, b in fake.posts if a[3] == f"repos/{REPO}/rulesets"]
         self.assertEqual(
-            [(a, b) for a, b in fake.posts if a[3] == f"repos/{REPO}/rulesets"], []
+            ruleset_posts[0]["rules"][0]["parameters"]["required_status_checks"],
+            [{"context": "codex"}, {"context": "zizmor"}],
+        )
+        self.assertIn(
+            "'lanes' waits for .github/workflows/ci.yml to be on 'main' -- pull request #20 is "
+            "adding it",
+            out,
         )
 
     def test_a_ruleset_widened_onto_this_branch_is_held_back_too(self):
@@ -7786,17 +8473,100 @@ class BootstrapStepTest(unittest.TestCase):
                 },
             ],
         }
+        # The one shape deferral cannot express: the checks are already in
+        # the ruleset, so leaving them alone keeps them, and the widening
+        # makes them required on a branch that cannot publish them.
+        # Dropping them would loosen `release`. Refused.
         code, out, err = _run(fake, ["--dry-run", REPO])
         self.assertEqual(code, 1)
-        self.assertIn("SKIPPED: the fleet CI scaffold will not be on the branch", out)
+        self.assertIn("widening it onto 'main' would enforce there what nothing here can tell 'main' can satisfy: it requires 'codex', 'lanes', 'zizmor'", err)
 
         code, out, err = _run(fake, ["--force", REPO])
         self.assertEqual(code, 1)
-        self.assertIn("newly target", err)
-        self.assertIn("skipping the ruleset step", err)
+        self.assertIn("widening it onto 'main'", err)
+        self.assertIn("Widen the ruleset by hand", err)
+        self.assertIn("skipping the ruleset step -- held for a person", err)
+        self.assertIn("failed on: ruleset", err)
+        self.assertEqual(fake.puts, [])
+        # Held for a person, and only that step: the scaffold pull request
+        # still opens, and the settings still land (Codex review,
+        # mikelward/repo#56).
+        self.assertIn(f"{REPO}: opened pull request #42", out)
+        self.assertEqual(len(fake.created_pulls), 1)
+
+        # A glob in the include list is not evaluated, so it does not count
+        # as covering the branch: `refs/heads/release/*` misses `main`, and
+        # reading any glob as coverage would have let this widening wedge
+        # every merge (Codex review, mikelward/repo#56).
+        fake.ruleset_objects["7"]["conditions"]["ref_name"]["include"] = ["refs/heads/release/*"]
+        code, out, err = _run(fake, ["--force", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("widening it onto 'main'", err)
         self.assertEqual(fake.puts, [])
 
-    def test_a_scaffold_pull_request_holds_back_a_ruleset_that_adds_a_check(self):
+        # And evidence does not lift it: every check has passed on this
+        # repository, but a check's history here is not a history on THIS
+        # branch (a success on a release pull request says nothing about
+        # main), and three review rounds each found the previous reading
+        # one case short -- so a ruleset that carries any check at all is
+        # never widened onto the branch by this tool (Codex review,
+        # mikelward/repo#56).
+        fake.bootstrap_existing_paths = None  # scaffold complete: nothing deferred
+        fake.ruleset_objects["7"]["rules"][0]["parameters"]["required_status_checks"] = [
+            {"context": "lanes"}, {"context": "codex"}, {"context": "zizmor"}, {"context": "release-only"},
+        ]
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor", "release-only"]}
+        code, out, err = _run(fake, ["--force", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("it requires 'codex', 'lanes', 'release-only', 'zizmor'", err)
+        self.assertIn("Widen the ruleset by hand", err)
+        self.assertEqual(fake.puts, [])
+
+        # Nor is a check the only thing that can block the tool's own pull
+        # requests on the branch: an approval requirement, or a rule type
+        # this tool does not write, refuses the widening the same way.
+        fake.ruleset_objects["7"]["rules"][0]["parameters"]["required_status_checks"] = []
+        fake.check_runs = {fake.default_head_sha: []}
+        fake.ruleset_objects["7"]["rules"][1]["parameters"]["required_approving_review_count"] = 1
+        code, out, err = _run(fake, ["--force", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("it requires 1 approving review(s)", err)
+        self.assertEqual(fake.puts, [])
+        fake.ruleset_objects["7"]["rules"][1]["parameters"]["required_approving_review_count"] = 0
+        fake.ruleset_objects["7"]["rules"].append({"type": "required_signatures"})
+        code, out, err = _run(fake, ["--force", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("it carries a 'required_signatures' rule this tool does not manage", err)
+        self.assertEqual(fake.puts, [])
+
+        # A ruleset carrying nothing of the kind is widened: nothing on it
+        # can wedge.
+        fake.ruleset_objects["7"]["rules"].pop()
+        code, out, err = _run(fake, ["--force", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(fake.puts), 1)
+        self.assertEqual(fake.puts[0][1]["rules"][0]["parameters"]["required_status_checks"], [])
+
+        # And the widening write adds no check of its own either, whatever
+        # has passed on the repository: a success on a release pull request
+        # is not a history on main, so the checks this write would newly
+        # require wait for the run after, once the ruleset covers the
+        # branch (Codex review, mikelward/repo#56).
+        fake.puts.clear()
+        fake.ruleset_objects["7"]["conditions"]["ref_name"]["include"] = ["refs/heads/release"]
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor", "release-scan"]}
+        code, out, err = _run(fake, ["--force", "--rule", "release-scan", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(fake.puts), 1)
+        self.assertEqual(fake.puts[0][1]["rules"][0]["parameters"]["required_status_checks"], [])
+        self.assertIn(
+            "'release-scan' waits until ruleset 'main' covers 'main' -- this run widens it onto "
+            "the branch",
+            out,
+        )
+        self.assertIn("required checks: none yet", out)
+
+    def test_a_scaffold_pull_request_defers_the_checks_a_ruleset_would_add(self):
         # The other half of the same hazard, and the one a first-time-
         # pull-request-protection test cannot reach: the branch ALREADY
         # requires pull requests, so introduces_pr_protection is False,
@@ -7838,48 +8608,49 @@ class BootstrapStepTest(unittest.TestCase):
                 },
             ],
         }
-        # The dry run previews the same skip and the same exit status.
+        # The dry run previews the same deferral and the same exit status.
         code, out, err = _run(fake, ["--dry-run", REPO])
-        self.assertEqual(code, 1)
-        self.assertIn("SKIPPED: the fleet CI scaffold will not be on the branch", out)
-        self.assertIn("would newly require 'codex', 'zizmor'", out)
+        self.assertEqual(code, 0, err)
+        self.assertIn("'codex' waits for .github/workflows/codex-review-check.yml", out)
+        self.assertIn("'zizmor' waits for .github/workflows/zizmor.yml", out)
+        self.assertNotIn("would newly require", out)
 
         code, out, err = _run(fake, ["--force", REPO])
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 0, err)
         self.assertIn(f"{REPO}: opened pull request #42", out)
-        self.assertIn("skipping the ruleset step", err)
-        self.assertIn("newly require 'codex', 'zizmor'", err)
-        self.assertIn("failed on: ruleset", err)
-        self.assertEqual(fake.puts, [])  # the ruleset was never written
+        self.assertNotIn("skipping the ruleset step", err)
+        self.assertEqual(len(fake.puts), 1)  # linear history and force-push protection land now
+        self.assertEqual(
+            fake.puts[0][1]["rules"][0]["parameters"]["required_status_checks"],
+            [{"context": "lanes"}],
+        )
 
-    def test_a_never_reported_repository_still_gets_bootstrapped_and_only_skips_the_ruleset(self):
+
+    def test_a_never_reported_repository_gets_bootstrapped_and_a_ruleset_with_every_check_deferred(self):
         # The exact case this exists for: a fresh (or never-fully-
         # scaffolded) repository, `repo setup OWNER/REPO` with no flags at
-        # all. Its required checks have never reported -- there's been no
-        # CI to report them -- so the ruleset step can't safely proceed.
-        # Before this, that made the WHOLE run refuse to change anything,
-        # bootstrap included, even though bootstrap's own plan was fine on
-        # its own. Now it applies everything it safely can (bootstrap) and
-        # skips only the ruleset step, saying what unblocks it.
+        # all. Its required checks have never run -- there's been no CI to
+        # run them -- so none can be required yet. Everything else lands:
+        # the scaffold pull request, and the ruleset with pull-request
+        # protection and no checks, each deferred one named (SPEC.md,
+        # *The ladder*, rung 1).
         fake = FakeGh()
         fake.bootstrap_existing_paths = {".github/zizmor.yml"}  # real gaps to fill
         # fake.check_runs defaults to {} -- nothing has ever reported.
         with patch("builtins.input", return_value="y"):
             code, out, err = _run(fake, [REPO], isatty=True)
-        self.assertEqual(code, 1)
-        self.assertIn("failed on:", err)
-        self.assertIn("ruleset", err)
-        self.assertIn("skipping the ruleset step", err)
-        self.assertIn("never reported", err)
-        self.assertIn("--force", err)
-        # Bootstrap's writes actually landed...
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("skipping the ruleset step", err)
         self.assertIn(f"{REPO}: opened pull request #42", out)
         blob_posts = [body for _args, body in fake.posts if "encoding" in body]
         self.assertTrue(blob_posts, "no scaffold blobs were written")
         self.assertEqual(len(fake.created_pulls), 1)
-        # ...but no ruleset was ever created.
-        ruleset_posts = [(a, b) for a, b in fake.posts if a[3] == f"repos/{REPO}/rulesets"]
-        self.assertEqual(ruleset_posts, [])
+        ruleset_posts = [b for a, b in fake.posts if a[3] == f"repos/{REPO}/rulesets"]
+        self.assertEqual(len(ruleset_posts), 1)
+        self.assertEqual(ruleset_posts[0]["rules"][0]["parameters"]["required_status_checks"], [])
+        self.assertIn("'lanes' waits for .github/workflows/ci.yml", out)
+        self.assertIn("'codex' waits for .github/workflows/codex-review-check.yml", out)
+        self.assertIn("'zizmor' waits for .github/workflows/zizmor.yml", out)
 
     def test_missing_workflow_scope_skips_the_bootstrap_step_before_any_write(self):
         # Reported directly (mikelward/repo#18): `repo setup OWNER/REPO
@@ -7901,30 +8672,31 @@ class BootstrapStepTest(unittest.TestCase):
         self.assertEqual(fake.posts, [])
         self.assertEqual(fake.patches, [])
 
-    def test_a_scope_blocked_scaffold_previews_the_ruleset_skip_too(self):
+
+    def test_a_scope_blocked_scaffold_previews_the_same_deferrals(self):
         # A missing `workflow` scope leaves the scaffold off the branch
-        # just as surely as a pending pull request does, and the Apply
-        # section skips the ruleset for it -- so the preview has to say so
-        # too, rather than promising a ruleset the real run holds back and
-        # asking to confirm a write that will not happen (Codex review,
-        # mikelward/repo#42).
+        # just as surely as a pending pull request does, so the checks it
+        # would install are deferred with that reason -- in the preview and
+        # in the run alike (Codex review, mikelward/repo#42).
         fake = FakeGh()
         fake.bootstrap_existing_paths = set()
         fake.token_scopes = ("gist", "read:org", "repo")
         fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
         code, out, err = _run(fake, ["--dry-run", REPO])
-        self.assertEqual(code, 1)
-        self.assertIn("SKIPPED: the fleet CI scaffold will not be on the branch", out)
+        self.assertEqual(code, 1)  # the bootstrap step is skipped, and that is a failure
+        self.assertIn(
+            "'lanes' waits for .github/workflows/ci.yml to be on 'main' -- this gh token cannot "
+            "write it",
+            out,
+        )
 
-        # And the real run agrees, without a confirmation: the only
-        # mutation left is one it is about to skip.
-        code, out, err = _run(fake, [REPO])  # no --force, stdin is not a terminal
+        code, out, err = _run(fake, ["--force", REPO])
         self.assertEqual(code, 1)
-        self.assertNotIn("stdin is not a terminal", err)
         self.assertIn("skipping the bootstrap step", err)
-        self.assertIn("skipping the ruleset step", err)
-        self.assertEqual(fake.posts, [])
-        self.assertEqual(fake.puts, [])
+        self.assertNotIn("skipping the ruleset step", err)
+        ruleset_posts = [b for a, b in fake.posts if a[3] == f"repos/{REPO}/rulesets"]
+        self.assertEqual(ruleset_posts[0]["rules"][0]["parameters"]["required_status_checks"], [])
+        self.assertIn("this gh token cannot write it", out)
 
     def test_missing_workflow_scope_message_counts_only_workflow_files(self):
         # Codex review, mikelward/repo#18: the skip message counted
@@ -8032,21 +8804,24 @@ class BootstrapStepTest(unittest.TestCase):
         )
         self.assertEqual(fake.puts, [])
 
-    def test_a_bootstrap_failure_blocks_creating_a_new_ruleset(self):
-        # Activating pull-request protection while the scaffold failed
-        # would leave the repository permanently stuck the way TODO.md
-        # describes -- apply_gaps has no path past that protection once
-        # it exists (Codex review, mikelward/repo#14).
+
+    def test_a_bootstrap_failure_defers_every_check_but_still_creates_the_ruleset(self):
+        # A plan that failed cannot say what is missing, so no check may be
+        # newly required on its account -- but pull-request protection,
+        # linear history and force-push protection block nothing a later
+        # run cannot fix, and they land now (SPEC.md, invariant 1).
         fake = FakeGh()
         fake.template_fetch_fails = {"codex-review.yml"}  # a plan-time bootstrap failure
         fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
         code, out, err = _run(fake, ["--force", REPO])
         self.assertEqual(code, 1)
-        self.assertIn("failed on:", err)
-        self.assertIn("bootstrap", err)
-        self.assertIn("ruleset", err)
-        self.assertIn("skipping the ruleset step", err)
-        self.assertEqual(fake.posts, [])  # no rulesets POST, no scaffold blobs either
+        self.assertIn("failed on: bootstrap", err)
+        self.assertNotIn("skipping the ruleset step", err)
+        ruleset_posts = [b for a, b in fake.posts if a[3] == f"repos/{REPO}/rulesets"]
+        self.assertEqual(len(ruleset_posts), 1)
+        self.assertEqual(ruleset_posts[0]["rules"][0]["parameters"]["required_status_checks"], [])
+        self.assertIn("'lanes' waits until the fleet CI scaffold can be planned", out)
+        self.assertEqual([b for a, b in fake.posts if "encoding" in b], [])  # no scaffold blobs
 
     def test_a_bootstrap_failure_does_not_block_updating_an_existing_ruleset(self):
         # The branch is already protected either way here -- from a run
@@ -8096,14 +8871,13 @@ class BootstrapStepTest(unittest.TestCase):
         failed_line = next(line for line in err.splitlines() if line.startswith("error: failed on:"))
         self.assertNotIn("ruleset", failed_line)
 
-    def test_a_bootstrap_failure_blocks_an_update_that_newly_adds_pull_request_protection(self):
-        # An existing_id-only check misses this: the ruleset already
-        # exists, but only carries required_linear_history/
-        # non_fast_forward -- no pull_request rule yet. This update would
-        # still be the one that first makes the branch require a pull
-        # request, so it's exactly as dangerous, paired with a failed
-        # bootstrap, as creating a fresh ruleset would be (Codex review,
-        # mikelward/repo#14).
+
+    def test_a_bootstrap_failure_does_not_block_an_update_that_newly_adds_pull_request_protection(self):
+        # The ruleset only carries required_linear_history/non_fast_forward
+        # -- no pull_request rule yet. Pull-request protection does not
+        # block the scaffold's own pull request (a pull request is what it
+        # is), so the update lands; `lanes`, which the plan failure leaves
+        # unaccounted for, is deferred rather than newly required.
         fake = FakeGh()
         fake.template_fetch_fails = {"codex-review.yml"}
         fake.check_runs = {fake.default_head_sha: ["lanes"]}
@@ -8118,13 +8892,14 @@ class BootstrapStepTest(unittest.TestCase):
         }
         code, out, err = _run(fake, ["--force", "--rule", "lanes", REPO])
         self.assertEqual(code, 1)
-        self.assertIn("skipping the ruleset step", err)
-        self.assertIn("require a pull request for the first time", err)
+        self.assertNotIn("skipping the ruleset step", err)
         failed_line = next(line for line in err.splitlines() if line.startswith("error: failed on:"))
-        self.assertIn("ruleset", failed_line)
-        self.assertEqual(fake.puts, [])  # no PUT to the ruleset either
+        self.assertNotIn("ruleset", failed_line)
+        self.assertEqual(len(fake.puts), 1)
+        self.assertEqual(fake.puts[0][1]["rules"][-2]["parameters"]["required_status_checks"], [])
+        self.assertIn("'lanes' waits until the fleet CI scaffold can be planned", out)
 
-    def test_pull_request_protection_added_during_the_wait_is_refused_even_though_the_preview_missed_it(self):
+    def test_pull_request_protection_re_added_during_the_wait_is_written_when_it_strands_nothing(self):
         # The preview's own introduces_pr_protection reflects a SNAPSHOT:
         # here the existing ruleset already has pull_request when
         # setup_cmd's own preview reads it, so the early external gate
@@ -8179,11 +8954,15 @@ class BootstrapStepTest(unittest.TestCase):
         changed_object["rules"] = [changed_object["rules"][0]]  # pull_request removed
         fake.ruleset_objects_after_change["7"] = changed_object
 
+        # Nothing here strands the branch: `lanes` stays required exactly as
+        # it was, and pull-request protection blocks no pull request. The
+        # confirmed body is what gets written.
         code, out, err = _run(fake, ["--force", "--rule", "lanes", REPO])
-        self.assertEqual(code, 1)
-        self.assertNotIn("skipping the ruleset step", err)  # the early gate missed it
-        self.assertIn("would now introduce pull-request protection", err)
-        self.assertEqual(fake.puts, [])
+        self.assertEqual(code, 1)  # the bootstrap plan failure, and only that
+        failed_line = next(line for line in err.splitlines() if line.startswith("error: failed on:"))
+        self.assertNotIn("ruleset", failed_line)
+        self.assertEqual(len(fake.puts), 1)
+        self.assertIn("pull_request", {r["type"] for r in fake.puts[0][1]["rules"]})
 
     def test_pull_request_protection_added_during_the_wait_is_refused_on_an_empty_no_bootstrap_branch(self):
         # Same race as the test above, but reached from the OTHER
@@ -8262,6 +9041,38 @@ class BootstrapStepTest(unittest.TestCase):
         self.assertNotIn("bootstrap", out)
         self.assertEqual(fake.posts, [])
 
+    def test_a_failed_bootstrap_plan_on_an_empty_branch_skips_the_ruleset_step(self):
+        # The template fetch fails before the plan reads whether the branch
+        # has any commits, so the plan cannot say -- and a ruleset that
+        # first requires a pull request on an empty branch strands it just
+        # as --no-bootstrap would (Codex review, mikelward/repo#56). Read
+        # here instead, previewed the same by --dry-run.
+        for flags in (["--dry-run"], ["--force"]):
+            fake = FakeGh()
+            fake.bootstrap_ref_missing = True
+            fake.template_fetch_fails = {"codex-review.yml"}
+            code, out, err = _run(fake, flags + [REPO])
+            self.assertEqual(code, 1, err)
+            self.assertIn("could not be planned", out + err)
+            self.assertIn("branch has no commits yet", out + err)
+            self.assertEqual([a for a, b in fake.posts if a[3] == f"repos/{REPO}/rulesets"], [])
+        self.assertIn("skipping the ruleset step", err)
+
+    def test_a_bootstrap_that_left_the_branch_empty_skips_the_ruleset_step(self):
+        # The plan read an empty branch and this run was to fill it first;
+        # the write failed, so the branch is as empty as it was and the
+        # ruleset write behind it is refused the same way (Codex review,
+        # mikelward/repo#56).
+        fake = FakeGh()
+        fake.bootstrap_ref_missing = True
+        fake.bootstrap_contents_put_fails = True
+        code, out, err = _run(fake, ["--force", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("skipping the ruleset step", err)
+        self.assertIn("this run's bootstrap step did not add one", err)
+        self.assertIn("failed on: bootstrap ruleset", err)
+        self.assertEqual([a for a, b in fake.posts if a[3] == f"repos/{REPO}/rulesets"], [])
+
     def test_no_bootstrap_on_an_empty_branch_skips_the_ruleset_step(self):
         # --no-bootstrap means nothing here will ever add an initial
         # commit -- unlike a bootstrap FAILURE, which at least attempted
@@ -8299,34 +9110,34 @@ class BootstrapStepTest(unittest.TestCase):
         self.assertIn("branch has no commits yet", out)
         self.assertEqual(fake.posts, [])  # dry run: no writes at all regardless
 
-    def test_dry_run_previews_the_never_reported_ruleset_skip_accurately(self):
-        # Same accuracy requirement as the no-commits-yet case above, for
-        # the never-reported-checks skip: --dry-run must show the same
-        # SKIPPED verdict and exit status the real run would, not report
-        # the ruleset as creatable when the real run would skip it.
+
+    def test_dry_run_previews_the_deferrals_accurately(self):
+        # --dry-run must show the same deferrals and exit status the real
+        # run would, not report the ruleset as creatable with every check.
         fake = FakeGh()
         fake.bootstrap_existing_paths = {".github/zizmor.yml"}
         # fake.check_runs defaults to {} -- nothing has ever reported.
         code, out, err = _run(fake, ["--dry-run", REPO])
-        self.assertEqual(code, 1)
-        self.assertIn("SKIPPED", out)
-        self.assertIn("never reported", out)
-        self.assertIn("add .github/workflows/ci.yml", out)  # bootstrap's own plan still shown
+        self.assertEqual(code, 0, err)
+        self.assertIn("deferred, not required yet", out)
+        # The publisher's absence is the reason that gets said: it holds
+        # whatever the check has reported meanwhile.
+        self.assertIn("'lanes' waits for .github/workflows/ci.yml", out)
+        self.assertIn("- add .github/workflows/ci.yml", out)  # bootstrap's own plan still shown
         self.assertEqual(fake.posts, [])  # dry run: no writes at all regardless
 
     def test_a_check_removed_during_the_wait_is_not_silently_re_added(self):
-        # The other half of the window the introduces_pr_protection
-        # refusal already closes. The preview sees all three checks
-        # already required (so nothing is held back) but a write still
-        # needed for the linear-history rule; an administrator then
-        # removes `codex` during the confirmation wait. The fresh
-        # recompute rebuilds the SAME target body -- an entry with no
-        # integration_id reconstructs byte for byte -- so the fingerprint
-        # passes, and without this refusal the write would silently
-        # re-add a check whose workflow is still inside the pending
-        # scaffold pull request (Codex review, mikelward/repo#42).
+        # The preview sees all three checks already required -- so the
+        # deferral for the pending scaffold leaves them as they are -- but
+        # a write still needed for the linear-history rule; an
+        # administrator then removes `codex` during the confirmation wait.
+        # The fresh recompute now DEFERS `codex` (it is no longer required,
+        # and its publisher is still inside the scaffold pull request), so
+        # the body differs from the one confirmed and the fingerprint
+        # refuses -- the write would otherwise have re-added a check
+        # nothing can report (Codex review, mikelward/repo#42).
         fake = FakeGh()
-        fake.bootstrap_existing_paths = set()  # scaffold pending, so the caller refuses
+        fake.bootstrap_existing_paths = set()  # every publisher is still in the pull request
         fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
         fake.existing_ruleset_id = "7"
         fake.all_ruleset_ids = ["7"]
@@ -8371,48 +9182,41 @@ class BootstrapStepTest(unittest.TestCase):
 
         code, out, err = _run(fake, ["--force", REPO])
         self.assertEqual(code, 1)
-        self.assertIn("would now newly require 'codex'", err)
-        self.assertIn("Not writing it", err)
+        self.assertIn("no longer matches what was previewed", err)
         self.assertEqual(fake.puts, [])
 
-    def test_a_held_back_ruleset_write_is_not_something_to_confirm(self):
-        # With a scaffold pull request already open there is nothing for
-        # the bootstrap step to write, and the ruleset write is one the
-        # Apply section is already going to skip -- so there is no
-        # question to ask. Before this, a non-interactive run without
-        # --force refused at the stdin check and never reached the step
-        # that reports the open pull request (Codex review,
+
+    def test_an_open_pull_request_that_only_waits_is_not_something_to_confirm(self):
+        # With a scaffold pull request already open and nothing to do to it
+        # yet, the bootstrap step has no write to ask about: the plan says
+        # what it waits on and the run moves on (Codex review,
         # mikelward/repo#42).
         fake = FakeGh()
         fake.bootstrap_existing_paths = set()
-        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
         fake.bootstrap_open_pulls = [
             (18, "repo-setup/fleet-ci-scaffold-abc1234", True, "https://github.com/owner/repo/pull/18")
         ]
-        code, out, err = _run(fake, [REPO])  # no --force, stdin is not a terminal
-        self.assertEqual(code, 1)
+        code, out, err = _run(fake, ["--no-rules", REPO])  # no --force, stdin is not a terminal
+        self.assertEqual(code, 0, err)
         self.assertNotIn("stdin is not a terminal", err)
-        self.assertIn("pull request #18 is adding the fleet CI scaffold", out)
-        self.assertIn("skipping the ruleset step", err)
+        self.assertIn("pull request #18 waits: 'lanes', 'zizmor' has not succeeded as a run of its own workflow from it yet", err)
         self.assertEqual(fake.puts, [])
         self.assertEqual(fake.created_pulls, [])
 
-    def test_dry_run_previews_the_pending_scaffold_ruleset_skip_accurately(self):
-        # Same accuracy requirement again, for the skip the pull-request
-        # write path introduces: with files missing and the checks already
-        # reporting, --dry-run reached neither the Apply section's gate nor
-        # the never-reported one, so it printed the ruleset as creatable
-        # and exited 0 while the equivalent real run
-        # (test_a_scaffold_still_in_a_pull_request_holds_back_new_pr_
-        # protection) skips it and exits 1 (Codex review,
-        # mikelward/repo#42).
+
+    def test_dry_run_previews_the_pending_scaffold_deferrals_accurately(self):
+        # With files missing and the checks already reporting, --dry-run
+        # shows the ruleset as creatable WITHOUT the checks the scaffold
+        # pull request is still adding, exactly as the real run writes it
+        # (Codex review, mikelward/repo#42).
         fake = FakeGh()
         fake.bootstrap_existing_paths = set()
         fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
         code, out, err = _run(fake, ["--dry-run", REPO])
-        self.assertEqual(code, 1)
-        self.assertIn("SKIPPED: the fleet CI scaffold will not be on the branch", out)
-        self.assertIn("open a pull request adding 9 file(s):", out)  # bootstrap's own plan still shown
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("SKIPPED", out)
+        self.assertIn("'lanes' waits for .github/workflows/ci.yml", out)
+        self.assertIn("open a pull request writing 9 file(s)", out)  # bootstrap's own plan still shown
         self.assertEqual(fake.posts, [])  # dry run: no writes at all regardless
 
     def test_dry_run_does_not_claim_the_skip_where_protection_already_exists(self):
@@ -8646,14 +9450,15 @@ class BootstrapStepTest(unittest.TestCase):
         ]
         code, out, err = _run(fake, ["--dry-run", "--no-rules", REPO])
         self.assertEqual(code, 0, err)
-        self.assertIn("pull request #11 is adding the scaffold", out)
+        self.assertIn("pull request #11 is carrying the scaffold", out)
+        self.assertIn("pull request #11 waits: 'lanes', 'zizmor' has not succeeded as a run of its own workflow from it yet", out)
         self.assertIn("still absent from the default branch: 9 file(s)", out)
-        self.assertNotIn("open a pull request adding", out)
+        self.assertNotIn("open a pull request writing", out)
 
         code, out, err = _run(fake, ["--no-rules", REPO])  # no --force, no terminal
         self.assertEqual(code, 0, err)
-        self.assertIn("pull request #11 is adding the fleet CI scaffold", out)
-        self.assertIn("merge it, then rerun", out)
+        self.assertIn("pull request #11 waits: 'lanes', 'zizmor' has not succeeded as a run of its own workflow from it yet", err)
+        self.assertIn("a later run looks again", err)
         # Nothing to confirm and nothing to write: not a blob, not a
         # branch, not a second pull request.
         self.assertEqual(fake.posts, [])
@@ -8721,8 +9526,8 @@ class BootstrapStepTest(unittest.TestCase):
         with patch("builtins.input", return_value="y"):
             code, out, err = _run(fake, ["--no-rules", REPO], isatty=True)
         self.assertEqual(code, 0, err)
-        self.assertIn("open a pull request adding 9 file(s):", err)  # what the plan showed
-        self.assertIn("pull request #12 is adding the fleet CI scaffold", out)
+        self.assertIn("open a pull request writing 9 file(s)", err)  # what the plan showed
+        self.assertIn("pull request #12 waits", err)
         self.assertEqual(fake.created_refs, [])
         self.assertEqual(fake.created_pulls, [])
 
@@ -8751,9 +9556,12 @@ class BootstrapStepTest(unittest.TestCase):
         # of this tool's own pull requests as a fork's the moment a caller
         # types the repository in another casing, or under a name GitHub
         # has since renamed away from.
-        listings = [c for c in fake.calls if any("&base=" in a for a in c)]
+        listings = [c for c in fake.calls if any(a.endswith("/pulls?state=open&per_page=100") for a in c)]
         self.assertTrue(listings, "the open-pull-request listing was never made")
         self.assertIn(".head.repo.id == .base.repo.id", listings[0][listings[0].index("--jq") + 1])
+        # And no base filter: a retargeted pull request of this tool's own
+        # has to be found to be replaced (Codex review, mikelward/repo#56).
+        self.assertFalse([c for c in fake.calls if any("&base=" in a for a in c)])
 
     def test_an_open_pull_request_is_reported_even_without_the_workflow_scope(self):
         # The scope only matters for a write. With a scaffold pull request
@@ -8769,12 +9577,12 @@ class BootstrapStepTest(unittest.TestCase):
         ]
         code, out, err = _run(fake, ["--dry-run", "--no-rules", REPO])
         self.assertEqual(code, 0, err)
-        self.assertIn("pull request #15 is adding the scaffold", out)
+        self.assertIn("pull request #15 is carrying the scaffold", out)
         self.assertNotIn("workflow", err)
 
         code, out, err = _run(fake, ["--force", "--no-rules", REPO])
         self.assertEqual(code, 0, err)
-        self.assertIn("pull request #15 is adding the fleet CI scaffold", out)
+        self.assertIn("pull request #15 waits", err)
         self.assertEqual(fake.posts, [])
 
     def test_an_unreadable_pull_request_listing_fails_the_step_closed(self):
@@ -8797,7 +9605,7 @@ class BootstrapStepTest(unittest.TestCase):
         code, out, err = _run(fake, ["--no-rules", REPO])
         self.assertEqual(code, 0, err)
         self.assertFalse(
-            any("&base=" in c[1] for c in fake.calls if c[0] == "api" and len(c) > 1),
+            any("/pulls?state=open" in c[1] for c in fake.calls if c[0] == "api" and len(c) > 1),
             [c for c in fake.calls if c[0] == "api"],
         )
 
@@ -8875,13 +9683,45 @@ class BootstrapStepTest(unittest.TestCase):
         self.assertIn(f"{REPO}: opened pull request #42", out)
         self.assertEqual(len(fake.created_pulls), 1)
 
-    def test_a_gap_branch_holding_something_else_is_refused_not_moved(self):
+    def test_a_gap_branch_holding_something_else_is_left_and_the_next_name_taken(self):
         # The other side of the same check: this module never overwrites
-        # what is already there, a ref included.
+        # what is already there, a ref included -- a branch of an earlier
+        # pull request of this tool's that somebody pushed to is left as
+        # it is, and the replacement takes the next name, so it can
+        # always open (Codex review, mikelward/repo#56).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        taken = f"{scaffold.GAP_BRANCH_PREFIX}-newscaf"
+        fake.bootstrap_occupied_gap_refs = {taken: "somebody-elses-commit"}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"{REPO}: opened pull request #42", out)
+        self.assertEqual([p["head"] for p in fake.created_pulls], [f"{taken}-2"])
+        self.assertEqual([r["ref"] for r in fake.created_refs], [f"refs/heads/{taken}-2"])
+        # The occupied ref was not touched.
+        self.assertFalse([p for p in fake.patches if "git/refs" in p[0][3]])
+
+    def test_every_gap_branch_name_occupied_is_refused_not_moved(self):
+        # Five names all holding other commits is not a leftover; said,
+        # and nothing force-moved.
         fake = FakeGh()
         fake.bootstrap_existing_paths = set()
         fake.bootstrap_ref_create_fails = True
         fake.bootstrap_gap_ref_sha = "somebody-elses-commit"
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("all exist and hold other commits", err)
+        self.assertIn(f"'{scaffold.GAP_BRANCH_PREFIX}-newscaf-5'", err)
+        self.assertIn("failed on: bootstrap", err)
+        self.assertEqual(fake.created_pulls, [])
+
+    def test_a_gap_branch_create_failure_that_is_not_an_occupied_ref_is_reported(self):
+        # A ref POST failing with nothing there under the name is a real
+        # failure, reported as such, not a name to skip.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_ref_create_fails = True
+        fake.bootstrap_gap_ref_sha = None
         code, out, err = _run(fake, ["--force", "--no-rules", REPO])
         self.assertEqual(code, 1)
         self.assertIn("could not create the branch", err)
@@ -8974,6 +9814,1112 @@ class BootstrapStepTest(unittest.TestCase):
         self.assertIn("add .github/zizmor.yml", out)
         self.assertEqual(fake.posts, [])
         self.assertEqual(fake.patches, [])
+
+    _OPEN_11 = [(11, "repo-setup/fleet-ci-scaffold-abc1234", True, "https://github.com/owner/repo/pull/11")]
+
+    def test_a_complete_scaffold_closes_a_leftover_pull_request_of_its_own(self):
+        # Every scaffold file is on the branch, and a pull request of this
+        # tool's own is still open -- a concurrent run opened it after the
+        # merging run took its look, or the files landed by hand. Looked
+        # for on every run, complete branch included, and closed: left
+        # alone it would be open forever (Codex review, mikelward/repo#56).
+        fake = FakeGh()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        code, out, err = _run(fake, ["--dry-run", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("close pull request #11: this tool's own, and the scaffold is complete", out)
+        self.assertEqual(fake.closed_pulls, [])
+
+        # A write, agreed to like any other: not confirmed, not made.
+        code, out, err = _run(fake, ["--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("stdin is not a terminal", err)
+        self.assertEqual(fake.closed_pulls, [])
+        with patch("builtins.input", return_value="n"):
+            code, out, err = _run(fake, ["--no-rules", REPO], isatty=True)
+        self.assertEqual(code, 1)
+        self.assertIn("not confirmed", err)
+        self.assertEqual(fake.closed_pulls, [])
+
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.closed_pulls, [11])
+        self.assertIn("closed pull request #11 -- this tool's own, and the scaffold is complete on 'main'", out + err)
+        self.assertEqual(fake.created_pulls, [])
+        self.assertEqual(fake.merged_pulls, [])
+
+    def test_a_second_scaffold_pull_request_from_an_overlapping_run_is_closed_first(self):
+        # Two runs overlapping each found none open and opened their own.
+        # The lower-numbered one is acted on (every run picks the same);
+        # the other is closed first, since a scaffold that is complete
+        # afterwards never looks for it again (Codex review,
+        # mikelward/repo#56).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = [
+            (12, "repo-setup/fleet-ci-scaffold-def5678", True, "https://github.com/owner/repo/pull/12"),
+            *self._OPEN_11,
+        ]
+        fake.check_runs = {"prhead11": ["lanes", "zizmor"]}
+        code, out, err = _run(fake, ["--dry-run", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("merge pull request #11: 'lanes', 'zizmor' passed on it; close #12 first", out)
+        self.assertEqual(fake.closed_pulls, [])
+
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.closed_pulls, [12])
+        self.assertEqual([n for n, _ in fake.merged_pulls], [11])
+
+    def test_closing_a_duplicate_beside_a_waiting_pull_request_is_confirmed_too(self):
+        # The one acted on waits (a check still running), so nothing else
+        # here writes -- but the duplicate beside it is closed, and that
+        # is a write to agree to like any other (Codex review,
+        # mikelward/repo#56).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = [
+            (12, "repo-setup/fleet-ci-scaffold-def5678", True, "https://github.com/owner/repo/pull/12"),
+            *self._OPEN_11,
+        ]
+        fake.check_runs = {"prhead11": ["lanes", ("zizmor", None, None)]}
+        code, out, err = _run(fake, ["--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("stdin is not a terminal", err)
+        self.assertEqual(fake.closed_pulls, [])
+        with patch("builtins.input", return_value="n"):
+            code, out, err = _run(fake, ["--no-rules", REPO], isatty=True)
+        self.assertEqual(code, 1)
+        self.assertIn("not confirmed", err)
+        self.assertEqual(fake.closed_pulls, [])
+
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.closed_pulls, [12])
+        self.assertIn("pull request #11 waits: 'zizmor' still running on it", err)
+        self.assertEqual(fake.merged_pulls, [])
+
+    def test_a_duplicate_that_appeared_after_the_plan_is_left_for_a_later_run(self):
+        # The plan saw one pull request, waiting; by the time this run
+        # acts, an overlapping run has opened a second. Closing it was
+        # never shown or agreed to, so it is left, said, for a later run
+        # whose plan carries it (Codex review, mikelward/repo#56).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.bootstrap_open_pulls_later = [
+            *self._OPEN_11,
+            (12, "repo-setup/fleet-ci-scaffold-def5678", True, "https://github.com/owner/repo/pull/12"),
+        ]
+        fake.check_runs = {"prhead11": ["lanes", ("zizmor", None, None)]}
+        code, out, err = _run(fake, ["--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("pull request #12 -- a second scaffold pull request this tool opened -- appeared after this run planned", err)
+        self.assertEqual(fake.closed_pulls, [])
+        self.assertEqual(fake.merged_pulls, [])
+
+    def test_a_lower_numbered_pull_request_that_appeared_after_the_plan_fails_the_step(self):
+        # The one to act on is the lowest-numbered, and a lower one
+        # appeared since the plan: this run planned against another, so
+        # nothing is done to either and a rerun plans afresh.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.bootstrap_open_pulls_later = [
+            (10, "repo-setup/fleet-ci-scaffold-0123456", True, "https://github.com/owner/repo/pull/10"),
+            *self._OPEN_11,
+        ]
+        fake.check_runs = {"prhead11": ["lanes", "zizmor"]}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("pull request #10 is this tool's own and open now, where this run planned against #11", err)
+        self.assertIn("failed on: bootstrap", err)
+        self.assertEqual(fake.closed_pulls, [])
+        self.assertEqual(fake.merged_pulls, [])
+
+    def test_a_scaffold_pull_request_whose_checks_passed_is_merged_by_a_later_run(self):
+        # SPEC.md, *The ladder*, rung 2: the run finds its own pull request
+        # green and mergeable, and merges it -- rebase, with the head sha it
+        # read as the merge's precondition.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.check_runs = {"prhead11": ["lanes", ("zizmor", None, "skipped")]}
+        code, out, err = _run(fake, ["--dry-run", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("merge pull request #11: 'lanes', 'zizmor' passed on it", out)
+
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"{REPO}: merged pull request #11", out)
+        self.assertIn("is on 'main' now", out)
+        self.assertEqual(fake.merged_pulls, [(11, {"merge_method": "rebase", "sha": "prhead11"})])
+        self.assertEqual(fake.created_pulls, [])
+        # What was read to decide: the pull request, its head's check runs
+        # and statuses -- never its file list.
+        self.assertFalse([c for c in fake.calls if any("/files" in str(a) for a in c)])
+        # delete-branch-on-merge was already on, so nothing was written for
+        # it before the merge.
+        self.assertFalse([b for a, b in fake.patches if "delete_branch_on_merge" in b])
+
+    def test_delete_branch_on_merge_is_turned_on_before_merging_the_scaffold(self):
+        # The settings step enables it later in the same run -- too late
+        # for this merge, which GitHub sweeps only if the setting is on
+        # when it happens. So it is turned on first, and the merged branch
+        # goes with the merge itself rather than by a separate delete that
+        # would race a push to the branch (Codex review, mikelward/repo#56,
+        # three rounds).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.check_runs = {"prhead11": ["lanes", "zizmor"]}
+        fake.delete_branch_on_merge = "false"
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"{REPO}: merged pull request #11", out)
+        self.assertEqual(fake.delete_branch_on_merge, "true")
+        order = [
+            "patch" if "PATCH" in c and c[3] == f"repos/{REPO}" else "merge"
+            for c in fake.calls
+            if ("PATCH" in c and c[3] == f"repos/{REPO}") or any("/pulls/11/merge" in str(a) for a in c)
+        ]
+        self.assertEqual(order[:2], ["patch", "merge"], order)
+
+        # On the plan's word only, never a read of its own: the settings
+        # step's read failed, so nothing planned turning it on, and the
+        # merge leaves it alone (Codex review, mikelward/repo#56).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.check_runs = {"prhead11": ["lanes", "zizmor"]}
+        fake.fail_delete_branch_on_merge = True
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertIn(f"{REPO}: merged pull request #11", out)
+        self.assertIn("could not read whether owner/repo deletes branches on merge", err)
+        self.assertFalse([b for a, b in fake.patches if "delete_branch_on_merge" in b])
+
+        # Read as on at plan time: the merge makes no read of its own --
+        # an administrator turning it off meanwhile is a change the plan
+        # never showed, not one to undo here -- and no write.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.check_runs = {"prhead11": ["lanes", "zizmor"]}
+        fake.delete_branch_on_merge = "true"
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"{REPO}: merged pull request #11", out)
+        self.assertFalse([b for a, b in fake.patches if "delete_branch_on_merge" in b])
+        reads = [c for c in fake.calls if c[-1] == ".delete_branch_on_merge"]
+        self.assertEqual(len(reads), 1, reads)  # the settings step's own, at plan time
+
+        # A failure to turn it on is said, not fatal: the merge stands and
+        # `repo cleanup` sweeps the branch.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.check_runs = {"prhead11": ["lanes", "zizmor"]}
+        fake.delete_branch_on_merge = "false"
+        fake.patch_fails = True
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertIn(f"{REPO}: merged pull request #11", out)
+        self.assertIn("could not enable delete-branch-on-merge before merging pull request #11", err)
+        self.assertEqual(len(fake.merged_pulls), 1)
+
+    def test_merging_is_a_write_that_needs_confirming(self):
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.check_runs = {"prhead11": ["lanes", "zizmor"]}
+        code, out, err = _run(fake, ["--no-rules", REPO])  # no --force, stdin is not a terminal
+        self.assertEqual(code, 1)
+        self.assertIn("stdin is not a terminal", err)
+        self.assertIn("merge pull request #11", err)  # the plan it would have asked about
+        self.assertEqual(fake.merged_pulls, [])
+
+    def test_a_merged_scaffold_still_defers_its_checks_this_run(self):
+        # The merge puts the files on the branch, but this run's answer to
+        # "which checks can the branch publish" was read before it, from
+        # the tree it compared against -- and what the pull request
+        # contained is not something this run reads. Deferred once more;
+        # the next run reads the branch as it is and requires them.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set(_SCAFFOLD_PATHS) - {".github/workflows/ci.yml"}
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.check_runs = {fake.default_head_sha: ["codex", "zizmor"], "prhead11": ["lanes"]}
+        code, out, err = _run(fake, ["--force", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"{REPO}: merged pull request #11", out)
+        ruleset_posts = [b for a, b in fake.posts if a[3] == f"repos/{REPO}/rulesets"]
+        self.assertEqual(
+            ruleset_posts[0]["rules"][0]["parameters"]["required_status_checks"],
+            [{"context": "codex"}, {"context": "zizmor"}],
+        )
+        self.assertIn("'lanes' waits for .github/workflows/ci.yml", out)
+
+    def test_a_pull_request_that_nothing_will_ever_report_on_needs_a_person(self):
+        # With Actions disabled, the scaffold's checks will never report on
+        # the pull request, so waiting would repeat forever with exit 0
+        # (Codex review, mikelward/repo#56): held for a person instead --
+        # whether nothing has reported, or only something unrelated has
+        # (an external status), which must not read as mergeable.
+        for statuses in ({}, {"prhead11": ["external-scan"]}):
+            fake = FakeGh()
+            fake.bootstrap_existing_paths = set()
+            fake.bootstrap_open_pulls = self._OPEN_11
+            fake.actions_enabled = False
+            fake.statuses = statuses
+            code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+            self.assertEqual(code, 1)
+            self.assertIn("needs a person: GitHub Actions is disabled on this repository", err)
+            self.assertIn("failed on: bootstrap", err)
+            self.assertEqual(fake.merged_pulls, [])
+
+        # But a gap that adds no workflow to run from the head -- AGENTS.md
+        # alone -- has nothing to wait for, and merges on GitHub's word
+        # whether or not Actions is enabled (Codex review, mikelward/repo#56).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set(_SCAFFOLD_PATHS) - {"AGENTS.md", "CLAUDE.md"}
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.actions_enabled = False
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"{REPO}: merged pull request #11", out)
+        self.assertFalse([c for c in fake.calls if any("actions/permissions" in str(a) for a in c)])
+
+    def test_an_unreadable_actions_setting_fails_the_step_rather_than_merging(self):
+        # "Could not tell" is not "enabled", and not a wait either: a wait
+        # exits 0 on every run for as long as a token cannot read this
+        # (Codex review, mikelward/repo#56, twice).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.check_runs = {"prhead11": ["lanes", "zizmor"]}
+        fake.actions_permissions_fails = True
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("could not read whether Actions is enabled on owner/repo", err)
+        self.assertIn("failed on: bootstrap", err)
+        self.assertEqual(fake.merged_pulls, [])
+
+    def test_unreadable_branch_rules_on_a_blocked_pull_request_fail_the_step(self):
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.check_runs = {"prhead11": ["lanes", "zizmor"]}
+        fake.pulls = {11: {"mergeable_state": "blocked"}}
+        fake.effective_rules_read_fails = True
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("GitHub reports pull request #11 blocked, and what 'main' requires could not be read", err)
+        self.assertEqual(fake.merged_pulls, [])
+
+    def test_an_unrelated_passing_check_does_not_stand_in_for_the_scaffolds_own(self):
+        # The pull request adds ci.yml and zizmor.yml; an external status
+        # passed on its head before Actions registered them. "Something
+        # passed" is not "the scaffold ran": it waits for `lanes` and
+        # `zizmor` (Codex review, mikelward/repo#56).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.statuses = {"prhead11": ["external-scan"]}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "pull request #11 waits: 'lanes', 'zizmor' has not succeeded as a run of its own "
+            "workflow from it yet",
+            err,
+        )
+        self.assertEqual(fake.merged_pulls, [])
+
+        # Nor does a report merely NAMED `lanes`: a status anyone with
+        # write access can post, or another App's check run. What counts
+        # is a successful Actions run of the workflow the pull request
+        # adds, by path (Codex review, mikelward/repo#56).
+        for reports in (
+            {"statuses": {"prhead11": ["lanes", "zizmor"]}},
+            {"check_runs": {"prhead11": [("lanes", 7), ("zizmor", 7)]}},
+        ):
+            fake = FakeGh()
+            fake.bootstrap_existing_paths = set()
+            fake.bootstrap_open_pulls = self._OPEN_11
+            for attr, value in reports.items():
+                setattr(fake, attr, value)
+            fake.workflow_runs = {"prhead11": [(".github/workflows/zizmor.yml", "completed", "success")]}
+            code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+            self.assertEqual(code, 0, err)
+            self.assertIn("'lanes' has not succeeded as a run of its own workflow from it yet", err)
+            self.assertEqual(fake.merged_pulls, [])
+
+        # A run still going is not a success either: a wait.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.check_runs = {"prhead11": ["lanes", "zizmor"]}
+        fake.workflow_runs = {
+            "prhead11": [
+                (".github/workflows/ci.yml", "in_progress", None),
+                (".github/workflows/zizmor.yml", "completed", "success"),
+            ]
+        }
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("'lanes' has not succeeded as a run of its own workflow", err)
+        self.assertEqual(fake.merged_pulls, [])
+
+        # A run that completed without success -- a failure, a timeout, a
+        # startup failure that left no failed check run -- is held for a
+        # person: waiting changes nothing (Codex review, mikelward/repo#56).
+        # A re-run supersedes the attempt it re-ran, newest first.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.check_runs = {"prhead11": ["lanes", "zizmor"]}
+        fake.workflow_runs = {
+            "prhead11": [
+                (".github/workflows/ci.yml", "completed", "success"),
+                (".github/workflows/ci.yml", "completed", "failure"),  # the older attempt
+                (".github/workflows/zizmor.yml", "completed", "startup_failure"),
+            ]
+        }
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("needs a person: 'zizmor''s own workflow ran from it and did not succeed", err)
+        self.assertIn("failed on: bootstrap", err)
+        self.assertEqual(fake.merged_pulls, [])
+
+        # An unreadable run listing fails the step rather than guessing.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.check_runs = {"prhead11": ["lanes", "zizmor"]}
+        fake.workflow_runs_read_fails = True
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("could not read the workflow runs from prhead1", err)
+        self.assertEqual(fake.merged_pulls, [])
+
+        # A gap with no head-published workflow in it expects nothing
+        # beyond what reported -- and nothing reporting at all is not a
+        # wait either: a gap of only AGENTS.md on a repository whose own
+        # ci.yml does not run for that diff would otherwise wait forever
+        # (Codex review, mikelward/repo#56). GitHub's mergeability decides.
+        for check_runs in ({"prhead11": ["lanes", "zizmor"]}, {}):
+            fake = FakeGh()
+            fake.bootstrap_existing_paths = set(_SCAFFOLD_PATHS) - {"AGENTS.md", "CLAUDE.md"}
+            fake.bootstrap_open_pulls = self._OPEN_11
+            fake.check_runs = check_runs
+            code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+            self.assertEqual(code, 0, err)
+            self.assertEqual(len(fake.merged_pulls), 1)
+        self.assertIn("merged pull request #11", out)
+
+    def test_a_pull_request_with_a_check_still_running_waits(self):
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.check_runs = {"prhead11": ["lanes", ("zizmor", None, None)]}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("pull request #11 waits: 'zizmor' still running on it", err)
+        self.assertEqual(fake.merged_pulls, [])
+
+    def test_a_pending_status_on_the_head_waits_too(self):
+        # `codex` is a commit status, not a check run, and a pending one is
+        # the sweep still reading.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.check_runs = {"prhead11": ["lanes", "zizmor"]}
+        fake.statuses = {"prhead11": [("codex", "pending")]}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("'codex' still running on it", err)
+        self.assertEqual(fake.merged_pulls, [])
+
+    def test_a_pull_request_with_a_failed_check_needs_a_person_and_fails_the_run(self):
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.check_runs = {"prhead11": ["lanes", ("zizmor", None, "failure")]}
+        code, out, err = _run(fake, ["--dry-run", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("pull request #11 needs a person: 'zizmor' failed on it", out)
+
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("pull request #11 needs a person: 'zizmor' failed on it", err)
+        self.assertIn("failed on: bootstrap", err)
+        self.assertEqual(fake.merged_pulls, [])
+
+    def test_a_conflicting_or_draft_pull_request_needs_a_person(self):
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.check_runs = {"prhead11": ["lanes", "zizmor"]}
+        fake.pulls = {11: {"mergeable": False, "mergeable_state": "dirty"}}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("it conflicts with its base branch", err)
+        self.assertEqual(fake.merged_pulls, [])
+
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.check_runs = {"prhead11": ["lanes", "zizmor"]}
+        fake.pulls = {11: {"draft": True}}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("converted to a draft", err)
+        self.assertEqual(fake.merged_pulls, [])
+
+        # A draft that is also stale is replaced, not held: marking it
+        # ready would only have the next run replace it (Codex review,
+        # mikelward/repo#56).
+        for staleness in ({"base_ref": "release"}, {}):
+            fake = FakeGh()
+            fake.bootstrap_existing_paths = set()
+            fake.bootstrap_open_pulls = self._OPEN_11
+            fake.check_runs = {"prhead11": ["lanes", "zizmor"]}
+            fake.pulls = {11: {"draft": True, **staleness}}
+            if not staleness:
+                fake.pull_head_parents = {11: ["a-pushed-commit"]}
+            code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+            self.assertEqual(code, 0, err)
+            self.assertIn("in place of the stale #11", out)
+            self.assertNotIn("converted to a draft", err)
+            self.assertEqual(fake.closed_pulls, [11])
+
+    def test_a_pull_request_whose_head_is_not_the_generated_commit_is_replaced(self):
+        # Provenance by content, not by name (Codex review,
+        # mikelward/repo#56): a head that is not exactly the base plus the
+        # generated changes -- here, a file pushed onto the branch -- is
+        # never merged, whatever its checks say. It is stale, so the run
+        # closes it and opens a fresh one. A base that moved and a template
+        # that moved upstream read the same way.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.check_runs = {"prhead11": ["lanes", "zizmor"]}
+        fake.pull_head_extra_paths = {11: {"src/pushed.py"}}
+        code, out, err = _run(fake, ["--dry-run", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("close pull request #11 and open a fresh one: its head is not the commit", out)
+        self.assertIn("e.g. src/pushed.py", out)
+
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.closed_pulls, [11])
+        self.assertEqual(fake.merged_pulls, [])
+        self.assertEqual(len(fake.created_pulls), 1)
+        self.assertIn(f"{REPO}: opened pull request #42 in place of the stale #11, now closed,", out)
+
+    def test_a_head_with_the_right_tree_but_more_history_is_stale(self):
+        # A push and its revert leave the expected tree, and a rebase merge
+        # would replay both commits onto the branch -- so the head has to
+        # be the one generated commit on top of the tip, not merely reach
+        # the right tree (Codex review, mikelward/repo#56).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.check_runs = {"prhead11": ["lanes", "zizmor"]}
+        fake.pull_head_parents = {11: ["a-pushed-commit"]}
+        code, out, err = _run(fake, ["--dry-run", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("close pull request #11 and open a fresh one: its head is not a single commit", out)
+
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("in place of the stale #11", out)
+        self.assertEqual(fake.closed_pulls, [11])
+        self.assertEqual(fake.merged_pulls, [])
+
+    def test_a_pull_request_retargeted_off_the_default_branch_is_stale(self):
+        # Listed against 'main', retargeted since: the merge lands wherever
+        # the base points now, and the head sha pins only the head (Codex
+        # review, mikelward/repo#56). The base is read fresh with the head
+        # right before the merge, and a moved one is replaced, not merged.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.check_runs = {"prhead11": ["lanes", "zizmor"]}
+        fake.pulls = {11: {"base_ref": "release"}}
+        code, out, err = _run(fake, ["--dry-run", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("close pull request #11 and open a fresh one: it now targets 'release', not 'main'", out)
+
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("in place of the stale #11", out)
+        self.assertEqual(fake.closed_pulls, [11])
+        self.assertEqual(fake.merged_pulls, [])
+
+    def test_a_retargeted_pull_request_is_still_found_and_replaced(self):
+        # Listed without a base filter, so one retargeted before this run
+        # is found rather than left open beside a second one; found, its
+        # base reads wrong and it is replaced (Codex review,
+        # mikelward/repo#56).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.check_runs = {"prhead11": ["lanes", "zizmor"]}
+        fake.pulls = {11: {"base_ref": "release"}}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("in place of the stale #11", out)
+        self.assertEqual(fake.closed_pulls, [11])
+        self.assertEqual(len(fake.created_pulls), 1)
+        listing = next(c for c in fake.calls if any(a.endswith("/pulls?state=open&per_page=100") for a in c))
+        self.assertFalse(any("base=" in a for a in listing))
+
+    def test_a_base_retargeted_during_the_wait_is_not_merged(self):
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.check_runs = {"prhead11": ["lanes", "zizmor"]}
+        fake.pulls_later = {11: {"base_ref": "release"}}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("pull request #11 is not what this run planned against", err)
+        self.assertEqual(fake.merged_pulls, [])
+        self.assertEqual(fake.closed_pulls, [])
+
+    def test_a_head_with_the_right_tree_but_another_message_is_stale(self):
+        # The rebase merge replays the message onto the branch as surely as
+        # the tree, and the tree check cannot see it: a replaced commit with
+        # the generated tree and someone's own message (user data, say) is
+        # stale and replaced, not merged (Codex review, mikelward/repo#56).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.check_runs = {"prhead11": ["lanes", "zizmor"]}
+        fake.pull_head_messages = {11: "Add the scaffold\n\nTOKEN=abc1234"}
+        code, out, err = _run(fake, ["--dry-run", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "close pull request #11 and open a fresh one: its head's commit message is not the "
+            "one this run would generate",
+            out,
+        )
+
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("in place of the stale #11", out)
+        self.assertEqual(fake.closed_pulls, [11])
+        self.assertEqual(fake.merged_pulls, [])
+
+    def test_a_pull_request_by_someone_else_under_the_prefix_is_not_this_tools(self):
+        # The branch prefix is a name anyone with push access can use, and
+        # a later run merges what it finds under it -- so only a pull
+        # request this token's user opened counts (Codex review,
+        # mikelward/repo#56). Another author's is said and left alone, and
+        # this tool opens its own beside it.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = [
+            (11, "repo-setup/fleet-ci-scaffold-abc1234", True, "https://github.com/owner/repo/pull/11", "someone-else")
+        ]
+        fake.check_runs = {"prhead11": ["lanes", "zizmor"]}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("pull request #11 carries this tool's branch prefix but was opened by someone-else, not owner", err)
+        self.assertEqual(fake.merged_pulls, [])
+        self.assertEqual(fake.closed_pulls, [])
+        self.assertIn(f"{REPO}: opened pull request #42", out)
+
+    def test_an_unreadable_head_tree_fails_the_step_rather_than_merging(self):
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.check_runs = {"prhead11": ["lanes", "zizmor"]}
+        fake.bootstrap_commit_read_fails = True  # the head commit read, after the plan's own
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)  # plan_gaps's own commit read fails first here
+        self.assertEqual(fake.merged_pulls, [])
+
+    def test_a_blocked_pull_request_is_held_on_a_required_check_with_nothing_running(self):
+        # Every check this run can see passed, nothing is running, yet
+        # GitHub calls it blocked: `codex` is required and nothing has
+        # posted it on this head -- not even the sweep's pending status,
+        # which would be a wait (test_a_pending_status_on_the_head_waits_
+        # too). Nothing says it will ever report, so a person looks,
+        # rather than a wait forever with exit 0 (Codex review,
+        # mikelward/repo#56). Never merged past.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.check_runs = {"prhead11": ["lanes", "zizmor"]}
+        fake.pulls = {11: {"mergeable_state": "blocked"}}
+        fake.effective_rules = [
+            {
+                "type": "required_status_checks",
+                "parameters": {"required_status_checks": [{"context": "lanes"}, {"context": "codex"}]},
+            }
+        ]
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("needs a person", err)
+        self.assertIn(
+            "required check 'codex' has not passed on its head and nothing is running there",
+            err,
+        )
+        self.assertIn("Re-run the workflow on the pull request", err)
+        self.assertNotIn("waits:", err)
+        self.assertEqual(fake.merged_pulls, [])
+
+    def test_a_blocked_pull_request_is_held_on_a_foreign_required_check_that_never_ran(self):
+        # A check beyond the standard is required, kept as the floor, and
+        # nothing has posted it on this head: its workflow may have a path
+        # filter this diff does not match, and nothing here says it will
+        # ever run -- so held for a person, not waited on forever (Codex
+        # review, mikelward/repo#56). The same rule as the test above:
+        # the check's name proves nothing about whether it runs.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.check_runs = {"prhead11": ["lanes", "zizmor"]}
+        fake.pulls = {11: {"mergeable_state": "blocked"}}
+        fake.effective_rules = [
+            {
+                "type": "required_status_checks",
+                "parameters": {
+                    "required_status_checks": [{"context": "lanes"}, {"context": "deploy-preview"}]
+                },
+            }
+        ]
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("needs a person", err)
+        self.assertIn(
+            "required check 'deploy-preview' has not passed on its head and nothing is running "
+            "there, so nothing says it will report",
+            err,
+        )
+        self.assertNotIn("waits:", err)
+        self.assertEqual(fake.merged_pulls, [])
+
+    def test_a_blocked_pull_request_is_held_for_the_bound_app_not_a_same_named_check(self):
+        # `lanes` is required from App 12345, and the head carries a green
+        # `lanes` from App 7: by name it has reported, by binding it has
+        # not, and nothing is running -- a head that already ran under App
+        # 7 does not run again under App 12345 on its own. Held, naming
+        # the App, not a review block and not a wait forever (Codex
+        # review, mikelward/repo#56).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.check_runs = {"prhead11": [("lanes", 7), "zizmor"]}
+        fake.pulls = {11: {"mergeable_state": "blocked"}}
+        fake.effective_rules = [
+            {
+                "type": "required_status_checks",
+                "parameters": {"required_status_checks": [{"context": "lanes", "integration_id": 12345}]},
+            }
+        ]
+        fake.app_coverage = {12345: ("lanes-app", "all")}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("needs a person", err)
+        self.assertIn("required check 'lanes' (needs App 12345) has not passed on its head", err)
+        self.assertIn("a check bound to an App needs that App's own report", err)
+        self.assertNotIn("waits:", err)
+        self.assertEqual(fake.merged_pulls, [])
+
+    def test_a_check_required_both_bound_and_unbound_is_classified_not_crashed(self):
+        # Two rulesets require `lanes`, one bound to App 12345 and one to
+        # no App: the pair sorts without comparing None to an int, and the
+        # bound one is what the head still lacks (Codex review,
+        # mikelward/repo#56).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.check_runs = {"prhead11": ["lanes", "zizmor"]}
+        fake.pulls = {11: {"mergeable_state": "blocked"}}
+        fake.effective_rules = [
+            {
+                "type": "required_status_checks",
+                "parameters": {"required_status_checks": [{"context": "lanes"}]},
+            },
+            {
+                "type": "required_status_checks",
+                "parameters": {"required_status_checks": [{"context": "lanes", "integration_id": 12345}]},
+            },
+        ]
+        fake.app_coverage = {12345: ("lanes-app", "all")}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("needs a person", err)
+        self.assertIn("required check 'lanes' (needs App 12345) has not passed on its head", err)
+        self.assertEqual(fake.merged_pulls, [])
+
+    def test_a_bound_apps_superseded_success_still_counts_as_ever_passed(self):
+        # The same status history asked two ways. Of the repository, the
+        # question is whether the App has EVER passed `lanes` here: it did,
+        # even though it later replaced that with a failure on the same
+        # commit, so the evidence stands and the binding may be written. Of
+        # a pull request's head, the question is whether the requirement is
+        # satisfied NOW: the App's newest word is the failure, so it is not
+        # (Codex review, mikelward/repo#56, both ways).
+        fake = FakeGh()
+        fake.check_runs = {fake.default_head_sha: ["codex", "zizmor"]}
+        fake.statuses = {fake.default_head_sha: [("lanes", "failure")]}
+        fake.status_creators = {
+            fake.default_head_sha: [("lanes", "lanes-app[bot]", "failure"), ("lanes", "lanes-app[bot]")]
+        }
+        fake.app_coverage = {12345: ("lanes-app", "all")}
+        with patch("repo_lib.gh.run", fake.run), patch("repo_lib.gh.try_run", fake.try_run):
+            rules.reset_evidence_cache()
+            self.assertEqual(rules.never_passed(REPO, [("lanes", 12345)]), [])
+            rules.reset_evidence_cache()
+            self.assertEqual(
+                rules.never_passed(REPO, [("lanes", 12345)], shas=[fake.default_head_sha]),
+                [("lanes", 12345, True)],
+            )
+            # The same for an unbound context: the combined status shows
+            # only its latest state, so the history is read for it too --
+            # of the repository, never of a head (Codex review,
+            # mikelward/repo#56).
+            rules.reset_evidence_cache()
+            self.assertEqual(rules.never_passed(REPO, [("lanes", None)]), [])
+            rules.reset_evidence_cache()
+            self.assertEqual(
+                rules.never_passed(REPO, [("lanes", None)], shas=[fake.default_head_sha]),
+                [("lanes", None, True)],
+            )
+
+    def test_a_superseded_success_on_a_pull_request_head_still_counts_in_the_history(self):
+        # The only pass is on a pull request's head, later replaced by a
+        # failure on the same commit. Of the repository's history every
+        # attempt counts, on a pull request head as on the default
+        # branch's -- the page of heads must not flip the scan into the
+        # newest-only reading a head gets (Codex review,
+        # mikelward/repo#56).
+        fake = FakeGh()
+        fake.check_runs = {fake.default_head_sha: ["codex", "zizmor"]}
+        fake.open_prs = ["prsha1"]
+        fake.statuses = {"prsha1": [("lanes", "failure")]}
+        fake.status_creators = {"prsha1": [("lanes", "someone", "failure"), ("lanes", "someone")]}
+        with patch("repo_lib.gh.run", fake.run), patch("repo_lib.gh.try_run", fake.try_run):
+            rules.reset_evidence_cache()
+            self.assertEqual(rules.never_passed(REPO, [("lanes", None)]), [])
+
+    def test_a_bound_apps_superseded_success_is_not_a_pass(self):
+        # The bound App posted `lanes` success, then failure, on this head,
+        # and another producer's success is what the combined status shows.
+        # The status history lists newest first, and only the App's newest
+        # word counts -- so the requirement is unmet and the pull request
+        # waits, rather than the stale success reading as satisfied and the
+        # block as a review's (Codex review, mikelward/repo#56).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set(_SCAFFOLD_PATHS) - {"AGENTS.md", "CLAUDE.md"}
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.check_runs = {"prhead11": ["zizmor"]}
+        fake.statuses = {"prhead11": ["lanes"]}
+        fake.status_creators = {
+            "prhead11": [
+                ("lanes", "other-bot[bot]"),
+                ("lanes", "lanes-app[bot]", "failure"),
+                ("lanes", "lanes-app[bot]"),
+            ]
+        }
+        fake.pulls = {11: {"mergeable_state": "blocked"}}
+        fake.effective_rules = [
+            {
+                "type": "required_status_checks",
+                "parameters": {"required_status_checks": [{"context": "lanes", "integration_id": 12345}]},
+            }
+        ]
+        fake.app_coverage = {12345: ("lanes-app", "all")}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("needs a person", err)
+        self.assertIn("required check 'lanes' (needs App 12345) has not passed on its head", err)
+        self.assertIn("a check bound to an App needs that App's own report", err)
+        self.assertNotIn("waits:", err)
+        self.assertEqual(fake.merged_pulls, [])
+
+    def test_a_required_check_that_skipped_satisfies_the_blocked_head_as_github_counts_it(self):
+        # GitHub counts a skipped or neutral required check as satisfied,
+        # and the merge assessment does too -- so the blocked classification
+        # must not read one as "has not passed" and wait forever where a
+        # review block needs a person (Codex review, mikelward/repo#56).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.check_runs = {"prhead11": [("lanes", None, "skipped"), "zizmor"]}
+        fake.pulls = {11: {"mergeable_state": "blocked"}}
+        fake.effective_rules = [
+            {
+                "type": "required_status_checks",
+                "parameters": {"required_status_checks": [{"context": "lanes"}]},
+            }
+        ]
+        fake.review_decision = "REVIEW_REQUIRED"
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("needs a person: GitHub blocks it on a review it requires and does not have", err)
+
+    def test_a_pull_request_blocked_by_a_review_needs_a_person(self):
+        # Every required check has passed and GitHub still calls it blocked,
+        # and asked live, GitHub says a review rule holds it -- a review it
+        # lacks, one requesting changes, or an unresolved conversation --
+        # which no later run can settle: held, not waited on forever (Codex
+        # review, mikelward/repo#56). Read live, not inferred from the rules
+        # present, because a rule on the branch is not a rule unsatisfied.
+        cases = [
+            ("REVIEW_REQUIRED", 0, "a review it requires and does not have"),
+            ("CHANGES_REQUESTED", 0, "a review requesting changes"),
+            (None, 2, "2 unresolved conversation(s)"),
+            ("REVIEW_REQUIRED", 1, "a review it requires and does not have and 1 unresolved conversation(s)"),
+        ]
+        for decision, unresolved, expected in cases:
+            fake = FakeGh()
+            fake.bootstrap_existing_paths = set()
+            fake.bootstrap_open_pulls = self._OPEN_11
+            fake.check_runs = {"prhead11": ["lanes", "zizmor"]}
+            fake.pulls = {11: {"mergeable_state": "blocked"}}
+            fake.effective_rules = [
+                {
+                    "type": "required_status_checks",
+                    "parameters": {"required_status_checks": [{"context": "lanes"}]},
+                },
+                {"type": "pull_request", "parameters": {"required_review_thread_resolution": True}},
+                # A rule that settles on its own is ALSO on the branch, and
+                # must not turn a live review block into a wait.
+                {"type": "required_deployments", "parameters": {}},
+            ]
+            fake.review_decision = decision
+            fake.unresolved_threads = unresolved
+            code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+            self.assertEqual(code, 1, (decision, unresolved, err))
+            self.assertIn(f"needs a person: GitHub blocks it on {expected}, which this tool cannot settle", err)
+            self.assertIn("failed on: bootstrap", err)
+            self.assertEqual(fake.merged_pulls, [])
+
+    def test_an_unresolved_conversation_blocks_only_where_a_rule_makes_it(self):
+        # No rule requires conversations resolved, so an unresolved one is
+        # not what blocks the pull request -- and with nothing else to
+        # name, the block is held as one this tool cannot identify.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.check_runs = {"prhead11": ["lanes", "zizmor"]}
+        fake.pulls = {11: {"mergeable_state": "blocked"}}
+        fake.effective_rules = [
+            {
+                "type": "required_status_checks",
+                "parameters": {"required_status_checks": [{"context": "lanes"}]},
+            }
+        ]
+        fake.unresolved_threads = 1
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("needs a person: GitHub blocks it on something this tool cannot identify", err)
+        self.assertEqual(fake.merged_pulls, [])
+
+    def test_a_signature_rule_holds_the_generated_commit_for_a_person(self):
+        # The git-data API commit is unsigned, so a required_signatures
+        # rule on the branch is what blocks it, and only a person settles
+        # that.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.check_runs = {"prhead11": ["lanes", "zizmor"]}
+        fake.pulls = {11: {"mergeable_state": "blocked"}}
+        fake.effective_rules = [{"type": "required_signatures"}]
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "needs a person: 'main' carries a 'required_signatures' rule, which the generated "
+            "commit cannot satisfy",
+            err,
+        )
+        self.assertEqual(fake.merged_pulls, [])
+
+    def test_review_threads_are_read_to_the_last_page(self):
+        # A page boundary is not a blocker: 150 resolved threads are not
+        # "more conversations than this tool reads", and an unresolved one
+        # on the second page is found (Codex review, mikelward/repo#56).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.check_runs = {"prhead11": ["lanes", "zizmor"]}
+        fake.pulls = {11: {"mergeable_state": "blocked"}}
+        fake.effective_rules = [
+            {"type": "pull_request", "parameters": {"required_review_thread_resolution": True}}
+        ]
+        fake.review_threads = [True] * 150
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("needs a person: GitHub blocks it on something this tool cannot identify", err)
+        self.assertNotIn("conversation", err)
+        self.assertEqual(fake.review_state_reads, 4)  # two pages, at plan time and again before the write
+
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.check_runs = {"prhead11": ["lanes", "zizmor"]}
+        fake.pulls = {11: {"mergeable_state": "blocked"}}
+        fake.effective_rules = [
+            {"type": "pull_request", "parameters": {"required_review_thread_resolution": True}}
+        ]
+        fake.review_threads = [True] * 100 + [False]
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("needs a person: GitHub blocks it on 1 unresolved conversation(s)", err)
+
+    def test_a_merge_that_landed_elsewhere_is_reported_not_returned(self):
+        # The merge API pins the head, not the base: a retarget in the
+        # window after the fresh assessment lands the commit on another
+        # branch. Confirmed afterwards, and reported as such rather than
+        # returned as the default branch's new tip (Codex review,
+        # mikelward/repo#56).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.check_runs = {"prhead11": ["lanes", "zizmor"]}
+        fake.merge_landed = "diverged"
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("merged pull request #11 on owner/repo, but 'main' does not contain the merged commit", err)
+        self.assertIn("failed on: bootstrap", err)
+        self.assertNotIn("is on 'main' now", out)
+        self.assertEqual(len(fake.merged_pulls), 1)
+
+    def test_an_unreadable_review_state_fails_the_step_rather_than_guessing(self):
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.check_runs = {"prhead11": ["lanes", "zizmor"]}
+        fake.pulls = {11: {"mergeable_state": "blocked"}}
+        fake.effective_rules = []
+        fake.review_state_fails = True
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("GitHub reports pull request #11 blocked, and its review state could not be read", err)
+        self.assertEqual(fake.merged_pulls, [])
+
+    def test_a_rule_that_settles_on_its_own_is_a_hint_in_the_hold_not_a_wait(self):
+        # Every required check has passed and GitHub still calls it
+        # blocked, but the branch carries a required_deployments rule: a
+        # deployment finishing settles that without a person, so it is a
+        # wait, not a hold (Codex review, mikelward/repo#56).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.check_runs = {"prhead11": ["lanes", "zizmor"]}
+        fake.pulls = {11: {"mergeable_state": "blocked"}}
+        fake.effective_rules = [
+            {
+                "type": "required_status_checks",
+                "parameters": {"required_status_checks": [{"context": "lanes"}]},
+            },
+            {
+                "type": "required_deployments",
+                "parameters": {"required_deployment_environments": ["staging"]},
+            },
+        ]
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "pull request #11 needs a person: GitHub blocks it on something this tool cannot "
+            "identify (the branch carries a 'required_deployments' rule, which may settle on its "
+            "own",
+            err,
+        )
+        self.assertEqual(fake.merged_pulls, [])
+
+    def test_a_head_that_moved_during_the_wait_is_not_merged(self):
+        # The plan read one head; by the write a push has replaced it. What
+        # was confirmed was the merge of the head that was read, so the
+        # fresh state is reported and left for a later run.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.check_runs = {"prhead11": ["lanes", "zizmor"], "prhead11-moved": ["lanes", "zizmor"]}
+        fake.pulls_later = {11: {"head_sha": "prhead11-moved"}}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("pull request #11 is not what this run planned against", err)
+        self.assertEqual(fake.merged_pulls, [])
+
+    def test_a_merge_github_refuses_fails_the_step_and_nothing_else(self):
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.check_runs = {"prhead11": ["lanes", "zizmor"]}
+        fake.pull_merge_fails = {11}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("could not merge pull request #11", err)
+        self.assertIn("failed on: bootstrap", err)
+
+    def test_an_outdated_pinned_template_is_updated_through_the_pull_request(self):
+        # codex-review's three workflow files are byte-pinned in every
+        # consumer, so a copy that differs is never a customization: the
+        # pull request replaces it with the current template (SPEC.md,
+        # *What is updated, and what is only added*). Nothing else present
+        # is touched, and an outdated copy still publishes its check, so
+        # nothing is deferred on its account.
+        fake = FakeGh()
+        fake.bootstrap_outdated_paths = {".github/workflows/codex-review-listener.yml"}
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+        code, out, err = _run(fake, ["--dry-run", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "open a pull request writing 1 file(s) (update fleet ci scaffold files to the current "
+            "templates):",
+            out,
+        )
+        self.assertIn("- update .github/workflows/codex-review-listener.yml to the current template", out)
+        self.assertIn("already present, untouched: 8 file(s)", out)
+        self.assertNotIn("deferred", out)
+
+        code, out, err = _run(fake, ["--force", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"{REPO}: opened pull request #42 writing 1 fleet CI scaffold file(s)", out)
+        tree_posts = [body for _args, body in fake.posts if "base_tree" in body]
+        self.assertEqual(
+            [e["path"] for e in tree_posts[0]["tree"]], [".github/workflows/codex-review-listener.yml"]
+        )
+        commit_posts = [body for _args, body in fake.posts if "parents" in body]
+        self.assertTrue(
+            commit_posts[0]["message"].startswith("Update fleet CI scaffold files to the current templates\n"),
+            commit_posts[0]["message"],
+        )
+        self.assertEqual(fake.created_pulls[0]["title"], "Update fleet CI scaffold files to the current templates")
+        self.assertIn("- update `.github/workflows/codex-review-listener.yml`", fake.created_pulls[0]["body"])
+        ruleset_posts = [b for a, b in fake.posts if a[3] == f"repos/{REPO}/rulesets"]
+        self.assertEqual(
+            [e["context"] for e in ruleset_posts[0]["rules"][0]["parameters"]["required_status_checks"]],
+            ["lanes", "codex", "zizmor"],
+        )
+
+    def test_a_missing_and_an_outdated_file_ride_one_pull_request(self):
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set(_SCAFFOLD_PATHS) - {"AGENTS.md"}
+        fake.bootstrap_outdated_paths = {".github/workflows/codex-review.yml"}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        commit_posts = [body for _args, body in fake.posts if "parents" in body]
+        self.assertTrue(commit_posts[0]["message"].startswith("Add and update fleet CI scaffold files\n"))
+        self.assertIn("- add AGENTS.md", commit_posts[0]["message"])
+        self.assertIn("- update .github/workflows/codex-review.yml to the current template", commit_posts[0]["message"])
+        # A workflow rides the code lane, so no docs prefix even though
+        # AGENTS.md alone would have taken one.
+        self.assertFalse(commit_posts[0]["message"].startswith("docs:"))
+
+    def test_a_present_unpinned_file_that_differs_is_left_alone(self):
+        # ci.yml, the zizmor files, lanes.conf and the conventions files may
+        # carry a project's own decisions: present is enough, whatever they
+        # hold. (The fixture reports a placeholder sha for each of them, so
+        # every one differs from the scaffold's content.)
+        fake = FakeGh()
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.posts, [])
+        self.assertEqual(fake.created_pulls, [])
+        self.assertNotIn("update", out + err)
 
 
 class LogOpenFailureTest(unittest.TestCase):

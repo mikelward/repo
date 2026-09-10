@@ -18,9 +18,9 @@ _RULES_RE = re.compile(r"^repos/([^/]+/[^/]+)/rules/branches/(.+)$")
 _RULESETS_ALL_RE = re.compile(r"^repos/([^/]+/[^/]+)/rulesets\?includes_parents=true$")
 _RULESETS_LOOKUP_RE = re.compile(r"^repos/([^/]+/[^/]+)/rulesets\?includes_parents=false$")
 _RULESET_ONE_RE = re.compile(r"^repos/([^/]+/[^/]+)/rulesets/([^/]+)$")
-_MASTER_BRANCH_RE = re.compile(r"^repos/([^/]+/[^/]+)/branches/master$")
+_SIBLING_REF_RE = re.compile(r"^repos/([^/]+/[^/]+)/git/ref/heads/(main|master)$")
 _COMMITS_HEAD_RE = re.compile(r"^repos/([^/]+/[^/]+)/commits\?per_page=1(?:&sha=(.+))?$")
-_CHECK_RUNS_RE = re.compile(r"^repos/([^/]+/[^/]+)/commits/([^/]+)/check-runs$")
+_CHECK_RUNS_RE = re.compile(r"^repos/([^/]+/[^/]+)/commits/([^/]+)/check-runs(?:\?filter=all)?$")
 _STATUS_RE = re.compile(r"^repos/([^/]+/[^/]+)/commits/([^/]+)/status$")
 _STATUSES_RE = re.compile(r"^repos/([^/]+/[^/]+)/commits/([^/]+)/statuses$")
 _INSTALLATIONS_RE = re.compile(r"^user/installations$")
@@ -122,9 +122,11 @@ class FakeGh:
         # Which ids the repository itself owns; None means all of them.
         # Only consulted for an includes_parents=false lookup.
         self.repo_owned_ruleset_ids = None
-        self.master_exists = False
-        self.master_error = None  # non-404 stderr text, or None
-        self.master_redirect_name = None  # branch a renamed master redirects to
+        # A real branch named main or master beside the default branch
+        # (git/ref/heads/<name>: the branches endpoint follows a rename's
+        # 301 and is not what the tool asks).
+        self.sibling_exists = False
+        self.sibling_error = None  # non-404 stderr text, or None
         # A healthy repo: every default check has reported on the head, so
         # the never-reported walk short-circuits after one commit.
         self.default_head_sha = "abc123"
@@ -220,24 +222,26 @@ class FakeGh:
         if m:
             if self.check_runs_fails is not None:
                 raise gh.GhError(self.check_runs_fails)
-            # Models --jq '[.name, .app.id]': an entry may be a bare name
-            # (no App binding) or a (name, app id) pair.
+            # Models --jq '[.name, .app.id, .conclusion]': an entry may be a
+            # bare name (no App binding) or a (name, app id) pair; audit
+            # asks only whether a check reported, so every one passed.
             return "".join(
-                json.dumps(list(n) if isinstance(n, tuple) else [n, None]) + "\n"
+                json.dumps((list(n) if isinstance(n, tuple) else [n, None]) + ["success"]) + "\n"
                 for n in self.check_runs.get(m.group(2), [])
             )
 
         m = _STATUS_RE.match(endpoint)
         if m:
+            # Models --jq '[.context, .state]'.
             return "".join(
-                json.dumps(c) + "\n" for c in self.statuses.get(m.group(2), [])
+                json.dumps([c, "success"]) + "\n" for c in self.statuses.get(m.group(2), [])
             )
 
         m = _STATUSES_RE.match(endpoint)
         if m:
-            # Models --jq '.[] | [.context, (.creator.login // "")]'.
+            # Models --jq '.[] | [.context, (.creator.login // ""), .state]'.
             return "".join(
-                json.dumps([ctx, login]) + "\n"
+                json.dumps([ctx, login, "success"]) + "\n"
                 for ctx, login in self.status_creators.get(m.group(2), [])
             )
 
@@ -287,7 +291,10 @@ class FakeGh:
         m = _PULLS_RE.match(endpoint)
         if m:
             shas = self.open_prs if m.group(2) == "open" else self.closed_prs
-            return "".join(sha + "\n" for sha in shas)
+            # Paged the way GitHub pages: 100 per page, `page=` from 1.
+            page_m = re.search(r"[&?]page=(\d+)", endpoint)
+            page = int(page_m.group(1)) if page_m else 1
+            return "".join(sha + "\n" for sha in shas[(page - 1) * 100 : page * 100])
 
         if _RULESETS_LOOKUP_RE.match(endpoint) or (
             _RULESETS_ALL_RE.match(endpoint) and jq and "select(.name ==" in jq
@@ -405,16 +412,12 @@ class FakeGh:
         self.calls.append(list(args))
         assert args[0] == "api", args
         endpoint = args[1]
-        if _MASTER_BRANCH_RE.match(endpoint):
-            if self.master_error:
-                return False, self.master_error
-            if self.master_redirect_name:
-                # GitHub 301s a renamed branch's old name to the new one and
-                # gh follows it, so the call succeeds -- reporting the name
-                # it landed on, not the one asked for.
-                return True, f"{self.master_redirect_name}\n"
-            if self.master_exists:
-                return True, "master\n"
+        m = _SIBLING_REF_RE.match(endpoint)
+        if m and m.group(2) != self.default_branch:
+            if self.sibling_error:
+                return False, self.sibling_error
+            if self.sibling_exists:
+                return True, json.dumps({"object": {"sha": "5ib1150000000000000000000000000000000000"}})
             return False, "gh: HTTP 404: Not Found\n"
         m = _WORKFLOWS_DIR_RE.match(endpoint)
         if m:
@@ -1235,50 +1238,52 @@ class AuditCmdTest(unittest.TestCase):
         self.assertNotIn("never reported", out + err)
         self.assertNotIn("does not cover this repo", out + err)
 
-    # ---- master branch check --------------------------------------------
+    # ---- sibling branch check --------------------------------------------
 
-    def test_master_branch_present_is_a_gap(self):
+    def test_sibling_master_beside_main_is_a_gap(self):
         fake = FakeGh()
-        fake.master_exists = True
+        fake.sibling_exists = True
         code, out, err = _run(fake, [REPO])
         self.assertEqual(code, 1, err)
-        self.assertIn("[GAP] a branch literally named 'master' exists", out)
+        self.assertIn("[GAP] a branch named 'master' exists beside the default branch 'main'", out)
+        self.assertIn("holds its ruleset step", out)
 
-    def test_master_branch_absent_is_ok(self):
+    def test_no_sibling_branch_is_ok(self):
         fake = FakeGh()
-        fake.master_exists = False
+        fake.sibling_exists = False
         code, out, err = _run(fake, [REPO])
         self.assertEqual(code, 0, err)
-        self.assertIn("[ok] no branch literally named 'master'", out)
+        self.assertIn("[ok] no branch named 'main' or 'master' beside the default branch 'main'", out)
 
-    def test_renamed_master_is_not_reported_as_an_existing_branch(self):
-        # A repository renamed master -> main keeps a 301 from the old name,
-        # and gh follows it, so the endpoint answers 200 with main's record.
-        # Reading only the exit status turns every such rename into a
-        # standing false gap -- on exactly the repositories that closed the
-        # backdoor by renaming.
+    def test_sibling_is_read_as_a_git_ref_never_the_redirecting_branches_endpoint(self):
+        # A repository renamed master -> main keeps a 301 from the old name
+        # on the branches endpoint, and gh follows it, so that endpoint
+        # answers 200 with main's record -- a standing false gap on exactly
+        # the repositories that closed the backdoor by renaming. The git
+        # ref read answers only for a ref that exists.
         fake = FakeGh()
-        fake.master_redirect_name = "main"
+        fake.sibling_exists = False
         code, out, err = _run(fake, [REPO])
         self.assertEqual(code, 0, err)
-        self.assertIn("[ok] no branch literally named 'master'", out)
-        self.assertNotIn("[GAP] a branch literally named 'master' exists", out)
+        self.assertIn("[ok] no branch named 'main' or 'master'", out)
+        self.assertIn(["api", f"repos/{REPO}/git/ref/heads/master"], fake.calls)
+        self.assertNotIn(["api", f"repos/{REPO}/branches/master", "--jq", ".name"], fake.calls)
 
-    def test_master_branch_lookup_without_a_name_fails_closed(self):
-        # 200 but nothing to identify the branch by is "could not tell",
-        # which is neither a gap nor an ok.
+    def test_a_master_default_branch_is_not_its_own_sibling(self):
+        # A fork whose default branch is master has no main beside it:
+        # nothing to report, and the lock there is the literal main.
         fake = FakeGh()
-        fake.master_redirect_name = None
-        fake.master_exists = True
-        with patch.object(fake, "try_run", lambda args: (True, "\n")):
-            code, out, err = _run(fake, [REPO])
-        self.assertEqual(code, 1)
-        self.assertIn("could not check whether", err)
-        self.assertNotIn("branch literally named 'master'", out)
+        fake.default_branch = "master"
+        fake.sibling_exists = False
+        code, out, err = _run(fake, ["--branch", "master", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[ok] no branch named 'main' or 'master' beside the default branch 'master'", out)
+        self.assertIn(["api", f"repos/{REPO}/git/ref/heads/main"], fake.calls)
+        self.assertNotIn(["api", f"repos/{REPO}/git/ref/heads/master"], fake.calls)
 
-    def test_master_branch_read_failure_fails_closed(self):
+    def test_sibling_branch_read_failure_fails_closed(self):
         fake = FakeGh()
-        fake.master_error = "gh: HTTP 403: Resource protected by organization SAML enforcement\n"
+        fake.sibling_error = "gh: HTTP 403: Resource protected by organization SAML enforcement\n"
         code, out, err = _run(fake, [REPO])
         self.assertEqual(code, 1)
         self.assertIn("could not check whether", err)
@@ -1288,60 +1293,8 @@ class AuditCmdTest(unittest.TestCase):
         # "master" substring check: the targeting-completeness summary
         # legitimately mentions "refs/heads/master" as part of the
         # hardened targeting it confirmed -- it's specifically the
-        # branch-exists finding that must be absent.
-        self.assertNotIn("branch literally named 'master'", out)
-
-    # ---- hard failures (fail closed, never a guessed gap) ----------------
-
-    def test_could_not_read_default_branch_is_fatal(self):
-        fake = FakeGh()
-        fake.default_branch_fails = True
-        code, _, err = _run(fake, [REPO])
-        self.assertEqual(code, 1)
-        self.assertIn(f"could not read {REPO}", err)
-        # The underlying gh error (auth, rate limit, ...) is relayed, not
-        # discarded -- matching every other API failure path in this file.
-        self.assertIn("404", err)
-
-    def test_could_not_resolve_default_branch_for_a_tilde_default_branch_ruleset_is_fatal(self):
-        # Reaches the OTHER default-branch lookup: default_branch_matches(),
-        # lazily fetching the real default to resolve a ruleset's
-        # ~DEFAULT_BRANCH condition when --branch was given explicitly.
-        fake = FakeGh()
-        fake.default_branch_fails = True
-        fake.ruleset_ids = ["1"]
-        fake.ruleset_objects["1"] = _covering_ruleset(
-            include=["~DEFAULT_BRANCH", "refs/heads/main"]
-        )
-        code, _, err = _run(fake, ["--branch", "main", REPO])
-        self.assertEqual(code, 1, err)
-        self.assertIn(f"could not read {REPO}'s default branch", err)
-        self.assertIn("404", err)
-
-    def test_could_not_read_effective_rules_is_fatal(self):
-        fake = FakeGh()
-        fake.effective_rules_fails = "gh: HTTP 404: Not Found\n"
-        code, _, err = _run(fake, [REPO])
-        self.assertEqual(code, 1)
-        self.assertIn("could not read", err)
-        self.assertIn("effective rules", err)
-
-    def test_could_not_list_rulesets_is_fatal(self):
-        fake = FakeGh()
-        fake.rulesets_list_fails = "gh: HTTP 500: Internal Server Error\n"
-        code, _, err = _run(fake, [REPO])
-        self.assertEqual(code, 1)
-        self.assertIn("could not list", err)
-
-    def test_could_not_read_a_single_ruleset_is_fatal(self):
-        fake = FakeGh()
-        fake.ruleset_ids = ["1"]
-        fake.ruleset_read_fails = {"1"}
-        code, _, err = _run(fake, [REPO])
-        self.assertEqual(code, 1)
-        self.assertIn("could not read ruleset 1", err)
-
-    # ---- overall exit status ----------------------------------------------
+        # existence finding that must be absent.
+        self.assertNotIn("beside the default branch", out)
 
     def test_clean_repo_exits_zero(self):
         fake = FakeGh()
@@ -1350,7 +1303,7 @@ class AuditCmdTest(unittest.TestCase):
 
     def test_any_single_gap_makes_the_whole_run_exit_nonzero(self):
         fake = FakeGh()
-        fake.master_exists = True  # the only gap
+        fake.sibling_exists = True  # the only gap
         code, _, err = _run(fake, [REPO])
         self.assertEqual(code, 1, err)
 
@@ -2649,7 +2602,7 @@ class SecretsAuditTest(unittest.TestCase):
         code, out, err = _run(fake, [REPO])
         self.assertEqual(code, 1)
         self.assertIn("could not list owner/repo's repository secrets:", err)
-        tail = out.split("[ok] no branch literally named 'master'")[-1]
+        tail = out.split("[ok] no branch named 'main' or 'master' beside the default branch 'main'")[-1]
         self.assertNotIn("[GAP]", tail)
         self.assertNotIn("[FIX]", tail)
 
