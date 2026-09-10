@@ -232,7 +232,9 @@
       aggregate. A gap of only `AGENTS.md` holds nothing back either way, even
       when adding it failed. `--dry-run` previews the same skip, and the
       branch tip the whole assessment rests on is re-verified immediately
-      before the ruleset write.
+      before the ruleset write. (Superseded 2026-09-10: the hold is now a
+      per-check deferral inside the ruleset write, and the pull request is
+      merged by a later run -- see *Converging takes a few runs* below.)
 
 - [ ] **Key the scaffold branch name to the paths it adds.** Reusing an
       open scaffold pull request is matched by branch prefix -- an
@@ -321,37 +323,55 @@
       defers nothing, which is the case an earlier round of that review
       was right to protect.
 
-- [ ] **The scaffold adds, it never updates.** A scaffold file already on
-      a branch is left exactly as it is, template drift included -- the
-      module's own promise, and deliberate, since reconciling drift is a
-      human decision and the difference may be a project's own
-      customization. The cost is that nothing in the fleet ever brings an
-      old copy forward when `mikelward/codex-review`'s templates move: the
-      file is present, so every later run passes over it. Raised as a
-      finding against the reuse path (Codex, mikelward/repo#42: an older
-      scaffold pull request adding the same filenames with older contents
-      merges, and those contents then persist), but it is the whole
-      design, not that path -- the same is true of any repository whose
-      copy predates a template change, pull request or not. Closing it
-      means a real update step: compare each present scaffold file against
-      the template, report the drift, and offer to take the template's
-      version -- which is a different, riskier thing from gap-filling and
-      wants its own flag and its own confirmation.
+- [x] **The scaffold updates the byte-pinned files, and only those.**
+      A scaffold file already on a branch used to be left exactly as it
+      was, template drift included, on the reasoning that the difference
+      might be a project's own customization. That is true of `ci.yml`,
+      both zizmor files, `lanes.conf`, `AGENTS.md` and `CLAUDE.md`, and
+      they are still add-only. It is never true of codex-review's three
+      workflow files: `codex-review-check` compares them byte for byte in
+      every consumer, so a differing copy is a superseded shape (the
+      migration codex-review's own TODO asks every consumer to make) or
+      drift that already fails that check, and the current template is
+      the right content either way. `plan_gaps` now compares those three
+      by blob sha against the fetched template -- no content read -- and
+      the gap pull request replaces an outdated copy alongside whatever is
+      missing (`GapPlan.outdated`, `scaffold.UPDATED_PATHS`; SPEC.md,
+      *What is updated*). No flag and no separate confirmation: it rides
+      the same pull request, and a pull request is the review.
 
-- [ ] **Converging a repository still takes three runs, and `codex` is
-      why.** The scaffold pull request makes `lanes` and `zizmor` report,
-      but not `codex`: its status-writing workflow runs under
-      `pull_request_target`, which GitHub takes from the BASE branch's
-      copy, so the pull request adding that workflow is the one pull
-      request it cannot run on. So: run one opens the pull request, a
-      human merges it, run two still skips the ruleset step (`codex` has
-      never reported), some real pull request happens, run three writes
-      the ruleset. `--force` waives the never-reported guard and is a
-      legitimate way to cut that to two, since the workflow IS on the
-      default branch by then and the next pull request will report.
-      Closing it properly needs `repo setup` to open something for
-      `codex` to run on once the scaffold has landed -- which means
-      inventing a diff, and no good candidate has turned up yet.
+- [x] **Converging takes a few runs, one rung each, and no person.**
+      Two changes, both from the convergence contract in SPEC.md
+      (maintainer, 2026-09-10: "running repo setup should make progress
+      each time ... it's fine for it to set a new workflow, then the next
+      run can check it ran successfully and add the ruleset"). First, the
+      ruleset step no longer skips itself: a check that has not PASSED
+      here, or whose publishing workflow is still inside the scaffold pull
+      request, is deferred by name inside the write, and everything else
+      -- pull-request protection, linear history, force-push protection,
+      the checks that have passed -- lands now (`rules.never_passed`,
+      `apply_ruleset(defer=...)`). Second, `repo setup` merges its own
+      scaffold pull request on a later run once every check on it passed
+      and GitHub reports it mergeable, rebase, conditional on the head it
+      read (`scaffold.assess_gap_pull_request`, `merge_gap_pull_request`)
+      -- and only when its head is exactly the commit this run would
+      generate, which is what makes a pull request known only by name safe
+      to merge; a stale one is closed and replaced. `codex` still reports
+      only from a pull request the sweep sees after its workflow is on the
+      default branch -- the next scaffold update, a dependency batch,
+      anything -- and is deferred until then, which costs nothing else a
+      wait. `--force` no longer waives any guard: it means "apply without
+      asking", and the fleet loop passes it on every run.
+
+- [ ] **A scaffold pull request the codex sweep never reads waits forever.**
+      The sweep sets `codex` pending when the pull request opens, and Codex
+      reacts only once it reviews; when it never picks the pull request up
+      (seen on mikelward/repo#56, where `@codex review` had to be posted by
+      hand more than once), `repo setup` reads the pending status as a wait
+      on every run and exits 0. A run that finds the status still pending
+      from the run before could post `@codex review` once, and hold after
+      that -- the one nudge the reviewer documents, made by the tool that
+      is waiting on it.
 
 ## repo setup: one ruleset per repository
 
@@ -626,6 +646,139 @@
       repository and reading past the merged section each time.
 
 ## Decisions needing review
+
+- **The convergence contract's edges, as autopilot drew them** (2026-09-10,
+  from the maintainer's principle in chat -- progress every run, no operator
+  intervention, never a permanent wedge, open branches may break temporarily
+  if a rerun or a rebase onto main fixes them -- written into `SPEC.md`).
+  Each of these is one function or one predicate, and each is reversible:
+  - *"Passed" gates a requirement, not "reported".* A check that has run
+    and failed is deferred like one that never ran, with a message that
+    tells the two apart. The alternative -- require on any report, as
+    before -- would put a failing `zizmor` in front of every merge on a
+    repository the moment its scaffold lands. Reversible: `never_passed`
+    is one function beside `never_reported`, and `apply_ruleset` calls
+    one or the other.
+  - *`--force` waives nothing.* It used to waive the never-reported guard,
+    and the fleet loop passes it on every run, so the guard was off
+    exactly where it mattered. Requiring a check before it has passed is
+    now not possible from the command line at all. Reversible: the
+    waiver was three lines in `apply_ruleset`.
+  - *The run that merges the scaffold pull request still defers the checks
+    it publishes.* The deferral is computed from the tree the plan read,
+    before the merge, and what the pull request contained is not read; the
+    next run reads the branch as it is and requires them. Costs one run
+    on a repository that is converging; the alternative infers the
+    branch's contents from "our pull request merged", which is the kind of
+    reasoning ten findings on mikelward/repo#42 were about. Reversible:
+    `defer` in `setup_cmd._run` could be emptied on a merged outcome.
+  - *Merge only when every check run passed (skipped and neutral count as
+    not failed), no status is pending or failed, not a draft, and GitHub
+    reports it mergeable; `dirty`, a failed check, and a `blocked` whose
+    required checks have all passed (a review requirement or an unresolved
+    conversation, which no run can settle) are HELD for a person and exit
+    1; a `blocked` with a required check still unreported waits.* The
+    review-block split was Codex's finding on mikelward/repo#56: waiting
+    there repeated forever with exit 0. Whether a required check is
+    satisfied on the head is asked with the requirement's App binding and
+    with `skipped`/`neutral` counting as GitHub counts them (two more
+    rounds), so neither a same-named check from another App nor a
+    skipped required check misreads a review block.
+  - *"This tool's own" is prefix AND author; "safe to merge" is the head
+    tree.* Codex (mikelward/repo#56) found the prefix alone let a
+    collaborator's same-repository branch be merged once green. A pull
+    request's author is durable, so one another user opened is passed
+    over (and this tool opens its own beside it); what a head HOLDS is
+    checked by content -- the generated commit is deterministic, so the
+    head's tree must equal the branch's current tree plus the generated
+    changes, by blob sha -- and anything else is stale: closed, and a
+    fresh one opened. That subsumes "behind" (a moved base fails the
+    same comparison), so the update-branch path went. The head must also
+    be exactly ONE commit whose parent is the current tip: a push and its
+    revert leave the right tree, and a rebase merge would replay both
+    onto the branch (Codex, round 3). Closing was chosen
+    over holding because a stale one of the tool's own is regenerable and
+    closing is reversible; a signature check was NOT used because commits
+    made through the git-data API are not GitHub-signed, so committer
+    identity there is whatever email the creator typed. Reversible: the
+    author test is one line in `find_open_gap_pull_request`; the tree
+    comparison is `_head_is_the_generated_commit`.
+  - *An update never removes a required check.* A check the ruleset
+    requires that the run does not name used to be dropped, with a "would
+    NO LONGER require" plan line as the safeguard; Codex's security review
+    on mikelward/repo#56 found that with deferral the write could drop a
+    working App-bound gate while every standard check was still waiting,
+    leaving the branch with none. Rather than "keep it only while a
+    replacement is deferred, then swap", the standard is treated as the
+    floor it was declared to be (maintainer, 2026-09-06): extras stay,
+    named in the plan as "keeps requiring, beyond the standard", and
+    `--rule` can only add. Removing a check -- the rename sequence lanes'
+    README describes, say -- is done in the ruleset by hand. Reversible:
+    one line in `_build_update_body`.
+  - *A scaffold pull request is merged by API with the head sha as the
+    merge's precondition*, and only when its fresh verdict and head match
+    what the plan showed -- a change during the confirmation wait is
+    reported and left for a later run, never acted on unconfirmed.
+  - *A `blocked` pull request with every required check passed asks
+    GitHub live what holds it* (`reviewDecision` and unresolved threads,
+    one GraphQL read) rather than inferring a review block from the rules
+    present -- four Codex rounds each found one more rule type the
+    inference misread. What remains is ordered: a signature rule is held
+    (the API commit is unsigned), and anything else is held as
+    unidentified rather than waited on forever, naming any rule on the
+    branch that settles on its own (deployments, required workflows,
+    code scanning) as a hint. That hint was a wait until the fifth round
+    showed a settled deployment rule masking a block only a person can
+    clear; so a deployment still pending now costs one red run that
+    clears itself, rather than reading live deployment and code-scanning
+    state -- more endpoints for a corner nothing in this fleet has.
+    Reversible: the order and the two frozensets in
+    `assess_gap_pull_request`.
+  - *The update set is codex-review's three workflow files and nothing
+    else* (`scaffold.UPDATED_PATHS`). `zizmor.yml` is hand-pinned to a
+    zizmor release per consumer and a bump is a decision to re-read the
+    findings, so it stays add-only even though most copies are identical.
+    Reversible: one frozenset.
+  - *A ruleset that does not yet reach the default branch and already
+    requires a deferred check is refused, not deferred.* Widening it onto
+    the branch would make that check required where nothing can publish
+    it; dropping the check would loosen whatever it protected. The run
+    says what has to land first. Rare (a `main` ruleset scoped to
+    `release`), and the one whole-write refusal the deferral design keeps
+    beside the empty-branch one. Three Codex rounds sharpened it into
+    one rule: a glob include is unevaluated and so counts as NOT covering
+    the branch (fail closed), and a ruleset that does not reach the
+    branch is widened onto it only when it carries nothing that could
+    block a pull request there (`_widening_hazards`: a required check, an
+    approval requirement of any kind, a rule type this tool does not
+    write). Evidence was tried in between -- widen once every kept check
+    has passed here -- and the third round showed that a check's history
+    on the repository is not a history on this branch (a success on a
+    release pull request says nothing about main), so the reading was
+    dropped rather than narrowed again; the fourth round added approval
+    requirements, which the tool's own pull requests can never meet.
+    The refusal is a HOLD of the ruleset step alone (`RulesetHeld`,
+    `report["held"]`), not a preview failure: every other step still
+    runs, since a ruleset a person has to widen is no reason to leave
+    the scaffold unopened (fifth round). Reversible:
+    `_covers_default_branch`, `_widening_hazards` and the guard in
+    `_build_update_body`.
+  - *A real branch named `main` or `master` beside the default holds the
+    ruleset step* (maintainer, 2026-09-11, chosen in chat over
+    hazard-checking the literal refs one write at a time: "for my repos
+    it would be a bug to have a master branch"). Codex's sixth round
+    read the literals the write adds as a newly targeted branch the
+    hazard check skips; a hazard check there answers one write, since
+    the run after adds the checks to the sibling as they pass on the
+    repository, and the tool cannot know what the sibling is for. So the
+    whole step holds while one exists -- every other step still runs,
+    a person deletes or renames the branch or widens by hand -- and the
+    lock loses nothing meanwhile, since nobody can rename into a name
+    that is taken. A fork whose default IS `master` has no sibling and
+    is not held. Read as a Git ref (`git/ref/heads/<name>`), never
+    through `branches/<name>`, which follows a rename's 301 and reported
+    a renamed `master` as present. Reversible: `sibling_branch` and
+    `_hold_for_sibling_branch` in `rules.py`.
 
 - **Binding the `lanes` check to the App: how the verify side recognizes it, and
   what gates the bind** (maintainer-directed, 2026-09-09 -- "make repo setup do
@@ -1172,17 +1325,18 @@
   it too) if a future change to what `apply_ruleset()` manages makes the
   current split awkward.
 
-- **`check_master_branch`'s own read failure (a non-404 gh error, e.g. an
+- **`check_sibling_branch`'s own read failure (a non-404 gh error, e.g. an
   org's SAML enforcement blocking the call) is reported but does not fail
-  `repo setup`.** The task instruction ("warn when the repo has an actual
-  master branch... don't fail") covers the branch existing; it's silent on
-  what a failure to even check should do. Chose non-fatal — an advisory
-  check's own outage shouldn't block the ruleset write, which is the part
-  of `repo setup` that actually matters — over failing closed the way the
-  ruleset steps themselves do. Reversible: flip the last branch in
-  `check_master_branch` to return a failure signal and have `setup_cmd.run`
-  fold it into the exit code, if the owner wants this check held to the
-  same fail-closed standard as the rest of the module.
+  `repo setup` as a whole.** The task instruction ("warn when the repo has
+  an actual master branch... don't fail") covers the branch existing; it's
+  silent on what a failure to even check should do. Chose non-fatal for the
+  advisory — its outage shouldn't block the other steps. Since 2026-09-11
+  the ruleset step asks the same question before it writes (a sibling
+  branch holds the write), and THAT read failing fails the ruleset preview
+  like any other unreadable precondition of the write, so the write is
+  never made on a guess. Reversible: `sibling_branch` is one function, and
+  `_hold_for_sibling_branch` is the only place that turns its error into a
+  failed step.
 
 - **`repo cleanup`'s curses picker measures label width with `len()`, not
   terminal columns.** A branch name with double-width characters (CJK, some
