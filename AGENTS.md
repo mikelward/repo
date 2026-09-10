@@ -23,6 +23,10 @@ one that has stopped biting.
 
 ## Layout
 
+- `SPEC.md` -- the convergence contract for `repo setup`: every run makes
+  progress, nothing waits on an operator that a later run could settle,
+  nothing wedges a repository permanently. A change to the order things
+  land in, to what a run waits on, or to a flag changes that file first.
 - `repo` -- the executable entry point. Adds its own directory to
   `sys.path` so `import repo_lib` resolves without installing anything, then
   dispatches into `repo_lib.cli`.
