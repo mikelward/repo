@@ -114,8 +114,9 @@ per sweep saying nothing happened is the same noise somewhere else.
 
 `repo setup` composes four steps -- the required-checks
 branch ruleset (named `main`, with linear history required, force pushes
-blocked, plus a standalone warning when a repository has an actual
-`master` branch; a ruleset already carrying that name, or a name this tool
+blocked, and held for a person while a repository has a real `main` or
+`master` branch beside its default branch, which is also warned about on
+its own; a ruleset already carrying that name, or a name this tool
 used before it, is adopted and updated in place -- renamed where needed --
 rather than gaining a second one beside it, since rulesets aggregate and
 two of them are only ever confusing, and where both names exist the older

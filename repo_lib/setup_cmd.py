@@ -1503,6 +1503,7 @@ class _Tee:
 
 
 def run(args):
+    rules.reset_evidence_cache()  # one run's evidence, never an earlier one's
     if args.dry_run or args.no_log or not OWNER_REPO_RE.match(args.repo):
         # A dry run changes nothing, so there is nothing to record; a name
         # this has already rejected is _run's error to report, not a path
@@ -1545,11 +1546,7 @@ def _run(args, log=None):
     repo_owner = repo.split("/", 1)[0]
     checks = args.rule if args.rule else list(rules.DEFAULT_CHECKS)
 
-    # Independent of every step below and of --no-rules/--dry-run: worth
-    # flagging on its own, and read-only, so it always runs exactly once.
-    rules.check_master_branch(repo)
-
-    # Always on, like the master-branch check: the fleet credentials have
+    # Always on: the fleet credentials have
     # one right place each, so there is nothing to request -- this step
     # reads where they are and plans the difference. It reads before the
     # early return below so that a run requesting nothing else still
@@ -1603,7 +1600,21 @@ def _run(args, log=None):
             bootstrap_plan = scaffold.GapPlan(error=True)
         else:
             bootstrap_plan = scaffold.plan_gaps(repo, bootstrap_default_branch)
-    bootstrap_idle = args.no_bootstrap or (not bootstrap_plan.error and not bootstrap_plan.missing)
+    bootstrap_idle = args.no_bootstrap or (
+        not bootstrap_plan.error
+        and not bootstrap_plan.changes
+        and not bootstrap_plan.leftover_pull_requests
+    )
+
+    # Independent of every step below and of --no-rules/--dry-run: a real
+    # branch named main or master beside the default is worth flagging on
+    # its own, and the ruleset step holds itself on the same finding
+    # (rules.py). Read-only, once per run, here rather than at the top so
+    # it reuses the default branch the bootstrap step just read instead
+    # of reading it again; with --no-bootstrap it reads it itself. Skipped
+    # when that read already failed above: the failure is reported once.
+    if args.no_bootstrap or bootstrap_default_branch is not None:
+        rules.check_sibling_branch(repo, bootstrap_default_branch)
 
     # A check the branch ALREADY requires whose publisher GitHub reads from
     # the BASE branch, where it is missing, cannot report on any pull
@@ -1721,43 +1732,73 @@ def _run(args, log=None):
         # confirm. Codex review: reaching the confirmation gate below for
         # an empty request meant a non-interactive, no-force invocation of
         # e.g. `repo setup --no-rules OWNER/REPO` (a legitimate way to run
-        # just the master-branch check across a fleet) refused outright
+        # just the sibling-branch check across a fleet) refused outright
         # ("stdin is not a terminal") over a question with no actual
         # mutation behind it to confirm.
         return 0
 
     # ---- Preview: every step's own dry-run/plan, before anything is shown ----
 
+    # Checks the ruleset step must not NEWLY require this run, whatever
+    # they have reported, because their publishing workflow will not be on
+    # the branch when the ruleset takes effect: the bootstrap step is
+    # putting it there through a pull request, or could not (SPEC.md, *The
+    # ladder*). Asked of the BRANCH, never of the pending pull request: a
+    # publisher among the missing paths is one this branch has no way to
+    # report from, and whether some pull request would supply it is not a
+    # question with a durable answer -- a pull request is editable by
+    # anyone at any moment (Codex review, mikelward/repo#42). A gap of
+    # only AGENTS.md contains no publisher and defers nothing. Only two
+    # shapes defer nothing at all: nothing missing, and a branch with no
+    # commits, which the bootstrap step writes directly. A plan that
+    # failed cannot say what is missing, so it defers every check the
+    # ruleset does not already require -- the only safe reading of an
+    # unknown gap. Deferred is not skipped: everything else in the ruleset
+    # is written now, and apply_ruleset joins these with the checks that
+    # have not passed here yet.
+    defer = {}
+    if bootstrap_plan is not None and not args.no_rules:
+        if bootstrap_plan.error:
+            defer = {
+                check: f"'{check}' waits until the fleet CI scaffold can be planned (see the "
+                "bootstrap step), since whether its workflow is on the branch is unknown"
+                for check in checks
+            }
+        elif bootstrap_plan.changes and bootstrap_plan.base_commit_sha is not None:
+            # Every path the pull request carries: a publisher missing from
+            # the branch, and one present but outdated -- a pinned copy
+            # that differs from the template is one this tool does not
+            # vouch for, and a check required on the strength of what it
+            # once published could block the very pull request replacing
+            # it (Codex review, mikelward/repo#56).
+            unpublished = scaffold.checks_a_gap_leaves_unpublished(bootstrap_plan.changes, checks)
+
+            def where_for(path):
+                verb = "adding" if path in bootstrap_plan.missing else "replacing"
+                if bootstrap_plan.missing_workflow_scope:
+                    return "this gh token cannot write it (see the bootstrap step)"
+                if bootstrap_plan.open_pull_request is not None:
+                    return f"pull request #{bootstrap_plan.open_pull_request.number} is {verb} it"
+                return f"the pull request this run opens is {verb} it"
+
+            defer = {
+                check: (
+                    f"'{check}' waits for {scaffold.CHECK_PUBLISHERS[check][0]} to be on "
+                    f"'{bootstrap_default_branch}' -- {where_for(scaffold.CHECK_PUBLISHERS[check][0])}"
+                )
+                for check in unpublished
+            }
+
     ruleset_lines = []
     ruleset_preview_failed = False
-    # Set instead of ruleset_preview_failed when the ONLY reason the
-    # preview refused is the never-reported-check guard: the checks this
-    # run's own bootstrap step is about to push haven't run yet, which
-    # isn't a problem with the request -- it's the ordinary state of a
-    # repository that has never had CI run against it. That's recoverable
-    # by waiting, not by anything this run can fix now, so it skips just
-    # the ruleset step (below) instead of refusing to apply anything at
-    # all -- everything else this run CAN finish, it does.
-    ruleset_never_reported = None
     ruleset_report = {}
     if not args.no_rules:
         _progress(args, f"{repo}: checking rules")
         buf = io.StringIO()
         with redirect_stdout(buf):
-            # force=args.force here, NOT hardcoded True: this is the call
-            # that decides whether apply_ruleset's never-reported-check
-            # guard blocks outright or merely warns, and only an EXPLICIT
-            # --force may waive that guard -- not this function's own
-            # combined-plan confirmation, whether that comes from a "yes"
-            # or from --force. (The real apply below passes force=args.force
-            # too, not a hardcoded True, for the same reason -- see
-            # skip_confirm on that call for how it avoids trying to
-            # re-confirm from stdin a second time instead. Gating the
-            # never-reported guard specifically on args.force here, up
-            # front -- before the single confirmation is ever offered --
-            # gets the same "only --force overrides it" outcome without
-            # that second read. Codex review.)
-            code = rules.apply_ruleset(repo, checks, dry_run=True, force=args.force, report=ruleset_report)
+            code = rules.apply_ruleset(
+                repo, checks, dry_run=True, force=args.force, report=ruleset_report, defer=defer
+            )
         if code == 2:
             # A usage error (an empty or control-character check/ruleset
             # name), validated by apply_ruleset before any gh call it
@@ -1766,35 +1807,56 @@ def _run(args, log=None):
             # as a remote-state one.
             raise SystemExit(2)
         ruleset_lines = buf.getvalue().splitlines()
-        if code != 0:
-            ruleset_never_reported = ruleset_report.get("never_reported")
-            if not ruleset_never_reported:
-                ruleset_preview_failed = True
+        if code != 0 and not ruleset_report.get("held"):
+            ruleset_preview_failed = True
+    ruleset_deferred = ruleset_report.get("deferred") or []
+    # The ruleset step is HELD for a person (a widening that would enforce
+    # on the branch what nothing here can tell it satisfies): this step is
+    # skipped and says so, and every other step still runs -- a held
+    # ruleset is no reason to leave the scaffold unopened or a credential
+    # in the wrong place (SPEC.md, invariant 1; Codex review,
+    # mikelward/repo#56).
+    ruleset_held = ruleset_report.get("held")
 
     # The lanes App binding is a SECOND ruleset update, previewed here as its
     # own action and written (see the Apply section) only after this run's
-    # credential move has settled the pair. Its never-reported guard is the
-    # same one every required check gets: an App that has not published `lanes`
-    # yet holds the binding, and the plan says to rerun once it has.
+    # credential move has settled the pair. Its deferral is the same one
+    # every required check gets: an App that has not published `lanes` yet
+    # leaves the check required unbound, and the plan says a later run
+    # binds it once it has.
     binding_lines = []
     binding_report = {}
     binding_needs_write = False
-    binding_never_reported = None
+    binding_deferred = None
     binding_preview_failed = False
     if want_binding and not args.no_rules:
         bbuf = io.StringIO()
         with redirect_stdout(bbuf):
             bcode = rules.apply_ruleset(
-                repo, bound_checks, dry_run=True, force=args.force, report=binding_report
+                repo, bound_checks, dry_run=True, force=args.force, report=binding_report, defer=defer
             )
         if bcode == 2:
             raise SystemExit(2)
         binding_lines = bbuf.getvalue().splitlines()
-        binding_needs_write = bcode == 0 and bool(binding_report.get("needs_write"))
-        if bcode != 0:
-            binding_never_reported = binding_report.get("never_reported")
-            if not binding_never_reported:
-                binding_preview_failed = True
+        binding_deferred = dict(binding_report.get("deferred") or []).get(credentials.LANES_CHECK)
+        # A write this preview plans while the binding itself is deferred
+        # is the main ruleset step's own (a scope widening, say), not a
+        # binding write: the body carries no binding, and the main step
+        # makes that write first.
+        binding_needs_write = (
+            bcode == 0 and bool(binding_report.get("needs_write")) and not binding_deferred
+        )
+        if bcode != 0 and not binding_report.get("held"):
+            binding_preview_failed = True
+        # The binding preview is the same ruleset step, so a hold it reports
+        # -- the main preview found nothing to write, the binding's write
+        # met a sibling branch -- holds the step exactly as the main
+        # preview's would: said in the plan, the step skipped and counted
+        # failed, every other step still run. Otherwise the binding was
+        # silently skipped and the run exited 0 forever (Codex review,
+        # mikelward/repo#56).
+        if binding_report.get("held") and not ruleset_held:
+            ruleset_held = binding_report["held"]
 
     # setup does not re-point an existing `lanes` binding to a DIFFERENT App
     # (descope, maintainer 2026-09-10). The ruleset step preserves any existing
@@ -1848,8 +1910,22 @@ def _run(args, log=None):
     # can go stale by the time the real write happens (Codex review,
     # mikelward/repo#14).
     empty_branch_would_be_stranded = False
-    if bootstrap_plan is None and not args.no_rules:
-        no_bootstrap_default_branch = _bootstrap_default_branch(repo)
+    # Why nothing this run will push an initial commit: --no-bootstrap, or
+    # a bootstrap plan that failed -- possibly before it could read
+    # whether the branch has any commits at all (the template fetch comes
+    # first), so the answer is read here instead of assumed (Codex review,
+    # mikelward/repo#56). Fails closed either way.
+    empty_branch_reason = None
+    if not args.no_rules and (bootstrap_plan is None or bootstrap_plan.error):
+        if bootstrap_plan is None:
+            empty_branch_reason = "--no-bootstrap means nothing here will add one"
+            no_bootstrap_default_branch = _bootstrap_default_branch(repo)
+        else:
+            empty_branch_reason = (
+                "the fleet CI scaffold could not be planned (see the bootstrap step), so "
+                "nothing here will add one this run"
+            )
+            no_bootstrap_default_branch = bootstrap_default_branch
         if no_bootstrap_default_branch is None:
             empty_branch_would_be_stranded = True
         else:
@@ -1869,99 +1945,28 @@ def _run(args, log=None):
                     )
                 empty_branch_would_be_stranded = True
     # introduces_pr_protection OR checks_added, matching what the real
-    # apply refuses (refuse_if_adds_required_checks below takes the same
+    # apply refuses (refuse_if_newly_effective below takes the same
     # empty_branch_would_be_stranded): an empty branch cannot satisfy a
     # newly required check any more than it can satisfy a new pull-request
     # rule -- nothing has been pushed, so no workflow has ever run there.
     # Leaving the second half out let --dry-run promise an update the real
     # run then refused (Codex review, mikelward/repo#42).
+    ruleset_write_would_newly_bind = bool(
+        ruleset_report.get("introduces_pr_protection")
+        or ruleset_report.get("checks_added")
+        or ruleset_report.get("scope_added")
+    )
     empty_branch_would_strand_ruleset = (
-        not args.no_rules
-        and empty_branch_would_be_stranded
-        and bool(
-            ruleset_report.get("introduces_pr_protection")
-            or ruleset_report.get("checks_added")
-            or ruleset_report.get("scope_added")
-        )
+        not args.no_rules and empty_branch_would_be_stranded and ruleset_write_would_newly_bind
     )
-    # The same guard from a third direction, computed here for the same
-    # reason: anything missing on a branch that HAS commits goes in as a
-    # pull request (scaffold.apply_gaps), so the scaffold is not on the
-    # branch when the ruleset step runs.
-    #
-    # Two ways that wedges a repository, and BOTH have to hold the write
-    # back. Requiring pull requests for the first time blocks the scaffold's
-    # own pull request with the checks it is the thing installing. And
-    # ADDING a required check does the same on a branch that already
-    # requires pull requests, where introduces_pr_protection is False --
-    # `codex` above all, whose publisher runs under `pull_request_target`
-    # from the BASE branch's copy, so not even the scaffold pull request
-    # itself can report it while that copy is still inside the pull
-    # request. Nothing could then merge, the scaffold included, and only an
-    # administrator could undo it. Held back for any newly required check
-    # rather than for `codex` alone: `lanes` and `zizmor` would in fact
-    # report on the scaffold's own pull request, but the run already ends
-    # in "merge it, then rerun", so deferring costs one rerun and spares
-    # this gate a per-check map of which workflow publishes what from
-    # which ref -- knowledge that goes stale (Codex review,
-    # mikelward/repo#42).
-    #
-    # The Apply section decides this again from what the write actually
-    # did, which is the fresher answer; this copy exists so --dry-run
-    # previews the same skip and the same exit status instead of promising
-    # a ruleset the real run holds back.
-    # "This run will not put the scaffold on the branch", which is the
-    # thing the ruleset gate cares about -- and the mirror of the Apply
-    # section's own bootstrap_incomplete, case for case. A failed plan and
-    # a missing `workflow` scope belong here as much as the pull-request
-    # path does: the Apply section turns both into bootstrap_failed and
-    # skips the ruleset, so leaving them out left --dry-run promising a
-    # ruleset the real run holds back, and the confirmation counting a
-    # write that will not happen (Codex review, mikelward/repo#42). Only
-    # two shapes are NOT pending: nothing missing, and a branch with no
-    # commits, which the bootstrap step writes directly.
-    scaffold_pending = bootstrap_plan is not None and (
-        bootstrap_plan.error
-        # No pull request gets opened here, so a head-published check is
-        # as unreachable as a base-published one.
-        or (
-            bootstrap_plan.missing_workflow_scope
-            and bool(
-                scaffold.checks_a_gap_leaves_unpublished(bootstrap_plan.missing, checks)
-            )
-        )
-        or (
-            bool(bootstrap_plan.missing)
-            and bootstrap_plan.base_commit_sha is not None
-            # And only where what's missing actually stops one of these
-            # checks reporting. A pull request adding ci.yml runs ci.yml,
-            # so `lanes` reports on it; only a base-published publisher
-            # (`codex`) is beyond its reach. Holding the ruleset back for
-            # any gap at all deferred it over a missing AGENTS.md, which
-            # is most of this fleet and has every check it needs already
-            # (Codex review, mikelward/repo#42).
-            # Asked of the branch, not of the pending pull request: a
-            # publisher among the missing paths is one this branch has no
-            # way to report from, and whether some pull request would
-            # supply it is not a question with a durable answer (Codex
-            # review, mikelward/repo#42). A gap of only AGENTS.md contains
-            # no publisher and holds nothing back.
-            and bool(
-                scaffold.checks_a_gap_leaves_unpublished(bootstrap_plan.missing, checks)
-            )
-        )
-    )
-    scaffold_pending_would_strand_ruleset = (
-        not args.no_rules
-        and scaffold_pending
-        and bool(
-            ruleset_report.get("introduces_pr_protection")
-            or ruleset_report.get("checks_added")
-            # A ruleset can newly impose its rules on this branch without
-            # changing a rule at all, by widening its scope to cover it
-            # (Codex review, mikelward/repo#42).
-            or ruleset_report.get("scope_added")
-        )
+    # A scaffold pull request only a person can move: a failed check, a
+    # conflict, a draft (see scaffold.GapPullRequestState). Nothing is
+    # written for it, and the run exits 1 so a fleet loop's status names
+    # the repository -- the one kind of wait SPEC.md lets fall to a person.
+    bootstrap_needs_a_person = (
+        bootstrap_plan is not None
+        and bootstrap_plan.pull_request_state is not None
+        and bootstrap_plan.pull_request_state.verdict == "held"
     )
 
     secret_previews = []  # (SecretSpec, (repo, state, env_state), description lines)
@@ -2025,11 +2030,13 @@ def _run(args, log=None):
             # mikelward/repo#45).
             or ruleset_report.get("bypass_note")
             or empty_branch_would_strand_ruleset
-            or scaffold_pending_would_strand_ruleset
-            or ruleset_never_reported
+            or ruleset_held
+            # A check deferred to a later run is the step's change in
+            # progress, said on every run until it lands.
+            or ruleset_deferred
             # The App binding rides in this same section.
             or binding_needs_write
-            or binding_never_reported
+            or binding_deferred
             or binding_uncovered
         )
         if not args.no_rules and (full or not ruleset_idle):
@@ -2045,25 +2052,10 @@ def _run(args, log=None):
             if empty_branch_would_strand_ruleset:
                 lines.append(
                     "    SKIPPED: would strand this repository -- its branch has no commits "
-                    "yet and --no-bootstrap means nothing here will add one"
+                    f"yet and {empty_branch_reason}"
                 )
-            if scaffold_pending_would_strand_ruleset:
-                lines.append(
-                    "    SKIPPED: the fleet CI scaffold will not be on the branch after this run "
-                    "(see the bootstrap step below), so requiring checks it installs would block "
-                    "every merge -- including the pull request adding it"
-                    + (
-                        f" (would newly require {rules.quoted(ruleset_report['checks_added'])})"
-                        if ruleset_report.get("checks_added")
-                        else ""
-                    )
-                )
-            if ruleset_never_reported:
-                lines.append(
-                    f"    SKIPPED: {rules.describe_missing(ruleset_never_reported)} never "
-                    "reported on this repo yet; rerun once they have (--force adds the "
-                    "ruleset anyway, blocking every merge until then)"
-                )
+            if ruleset_held:
+                lines.append(f"    HELD: {ruleset_held}")
             if refuse_repoint:
                 # setup does not re-point an existing binding to a different App
                 # (see refuse_repoint); it leaves the working App in place.
@@ -2101,10 +2093,9 @@ def _run(args, log=None):
                 lines.append(
                     "    (the App binding is written after the credential is settled)"
                 )
-            elif binding_never_reported:
+            elif binding_deferred:
                 lines.append(
-                    f"    the App binding waits: {rules.describe_missing(binding_never_reported)} "
-                    "not yet published by the App it would be bound to; rerun once it has "
+                    f"    the App binding waits: {binding_deferred} -- a later run binds it "
                     "(the check stays required, unbound, until then)"
                 )
         if secret_previews:
@@ -2166,16 +2157,16 @@ def _run(args, log=None):
             or (bootstrap_plan is not None and bootstrap_plan.error)
             or (bootstrap_plan is not None and bootstrap_plan.missing_workflow_scope)
             or empty_branch_would_strand_ruleset
-            or scaffold_pending_would_strand_ruleset
-            or ruleset_never_reported
+            or ruleset_held
+            or bootstrap_needs_a_person
             or binding_preview_failed
             or binding_uncovered
             or refuse_repoint
             or refuse_credential_repoint
-            # A binding held because the App has not published `lanes` yet is
-            # the expected run-1 state of the two-run cadence, not a failure:
-            # the pair is placed, the check stays required (unbound), and a
-            # later run binds it. So it does not fail the (dry) run.
+            # A check deferred to a later run -- the App binding included --
+            # is the expected state of a repository climbing the ladder,
+            # not a failure: everything else lands, and a later run adds
+            # it. So it does not fail the (dry) run (SPEC.md).
         ):
             raise SystemExit(1)
         return 0
@@ -2210,10 +2201,7 @@ def _run(args, log=None):
     # rather than silently skipping if it's ever somehow missing. An App
     # step is a no-op unless its verdict is ADD; an ERROR verdict needs no
     # confirmation either, since apply_step reports it as a failure
-    # without ever attempting a write, confirmed or not. ruleset_never_
-    # reported is excluded outright: the Apply section below skips the
-    # step entirely rather than writing anything, so there is nothing
-    # for a confirmation to be about.
+    # without ever attempting a write, confirmed or not.
     # needs_write is not the whole of what the ruleset step mutates: it
     # also deletes a legacy-named ruleset that is identical to the one
     # this run leaves behind, and the steady state that happens in is an
@@ -2221,15 +2209,12 @@ def _run(args, log=None):
     # apply that deletion with nothing ever asked or shown.
     ruleset_needs_mutation = (
         (not args.no_rules)
-        and not ruleset_never_reported
         # A write the Apply section is already going to skip is not
-        # something to ask about, the same way a never-reported one isn't:
-        # asking spends a confirmation on nothing, and refusing a
-        # non-interactive run for it never reaches the step that would
-        # have reported the scaffold's own pull request (Codex review,
-        # mikelward/repo#42).
-        and not scaffold_pending_would_strand_ruleset
+        # something to ask about: asking spends a confirmation on nothing,
+        # and refusing a non-interactive run for it never reaches the
+        # steps that could still run (Codex review, mikelward/repo#42).
         and not empty_branch_would_strand_ruleset
+        and not ruleset_held
         and (ruleset_report.get("needs_write", True) or bool(ruleset_report.get("deletions")))
     )
     # The App binding is a ruleset write too; when the main ruleset step is
@@ -2249,10 +2234,24 @@ def _run(args, log=None):
             bootstrap_plan is not None
             and not bootstrap_plan.error
             and not bootstrap_plan.missing_workflow_scope
-            and bool(bootstrap_plan.missing)
-            # A scaffold pull request an earlier run left open is reported,
-            # not reopened -- there is no write here to agree to.
-            and bootstrap_plan.open_pull_request is None
+            and bool(bootstrap_plan.changes)
+            # A scaffold pull request an earlier run left open is never
+            # reopened; what this run may do to it is merge it or update
+            # its branch, and only then is there a write to agree to.
+            and (
+                bootstrap_plan.open_pull_request is None
+                or bootstrap_plan.pull_request_state.verdict in ("merge", "stale")
+            )
+        )
+        # Closing a pull request of this tool's own is a write too, agreed
+        # to like any other: one that outlived the scaffold, or a duplicate
+        # beside the one acted on, whatever that one waits on (Codex
+        # review, mikelward/repo#56, twice).
+        or (bootstrap_plan is not None and bool(bootstrap_plan.leftover_pull_requests))
+        or (
+            bootstrap_plan is not None
+            and bootstrap_plan.open_pull_request is not None
+            and bool(bootstrap_plan.open_pull_request.duplicates)
         )
     )
 
@@ -2335,25 +2334,15 @@ def _run(args, log=None):
     # with no commits at all, which has no base for a pull request to
     # target; the ordering still matters for it (scaffold that branch
     # before this run's own ruleset write takes effect, not after).
-    bootstrap_failed = False
-    # Set alongside bootstrap_failed when the failure leaves this run
-    # unable to say WHAT is missing -- a failed plan, or a default branch
-    # that moved out from under it. A publisher-based verdict needs a
-    # trustworthy `missing` set; without one the only safe answer is "the
-    # scaffold might be blocking anything" (Codex review,
-    # mikelward/repo#42).
-    bootstrap_state_unknown = False
-    # The branch's tip right after the bootstrap step verified or wrote
-    # it -- carried into the ruleset gate below so it can re-check the
-    # scaffold is still intact right before activating protection, not
-    # just whether bootstrap itself succeeded (Codex review,
-    # mikelward/repo#14).
+    # The branch's tip right after the bootstrap step verified, wrote or
+    # merged it -- carried into the ruleset step below so it can re-check
+    # the scaffold is still intact right before requiring anything new,
+    # not just whether bootstrap itself succeeded (Codex review,
+    # mikelward/repo#14). None where the scaffold is still in a pull
+    # request or the step failed: the ruleset step then rests on the tip
+    # the plan was built against, and the checks that gap leaves
+    # unpublished are already deferred (see `defer` above).
     bootstrap_completed_sha = None
-    # Set when the scaffold went in as a pull request instead: everything
-    # this step could do is done, but the files are NOT on the branch yet,
-    # so a ruleset about to require pull requests for the first time must
-    # not be written over them (see the gate below).
-    bootstrap_pull_request = None
     if bootstrap_plan is not None:
         if bootstrap_plan.error:
             # Already reported (either the default-branch read's own
@@ -2361,27 +2350,23 @@ def _run(args, log=None):
             # here knows what is missing, so nothing may conclude the gap
             # is harmless.
             failed.append("bootstrap")
-            bootstrap_failed = True
-            bootstrap_state_unknown = True
         elif bootstrap_plan.missing_workflow_scope:
-            # Same shape as ruleset.py's never_reported skip below:
-            # nothing is wrong with the repository or the request, only
+            # Nothing is wrong with the repository or the request, only
             # with what this gh token may write, and that's recoverable
             # by the caller (add the scope, rerun) -- not something to
             # attempt and watch fail, or to let block everything else
             # this run could otherwise still do (mikelward/repo#18).
             workflow_count = sum(
-                1 for path in bootstrap_plan.missing if path.startswith(".github/workflows/")
+                1 for path in bootstrap_plan.changes if path.startswith(".github/workflows/")
             )
             error(
                 f"{repo}: skipping the bootstrap step -- this gh token is missing the 'workflow' "
-                f"OAuth scope, needed to add {workflow_count} file(s) under "
+                f"OAuth scope, needed to write {workflow_count} file(s) under "
                 ".github/workflows/. Run `gh auth refresh -s workflow` (or add the scope your "
                 "token's own way) and rerun; nothing under .github/workflows/ was touched, and "
                 "this run's other steps still ran."
             )
             failed.append("bootstrap")
-            bootstrap_failed = True
         else:
             # Re-verify the default branch is still the one plan_gaps
             # built this plan against, whether or not anything was
@@ -2394,8 +2379,6 @@ def _run(args, log=None):
             current_default_branch = _bootstrap_default_branch(repo)
             if current_default_branch is None:
                 failed.append("bootstrap")
-                bootstrap_failed = True
-                bootstrap_state_unknown = True
             elif current_default_branch != bootstrap_default_branch:
                 error(
                     f"{repo}: default branch changed from '{bootstrap_default_branch}' to "
@@ -2404,42 +2387,61 @@ def _run(args, log=None):
                     "default branch."
                 )
                 failed.append("bootstrap")
-                bootstrap_failed = True
                 # The plan describes a branch that is no longer the one
                 # this repository uses; its `missing` says nothing about
                 # the new one.
-                bootstrap_state_unknown = True
             else:
                 # apply_gaps itself re-verifies the tip before reporting
                 # success either way -- pull request, empty-branch
                 # bootstrap, or, for a no-op plan, just the recheck -- so
                 # nothing further is needed here beyond reading what it
                 # says it did.
-                outcome = scaffold.apply_gaps(repo, bootstrap_default_branch, bootstrap_plan)
+                outcome = scaffold.apply_gaps(
+                    repo,
+                    bootstrap_default_branch,
+                    bootstrap_plan,
+                    # The settings step's own plan, agreed to above: the
+                    # merge turns the setting on first only where the plan
+                    # said it would (Codex review, mikelward/repo#56).
+                    enable_delete_branch_on_merge=delete_branch_state == "enable",
+                )
                 if outcome.error:
                     failed.append("bootstrap")
-                    bootstrap_failed = True
+                elif outcome.pull_request is not None and outcome.pull_request.merged:
+                    pull_request = outcome.pull_request
+                    bootstrap_completed_sha = outcome.branch_sha
+                    print(
+                        f"{repo}: merged pull request #{pull_request.number} -- the fleet CI "
+                        f"scaffold it carried is on '{bootstrap_default_branch}' now: "
+                        f"{pull_request.url}"
+                    )
                 elif outcome.pull_request is not None:
-                    bootstrap_pull_request = outcome.pull_request
                     pull_request = outcome.pull_request
                     if pull_request.opened:
+                        replaced = (
+                            f" in place of the stale #{pull_request.replaced}, now closed,"
+                            if pull_request.replaced is not None
+                            else ""
+                        )
                         print(
-                            f"{repo}: opened pull request #{pull_request.number} adding "
-                            f"{len(bootstrap_plan.missing)} fleet CI scaffold file(s): "
+                            f"{repo}: opened pull request #{pull_request.number}{replaced} writing "
+                            f"{len(bootstrap_plan.changes)} fleet CI scaffold file(s): "
                             f"{pull_request.url}"
                         )
                     else:
                         # Not a change this run made, but not noise either:
                         # it is the one thing standing between this
                         # repository and a scaffold, and a fleet run that
-                        # said nothing would leave it open forever. No
-                        # claim about what it contains -- a rerun after the
-                        # merge says what is left, and says it reliably.
-                        print(
-                            f"{repo}: pull request #{pull_request.number} is adding the fleet CI "
-                            f"scaffold -- merge it, then rerun to see what is left: "
-                            f"{pull_request.url}"
-                        )
+                        # said nothing would leave it open forever. What
+                        # it waits on, read fresh -- never what it
+                        # contains (Codex review, mikelward/repo#42).
+                        state = pull_request.state
+                        line = scaffold.describe_pull_request_state(pull_request, state)
+                        if state.verdict == "held":
+                            error(f"{repo}: {line}: {pull_request.url}")
+                            failed.append("bootstrap")
+                        else:
+                            info(f"{repo}: {line}: {pull_request.url}")
                     # The branch's own gate, read once at plan time and
                     # reported here in the same words the preview used. It
                     # describes a condition that predates this run, so a
@@ -2452,129 +2454,48 @@ def _run(args, log=None):
                         warn(f"{repo}: heads up -- {wedged}")
                 else:
                     bootstrap_completed_sha = outcome.branch_sha
-                    if bootstrap_plan.missing:
-                        print(f"{repo}: added {len(bootstrap_plan.missing)} fleet CI scaffold file(s)")
+                    if bootstrap_plan.changes:
+                        print(f"{repo}: added {len(bootstrap_plan.changes)} fleet CI scaffold file(s)")
 
-    # empty_branch_would_be_stranded (the --no-bootstrap-on-an-empty-branch
-    # case) was already computed above during planning, not here -- see its
-    # own comment there for why. bootstrap_failed, above, is the only thing
-    # this Apply section still needs to determine fresh (with
-    # bootstrap_pull_request beside it): a real write's success or failure
-    # genuinely can't be known ahead of attempting it.
-
-    # Blocks the ruleset step only when its write would be the one that
-    # FIRST makes the branch require a pull request -- from the existing
-    # ruleset's own rules (ruleset_report["introduces_pr_protection"]), not
-    # merely whether it already exists, since an update that ADDS
-    # pull_request to a ruleset that didn't have it is just as dangerous as
-    # creating one fresh. The danger is no longer the write path -- the
-    # bootstrap step goes through a pull request now, which protection
-    # does not block -- but the checks: a ruleset requiring `lanes`,
-    # `codex` and `zizmor` written while the scaffold is still IN a pull
-    # request blocks that pull request with the very checks it is the
-    # thing installing. So a scaffold still pending in one
-    # (bootstrap_pull_request) holds this back exactly as a failed
-    # bootstrap does. An update that doesn't introduce protection is let
-    # through regardless -- unchanged exposure either way.
-    # empty_branch_would_strand_ruleset (planning, above) is the same
-    # guard from the other direction: --no-bootstrap on an empty branch
-    # rather than a failed one (Codex review, mikelward/repo#14). A
-    # concurrent push moving the scaffold branch after bootstrap finished
-    # (or an administrator changing the default branch itself) is a
-    # separate, later check -- verify_scaffold_before_introducing_pr_
-    # protection, passed to the real apply_ruleset call below, since only
-    # ITS fresh recompute knows the CURRENT default branch and the CURRENT
-    # (not preview-snapshot) answer to whether this write introduces
-    # protection (Codex review, mikelward/repo#14).
-    # The scaffold is not on the branch: the step failed (or could not
-    # tell), or it is waiting in a pull request AND what is waiting there
-    # is something a requested check needs. The same cut the planning
-    # copy's scaffold_pending makes, so the preview and the run agree --
-    # a pull request carrying only AGENTS.md blocks no check and holds
-    # nothing back (Codex review, mikelward/repo#42).
-    bootstrap_incomplete = bootstrap_state_unknown or (
-        bootstrap_failed
-        # No pull request exists to report on, so a head-published check
-        # is as unreachable as a base-published one -- but a gap of only
-        # AGENTS.md still leaves every check publishable, and a failure to
-        # add it is no reason to hold back an unrelated ruleset write
-        # (Codex review, mikelward/repo#42).
-        and bool(scaffold.checks_a_gap_leaves_unpublished(bootstrap_plan.missing, checks))
-    ) or (
-        bootstrap_pull_request is not None
-        and bool(scaffold.checks_a_gap_leaves_unpublished(bootstrap_plan.missing, checks))
+    # The one whole-step skip left: pull-request protection on a branch
+    # with no commits that nothing this run will push one to. Every other
+    # reason a ruleset write once waited -- a check the scaffold has not
+    # installed, one that has never run -- is now a per-check deferral
+    # inside the write (see `defer` above and rules.apply_ruleset), so the
+    # rest of the ruleset lands and the run says what a later one adds
+    # (SPEC.md, *The ladder*). This one cannot be a deferral: it is the
+    # pull_request rule itself that strands the branch, and there is no
+    # smaller write to make.
+    # The same strand, found at apply time: the plan read an empty branch
+    # and this run's bootstrap step was going to fill it first, but did
+    # not -- so the branch is exactly as empty as it was, and the ruleset
+    # write that was safe behind a successful bootstrap is not safe now
+    # (Codex review, mikelward/repo#56).
+    bootstrap_left_branch_empty = (
+        bootstrap_plan is not None
+        and not bootstrap_plan.error
+        and bootstrap_plan.base_commit_sha is None
+        and bootstrap_completed_sha is None
     )
-    # introduces_pr_protection OR checks_added -- see
-    # scaffold_pending_would_strand_ruleset above for why adding a check is
-    # its own way to wedge a branch that already requires pull requests.
-    ruleset_would_need_the_scaffold = bool(
-        ruleset_report.get("introduces_pr_protection")
-        or ruleset_report.get("checks_added")
-        or ruleset_report.get("scope_added")
-    )
-
-    def _needs_the_scaffold_because():
-        """What this ruleset write would do that the pending scaffold has
-        to land first for -- both halves where both apply, since a write
-        can introduce pull-request protection AND name new checks."""
-        reasons = []
-        if ruleset_report.get("introduces_pr_protection"):
-            reasons.append("make its branch require a pull request for the first time")
-        if ruleset_report.get("checks_added"):
-            reasons.append(f"newly require {rules.quoted(ruleset_report['checks_added'])}")
-        if ruleset_report.get("scope_added"):
-            reasons.append(
-                "newly target " + ", ".join(ruleset_report["scope_added"]) + ", making its "
-                "existing rules effective there"
-            )
-        return " and ".join(reasons) or "require checks the fleet CI scaffold installs"
-    if not args.no_rules and (
-        (bootstrap_incomplete and ruleset_would_need_the_scaffold)
-        or empty_branch_would_strand_ruleset
-    ):
-        if bootstrap_pull_request is not None and not bootstrap_failed:
-            error(
-                f"{repo}: skipping the ruleset step -- it would {_needs_the_scaffold_because()}, "
-                f"and the fleet CI scaffold is still only in pull request "
-                f"#{bootstrap_pull_request.number} (see above), not on the branch. Requiring "
-                "checks it has not installed yet would block every merge -- that very pull "
-                "request included, and `codex` cannot report on it at all until its workflow is "
-                "on the branch. Merge it, then rerun."
-            )
-        elif bootstrap_failed:
-            error(
-                f"{repo}: skipping the ruleset step -- it would {_needs_the_scaffold_because()}, "
-                "and the bootstrap step that must land first (see above) failed. Requiring checks "
-                "the scaffold has not installed would block every merge -- the scaffold's own "
-                "pull request, which a rerun would open, included. Fix the bootstrap failure and "
-                "rerun."
-            )
-        else:
-            error(
-                f"{repo}: skipping the ruleset step -- it would make its branch require a pull "
-                "request for the first time, and the branch has no commits yet (--no-bootstrap "
-                "means nothing here will add one). Activating pull-request protection now would "
-                "permanently strand the repository: no direct push could create the branch, and no "
-                "pull request can target one that doesn't exist yet to use as a base. Push an "
-                "initial commit by hand first (or drop --no-bootstrap so this scaffolds one), then "
-                "rerun."
-            )
-        failed.append("ruleset")
-    elif not args.no_rules and ruleset_never_reported:
-        # The chicken-and-egg case: a repository whose required checks
-        # have never run has no way to satisfy them by the time this
-        # ruleset would take effect, so creating it now would just block
-        # every future merge. Nothing here is broken -- everything else
-        # this run could do (bootstrap included) already happened above
-        # -- so this skips only the ruleset step rather than the whole
-        # run refusing to change anything, and says what unblocks it.
+    if bootstrap_left_branch_empty:
+        empty_branch_would_be_stranded = True
+        empty_branch_reason = "this run's bootstrap step did not add one (see above)"
+        empty_branch_would_strand_ruleset = not args.no_rules and ruleset_write_would_newly_bind
+    if not args.no_rules and empty_branch_would_strand_ruleset:
         error(
-            f"{repo}: skipping the ruleset step -- {rules.describe_missing(ruleset_never_reported)} "
-            "never reported on this repo yet, so requiring them now would block every merge with no "
-            "way to satisfy it. Rerun once they have -- a scaffold pull request opened above runs "
-            "`lanes` and `zizmor`, and `codex` reports from the first pull request opened once the "
-            "scaffold is on the default branch -- or pass --force to add the ruleset anyway."
+            f"{repo}: skipping the ruleset step -- it would make its branch require a pull "
+            f"request for the first time, and the branch has no commits yet ({empty_branch_reason}). "
+            "Activating pull-request protection now would "
+            "permanently strand the repository: no direct push could create the branch, and no "
+            "pull request can target one that doesn't exist yet to use as a base. Push an "
+            "initial commit by hand first (or let this scaffold one: drop --no-bootstrap, or fix "
+            "what failed), then rerun."
         )
+        failed.append("ruleset")
+    elif not args.no_rules and ruleset_held:
+        # Already said in full when the preview held it; one line here so
+        # the run's record names the step that did not happen and why.
+        error(f"{repo}: skipping the ruleset step -- held for a person (see above)")
         failed.append("ruleset")
     elif not args.no_rules:
         # expected_fingerprint carries forward what the preview call
@@ -2607,11 +2528,11 @@ def _run(args, log=None):
         # they explicitly authorized overriding it. See apply_ruleset's own
         # doc for both parameters.
         # The branch tip every conclusion about the scaffold rests on:
-        # what the bootstrap step verified after writing, or -- where it
-        # went in as a pull request instead, or was a harmless gap that
+        # what the bootstrap step verified after writing (or merging), or
+        # -- where it went in as a pull request instead, or was a gap that
         # failed -- the tip the plan was built against, which is what
-        # "does this gap block a check" was computed from (Codex review,
-        # mikelward/repo#42).
+        # "does this gap leave a check unpublished" was computed from
+        # (Codex review, mikelward/repo#42).
         expected_tip = bootstrap_completed_sha
         if expected_tip is None and bootstrap_plan is not None and not bootstrap_plan.error:
             expected_tip = bootstrap_plan.base_commit_sha
@@ -2653,34 +2574,18 @@ def _run(args, log=None):
                 force=args.force,
                 expected_fingerprint=ruleset_report["fingerprint"],
                 skip_confirm=True,
-                # The gate above uses the PREVIEW's introduces_pr_protection,
-                # a snapshot; passing this through has apply_ruleset's own
-                # fresh recompute (right before the real write) refuse if it
-                # only became true during the confirmation wait -- covering
-                # both bootstrap_failed and the --no-bootstrap-on-an-empty-
-                # branch case, which never sets bootstrap_failed on its own
-                # (Codex review, mikelward/repo#14).
-                refuse_if_introduces_pr_protection=(
-                    bootstrap_incomplete or empty_branch_would_be_stranded
-                ),
-                # The other half of the same window: an administrator
-                # removing a required check during the wait makes the
-                # fresh recompute name it where the preview named nothing,
-                # and the target body -- and so the fingerprint -- is the
-                # same either way (Codex review, mikelward/repo#42).
-                refuse_if_adds_required_checks=(
-                    bootstrap_incomplete or empty_branch_would_be_stranded
-                ),
-                # And the third: a widening makes the ruleset's existing
-                # rules newly effective on this branch without changing a
-                # rule (Codex review, mikelward/repo#42).
-                refuse_if_widens_scope=(
-                    bootstrap_incomplete or empty_branch_would_be_stranded
-                ),
+                # The same deferrals the preview was shown with, so the
+                # fresh recompute plans the same body.
+                defer=defer,
+                # The gate above uses the PREVIEW's answer, a snapshot;
+                # passing this through has apply_ruleset's own fresh
+                # recompute (right before the real write) refuse if the
+                # write only became newly effective during the confirmation
+                # wait -- an existing pull_request rule or required check
+                # removed meanwhile (Codex review, mikelward/repo#14, #42).
+                refuse_if_newly_effective=empty_branch_would_be_stranded,
                 # Only meaningful once bootstrap has actually verified a
-                # tip to compare against -- bootstrap_failed above already
-                # blocks the case where it hasn't (Codex review,
-                # mikelward/repo#14).
+                # tip to compare against (Codex review, mikelward/repo#14).
                 verify_scaffold_before_requiring_checks=(
                     _verify_scaffold_still_current if expected_tip is not None else None
                 ),
@@ -2724,7 +2629,12 @@ def _run(args, log=None):
         _binding_apply_report = {}
         with redirect_stdout(io.StringIO()):
             _binding_capture_code = rules.apply_ruleset(
-                repo, bound_checks, dry_run=True, force=args.force, report=_binding_apply_report
+                repo,
+                bound_checks,
+                dry_run=True,
+                force=args.force,
+                report=_binding_apply_report,
+                defer=defer,
             )
         # Only a clean capture yields a fingerprint to pin the deferred write
         # to; a failed one (a transient read, say) leaves it None, and the
@@ -3196,6 +3106,7 @@ def _run(args, log=None):
                     force=args.force,
                     skip_confirm=True,
                     expected_fingerprint=binding_apply_fingerprint,
+                    defer=defer,
                 )
                 != 0
             ):

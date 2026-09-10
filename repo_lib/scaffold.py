@@ -15,11 +15,25 @@ workflow runs under `pull_request_target`, taken from the BASE branch's
 copy, so it reports from the first pull request opened after this one
 merges, not on this one.
 
-The gap-filling half never overwrites: a scaffold file `repo setup` finds
-already present is left exactly as it is, differences from the fleet's own
-copy included -- reconciling those is a human decision (the drift might be
-a deliberate, project-specific customization), not something this tool
-silently corrects. Only a path genuinely absent gets added.
+The gap-filling half never overwrites a file a project may have made its
+own: `ci.yml`, both zizmor files, `lanes.conf`, `AGENTS.md` and
+`CLAUDE.md` are left exactly as found, differences from the fleet's copy
+included -- reconciling those is a human decision. The one exception is
+the byte-pinned set, codex-review's three workflow files (UPDATED_PATHS):
+those are compared byte for byte against the templates in every consumer
+by `codex-review-check`, so a differing copy is never a customization,
+and the pull request replaces it with the current template -- which is
+how a template change reaches the fleet (SPEC.md, *What is updated*).
+
+The pull request this opens is merged by `repo setup` itself on a later
+run, once every check on it has passed and GitHub reports it mergeable
+(assess_gap_pull_request / merge_gap_pull_request) -- rebase, conditional
+on the head sha it read, and only when the head's tree is exactly what
+this run would generate on the branch as it is now; one that is not (the
+base moved, a template moved, something was pushed to it) is closed and
+replaced. A failed check, a conflict, a draft, or a review block is
+reported as needing a person; nothing is written for it (SPEC.md, *Its
+own pull requests*).
 
 Splits into what's mechanically safe to generate and what genuinely needs
 project knowledge, and only ever does the former:
@@ -102,13 +116,14 @@ attempting the write at all (see its own docstring, mikelward/repo#18).
 """
 
 import base64
+import hashlib
 import json
 import re
 import urllib.parse
 from dataclasses import dataclass, field
 
-from repo_lib import gh
-from repo_lib.common import error, error_lines
+from repo_lib import gh, rules
+from repo_lib.common import error, error_lines, info, warn
 
 # A prior version of this module retried a git-data CREATE call (blob/
 # tree/commit) on a 404, on the theory that GitHub's git-data backend
@@ -122,6 +137,14 @@ from repo_lib.common import error, error_lines
 # confirmed cause up front instead, so this fails in milliseconds with an
 # actionable message rather than after 62 seconds of pointless retrying
 # into the same unhelpful "Not Found".
+
+
+def _blob_sha(content):
+    """The sha git gives a blob holding `content` -- what a tree listing
+    reports for a file, so a present file can be compared against the
+    template with no read of its content at all."""
+    data = content.encode()
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
 
 
 def _missing_workflow_scope(missing_paths):
@@ -146,6 +169,16 @@ def _missing_workflow_scope(missing_paths):
 
 TEMPLATE_REPO = "mikelward/codex-review"
 TEMPLATE_FILES = ("codex-review.yml", "codex-review-check.yml", "codex-review-listener.yml")
+# The scaffold paths that are UPDATED when present and different, not only
+# added when absent: exactly the byte-pinned set. codex-review's
+# `codex-review-check` compares these three against its templates byte for
+# byte in every consumer, so a local copy that differs is either a
+# superseded shape (the migration the update performs) or drift that
+# already fails that check -- the current template is the right content
+# either way, and this is how a template change reaches the fleet. Every
+# other scaffold file may carry a project's own decisions and is only ever
+# added (SPEC.md, *What is updated, and what is only added*).
+UPDATED_PATHS = frozenset(f".github/workflows/{name}" for name in TEMPLATE_FILES)
 ZIZMOR_SOURCE_REPO = "mikelward/lanes"
 # The fleet's shared agent conventions, and where a scaffolded repository
 # gets its own copy from. One maintained file rather than a second copy
@@ -707,26 +740,37 @@ def push_initial_commit(repo, default_branch, files):
 # and gets a different branch.
 GAP_BRANCH_PREFIX = "repo-setup/fleet-ci-scaffold"
 
-_GAP_SUBJECT = "Add missing fleet CI scaffold files"
+_GAP_SUBJECTS = {
+    (True, False): "Add missing fleet CI scaffold files",
+    (False, True): "Update fleet CI scaffold files to the current templates",
+    (True, True): "Add and update fleet CI scaffold files",
+}
 
 _GAP_PULL_REQUEST_BODY = """\
 Opened by `repo setup`: the fleet's standard CI scaffold files this
-repository was missing.
+repository was missing or holding an outdated copy of.
 
 {files}
 
-Added through a pull request rather than pushed to the default branch so
-that the checks they install actually run: `lanes` and `zizmor` report on
-this pull request itself, which is what lets a required-checks ruleset
-name them. `codex` cannot report here -- its status-writing workflow runs
-under `pull_request_target`, which GitHub takes from the BASE branch's
-copy, so the pull request adding that workflow is the one pull request it
-cannot run on; it starts reporting on the first pull request opened after
-this one merges.
+A pull request rather than a push to the default branch so that the checks
+these files install actually run: `lanes` and `zizmor` report on this pull
+request itself, which is what lets a required-checks ruleset name them.
+`codex` cannot report on a pull request that is itself adding its workflow
+-- its status-writing sweep runs under `pull_request_target`, which GitHub
+takes from the BASE branch's copy -- so on a repository getting it for the
+first time it starts reporting on the first pull request opened after this
+one merges.
 
-Nothing already in the repository was touched: only paths that were
-absent are added.
+`repo setup` merges this pull request itself on a later run, once every
+check on it has passed and GitHub reports it mergeable. Nothing else in
+the repository was touched: a path that was absent is added, and only the
+three codex-review workflow files -- pinned byte for byte to their
+templates in every consumer -- are ever replaced.
 """
+
+
+def _gap_subject(missing, outdated):
+    return _GAP_SUBJECTS[(bool(missing), bool(outdated))]
 
 
 @dataclass
@@ -749,18 +793,64 @@ class GapPullRequest:
     url: str
     head_branch: str
     opened: bool = True
+    # Other open pull requests of this tool's own beside this one -- two
+    # runs overlapping, each finding none open and opening its own. This
+    # one (the lowest number, so every run picks the same) is the one
+    # acted on; apply_gaps closes the rest first, since a scaffold that
+    # is complete afterwards would otherwise never look for them again
+    # (Codex review, mikelward/repo#56).
+    duplicates: list = field(default_factory=list)
+    # Set by apply_gaps when this run merged it (see merge_gap_pull_request):
+    # the scaffold it carried is on the default branch now.
+    merged: bool = False
+    # What apply_gaps found it waiting on, when it did not merge it.
+    state: "GapPullRequestState" = None
+    # The number of the stale pull request this one was opened in place of.
+    replaced: int = None
+
+
+@dataclass
+class GapPullRequestState:
+    """What a scaffold pull request an earlier run left open is waiting
+    on, read from its head and its checks -- never from its diff (see
+    GapPullRequest). `verdict` is one of:
+
+    - "merge": every check run on the head completed without failing, no
+      commit status is pending or failed, and GitHub reports it mergeable
+      -- apply_gaps merges it (SPEC.md, *Its own pull requests*).
+    - "stale": its head is not the commit this run would generate on the
+      branch as it is now -- the base moved, a template moved, or
+      something was pushed to it -- so apply_gaps closes it and opens a
+      fresh one. Checked before anything else about it: whatever its
+      checks say, it is not the pull request this tool would open today.
+    - "wait": something is still running, GitHub has not decided
+      mergeability yet, a required check has not reported on it, or nothing
+      has reported on the head at all -- a later run looks again, and
+      nothing is written.
+    - "held": a person is needed -- a check failed, the branch conflicts
+      with its base, the pull request was made a draft, or GitHub blocks it
+      on a review requirement or an unresolved conversation, which this
+      tool cannot settle. Said with the reason; nothing is written.
+
+    `head_sha` is the head the verdict was read from, and what a merge is
+    made conditional on."""
+
+    verdict: str
+    reason: str
+    head_sha: str = None
 
 
 @dataclass
 class GapOutcome:
     """What apply_gaps did. `error` means it failed (already reported).
-    Otherwise exactly one of the other two is set: `branch_sha` is the
-    default branch's freshly verified tip when the scaffold is ON it
-    (nothing was missing, or a branch with no commits was bootstrapped),
-    and `pull_request` is where the scaffold is instead waiting when it
-    went through a pull request -- in which case the branch itself is
-    still unscaffolded, which is what a caller about to activate
-    pull-request protection has to know."""
+    Otherwise: `branch_sha` is the default branch's freshly verified tip
+    when the scaffold is ON it (nothing was missing, a branch with no
+    commits was bootstrapped, or this run merged the pull request that
+    carried it -- `pull_request.merged` then says which), and
+    `pull_request` alone is where the scaffold is instead still waiting
+    when it went through a pull request that is still open -- in which
+    case the branch itself is still unscaffolded, which is what a caller
+    about to require the checks it publishes has to know."""
 
     error: bool = False
     branch_sha: str = None
@@ -772,9 +862,14 @@ def _gap_branch(ref):
     return ref == GAP_BRANCH_PREFIX or ref.startswith(GAP_BRANCH_PREFIX + "-")
 
 
-def find_open_gap_pull_request(repo, default_branch):
+def find_open_gap_pull_request(repo):
     """(ok, GapPullRequest or None): the scaffold pull request an earlier
-    run left open against `default_branch`, if there is one.
+    run left open, if there is one -- whatever branch it targets now.
+    Listed without a base filter on purpose: one retargeted off the
+    default branch since it was opened would otherwise be invisible here,
+    and this run would open a second beside it and leave it open forever;
+    found, assess_gap_pull_request reads its base and replaces it as
+    stale (Codex review, mikelward/repo#56).
 
     ok is False -- with the failure already reported -- when the read
     itself failed. Fail closed: "could not tell" must not read as "there
@@ -789,24 +884,36 @@ def find_open_gap_pull_request(repo, default_branch):
     (Codex review, mikelward/repo#42). The base repository IS the one
     just listed from, so comparing the two ids settles same-repo against
     fork with nothing to normalize. A head whose fork was deleted answers
-    null, which is not the base's id either."""
+    null, which is not the base's id either.
+
+    And only a pull request THIS token's user opened: the branch prefix
+    is a name anyone with push access can use, and a later run merges
+    what it finds here (Codex review, mikelward/repo#56). A pull
+    request's author is durable -- nothing after opening changes it --
+    where a commit's committer is whatever email its creator typed. One
+    with the prefix and another author is said and passed over; this
+    tool then opens its own beside it, under a different sha-keyed name.
+    What the pull request's head HOLDS is the merge-time question, and
+    _head_is_the_generated_commit answers it from the tree."""
     ok, raw = gh.try_run(
         [
             "api",
             "--paginate",
-            f"repos/{repo}/pulls?state=open&per_page=100&base={urllib.parse.quote(default_branch)}",
+            f"repos/{repo}/pulls?state=open&per_page=100",
             "--jq",
-            r'.[] | "\(.number) \(.head.ref) \(.head.repo.id == .base.repo.id) \(.html_url)"',
+            r'.[] | "\(.number) \(.head.ref) \(.head.repo.id == .base.repo.id) \(.user.login) \(.html_url)"',
         ]
     )
     if not ok:
         error_lines(f"could not list {repo}'s open pull requests:", raw)
         return False, None
+    me = None
+    own = []
     for line in raw.splitlines():
         parts = line.split(" ")
-        if len(parts) != 4:
+        if len(parts) != 5:
             continue
-        number, head_ref, same_repo, url = parts
+        number, head_ref, same_repo, author, url = parts
         # Only a branch in this repository: a fork's branch can be named
         # anything at all, and one that happens to carry this prefix is
         # not a pull request this tool opened.
@@ -816,8 +923,662 @@ def find_open_gap_pull_request(repo, default_branch):
             number = int(number)
         except ValueError:
             continue
-        return True, GapPullRequest(number=number, url=url, head_branch=head_ref, opened=False)
-    return True, None
+        if me is None:
+            # Lazily: the common path, no candidate at all, pays no read.
+            me = _token_login()
+            if me is None:
+                return False, None
+        if author.lower() != me.lower():
+            warn(
+                f"{repo}: pull request #{number} carries this tool's branch prefix but was "
+                f"opened by {author}, not {me} -- not this tool's, so it is left alone"
+            )
+            continue
+        own.append(GapPullRequest(number=number, url=url, head_branch=head_ref, opened=False))
+    if not own:
+        return True, None
+    own.sort(key=lambda pr: pr.number)
+    first, *rest = own
+    first.duplicates = rest
+    return True, first
+
+
+def _token_login():
+    """The login this gh token acts as, or None with the failure reported."""
+    ok, raw = gh.try_run(["api", "user", "--jq", ".login"])
+    if not ok or not raw.strip():
+        error_lines("could not read which user this gh token acts as:", raw)
+        return None
+    return raw.strip()
+
+
+def _head_is_the_generated_commit(repo, pr, head_sha, plan):
+    """(matches, reason): whether `head_sha`'s tree is exactly what this
+    plan's commit would produce on the branch as it is now -- the branch's
+    own entries plus the generated changes, nothing else. None for
+    `matches` when it could not be read (reported in `reason`).
+
+    This is what makes an earlier run's pull request safe to merge without
+    reading its diff or trusting its name: the generated commit is
+    deterministic -- one commit whose parent is the branch's tip and whose
+    tree is the tip's plus the changes -- so the head either IS it or is
+    not. A base that moved, a template that moved upstream, and a push
+    onto the branch (even one reverted afterwards: the history would still
+    be replayed by the merge) all read as "not", and the pull request is
+    replaced rather than merged. Two reads -- the head commit and its
+    tree, by blob sha, the same way plan_gaps reads the branch."""
+    try:
+        raw = gh.run(["api", f"repos/{repo}/git/commits/{head_sha}"])
+        commit = json.loads(raw)
+        tree_sha = commit["tree"]["sha"]
+        parents = [parent["sha"] for parent in commit["parents"]]
+        message = commit["message"]
+        raw = gh.run(["api", f"repos/{repo}/git/trees/{tree_sha}?recursive=1"])
+        tree = json.loads(raw)
+        entries = tree["tree"]
+    except gh.GhError as e:
+        return None, f"could not read pull request #{pr.number}'s head tree: {e.stderr.strip()}"
+    except (ValueError, KeyError, TypeError):
+        return None, f"could not read pull request #{pr.number}'s head tree: unexpected response"
+    if tree.get("truncated"):
+        return None, f"pull request #{pr.number}'s head tree is too large to list in one call"
+    if parents != [plan.base_commit_sha]:
+        # One commit on top of the branch as it is now, or nothing: a
+        # rebase merge replays every commit between base and head, so a
+        # head whose TREE is right but whose history carries more (a push
+        # and its revert, say) would land that history on the branch
+        # (Codex review, mikelward/repo#56). The tree check below is what
+        # the one commit holds; this is that there is exactly one.
+        return False, (
+            f"its head is not a single commit on top of '{plan.default_branch}' as it is now"
+        )
+    if message != _gap_commit_message(plan.missing, plan.outdated):
+        # The message is replayed onto the branch by the rebase merge as
+        # surely as the tree is, and it is the one part of the commit the
+        # tree check cannot see -- a replaced commit with the right tree
+        # and someone's own message (user data, say) would otherwise land
+        # in the branch's history (Codex review, mikelward/repo#56).
+        return False, "its head's commit message is not the one this run would generate"
+    head = {
+        entry["path"]: (entry.get("sha"), entry.get("mode"))
+        for entry in entries
+        if "path" in entry and entry.get("type") != "tree"
+    }
+    expected = plan.expected_head_entries
+    if head == expected:
+        return True, ""
+    changed = sorted(
+        path for path in set(head) | set(expected) if head.get(path) != expected.get(path)
+    )
+    return False, (
+        f"its head is not the commit this run would generate on '{plan.default_branch}' as it "
+        f"is now ({len(changed)} path(s) differ, e.g. {changed[0]})"
+    )
+
+
+
+
+# A check run that finished without failing. `skipped` and `neutral` are
+# how a job that had nothing to do reports (lanes' heavy jobs on the docs
+# lane, say), and GitHub itself counts both as satisfying a required check.
+_PASSING_CONCLUSIONS = frozenset({"success", "skipped", "neutral"})
+# Rule types that block a pull request until something automatic reports
+# -- a deployment finishing, a required workflow running, a code-scanning
+# analysis landing -- rather than until a person acts. Named as a HINT in
+# the hold for a block this tool cannot identify, never read as the
+# reason: a rule's presence on the branch says nothing about whether it
+# is what blocks this pull request, and reading it as a wait let a
+# settled deployment rule mask a block only a person can clear, forever
+# and silently (Codex review, mikelward/repo#56). rules.py carries such
+# rules through an update untouched.
+_SETTLES_ON_ITS_OWN = frozenset({"required_deployments", "workflows", "code_scanning"})
+# Rule types the generated commit can never satisfy: git-data API commits
+# are not signed, by GitHub or anyone. Present on the branch, such a rule
+# is what blocks the pull request, and only a person settles it.
+_GENERATED_COMMIT_CANNOT_SATISFY = frozenset({"required_signatures"})
+
+# What GitHub's review rules hold a pull request on right now, which the
+# REST pull request read does not say: `reviewDecision` is null where no
+# rule requires a review, and thread resolution is GraphQL-only.
+_REVIEW_STATE_QUERY = """
+query($owner: String!, $name: String!, $number: Int!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviewDecision
+      reviewThreads(first: 100, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes { isResolved }
+      }
+    }
+  }
+}
+"""
+
+
+def _review_blockers(repo, number, resolution_required):
+    """What GitHub's review rules hold pull request `number` on right now,
+    as phrases for a message -- empty when nothing does -- or None with
+    the read's failure in the second element. Asked live rather than
+    inferred from the rules present: a rule being on the branch says
+    nothing about whether this pull request satisfies it (Codex review,
+    mikelward/repo#56). Unresolved conversations count only where a rule
+    makes them block (`resolution_required`), and the threads are read to
+    the last page: a page boundary is not a blocker."""
+    owner, name = repo.split("/", 1)
+    args = [
+        "api",
+        "graphql",
+        "-f",
+        f"query={_REVIEW_STATE_QUERY}",
+        "-F",
+        f"owner={owner}",
+        "-F",
+        f"name={name}",
+        "-F",
+        f"number={number}",
+    ]
+    unresolved = 0
+    after = None
+    while True:
+        ok, raw = gh.try_run(args + (["-F", f"after={after}"] if after is not None else []))
+        if not ok:
+            return None, raw.strip()
+        try:
+            pull = json.loads(raw)["data"]["repository"]["pullRequest"]
+            decision = pull["reviewDecision"]
+            threads = pull["reviewThreads"]
+            unresolved += sum(1 for node in threads["nodes"] if not node["isResolved"])
+            more, after = bool(threads["pageInfo"]["hasNextPage"]), threads["pageInfo"]["endCursor"]
+        except (ValueError, KeyError, TypeError):
+            return None, "unexpected response"
+        if not more:
+            break
+        if not after:
+            return None, "unexpected response"  # a next page with no cursor to reach it
+    blockers = []
+    if decision == "REVIEW_REQUIRED":
+        blockers.append("a review it requires and does not have")
+    elif decision == "CHANGES_REQUESTED":
+        blockers.append("a review requesting changes")
+    if resolution_required and unresolved:
+        blockers.append(f"{unresolved} unresolved conversation(s)")
+    return blockers, ""
+
+
+def assess_gap_pull_request(repo, pr, plan):
+    """What the scaffold pull request `pr` is waiting on, as a
+    GapPullRequestState, or None with the failure already reported.
+
+    Read from the pull request's head and the checks on it -- never from
+    its diff (see GapPullRequest): the pull request itself (head sha, base
+    branch, mergeability, draft), the head's tree by blob sha against what
+    `plan` would generate (_head_is_the_generated_commit), the head's
+    check runs and its commit statuses, and -- only when GitHub calls it
+    `blocked` with every visible check passed -- the base branch's
+    effective rules and the pull request's live review state, to tell a
+    required check that has not reported or a rule that settles on its
+    own (wait) from a review it lacks, an unresolved conversation or a
+    signature rule, which this tool cannot settle (held; Codex review,
+    mikelward/repo#56)."""
+    ok, raw = gh.try_run(
+        [
+            "api",
+            f"repos/{repo}/pulls/{pr.number}",
+            "--jq",
+            "[.state, .draft, .head.sha, .base.ref, .mergeable, .mergeable_state] | @json",
+        ]
+    )
+    if not ok:
+        error_lines(f"could not read pull request #{pr.number} on {repo}:", raw)
+        return None
+    try:
+        state, draft, head_sha, base_ref, mergeable, mergeable_state = json.loads(raw)
+    except (ValueError, TypeError):
+        error(f"could not read pull request #{pr.number} on {repo}: unexpected response")
+        return None
+    if state != "open":
+        # Closed or merged since it was listed: a later run reads the
+        # branch as it is now, which is the only trustworthy answer.
+        return GapPullRequestState("wait", "it is no longer open; a rerun replans from the branch")
+    if base_ref != plan.default_branch:
+        # Listed against the default branch, retargeted since: the merge
+        # lands wherever the base points NOW, and the head sha pins only
+        # the head (Codex review, mikelward/repo#56). The generated commit
+        # was made for the default branch, so this one is replaced.
+        return GapPullRequestState(
+            "stale", f"it now targets '{base_ref}', not '{plan.default_branch}'", head_sha
+        )
+
+    generated, why = _head_is_the_generated_commit(repo, pr, head_sha, plan)
+    if generated is None:
+        # A read that failed is not a wait: a wait exits 0 and repeats
+        # on every run, which would hide a token that cannot read this
+        # forever (Codex review, mikelward/repo#56). The step fails and
+        # says why; a transient failure is one red run.
+        error(f"{repo}: pull request #{pr.number}: {why}")
+        return None
+    if not generated:
+        return GapPullRequestState("stale", why, head_sha)
+    if draft:
+        # Asked after staleness on purpose: a draft that is also stale is
+        # replaced like any other, rather than held for a person to mark
+        # ready a pull request the next run would replace anyway (Codex
+        # review, mikelward/repo#56). Only a draft of the very commit this
+        # run would generate is a person's decision to honor.
+        return GapPullRequestState(
+            "held", "it was converted to a draft; mark it ready for review", head_sha
+        )
+
+    # The workflows this pull request adds from its own head, which have
+    # to have RUN from it before it merges (see below): what the Actions
+    # hold and the workflow-run read are both about.
+    expected = {
+        check: path
+        for check, (path, where) in CHECK_PUBLISHERS.items()
+        if where == "head" and path in plan.changes
+    }
+    if expected:
+        # The scaffold's own checks run on Actions, so a repository with
+        # Actions disabled never reports them, whatever else reports on
+        # the head (an external status, say) -- and merging on that would
+        # land workflows nothing has run. Nothing a later run resolves, so
+        # it is held for a person, and read before the checks rather than
+        # only when none reported (Codex review, mikelward/repo#56, twice).
+        # Only where the pull request adds a workflow that has to run from
+        # it: a gap of AGENTS.md alone needs no run, and holding it would
+        # hold a pull request that has nothing to wait for (Codex review,
+        # mikelward/repo#56).
+        ok, raw = gh.try_run(["api", f"repos/{repo}/actions/permissions", "--jq", ".enabled"])
+        if not ok:
+            # Fail closed, and as a failure rather than a wait: "could not
+            # tell" is not "enabled", and a wait would exit 0 on every run
+            # for as long as the read keeps failing (Codex review,
+            # mikelward/repo#56, twice).
+            error_lines(f"could not read whether Actions is enabled on {repo}:", raw)
+            return None
+        if raw.strip() == "false":
+            return GapPullRequestState(
+                "held",
+                "GitHub Actions is disabled on this repository, so the workflows this pull "
+                "request adds will never run on it -- enable Actions, or merge it by hand",
+                head_sha,
+            )
+
+    try:
+        out = gh.run(
+            [
+                "api",
+                "--paginate",
+                f"repos/{repo}/commits/{head_sha}/check-runs",
+                "--jq",
+                ".check_runs[] | [.name, .status, .conclusion] | @json",
+            ]
+        )
+    except gh.GhError as e:
+        error_lines(f"could not read the check runs on pull request #{pr.number}'s head:", e.stderr)
+        return None
+    running, failed, passed = [], [], []
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        name, status, conclusion = json.loads(line)
+        if status != "completed":
+            running.append(name)
+        elif conclusion in _PASSING_CONCLUSIONS:
+            passed.append(name)
+        else:
+            failed.append(name)
+    try:
+        out = gh.run(
+            [
+                "api",
+                "--paginate",
+                f"repos/{repo}/commits/{head_sha}/status",
+                "--jq",
+                ".statuses[] | [.context, .state] | @json",
+            ]
+        )
+    except gh.GhError as e:
+        error_lines(f"could not read the statuses on pull request #{pr.number}'s head:", e.stderr)
+        return None
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        context, status_state = json.loads(line)
+        if status_state == "success":
+            passed.append(context)
+        elif status_state == "pending":
+            running.append(context)
+        else:
+            failed.append(context)
+
+    if failed:
+        return GapPullRequestState(
+            "held",
+            f"{_quoted(failed)} failed on it -- fix the cause on '{plan.default_branch}' and "
+            "rerun (a push to this pull request's branch is replaced, not merged: only the "
+            "generated commit is), or edit and merge it by hand",
+            head_sha,
+        )
+    if running:
+        return GapPullRequestState("wait", f"{_quoted(running)} still running on it", head_sha)
+    # Nothing having reported is not, by itself, a wait: a gap of only
+    # AGENTS.md on a repository whose own ci.yml does not run for that
+    # diff has nothing that will ever report, and waiting for it would be
+    # forever (Codex review, mikelward/repo#56). What the pull request
+    # itself adds is required to have run, below; the rest is GitHub's
+    # mergeability.
+    # The workflows this pull request adds from its own head have to have
+    # RUN from it, and succeeded -- "something passed" is not "the
+    # scaffold ran": an unrelated external check can report before
+    # Actions has registered the new workflows, and a status or check run
+    # merely NAMED `lanes` can come from any App or anyone with write
+    # access, so the name proves nothing. Asked of Actions by workflow
+    # path instead, which nothing but that workflow running from this
+    # head can produce. Merging without it would land workflows nothing
+    # has run and then defer their checks for as long as it takes (Codex
+    # review, mikelward/repo#56, twice).
+    if expected:
+        runs = _workflow_runs_from(repo, head_sha)
+        if runs is None:
+            return None
+        failed_runs = sorted(check for check, path in expected.items() if runs.get(path) == "failed")
+        if failed_runs:
+            # Completed without success, and no failed check run to say so
+            # (a startup failure leaves none): waiting changes nothing.
+            return GapPullRequestState(
+                "held",
+                f"{_quoted(failed_runs)}'s own workflow ran from it and did not succeed -- fix "
+                f"the cause on '{plan.default_branch}' and rerun (a push to this pull request's "
+                "branch is replaced, not merged), or edit and merge it by hand",
+                head_sha,
+            )
+        unrun = sorted(check for check, path in expected.items() if runs.get(path) != "succeeded")
+        if unrun:
+            return GapPullRequestState(
+                "wait",
+                f"{_quoted(unrun)} has not succeeded as a run of its own workflow from it yet",
+                head_sha,
+            )
+    if mergeable is False:
+        return GapPullRequestState(
+            "held",
+            "it conflicts with its base branch -- close it and rerun to open a fresh one",
+            head_sha,
+        )
+    if mergeable is None or mergeable_state == "unknown":
+        return GapPullRequestState(
+            "wait", "GitHub has not computed whether it can merge yet", head_sha
+        )
+    if mergeable_state == "blocked":
+        # Every check this read can see passed, so what blocks it is a
+        # requirement none of them satisfies. In order: a required check
+        # that has not passed on this head with nothing running there,
+        # held (see below); what GitHub's review rules hold it on right
+        # now, read live, which no later run can settle; a signature rule the
+        # generated commit can never satisfy; and, none of those, a block
+        # this tool cannot name, held rather than waited on forever, with
+        # any rule on the branch that settles on its own named as a hint
+        # -- a false hold on a pending deployment costs one red run that
+        # clears itself, where a wait read off a rule's presence cost a
+        # silent forever (Codex review, mikelward/repo#56, five rounds --
+        # each inferred one more case from the rules present, and a rule
+        # present is not a rule unsatisfied).
+        try:
+            effective = rules.effective_rules(repo, plan.default_branch)
+            required = rules.required_checks_in(effective)
+            # Asked with the requirement's App binding, not by name: a
+            # `lanes` required from App A is not satisfied by App B's
+            # `lanes` on this head, and a later report from A settles it
+            # -- so that is a wait, not a review block (Codex review,
+            # mikelward/repo#56). One more read of the head, only here.
+            # Sorted for a stable message; an unbound entry (None) sits
+            # beside a bound one of the same name when two rulesets require
+            # it both ways, and None does not compare with an int.
+            unsatisfied = rules.never_passed(
+                repo,
+                sorted(required, key=lambda entry: (entry[0], entry[1] or 0)),
+                shas=[head_sha],
+                passing=_PASSING_CONCLUSIONS,
+            )
+        except rules.RulesetError as e:
+            error_lines(
+                f"GitHub reports pull request #{pr.number} blocked, and what "
+                f"'{plan.default_branch}' requires could not be read to say by what:",
+                e.detail,
+            )
+            return None
+        if unsatisfied:
+            # Nothing is running on this head (a run still going, or a
+            # pending status -- the codex sweep's "waiting" -- was a wait
+            # above, before this branch), so a required check with nothing
+            # passing here is one nothing says will ever report: a
+            # workflow whose path filter this diff does not match never
+            # runs on it, whether the tool's own or a project's customized
+            # copy, and a check bound to an App is satisfied only by that
+            # App's own report, which a head that already ran under
+            # another does not get again. Neither a rerun nor a rebase
+            # changes that, so it is held rather than waited on forever
+            # (Codex review, mikelward/repo#56, twice: first a check
+            # beyond the standard, then a customized standard workflow --
+            # the check's name proves nothing about whether it runs).
+            return GapPullRequestState(
+                "held",
+                f"required check {rules.describe_missing(unsatisfied)} has not passed on its "
+                "head and nothing is running there, so nothing says it will report: a "
+                "workflow whose path filter this diff does not match never runs on it, and a "
+                "check bound to an App needs that App's own report. Re-run the workflow on the "
+                "pull request, require the check only where it runs, or merge by hand",
+                head_sha,
+            )
+        resolution_required = any(
+            rule.get("type") == "pull_request"
+            and (rule.get("parameters") or {}).get("required_review_thread_resolution")
+            for rule in effective
+        )
+        blockers, why = _review_blockers(repo, pr.number, resolution_required)
+        if blockers is None:
+            error_lines(
+                f"GitHub reports pull request #{pr.number} blocked, and its review state could "
+                "not be read to say by what:",
+                why,
+            )
+            return None
+        if blockers:
+            return GapPullRequestState(
+                "held",
+                f"GitHub blocks it on {' and '.join(blockers)}, which this tool cannot settle",
+                head_sha,
+            )
+        types = {rule.get("type") for rule in effective}
+        unsatisfiable = sorted(types & _GENERATED_COMMIT_CANNOT_SATISFY)
+        if unsatisfiable:
+            return GapPullRequestState(
+                "held",
+                f"'{plan.default_branch}' carries a {_quoted(unsatisfiable)} rule, which the "
+                "generated commit cannot satisfy -- merge it by hand, or drop the rule",
+                head_sha,
+            )
+        settling = sorted(types & _SETTLES_ON_ITS_OWN)
+        hint = (
+            f" (the branch carries a {_quoted(settling)} rule, which may settle on its own once "
+            "what it waits on reports)"
+            if settling
+            else ""
+        )
+        return GapPullRequestState(
+            "held",
+            f"GitHub blocks it on something this tool cannot identify{hint} -- look at the "
+            "pull request",
+            head_sha,
+        )
+    return GapPullRequestState(
+        "merge",
+        f"{_quoted(passed)} passed on it" if passed else "nothing reports on it and GitHub calls it mergeable",
+        head_sha,
+    )
+
+
+def _quoted(names):
+    return ", ".join(f"'{name}'" for name in sorted(set(names)))
+
+
+def _workflow_runs_from(repo, head_sha):
+    """The newest Actions run per workflow path from `head_sha`, as path
+    -> "succeeded", "running" or "failed", or None with the failure
+    already reported. A workflow run carries the path of the file it ran,
+    so this is the one read that says which of a pull request's own
+    workflows actually ran from it -- and how the latest attempt ended,
+    since a run that completed without success (a failure, a timeout, a
+    startup failure that left no failed check run behind) is not going to
+    change by waiting (Codex review, mikelward/repo#56). Runs list newest
+    first, so a re-run supersedes what it re-ran."""
+    try:
+        out = gh.run(
+            [
+                "api",
+                "--paginate",
+                f"repos/{repo}/actions/runs?head_sha={head_sha}&per_page=100",
+                "--jq",
+                ".workflow_runs[] | [.path, .status, .conclusion] | @json",
+            ]
+        )
+    except gh.GhError as e:
+        error_lines(f"could not read the workflow runs from {head_sha[:7]} on {repo}:", e.stderr)
+        return None
+    runs = {}
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        try:
+            path, status, conclusion = json.loads(line)
+        except (ValueError, TypeError):
+            error(f"could not read the workflow runs from {head_sha[:7]} on {repo}: unexpected response")
+            return None
+        if path in runs:
+            continue  # an older attempt; the newest already spoke
+        if status != "completed":
+            runs[path] = "running"
+        elif conclusion == "success":
+            runs[path] = "succeeded"
+        else:
+            runs[path] = "failed"
+    return runs
+
+
+def merge_gap_pull_request(repo, pr, state, default_branch, enable_delete_branch_on_merge=False):
+    """Rebase-merges `pr` at the head `state` was read from. Returns the
+    merged commit's sha, confirmed to be on `default_branch`, or None
+    with the failure already reported.
+
+    The head sha is a precondition on the merge itself, not something
+    checked and then acted on: GitHub refuses the merge if the head has
+    moved since the read, so an edit landing between the assessment and
+    this call is a refusal, never a merge of something nobody assessed
+    (SPEC.md, *Its own pull requests*). Rebase, because the ruleset this
+    tool writes allows nothing else.
+
+    The merge API pins no base: a retarget landing between the
+    assessment's fresh read of the base and this call would rebase the
+    commit onto whatever branch the pull request points at by then.
+    Nothing GitHub offers prevents that (a ref update would be refused
+    by the pull-request rule this tool writes), and the retarget takes
+    the same write access that could push the commit there directly --
+    so it is confirmed afterwards instead, and a merge that landed
+    elsewhere is reported as such rather than returned as the branch's
+    new tip (Codex review, mikelward/repo#56)."""
+    # delete-branch-on-merge is part of the standard and the settings step
+    # enables it later in this same run -- too late for this merge, which
+    # GitHub sweeps only if the setting is on when it happens. Turned on
+    # here first, so the merged branch goes with the merge itself: a delete
+    # afterwards would be a separate request GitHub gives no sha
+    # precondition, racing anyone pushing to the branch (Codex review,
+    # mikelward/repo#56, three rounds). Only on the PLAN's word
+    # (`enable_delete_branch_on_merge`: the settings step read it off and
+    # the run agreed to turning it on), never on a read of its own: a read
+    # here that failed is not a known off, and one that found it off after
+    # the plan read it on is an administrator's change the plan never
+    # showed -- either way a repository-wide setting changed on a guess
+    # (Codex review, mikelward/repo#56, twice). A failure here is said,
+    # not fatal: the merge stands, and `repo cleanup` sweeps the branch.
+    if enable_delete_branch_on_merge:
+        try:
+            gh.run_with_input(
+                ["api", "--method", "PATCH", f"repos/{repo}", "--input", "-"],
+                json.dumps({"delete_branch_on_merge": True}).encode(),
+            )
+        except gh.GhError as e:
+            warn(
+                f"{repo}: could not enable delete-branch-on-merge before merging pull request "
+                f"#{pr.number}, so its branch may be left behind -- `repo cleanup` sweeps it: "
+                f"{e.stderr.strip()}"
+            )
+    try:
+        raw = gh.run_with_input(
+            ["api", "--method", "PUT", f"repos/{repo}/pulls/{pr.number}/merge", "--input", "-"],
+            json.dumps({"merge_method": "rebase", "sha": state.head_sha}).encode(),
+        )
+    except gh.GhError as e:
+        error_lines(
+            f"could not merge pull request #{pr.number} on {repo} (its head moved, or GitHub "
+            "refused the merge -- a later run reads it again):",
+            e.stderr,
+        )
+        return None
+    try:
+        data = json.loads(raw)
+        merged, sha = data["merged"], data["sha"]
+    except (ValueError, KeyError, TypeError):
+        error(
+            f"merged pull request #{pr.number} on {repo}, but could not read the resulting "
+            "commit from the response; a rerun reads the branch as it is now"
+        )
+        return None
+    if not merged:
+        error(f"GitHub did not merge pull request #{pr.number} on {repo}: {data.get('message', '')}")
+        return None
+    ok, raw = gh.try_run(
+        [
+            "api",
+            f"repos/{repo}/compare/{sha}...{_branch_ref_path(default_branch)}",
+            "--jq",
+            ".status",
+        ]
+    )
+    # `identical` or `ahead` says the branch contains the merged commit
+    # (ahead when something else landed right after); anything else says
+    # it merged somewhere else.
+    if not ok:
+        error_lines(
+            f"merged pull request #{pr.number} on {repo}, but could not confirm it landed on "
+            f"'{default_branch}'; a rerun reads the branch as it is now:",
+            raw,
+        )
+        return None
+    if raw.strip() not in ("identical", "ahead"):
+        error(
+            f"merged pull request #{pr.number} on {repo}, but '{default_branch}' does not "
+            f"contain the merged commit {sha[:7]} -- it was retargeted while merging; look at "
+            "where it landed. A rerun reads the branch as it is now"
+        )
+        return None
+    return sha
+
+
+def _close_pull_request(repo, pr):
+    """Closes `pr` -- this tool's own, stale -- so a fresh one can be
+    opened in its place. True on success, False with the failure reported.
+    The branch stays: closing is reversible, and delete-branch-on-merge
+    never sees a closed pull request, so `repo cleanup` sweeps it."""
+    try:
+        gh.run_with_input(
+            ["api", "--method", "PATCH", f"repos/{repo}/pulls/{pr.number}", "--input", "-"],
+            json.dumps({"state": "closed"}).encode(),
+        )
+    except gh.GhError as e:
+        error_lines(f"could not close the stale pull request #{pr.number} on {repo}:", e.stderr)
+        return False
+    return True
 
 
 # Which scaffold file publishes each check this fleet requires, and where
@@ -838,9 +1599,15 @@ CHECK_PUBLISHERS = {
 }
 
 
-def checks_a_gap_leaves_unpublished(missing, checks):
-    """Which of `checks` the branch has no publisher for, because their
-    publishing workflow is among `missing`.
+def checks_a_gap_leaves_unpublished(paths, checks):
+    """Which of `checks` the branch has no publisher this tool vouches
+    for, because their publishing workflow is among `paths` -- the files
+    a gap-fill pull request carries: missing from the branch, or present
+    as an outdated pinned copy the pull request replaces. A copy that
+    differs from the template is not one whose history says anything
+    about the copy landing, and a check required on the strength of it
+    could block the very pull request replacing it (Codex review,
+    mikelward/repo#56).
 
     Asked of the BRANCH, never of a pending pull request. A pull request
     adding `ci.yml` does run `ci.yml`, so `lanes` could in principle
@@ -854,7 +1621,7 @@ def checks_a_gap_leaves_unpublished(missing, checks):
     only `AGENTS.md`, say, which is the common case across this fleet --
     defers nothing either way."""
     return [
-        check for check in checks if CHECK_PUBLISHERS.get(check, (None, None))[0] in missing
+        check for check in checks if CHECK_PUBLISHERS.get(check, (None, None))[0] in paths
     ]
 
 
@@ -912,9 +1679,18 @@ def _rides_the_docs_lane(path):
     return not head or head == "docs" or head.endswith("/docs")
 
 
-def _gap_commit_message(missing):
-    subject = f"docs: {_GAP_SUBJECT}" if _docs_lane_only(missing) else _GAP_SUBJECT
-    return subject + "\n\n" + "\n".join(f"- {path}" for path in sorted(missing))
+def _gap_commit_message(missing, outdated):
+    subject = _gap_subject(missing, outdated)
+    if _docs_lane_only({**missing, **outdated}):
+        subject = f"docs: {subject}"
+    return subject + "\n\n" + "\n".join(_change_lines(missing, outdated))
+
+
+def _change_lines(missing, outdated):
+    """One line per path a gap-fill touches, saying which way."""
+    return [f"- add {path}" for path in sorted(missing)] + [
+        f"- update {path} to the current template" for path in sorted(outdated)
+    ]
 
 
 @dataclass
@@ -944,17 +1720,60 @@ class GapPlan:
 
     error: bool = False
     missing_workflow_scope: bool = False
+    default_branch: str = None
     base_commit_sha: str = None
     base_tree_sha: str = None
     present: list = field(default_factory=list)
     missing: dict = field(default_factory=dict)
+    # Present, byte-pinned, and not the current template (UPDATED_PATHS):
+    # path -> the content to replace it with. Rides the same commit as
+    # `missing`; kept apart because only `missing` says which checks the
+    # BRANCH cannot publish yet (checks_a_gap_leaves_unpublished) -- an
+    # outdated copy still runs.
+    outdated: dict = field(default_factory=dict)
     open_pull_request: GapPullRequest = None
+    # On a branch that is already complete: every open pull request of
+    # this tool's own, with nothing left for it to add -- a duplicate a
+    # concurrent run opened after the merging run took its look, or one
+    # whose files landed by hand. Closed by apply_gaps, so a leftover
+    # never outlives the scaffold (Codex review, mikelward/repo#56,
+    # twice: reconciling only where there is something to write left the
+    # window between a run's look and its merge).
+    leftover_pull_requests: list = field(default_factory=list)
+    # What the open pull request is waiting on, read at plan time so the
+    # plan can say whether this run merges it (see GapPullRequestState);
+    # None when there is no open pull request.
+    pull_request_state: GapPullRequestState = None
+    # Every non-directory entry of the branch's tree, path -> (sha, mode):
+    # what a scaffold pull request's head has to equal, plus `changes`,
+    # to be merged (see _head_is_the_generated_commit).
+    base_tree_entries: dict = field(default_factory=dict)
+
+    @property
+    def expected_head_entries(self):
+        """path -> (sha, mode) of the tree this plan's commit produces on
+        top of the branch: the branch's own entries with `changes` written
+        over them. Deterministic, which is what lets a pull request an
+        earlier run opened be checked against it with no read of its diff."""
+        entries = dict(self.base_tree_entries)
+        for path, content in self.changes.items():
+            entries[path] = (_blob_sha(content), "100644")
+        return entries
+
+    @property
+    def changes(self):
+        """Every path the gap-fill commit writes, missing and outdated
+        alike, with its content."""
+        return {**self.missing, **self.outdated}
 
 
 def plan_gaps(repo, default_branch):
-    """Which of the scaffold's files `repo` is missing on `default_branch`,
-    read-only: builds the scaffold (same as build_scaffold_files) and
-    compares it against the branch's current tree. Returns a GapPlan --
+    """Which of the scaffold's files `repo` is missing on `default_branch`
+    -- and which byte-pinned ones are present but not the current template
+    (UPDATED_PATHS) -- read-only: builds the scaffold (same as
+    build_scaffold_files) and compares it against the branch's current
+    tree, by path for presence and by blob sha for the pinned set, so no
+    file content is read. Returns a GapPlan --
     `error` set (with the failure already reported) if fetching the
     scaffold's own template sources fails, if reading the branch's
     current state does, or if a scaffold path (or an ancestor directory
@@ -1019,6 +1838,12 @@ def plan_gaps(repo, default_branch):
     # only a regular-file mode may be treated as the scaffold content
     # already being there (Codex review, mikelward/repo#14).
     existing = {entry["path"]: (entry.get("type"), entry.get("mode")) for entry in entries if "path" in entry}
+    blob_shas = {entry["path"]: entry.get("sha") for entry in entries if "path" in entry}
+    base_tree_entries = {
+        entry["path"]: (entry.get("sha"), entry.get("mode"))
+        for entry in entries
+        if "path" in entry and entry.get("type") != "tree"
+    }
 
     def is_regular_file(path):
         kind, mode = existing.get(path, (None, None))
@@ -1064,10 +1889,14 @@ def plan_gaps(repo, default_branch):
 
     present = []
     missing = {}
+    outdated = {}
     occupied = {}
     for path, content in files.items():
         if is_regular_file(path):
-            present.append(path)
+            if path in UPDATED_PATHS and blob_shas.get(path) != _blob_sha(content):
+                outdated[path] = content
+            else:
+                present.append(path)
             continue
         reason = occupied_reason(path)
         if reason is not None:
@@ -1083,31 +1912,42 @@ def plan_gaps(repo, default_branch):
             error(f"{repo}: cannot add {path} to the scaffold: {occupied[path]}; add it by hand")
         return GapPlan(error=True)
 
-    open_pull_request = None
-    if missing:
-        # Only when there IS something to add: on an already-complete
-        # repository -- every one of them, once a fleet has converged --
-        # this read would answer a question nobody asked.
-        ok, open_pull_request = find_open_gap_pull_request(repo, default_branch)
-        if not ok:
-            return GapPlan(error=True)
-
-    return GapPlan(
+    plan = GapPlan(
+        default_branch=default_branch,
         base_commit_sha=commit_sha,
         base_tree_sha=tree_sha,
+        base_tree_entries=base_tree_entries,
         present=sorted(present),
         missing=missing,
-        # Only where this run would actually write. With a scaffold pull
-        # request already open there is nothing to write, so a token that
-        # could not have written it is not a problem to report -- and
-        # reporting one would fail the step over a repository whose
-        # scaffold is already on its way in (Codex review,
-        # mikelward/repo#42).
-        missing_workflow_scope=(
-            open_pull_request is None and _missing_workflow_scope(missing)
-        ),
-        open_pull_request=open_pull_request,
+        outdated=outdated,
     )
+    # Asked on every run, complete branch included -- one listing, on a
+    # repository that has converged -- since a pull request of this tool's
+    # own can outlive the scaffold: a concurrent run opens one after the
+    # merging run took its look, or the files land by hand. Left alone it
+    # would be open forever (Codex review, mikelward/repo#56).
+    ok, found = find_open_gap_pull_request(repo)
+    if not ok:
+        return GapPlan(error=True)
+    if missing or outdated:
+        plan.open_pull_request = found
+        if plan.open_pull_request is not None:
+            plan.pull_request_state = assess_gap_pull_request(repo, plan.open_pull_request, plan)
+            if plan.pull_request_state is None:
+                return GapPlan(error=True)
+    elif found is not None:
+        plan.leftover_pull_requests = [found, *found.duplicates]
+        found.duplicates = []
+    # Only where this run would actually write. With a scaffold pull
+    # request already open that waits, there is nothing to write, so a
+    # token that could not have written it is not a problem to report --
+    # and reporting one would fail the step over a repository whose
+    # scaffold is already on its way in (Codex review, mikelward/repo#42).
+    # A stale one is replaced, which is a write.
+    plan.missing_workflow_scope = (
+        plan.open_pull_request is None or plan.pull_request_state.verdict == "stale"
+    ) and _missing_workflow_scope(plan.changes)
+    return plan
 
 
 def describe_gap_plan(plan):
@@ -1117,9 +1957,9 @@ def describe_gap_plan(plan):
     if plan.error:
         return ["could not plan (see above); nothing added"]
     if plan.missing_workflow_scope:
-        workflow_count = sum(1 for path in plan.missing if path.startswith(".github/workflows/"))
+        workflow_count = sum(1 for path in plan.changes if path.startswith(".github/workflows/"))
         return [
-            f"SKIPPED: this gh token is missing the 'workflow' OAuth scope, needed to add "
+            f"SKIPPED: this gh token is missing the 'workflow' OAuth scope, needed to write "
             f"{workflow_count} file(s) under .github/workflows/ -- run `gh auth refresh -s "
             "workflow` (or add the scope your token's own way) and rerun"
         ]
@@ -1129,19 +1969,52 @@ def describe_gap_plan(plan):
         # editable at any moment, and a rerun after the merge says what is
         # actually left far more reliably than a read of it can.
         lines = [
-            f"pull request #{pr.number} is adding the scaffold ({pr.url}); nothing to open here "
-            "-- merge it, then rerun to see what is left",
+            f"pull request #{pr.number} is carrying the scaffold ({pr.url}); nothing to open here",
+            describe_pull_request_state(pr, plan.pull_request_state),
         ]
-        lines.append(f"still absent from the default branch: {len(plan.missing)} file(s)")
+        if plan.missing:
+            lines.append(f"still absent from the default branch: {len(plan.missing)} file(s)")
+        if plan.outdated:
+            lines.append(f"still outdated on the default branch: {len(plan.outdated)} file(s)")
         return lines
-    lines = [f"add {path}" for path in sorted(plan.missing)]
-    if plan.missing:
-        lines.insert(0, f"open a pull request adding {len(plan.missing)} file(s):")
+    lines = _change_lines(plan.missing, plan.outdated)
+    if lines:
+        lines.insert(
+            0,
+            f"open a pull request writing {len(lines)} file(s) "
+            f"({_gap_subject(plan.missing, plan.outdated).lower()}):",
+        )
+    for pr in plan.leftover_pull_requests:
+        lines.append(
+            f"close pull request #{pr.number}: this tool's own, and the scaffold is complete "
+            f"-- nothing left for it to add ({pr.url})"
+        )
     if plan.present:
         lines.append(f"already present, untouched: {len(plan.present)} file(s)")
     if not lines:
         lines.append("already complete")
     return lines
+
+
+def describe_pull_request_state(pr, state):
+    """The one plan line for an open scaffold pull request: what this run
+    does about it, or what it waits on -- and the duplicates it closes
+    first, if two runs overlapped."""
+    if state.verdict == "merge":
+        line = f"merge pull request #{pr.number}: {state.reason}"
+    elif state.verdict == "stale":
+        line = f"close pull request #{pr.number} and open a fresh one: {state.reason}"
+    elif state.verdict == "wait":
+        line = f"pull request #{pr.number} waits: {state.reason} -- a later run looks again"
+    else:
+        line = f"pull request #{pr.number} needs a person: {state.reason}"
+    if pr.duplicates:
+        numbers = ", ".join(f"#{d.number}" for d in pr.duplicates)
+        line += (
+            f"; close {numbers} first -- a second scaffold pull request this tool opened "
+            "beside it (two runs overlapped)"
+        )
+    return line
 
 
 def _recheck_branch_sha(repo, default_branch):
@@ -1161,14 +2034,15 @@ def _recheck_branch_sha(repo, default_branch):
 
 
 def _create_gap_commit(repo, plan):
-    """One commit adding `plan.missing` on top of plan.base_commit_sha --
+    """One commit writing `plan.changes` -- the missing files added, the
+    outdated pinned ones replaced -- on top of plan.base_commit_sha:
     blobs, then a tree over the branch's own base_tree, then the commit
     itself. Returns its sha, or None with the failure already reported.
 
     Writes no ref: where that commit then goes (a new branch, for the
     pull request apply_gaps opens) is the caller's decision."""
     tree_entries = []
-    for path, content in sorted(plan.missing.items()):
+    for path, content in sorted(plan.changes.items()):
         try:
             raw = gh.run_with_input(
                 ["api", "--method", "POST", f"repos/{repo}/git/blobs", "--input", "-"],
@@ -1195,7 +2069,7 @@ def _create_gap_commit(repo, plan):
             ["api", "--method", "POST", f"repos/{repo}/git/commits", "--input", "-"],
             json.dumps(
                 {
-                    "message": _gap_commit_message(plan.missing),
+                    "message": _gap_commit_message(plan.missing, plan.outdated),
                     "tree": tree_sha,
                     "parents": [plan.base_commit_sha],
                 }
@@ -1207,6 +2081,12 @@ def _create_gap_commit(repo, plan):
     return json.loads(raw)["sha"]
 
 
+# How many names _create_gap_branch tries before giving up: the commit's
+# own, then `-2`, `-3`, ... A run that finds them all occupied has found
+# something stranger than a leftover branch.
+_GAP_BRANCH_NAMES = 5
+
+
 def _create_gap_branch(repo, commit_sha):
     """A new branch at `commit_sha`, named after it. Returns the branch
     name, or None with the failure already reported.
@@ -1214,20 +2094,39 @@ def _create_gap_branch(repo, commit_sha):
     A ref that already exists under this name is accepted only when it
     already points at exactly this commit -- the name carries the commit's
     own sha, so that is a rerun that rebuilt an identical commit, not
-    somebody else's branch. Anything else is refused rather than
-    force-moved: this module never overwrites what is already there."""
-    branch = f"{GAP_BRANCH_PREFIX}-{commit_sha[:7]}"
-    try:
-        gh.run_with_input(
-            ["api", "--method", "POST", f"repos/{repo}/git/refs", "--input", "-"],
-            json.dumps({"ref": f"refs/heads/{branch}", "sha": commit_sha}).encode(),
-        )
-    except gh.GhError as e:
-        if _read_ref_sha(repo, branch) == commit_sha:
-            return branch
-        error_lines(f"could not create the branch '{branch}' on {repo}:", e.stderr)
-        return None
-    return branch
+    somebody else's branch. One pointing at another commit is a branch of
+    an earlier pull request of this tool's (since closed, or the ref left
+    behind) that somebody pushed to; it is left exactly as it is and the
+    next name is taken (`-2`, `-3`, ... -- `repo cleanup` sweeps the
+    leftover), so a replacement can always open (Codex review,
+    mikelward/repo#56). Nothing is ever force-moved: this module never
+    overwrites what is already there."""
+    base = f"{GAP_BRANCH_PREFIX}-{commit_sha[:7]}"
+    occupied = []
+    for n in range(1, _GAP_BRANCH_NAMES + 1):
+        branch = base if n == 1 else f"{base}-{n}"
+        try:
+            gh.run_with_input(
+                ["api", "--method", "POST", f"repos/{repo}/git/refs", "--input", "-"],
+                json.dumps({"ref": f"refs/heads/{branch}", "sha": commit_sha}).encode(),
+            )
+        except gh.GhError as e:
+            existing = _read_ref_sha(repo, branch)
+            if existing == commit_sha:
+                return branch
+            if existing is None:
+                error_lines(f"could not create the branch '{branch}' on {repo}:", e.stderr)
+                return None
+            occupied.append(branch)
+            continue
+        return branch
+    error(
+        f"could not create a branch for the scaffold on {repo}: "
+        + ", ".join(f"'{b}'" for b in occupied)
+        + " all exist and hold other commits. Delete the ones that are leftovers (`repo "
+        "cleanup` sweeps this tool's own), then rerun."
+    )
+    return None
 
 
 def _read_ref_sha(repo, branch):
@@ -1296,7 +2195,7 @@ def open_gap_pull_request(repo, default_branch, plan):
         )
         return None
 
-    ok, existing = find_open_gap_pull_request(repo, default_branch)
+    ok, existing = find_open_gap_pull_request(repo)
     if not ok:
         return None
     if existing is not None:
@@ -1317,6 +2216,13 @@ def open_gap_pull_request(repo, default_branch, plan):
         )
         return None
 
+    return _open_fresh_pull_request(repo, default_branch, plan)
+
+
+def _open_fresh_pull_request(repo, default_branch, plan, replacing=None):
+    """The commit, its branch and the pull request itself, for a gap-fill
+    nothing open already carries. Returns the GapPullRequest, or None
+    with the failure reported."""
     commit_sha = _create_gap_commit(repo, plan)
     if commit_sha is None:
         return None
@@ -1325,14 +2231,20 @@ def open_gap_pull_request(repo, default_branch, plan):
         return None
 
     body = _GAP_PULL_REQUEST_BODY.format(
-        files="\n".join(f"- `{path}`" for path in sorted(plan.missing))
+        files="\n".join(
+            line.replace(path, f"`{path}`", 1)
+            for line, path in zip(
+                _change_lines(plan.missing, plan.outdated),
+                sorted(plan.missing) + sorted(plan.outdated),
+            )
+        )
     )
     try:
         raw = gh.run_with_input(
             ["api", "--method", "POST", f"repos/{repo}/pulls", "--input", "-"],
             json.dumps(
                 {
-                    "title": _GAP_SUBJECT,
+                    "title": _gap_subject(plan.missing, plan.outdated),
                     "head": branch,
                     "base": default_branch,
                     "body": body,
@@ -1349,7 +2261,9 @@ def open_gap_pull_request(repo, default_branch, plan):
         return None
     try:
         data = json.loads(raw)
-        return GapPullRequest(number=int(data["number"]), url=data["html_url"], head_branch=branch)
+        return GapPullRequest(
+            number=int(data["number"]), url=data["html_url"], head_branch=branch, replaced=replacing
+        )
     except (ValueError, KeyError, TypeError):
         # The pull request itself was very likely created -- the write
         # succeeded, only its response didn't parse -- so this must not
@@ -1363,7 +2277,7 @@ def open_gap_pull_request(repo, default_branch, plan):
         return None
 
 
-def apply_gaps(repo, default_branch, plan):
+def apply_gaps(repo, default_branch, plan, enable_delete_branch_on_merge=False):
     """Applies a GapPlan built by plan_gaps, and reports what it did as a
     GapOutcome. Three shapes, decided by the plan:
 
@@ -1374,14 +2288,15 @@ def apply_gaps(repo, default_branch, plan):
       the tree must not go unnoticed just because there is nothing left
       here to write (Codex review, mikelward/repo#14). The verified tip
       comes back as `branch_sha`, so a caller gets a fresh sha to build
-      further checks on rather than only a bool.
+      further checks on rather than only a bool. A pull request of this
+      tool's own still open (plan.leftover_pull_requests) is closed here.
     - No commits on the branch at all (plan.base_commit_sha is None): the
       same two-commit bootstrap `repo create --scaffold` uses
       (push_initial_commit). The one case that still writes the branch
       directly, because it has to -- a pull request needs a base branch,
       and there isn't one yet.
-    - Anything missing on a branch that has commits: a pull request
-      (open_gap_pull_request), never a direct push. See that function's
+    - Anything missing or outdated on a branch that has commits: a pull
+      request (open_gap_pull_request), never a direct push. See that function's
       own docstring for both reasons. `branch_sha` stays None there: the
       scaffold is not on the branch yet, which is exactly what a caller
       about to activate pull-request protection needs to know."""
@@ -1395,7 +2310,7 @@ def apply_gaps(repo, default_branch, plan):
         sha = push_initial_commit(repo, default_branch, plan.missing)
         return GapOutcome(error=True) if sha is None else GapOutcome(branch_sha=sha)
 
-    if not plan.missing:
+    if not plan.changes:
         current_sha = _recheck_branch_sha(repo, default_branch)
         if current_sha is None:
             return GapOutcome(error=True)
@@ -1406,9 +2321,89 @@ def apply_gaps(repo, default_branch, plan):
                 "report the scaffold complete; rerun to check its current state."
             )
             return GapOutcome(error=True)
+        # A pull request of this tool's own with nothing left to add is
+        # closed, not left to outlive the scaffold; closing is reversible.
+        for pr in plan.leftover_pull_requests:
+            if not _close_pull_request(repo, pr):
+                return GapOutcome(error=True)
+            info(
+                f"{repo}: closed pull request #{pr.number} -- this tool's own, and the scaffold "
+                f"is complete on '{default_branch}': {pr.url}"
+            )
         return GapOutcome(branch_sha=current_sha)
 
     pull_request = open_gap_pull_request(repo, default_branch, plan)
     if pull_request is None:
         return GapOutcome(error=True)
+    if pull_request.opened:
+        return GapOutcome(pull_request=pull_request)
+
+    # Two runs overlapping opened two: the lower-numbered one is acted on
+    # below and the rest are closed first -- this tool's own, so closing
+    # is its call, and reversible; left open they would outlive the
+    # scaffold. Only as the plan said, though: what was agreed to is the
+    # plan's pull request and the duplicates the plan showed, and one
+    # that appeared since -- a run overlapping this one -- is a write
+    # nobody confirmed, left for a later run to plan against (Codex
+    # review, mikelward/repo#56).
+    planned = plan.open_pull_request
+    if planned is not None and pull_request.number != planned.number:
+        error(
+            f"{repo}: pull request #{pull_request.number} is this tool's own and open now, "
+            f"where this run planned against #{planned.number} -- a run overlapped this one. "
+            "Nothing done to either; rerun to plan against what is open now."
+        )
+        return GapOutcome(error=True)
+    planned_duplicates = {d.number for d in planned.duplicates} if planned is not None else set()
+    for duplicate in pull_request.duplicates:
+        if duplicate.number not in planned_duplicates:
+            warn(
+                f"{repo}: pull request #{duplicate.number} -- a second scaffold pull request "
+                f"this tool opened -- appeared after this run planned; a later run closes it "
+                "once its plan says so"
+            )
+            continue
+        warn(
+            f"{repo}: closing pull request #{duplicate.number} -- a second scaffold pull "
+            f"request this tool opened beside #{pull_request.number} (two runs overlapped)"
+        )
+        if not _close_pull_request(repo, duplicate):
+            return GapOutcome(error=True)
+    pull_request.duplicates = []
+
+    # An earlier run's pull request. Read fresh what it is waiting on, and
+    # act only as the plan said it would: a verdict that changed during
+    # the confirmation wait -- a check re-running after a push, say -- is
+    # reported and left for a later run, since what this run agreed to was
+    # the plan's action on the plan's head, and nothing else was confirmed.
+    state = assess_gap_pull_request(repo, pull_request, plan)
+    if state is None:
+        return GapOutcome(error=True)
+    pull_request.state = state
+    planned = plan.pull_request_state
+    unchanged = (
+        planned is not None
+        and planned.verdict == state.verdict
+        and planned.head_sha == state.head_sha
+    )
+    if state.verdict == "merge" and unchanged:
+        merged_sha = merge_gap_pull_request(
+            repo, pull_request, state, default_branch, enable_delete_branch_on_merge
+        )
+        if merged_sha is None:
+            return GapOutcome(error=True)
+        pull_request.merged = True
+        return GapOutcome(branch_sha=merged_sha, pull_request=pull_request)
+    if state.verdict == "stale" and unchanged:
+        if not _close_pull_request(repo, pull_request):
+            return GapOutcome(error=True)
+        fresh = _open_fresh_pull_request(repo, default_branch, plan, replacing=pull_request.number)
+        if fresh is None:
+            return GapOutcome(error=True)
+        return GapOutcome(pull_request=fresh)
+    if state.verdict in ("merge", "stale"):
+        warn(
+            f"{repo}: pull request #{pull_request.number} is not what this run planned against "
+            f"(now: {state.reason}); leaving it for a later run"
+        )
     return GapOutcome(pull_request=pull_request)

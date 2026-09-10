@@ -6,7 +6,7 @@ something, and only where the current, fully-hardened shell source --
 mikelward/scripts#216 -- differs from an earlier version). Read-only: it
 never writes anything, unlike repo_lib.rules (repo setup's ruleset
 composer), which this module deliberately does not call into except for
-check_master_branch (see below) -- the two tools ask genuinely different
+check_sibling_branch (see below) -- the two tools ask genuinely different
 questions (repo-rules composes a ruleset that satisfies a policy;
 repo-rules-audit reads GitHub's own MERGED view back and reports whether
 it already does), so their branch-condition-matching logic stays separate
@@ -14,11 +14,12 @@ here the same way it stays separate in the shell source, rather than
 threading this module through rules.py's private, create/update-oriented
 internals.
 
-check_master_branch IS reused directly from repo_lib.rules (with a small
+check_sibling_branch IS reused directly from repo_lib.rules (with a small
 quiet= addition -- see its own docstring) rather than reimplemented: it is
 a full, independently-tested API call + branching + messaging, not a
 one-line predicate, and repo setup already established it as this
-codebase's home for "does repo have an actual branch named master".
+codebase's home for "does repo have a real main or master beside its
+default branch".
 rules.DEFAULT_CHECKS is reused too, for the same reason the shell source
 threads one shared variable through its own usage() and arg-parsing
 default: so this can't silently drift from what repo-rules itself
@@ -50,8 +51,8 @@ whether every ruleset that plainly covers it also targets
 refs/heads/main and refs/heads/master (see _targeting_status below for
 the literal-first-then-glob-fallback nuance this took several rounds of
 review to get right in the shell source). Independent of any ruleset, it
-also warns whenever the repository has an actual branch named "master"
-at all.
+also reports a real branch named main or master beside the default
+branch.
 
 It also audits where secrets live (new here; the shell source never did).
 The fleet's shared credentials -- the weekly dependency batches'
@@ -865,6 +866,7 @@ def audit_secrets(repo, ok, fix):
 
 
 def run(args):
+    rules.reset_evidence_cache()  # one run's evidence, never an earlier one's
     if not OWNER_REPO_RE.match(args.repo):
         error(f"'{args.repo}' is not OWNER/REPO")
         raise SystemExit(2)
@@ -1115,22 +1117,22 @@ def run(args):
     # (same discipline as repo-rules itself -- see _branch_coverage_verdict).
     real_default = [None]
 
-    def default_branch_matches():
-        # Only meaningful (and only fetched) for a ruleset whose
-        # conditions actually reference ~DEFAULT_BRANCH -- lazily, and
-        # cached, so a repo whose rulesets never use the token costs no
-        # extra call. Directly whether $BRANCH IS the repository's real
-        # default, not merely whether --branch was omitted: an explicit
-        # `--branch main` naming the actual default must still get this.
+    def real_default_branch():
+        # The repository's real default branch: $BRANCH itself when
+        # --branch was omitted, else read lazily and cached, so a run that
+        # never needs it (no ~DEFAULT_BRANCH scope to resolve) costs no
+        # extra call. Fails closed: a finding built on a guessed default
+        # is not a finding.
         if asked_default:
-            return True
+            return branch
         if real_default[0] is None:
             try:
                 value = gh.run(["api", f"repos/{repo}", "--jq", ".default_branch"]).strip()
             except gh.GhError as e:
                 error_lines(
                     f"could not read {repo}'s default branch (needed to resolve a "
-                    "~DEFAULT_BRANCH ruleset scope):",
+                    "~DEFAULT_BRANCH ruleset scope, and to look for a branch named "
+                    "main or master beside it):",
                     e.stderr,
                 )
                 raise SystemExit(1)
@@ -1138,7 +1140,13 @@ def run(args):
                 error(f"could not read {repo}'s default branch")
                 raise SystemExit(1)
             real_default[0] = value
-        return real_default[0] == branch
+        return real_default[0]
+
+    def default_branch_matches():
+        # Directly whether $BRANCH IS the repository's real default, not
+        # merely whether --branch was omitted: an explicit `--branch main`
+        # naming the actual default must still get the checks this gates.
+        return real_default_branch() == branch
 
     try:
         ruleset_ids = [
@@ -1264,22 +1272,28 @@ def run(args):
                 "refs/heads/main and refs/heads/master"
             )
 
-    # Independent of any ruleset: a branch literally named "master" left
-    # over from a rename (or never renamed at all) is the backdoor
-    # repo-rules' wider targeting exists to close. quiet=True: this
+    # Independent of any ruleset: a real branch named main or master
+    # beside the default (left over from a rename done by hand, say) is
+    # the backdoor the hardened targeting exists to close, and `repo
+    # setup` holds its ruleset step while one exists. quiet=True: this
     # module reports the finding itself, in its own [ok]/[GAP] format,
-    # rather than duplicating rules.check_master_branch's own stderr
-    # wording.
-    status, detail = rules.check_master_branch(repo, quiet=True)
+    # rather than duplicating rules.check_sibling_branch's stderr wording.
+    default = real_default_branch()
+    status, detail = rules.check_sibling_branch(repo, default, quiet=True)
     if status == "exists":
         gap(
-            "a branch literally named 'master' exists -- delete it, or confirm "
-            f"every ruleset that protects {branch} also targets refs/heads/master"
+            f"a branch named '{detail}' exists beside the default branch '{default}' -- delete or "
+            f"rename it; the ruleset targets '{detail}' by name, and `repo setup` holds its "
+            "ruleset step while the branch exists"
         )
     elif status == "absent":
-        ok("no branch literally named 'master'")
+        ok(f"no branch named 'main' or 'master' beside the default branch '{default}'")
     else:
-        error_lines(f"could not check whether {repo} has a branch named 'master':", detail)
+        error_lines(
+            f"could not check whether {repo} has a branch named 'main' or 'master' beside "
+            f"'{default}':",
+            detail,
+        )
         raise SystemExit(1)
 
     audit_duplicate_rulesets(repo, ok, note)

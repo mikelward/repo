@@ -13,9 +13,20 @@ literal refs/heads/main and refs/heads/master, so a branch literally
 called master -- a leftover from a rename, or one that was simply never
 renamed -- cannot slip past the checks this module requires. An UPDATE
 leaves an existing ruleset's targeting alone, like every other field this
-module does not manage. check_master_branch() is independent of any
-ruleset: it warns whenever the repository has an actual branch named
-"master" at all, since deleting it removes the backdoor outright.
+module does not manage. A REAL branch by the other name, beside the
+default, is the branch that lock exists to close: check_sibling_branch()
+warns about it independent of any ruleset, since deleting it removes the
+backdoor outright, and the ruleset step holds itself while one exists
+(_hold_for_sibling_branch), since a ruleset written onto it enforces
+rules there nothing here can tell that branch satisfies.
+
+A required check has to have PASSED on the repository before this module
+requires it, and a check the caller says cannot be satisfied yet (its
+publishing workflow is still in a pull request) waits too: either one is
+DEFERRED -- named in the plan with its reason and left out of this write,
+never refused and never removed if already required -- so the rest of the
+ruleset lands now and a later run adds it (SPEC.md, *The ladder*). There
+is no override; `--force` only skips the confirmation.
 
 Every internal helper below either returns a plain false-y result or
 raises RulesetError to signal "abort the ruleset step" -- callers decide
@@ -99,6 +110,14 @@ class RulesetError(Exception):
     def __init__(self, detail=None):
         super().__init__(detail or "")
         self.detail = detail
+
+
+class RulesetHeld(RulesetError):
+    """The ruleset cannot be written until a person acts on it -- not a
+    failed read or a bad request, and not a reason for any other step to
+    stop. `.detail` says what and why; apply_ruleset reports it and hands
+    it back as report["held"], and setup_cmd skips only the ruleset step
+    (SPEC.md, invariant 1: every other step still makes its progress)."""
 
 
 def _valid_no_control_chars(value, what):
@@ -189,26 +208,55 @@ def _entry_satisfied(entry, names, app_pairs):
     return (context, integration_id) in app_pairs
 
 
-def _collect_reported(repo, wanted, ref=None):
-    """What this repository has ever reported, as (names, app_pairs):
-    every context name seen anywhere, and every (name, App id) pair seen
-    on a check run. Walks the default branch head, then open pull
-    requests, then closed ones -- each stage bounded to one page --
-    stopping as soon as every entry in `wanted` is satisfied.
+class _Reported:
+    """What this repository has reported, in two strengths: `names` and
+    `app_pairs` are every context name seen anywhere and every (name, App
+    id) pair seen on a check run; `passed_names` and `passed_pairs` are the
+    subset that concluded `success` at least once. Requiring a check that
+    has run but never passed wedges every merge exactly as one that has
+    never run does (SPEC.md, *The ladder*), so setup asks the stronger
+    question; audit's "required but never reported" asks the weaker."""
+
+    def __init__(self):
+        self.names = set()
+        self.app_pairs = set()
+        self.passed_names = set()
+        self.passed_pairs = set()
+
+    def satisfied(self, entry, passed):
+        if passed:
+            return _entry_satisfied(entry, self.passed_names, self.passed_pairs)
+        return _entry_satisfied(entry, self.names, self.app_pairs)
+
+
+def _collect_reported(repo, wanted, ref=None, passed=False, shas=None, passing=frozenset({"success"})):
+    """What this repository has ever reported, as a _Reported. Walks the
+    default branch head, then open pull requests, then closed ones -- each
+    stage bounded to one page -- stopping as soon as every entry in
+    `wanted` is satisfied: reported at all, or, with `passed`, reported
+    with a `success` conclusion.
 
     `wanted` is a set of (context, integration_id-or-None) entries. `ref`
     is the branch whose head to scan first -- the branch whose gates are
     actually in question. None means the repository's default branch. A
     check produced only on pushes to `release` never appears on the
     default branch's head, so scanning that head while auditing `release`
-    reports a working gate as never reported.
+    reports a working gate as never reported. `shas`, when given, is the
+    whole scan instead: exactly those commits, and no walk -- for asking
+    what one particular head has reported, with the same App-binding
+    semantics. `passing` is the set of check-run conclusions that count
+    as passed: `success` alone for deciding whether to REQUIRE a check
+    (a check that has only ever been skipped has not shown it can pass),
+    while a caller asking whether one head SATISFIES a requirement also
+    counts `skipped` and `neutral`, as GitHub does.
 
     Raises RulesetError on any read failure: an incomplete answer must
     never be read as "this check has never reported", which would either
-    reject a valid name or, with --force, require one on the strength of a
-    safety check that never finished."""
-    names = set()
-    app_pairs = set()
+    reject a valid name or require one on the strength of a safety check
+    that never finished."""
+    found = _Reported()
+    names = found.names
+    app_pairs = found.app_pairs
 
     # This answers only "has the bound App reported this check" -- evidence,
     # not liveness. A check RUN carries its App's id directly (below); the App
@@ -239,13 +287,18 @@ def _collect_reported(repo, wanted, ref=None):
 
     def scan(sha):
         try:
-            out = gh.run(
+            # Of the repository's history, every attempt counts (a re-run
+            # that failed after a pass does not unmake the pass); of a
+            # pull request's head, only the latest run per check is the
+            # check's current word, which is GitHub's own default listing.
+            history = shas is None
+            out = _cached_run(
                 [
                     "api",
                     "--paginate",
-                    f"repos/{repo}/commits/{sha}/check-runs",
+                    f"repos/{repo}/commits/{sha}/check-runs" + ("?filter=all" if history else ""),
                     "--jq",
-                    ".check_runs[] | [.name, .app.id] | @json",
+                    ".check_runs[] | [.name, .app.id, .conclusion] | @json",
                 ]
             )
         except gh.GhError as e:
@@ -253,23 +306,34 @@ def _collect_reported(repo, wanted, ref=None):
         for line in out.splitlines():
             if not line.strip():
                 continue
-            name, app_id = json.loads(line)
+            name, app_id, conclusion = json.loads(line)
             names.add(name)
+            if conclusion in passing:
+                found.passed_names.add(name)
             if app_id is not None:
                 app_pairs.add((name, app_id))
+                if conclusion in passing:
+                    found.passed_pairs.add((name, app_id))
         try:
-            out = gh.run(
+            out = _cached_run(
                 [
                     "api",
                     "--paginate",
                     f"repos/{repo}/commits/{sha}/status",
                     "--jq",
-                    ".statuses[].context | @json",
+                    ".statuses[] | [.context, .state] | @json",
                 ]
             )
         except gh.GhError as e:
             raise RulesetError(f"reading commit statuses for {sha}:\n{e.stderr}")
-        status_contexts = set(_json_lines(out))
+        status_contexts = set()
+        for line in out.splitlines():
+            if not line.strip():
+                continue
+            context, state = json.loads(line)
+            status_contexts.add(context)
+            if state == "success":
+                found.passed_names.add(context)
         names.update(status_contexts)
         # Only a bound entry the check-run scan did not already satisfy, AND
         # that this SHA actually carries a status for, needs the status's
@@ -280,38 +344,69 @@ def _collect_reported(repo, wanted, ref=None):
         # satisfy the binding with no installation lookup at all (Codex,
         # mikelward/repo#52). The combined /status endpoint drops the creator;
         # the per-status list below carries it.
+        # And, of the history, an UNBOUND context whose latest status is
+        # not a success but which has a status at all: the combined
+        # status shows only the latest per context, and a success the
+        # context later replaced on the same commit is still a pass here
+        # (Codex review, mikelward/repo#56). Of a head, the latest is the
+        # answer, so unbound entries never reach the history there.
         pending = [
             (context, iid)
-            for context, iid in bound
-            if (context, iid) not in app_pairs and context in status_contexts
+            for context, iid in wanted
+            if not found.satisfied((context, iid), passed)
+            and context in status_contexts
+            and (iid is not None or history)
         ]
-        want_logins = {iid: bot_login(iid) for _context, iid in pending}
-        if not any(want_logins.values()):
+        want_logins = {iid: bot_login(iid) for _context, iid in pending if iid is not None}
+        if not any(iid is None for _context, iid in pending) and not any(want_logins.values()):
             return
         try:
-            out = gh.run(
+            out = _cached_run(
                 [
                     "api",
                     "--paginate",
                     f"repos/{repo}/commits/{sha}/statuses",
                     "--jq",
-                    '.[] | [.context, (.creator.login // "")] | @json',
+                    '.[] | [.context, (.creator.login // ""), .state] | @json',
                 ]
             )
         except gh.GhError as e:
             raise RulesetError(f"reading commit status creators for {sha}:\n{e.stderr}")
+        # The list is every status ever posted on the SHA, newest first.
+        # Asked of a pull request's head (`shas`), only the first one per
+        # (context, creator) is that creator's current word: a success
+        # the same App later replaced with a failure or a pending does not
+        # satisfy the requirement now. Asked of the repository's history,
+        # the question is whether the App has EVER passed it here, and a
+        # success it later replaced on the same commit still answers yes
+        # (Codex review, mikelward/repo#56, both ways).
+        newest_only = shas is not None
+        seen = set()
         for line in out.splitlines():
             if not line.strip():
                 continue
-            context, login = json.loads(line)
-            if not login:
+            context, login, state = json.loads(line)
+            if newest_only and (context, login) in seen:
                 continue
+            seen.add((context, login))
             for entry_context, iid in pending:
-                if entry_context == context and want_logins.get(iid) == login:
+                if entry_context != context:
+                    continue
+                if iid is None:
+                    if state == "success":
+                        found.passed_names.add(context)
+                elif login and want_logins.get(iid) == login:
                     app_pairs.add((context, iid))
+                    if state == "success":
+                        found.passed_pairs.add((context, iid))
 
     def satisfied():
-        return all(_entry_satisfied(e, names, app_pairs) for e in wanted)
+        return all(found.satisfied(e, passed) for e in wanted)
+
+    if shas is not None:
+        for sha in shas:
+            scan(sha)
+        return found
 
     endpoint = f"repos/{repo}/commits?per_page=1"
     if ref is not None:
@@ -332,53 +427,62 @@ def _collect_reported(repo, wanted, ref=None):
     for sha in heads:
         scan(sha)
     if satisfied():
-        return names, app_pairs
+        return found
 
+    # Page by page, newest first, stopping at the first page that settles
+    # every entry: a pass on a pull request older than the newest hundred
+    # is still a pass here, and a listing capped at one page read it as
+    # "never" on every run (Codex review, mikelward/repo#56). Paged by
+    # hand rather than --paginate so a repository with a long history
+    # pays only for the pages it takes to find the answer -- and bounded,
+    # since each head costs two reads and a check that never passed would
+    # otherwise walk the whole history on every run, spending the hour's
+    # API budget on a repository with thousands of pull requests (Codex
+    # review, mikelward/repo#56). Evidence older than the bound is not
+    # counted: the check stays deferred, named on every run.
     for state in ("open", "closed"):
-        try:
-            out = gh.run(
-                [
-                    "api",
-                    f"repos/{repo}/pulls?state={state}&per_page=100&sort=updated&direction=desc",
-                    "--jq",
-                    ".[].head.sha",
-                ]
-            )
-        except gh.GhError as e:
-            raise RulesetError(f"listing {state} pull requests:\n{e.stderr}")
-        for sha in out.splitlines():
-            sha = sha.strip()
-            if not sha:
-                continue
-            scan(sha)
-            if satisfied():
-                return names, app_pairs
-        if satisfied():
-            return names, app_pairs
-    return names, app_pairs
+        page = 1
+        while page <= _EVIDENCE_PAGES:
+            try:
+                out = gh.run(
+                    [
+                        "api",
+                        f"repos/{repo}/pulls?state={state}&per_page=100&sort=updated"
+                        f"&direction=desc&page={page}",
+                        "--jq",
+                        ".[].head.sha",
+                    ]
+                )
+            except gh.GhError as e:
+                raise RulesetError(f"listing {state} pull requests:\n{e.stderr}")
+            # Not `shas`: scan() reads that name to tell the repository's
+            # history (every attempt counts) from a head (newest only),
+            # and rebinding it here flipped every pull request head into
+            # newest-only, discarding a superseded pass (Codex review,
+            # mikelward/repo#56).
+            page_shas = [sha.strip() for sha in out.splitlines() if sha.strip()]
+            for sha in page_shas:
+                scan(sha)
+                if satisfied():
+                    return found
+            if len(page_shas) < 100:
+                break
+            page += 1
+    return found
 
 
-def effective_required_checks(repo, branch):
-    """Every status check `branch` actually requires, from GitHub's own
-    effective-rules endpoint -- across every ruleset covering it, not just
-    the one this module manages. Rulesets AGGREGATE, so a check another
-    (or an inherited) ruleset requires is enforced just as hard as one in
+def effective_rules(repo, branch):
+    """Every rule GitHub enforces on `branch`, as the effective-rules
+    endpoint reports them -- across every ruleset covering it, not just
+    the one this module manages. Rulesets AGGREGATE, so a rule another
+    (or an inherited) ruleset carries is enforced just as hard as one in
     ours, and a caller asking "can a pull request satisfy this branch"
     gets the wrong answer from the managed ruleset alone (Codex review,
     mikelward/repo#42).
 
-    Returns (context, integration_id or None) pairs, the same shape
-    never_reported speaks, because the App a requirement is BOUND to is
-    part of what it requires: an unbound entry is satisfied by any
-    producer of that context, while a bound one names the single App that
-    may report it. A caller reasoning about which workflow publishes a
-    context must not read a same-named requirement bound to some other
-    App as one of its own (Codex review, mikelward/repo#42).
-
-    Raises RulesetError on a failed read. audit_cmd.py reads the same
-    endpoint for much more than this (every rule type, and each check's
-    App binding); this is the narrow answer setup_cmd.py needs, not a
-    replacement for that."""
+    Returns the rule dicts as GitHub sent them. Raises RulesetError on a
+    failed read. audit_cmd.py reads the same endpoint for much more than
+    this; this is the narrow read setup_cmd.py and scaffold.py need."""
     try:
         # --paginate concatenates each page's own array rather than
         # merging them, so '.[]' unwraps per page into one rule per line
@@ -394,7 +498,7 @@ def effective_required_checks(repo, branch):
         )
     except gh.GhError as e:
         raise RulesetError(f"reading {repo}'s effective rules for {branch}:\n{e.stderr}")
-    contexts = set()
+    found = []
     for line in raw.splitlines():
         if not line.strip():
             continue
@@ -402,6 +506,22 @@ def effective_required_checks(repo, branch):
             rule = json.loads(line)
         except ValueError:
             raise RulesetError(f"reading {repo}'s effective rules for {branch}: unexpected response")
+        if isinstance(rule, dict):
+            found.append(rule)
+    return found
+
+
+def required_checks_in(rules):
+    """The status checks the effective `rules` (see effective_rules)
+    require, as (context, integration_id or None) pairs -- the same shape
+    never_reported speaks, because the App a requirement is BOUND to is
+    part of what it requires: an unbound entry is satisfied by any
+    producer of that context, while a bound one names the single App that
+    may report it. A caller reasoning about which workflow publishes a
+    context must not read a same-named requirement bound to some other
+    App as one of its own (Codex review, mikelward/repo#42)."""
+    contexts = set()
+    for rule in rules:
         if rule.get("type") != "required_status_checks":
             continue
         for entry in (rule.get("parameters") or {}).get("required_status_checks") or []:
@@ -410,12 +530,53 @@ def effective_required_checks(repo, branch):
     return contexts
 
 
+def effective_required_checks(repo, branch):
+    """Every status check `branch` actually requires: required_checks_in
+    over effective_rules. Raises RulesetError on a failed read."""
+    return required_checks_in(effective_rules(repo, branch))
+
+
 def quoted(names):
     """Check names for a message, quoted and comma-separated. A name can
     contain spaces -- this repository has one called "Classify the diff" --
     so a space-joined list cannot be split back into names by eye, and the
     reader cannot tell one missing check from three."""
     return ", ".join(f"'{n}'" for n in names)
+
+
+# How far back the evidence scan looks per pull request state: pages of
+# a hundred, newest first (see _collect_reported).
+_EVIDENCE_PAGES = 5
+
+# What one run has already read about a commit's check runs and statuses,
+# keyed by the exact `gh api` argv. One `repo setup` asks the evidence
+# question up to five times (the preview, the binding's preview, the
+# write, the binding's fingerprint, the binding's write), and the per-call
+# bound above times five is a run that can spend the hour's API budget on
+# a repository with a long history (Codex review, mikelward/repo#56). A
+# pass on a commit does not un-happen, which is what makes a run-long
+# memo of these reads safe: what the write's fresh recompute might miss
+# is a pass that landed during the run, which the next run counts.
+# Reset at the start of each command's run (see reset_evidence_cache).
+_evidence_cache = {}
+
+
+def reset_evidence_cache():
+    """Forget what earlier reads in this process learned about commits'
+    check runs and statuses. Called at the start of a command's run, so a
+    long-lived process (the test suite) never carries one run's evidence
+    into another's."""
+    _evidence_cache.clear()
+
+
+def _cached_run(args):
+    """gh.run, memoized for this run on the exact argv (see
+    _evidence_cache). Failures are not cached: a read that failed once is
+    tried again where it is asked again."""
+    key = tuple(args)
+    if key not in _evidence_cache:
+        _evidence_cache[key] = gh.run(args)
+    return _evidence_cache[key]
 
 
 def never_reported(repo, entries, ref=None):
@@ -435,11 +596,31 @@ def never_reported(repo, entries, ref=None):
     Raises RulesetError on a failed read: "never reported" and "could not
     tell" are different findings, and only the first is a gap."""
     entries = list(entries)
-    names, app_pairs = _collect_reported(repo, set(entries), ref=ref)
+    found = _collect_reported(repo, set(entries), ref=ref)
     return [
-        (context, integration_id, context in names)
+        (context, integration_id, context in found.names)
         for context, integration_id in entries
-        if not _entry_satisfied((context, integration_id), names, app_pairs)
+        if not found.satisfied((context, integration_id), passed=False)
+    ]
+
+
+def never_passed(repo, entries, ref=None, shas=None, passing=frozenset({"success"})):
+    """Which of `entries` this repository has never reported a `success`
+    for, in the order given -- the question a ruleset write asks before
+    requiring a check (SPEC.md, *The ladder*): a check that has run and
+    failed blocks every merge exactly as one that has never run does.
+    With `shas`, the question is asked of those commits alone (see
+    _collect_reported) -- what a pull request's head still lacks.
+
+    Returns (context, integration_id, name_reported) triples, the same
+    shape as never_reported, so describe_missing and bound_to_another_app
+    read both. Raises RulesetError on a failed read, for the same reason."""
+    entries = list(entries)
+    found = _collect_reported(repo, set(entries), ref=ref, passed=True, shas=shas, passing=passing)
+    return [
+        (context, integration_id, context in found.names)
+        for context, integration_id in entries
+        if not found.satisfied((context, integration_id), passed=True)
     ]
 
 
@@ -462,6 +643,24 @@ def describe_missing(items):
         else f"'{context}'"
         for context, integration_id, name_reported in items
     )
+
+
+def deferral_reason(item):
+    """Why a check a write would have newly required is deferred instead,
+    for a plan line: which of the three states it is in decides what a
+    reader does about it. A check that has never run needs a pull request
+    to run on; one that has run and never passed needs the failure fixed;
+    a bound check the App has not published yet needs the App's
+    credential to reach the publisher."""
+    context, integration_id, name_reported = item
+    if integration_id is not None:
+        return (
+            f"'{context}' has not passed here as App {integration_id} yet"
+            + (" (it passes from another publisher)" if name_reported else "")
+        )
+    if name_reported:
+        return f"'{context}' has run here but never passed"
+    return f"'{context}' has never run here"
 
 
 def _lookup_ruleset_ids(repo, ruleset_name, include_parents=False):
@@ -1091,7 +1290,11 @@ def _binding_map(target_body):
     return mapping
 
 
-def _create_body(ruleset_name, checks):
+def _create_body(ruleset_name, checks, deferred=()):
+    """The body a fresh ruleset is POSTed with. `deferred` names the
+    checks left out of it this time (see apply_ruleset's `defer`): a
+    create requires nothing yet that nothing can satisfy, and a later
+    update adds each one once it can be."""
     return {
         "name": ruleset_name,
         "target": "branch",
@@ -1105,6 +1308,7 @@ def _create_body(ruleset_name, checks):
                     "required_status_checks": [
                         _check_entry(context, integration_id)
                         for context, integration_id in _as_entries(checks)
+                        if context not in deferred
                     ],
                 },
             },
@@ -1221,7 +1425,52 @@ def _newly_enforced(original_rules, target_rules):
     return added
 
 
-def _build_update_body(repo, existing_id, checks, ruleset_name):
+def _covers_default_branch(include, default_branch):
+    """Whether a ruleset's include list is KNOWN to reach the default
+    branch already: `~ALL`, `~DEFAULT_BRANCH`, or the branch by name. A
+    glob is not evaluated (this module never guesses at GitHub's pattern
+    semantics) and so reads as not covering it -- fail closed: the one
+    caller uses "already covered" to let a widening through while the
+    ruleset requires a check that cannot pass on the branch, and a glob
+    that in fact misses the branch (`refs/heads/release/*`) would let
+    that widening wedge every merge (Codex review, mikelward/repo#56).
+    The cost of the closed reading is a refused write, said with what
+    has to land first, on a ruleset whose glob did cover the branch."""
+    include = list(include or [])
+    if "~ALL" in include:
+        return True
+    return f"refs/heads/{default_branch}" in _normalize_refs(include, default_branch)
+
+
+def _widening_hazards(rules, contexts):
+    """What in a ruleset's existing rules could block a pull request on a
+    branch the ruleset is about to be widened onto, as reasons for the
+    refusal in _build_update_body: required checks (`contexts`), an
+    approval requirement of any kind (this tool's own pull requests get
+    no approver), and any rule type this module does not write, which it
+    cannot reason about (a required signature would refuse the tool's own
+    API commits; a required deployment or workflow may never run there)."""
+    hazards = []
+    if contexts:
+        hazards.append(f"it requires {quoted(contexts)}")
+    for rule in rules:
+        kind = rule.get("type")
+        params = rule.get("parameters") or {}
+        if kind == "pull_request":
+            if params.get("required_approving_review_count"):
+                hazards.append(
+                    f"it requires {params['required_approving_review_count']} approving review(s)"
+                )
+            if params.get("require_code_owner_review"):
+                hazards.append("it requires a code owner's review")
+            if params.get("require_last_push_approval"):
+                hazards.append("it requires approval of the last push")
+        elif kind not in MANAGED_RULE_TYPES:
+            hazards.append(f"it carries a '{kind}' rule this tool does not manage")
+    return hazards
+
+
+def _build_update_body(repo, existing_id, checks, ruleset_name, deferred=(), default_branch=None):
     """UPDATE does not build a body from scratch: it fetches the existing
     ruleset and edits only the managed rules inside it (plus the ref_name
     include list, see below), since a PUT replaces the whole object and
@@ -1230,6 +1479,22 @@ def _build_update_body(repo, existing_id, checks, ruleset_name):
     integration_id -- which binds a required check to a specific GitHub
     App -- is preserved by reusing the existing entry for any context that
     already has one, rather than rebuilding from names alone.
+
+    `deferred` names checks this write must not NEWLY require (see
+    apply_ruleset's `defer`). A deferred check the ruleset already
+    requires stays required exactly as it is -- unbound, or bound to
+    whatever App it was -- since leaving it alone changes nothing about
+    what the branch enforces; one it does not require yet is left out,
+    and one whose only novelty is an App binding keeps its existing entry.
+    Nothing is ever removed: a check the ruleset requires that `checks`
+    does not name stays (`checks_kept`), since the standard is a floor.
+    The one shape refused instead (RulesetError, reported) is a ruleset
+    that does not reach `default_branch` yet and carries anything that
+    could block a pull request there (_widening_hazards): the widening
+    would make it newly effective on the branch with nothing to say the
+    branch can satisfy it -- keeping it can strand the branch, dropping
+    it loosens whatever the ruleset was protecting -- so neither is
+    written, and widening it is a person's call.
 
     The one thing an update does rewrite outside `rules` is the ref_name
     include list, widened to carry the hardened three refs (see
@@ -1256,9 +1521,6 @@ def _build_update_body(repo, existing_id, checks, ruleset_name):
         original.pop(field, None)
 
     entries = _as_entries(checks)
-    wanted_contexts = [
-        _check_entry(context, integration_id) for context, integration_id in entries
-    ]
     # Contexts the ruleset requires TODAY, and the App each is bound to, so the
     # caller can be told which of `checks` this write would newly require -- a
     # distinction that matters to a caller holding back a write until something
@@ -1267,7 +1529,14 @@ def _build_update_body(repo, existing_id, checks, ruleset_name):
     # already-required check to an App is a new requirement too: nothing may
     # have reported it AS that App yet.
     existing_contexts = set()
-    existing_binding = {}
+    # context -> the entries the ruleset carries for it, in its order, and
+    # context -> the App ids they are bound to (None for an unbound one).
+    # By (context, App), never by context alone: GitHub lets one name be
+    # required from two Apps as two entries, and collapsing them to one
+    # silently dropped the other on every update -- the one thing the
+    # floor promises never happens (Codex review, mikelward/repo#56).
+    have_entries = {}
+    existing_bindings = {}
     has_status_checks = False
     has_pull_request = False
     has_linear_history = False
@@ -1278,23 +1547,14 @@ def _build_update_body(repo, existing_id, checks, ruleset_name):
         if rule.get("type") == "required_status_checks":
             has_status_checks = True
             params = dict(rule.get("parameters") or {})
-            have_by_context = {
-                h.get("context"): h for h in params.get("required_status_checks") or []
+            have_entries = {}
+            for h in params.get("required_status_checks") or []:
+                have_entries.setdefault(h.get("context"), []).append(h)
+            existing_contexts = set(have_entries)
+            existing_bindings = {
+                context: {(h.get("integration_id") or None) for h in hs}
+                for context, hs in have_entries.items()
             }
-            existing_contexts = set(have_by_context)
-            existing_binding = {
-                context: (h.get("integration_id") or None)
-                for context, h in have_by_context.items()
-            }
-            # An explicit binding in `checks` wins (it sets or re-points the
-            # App); an unbound wanted entry preserves whatever the ruleset
-            # already had, so a bare command-line name never strips an
-            # existing App binding off a check.
-            params["required_status_checks"] = [
-                w if "integration_id" in w else have_by_context.get(w["context"], w)
-                for w in wanted_contexts
-            ]
-            params["strict_required_status_checks_policy"] = True
             rule["parameters"] = params
         elif rule.get("type") == "pull_request":
             has_pull_request = True
@@ -1307,6 +1567,118 @@ def _build_update_body(repo, existing_id, checks, ruleset_name):
         elif rule.get("type") == "non_fast_forward":
             has_non_fast_forward = True
         new_rules.append(rule)
+
+    # Newly required: a context the ruleset does not require today, OR one it
+    # requires but not yet bound to the App this write binds it to -- both are
+    # requirements nothing may have satisfied AS asked yet, which is what the
+    # never-reported hold reads this for.
+    def _newly_required(context, integration_id):
+        if context not in existing_contexts:
+            return True
+        return integration_id is not None and integration_id not in existing_bindings[context]
+
+    conditions = dict(original.get("conditions") or {})
+    ref_name = dict(conditions.get("ref_name") or {})
+    widened, scope_added = _widen_include(ref_name.get("include") or [])
+    newly_covers_default = bool(
+        scope_added
+        and default_branch is not None
+        and not _covers_default_branch(ref_name.get("include"), default_branch)
+    )
+    if newly_covers_default:
+        # Widening makes everything the ruleset already carries effective
+        # on a branch it never applied to, and nothing this module can read
+        # says the branch can satisfy it: a check's history on this
+        # repository is not a history on THIS branch (a success on a
+        # release pull request says nothing about main), an approval
+        # requirement is one this tool's own pull requests can never meet,
+        # and a rule type this module does not write is one it cannot
+        # reason about. Four review rounds on mikelward/repo#56 each found
+        # the previous reading one case short, so the widening is refused
+        # whenever the ruleset carries anything that could block a pull
+        # request on the branch, and widening it is a person's call --
+        # rare (a `main`-named ruleset scoped off main), and fail-closed.
+        # A ruleset carrying nothing of the kind is widened.
+        hazards = _widening_hazards(original.get("rules") or [], sorted(existing_contexts))
+        if hazards:
+            raise RulesetHeld(
+                f"not writing ruleset '{ruleset_name}' (id {existing_id}) -- widening it "
+                f"onto '{default_branch}' would enforce there what nothing here can tell "
+                f"'{default_branch}' can satisfy: " + "; ".join(hazards) + ". Widen the ruleset "
+                "by hand once it is known to, or remove that from it first."
+            )
+
+    wanted_contexts = []
+    checks_deferred = []
+    # What the widening itself defers, with the reason apply_ruleset reports
+    # beside the caller's own: a check this write would newly require is
+    # left for the run after the one that widens, so the widening write
+    # carries nothing that could block a pull request on the branch -- the
+    # same rule the existing rules are held to above. A check's history
+    # elsewhere on this repository is not a history on the branch (Codex
+    # review, mikelward/repo#56); the next run requires it under the
+    # ordinary rule, once the ruleset covers the branch.
+    widening_deferred = {}
+    for context, integration_id in entries:
+        wanted = _check_entry(context, integration_id)
+        reason = deferred[context] if context in deferred else None
+        if reason is None and newly_covers_default and _newly_required(context, integration_id):
+            reason = widening_deferred[context] = (
+                f"'{context}' waits until ruleset '{ruleset_name}' covers '{default_branch}' -- "
+                "this run widens it onto the branch, and a check's history elsewhere on this "
+                "repository is not a history there"
+            )
+        if reason is not None:
+            if context not in existing_contexts:
+                # Not required today, and not to be newly required now.
+                checks_deferred.append(context)
+                continue
+            if integration_id is not None and integration_id not in existing_bindings[context]:
+                # Required today, but not as this App: the binding is the
+                # new requirement, and it is what waits. The entries stay
+                # as the ruleset has them.
+                checks_deferred.append(context)
+                wanted_contexts.extend(have_entries[context])
+                continue
+            widening_deferred.pop(context, None)  # required today as asked: nothing deferred
+            # Required today exactly as asked, or asked unbound: nothing new
+            # to defer -- deferral holds back a new requirement, never
+            # loosens a standing one.
+        # An explicit binding in `checks` wins (it sets or re-points the
+        # App); an unbound wanted entry preserves whatever the ruleset
+        # already had, so a bare command-line name never strips an
+        # existing App binding off a check.
+        if "integration_id" in wanted:
+            # The unbound entry, if there was one, becomes this bound one
+            # -- the same requirement, tightened to the App -- and an
+            # entry bound to another App stays beside it: the floor.
+            wanted_contexts.append(wanted)
+            wanted_contexts.extend(
+                h
+                for h in have_entries.get(context, [])
+                if (h.get("integration_id") or None) not in (None, integration_id)
+            )
+        else:
+            wanted_contexts.extend(have_entries.get(context) or [wanted])
+
+    # A context the ruleset requires today and `checks` does not stays
+    # required, exactly as it is. The fleet standard is a floor, not a
+    # ceiling (maintainer, 2026-09-06): a repository may enforce more, and
+    # this module only ever adds. Dropping it used to be the one line in a
+    # plan that loosened the gate, and with deferral it could have dropped
+    # a working gate while every replacement was still waiting -- a
+    # collaborator could then merge past it until a later run converged
+    # (Codex security review, mikelward/repo#56). Kept and named, so a
+    # plan still says what is required beyond the standard; removing one
+    # is a person's decision, made in the ruleset by hand.
+    wanted_names = {c for c, _ in entries}
+    checks_kept = sorted(c for c in existing_contexts if c not in wanted_names)
+    for c in checks_kept:
+        wanted_contexts.extend(have_entries[c])
+    for rule in new_rules:
+        if rule.get("type") == "required_status_checks":
+            rule["parameters"]["required_status_checks"] = wanted_contexts
+            rule["parameters"]["strict_required_status_checks_policy"] = True
 
     if not has_status_checks:
         new_rules.append(
@@ -1337,10 +1709,6 @@ def _build_update_body(repo, existing_id, checks, ruleset_name):
     if not has_non_fast_forward:
         new_rules.append({"type": "non_fast_forward"})
 
-    conditions = dict(original.get("conditions") or {})
-    ref_name = dict(conditions.get("ref_name") or {})
-    widened, scope_added = _widen_include(ref_name.get("include") or [])
-
     target = dict(original)
     target["rules"] = new_rules
     if scope_added:
@@ -1350,23 +1718,9 @@ def _build_update_body(repo, existing_id, checks, ruleset_name):
     # Adopting a legacy-named ruleset renames it here rather than in a
     # separate call, so the rename and the rules land in one write.
     target["name"] = ruleset_name
-    # Newly required: a context the ruleset does not require today, OR one it
-    # requires but not yet bound to the App this write binds it to -- both are
-    # requirements nothing may have satisfied AS asked yet, which is what the
-    # never-reported hold reads this for.
-    def _newly_required(context, integration_id):
-        if context not in existing_contexts:
-            return True
-        return integration_id is not None and existing_binding.get(context) != integration_id
-
-    checks_added = [c for c, iid in entries if _newly_required(c, iid)]
-    # A context the ruleset requires today and `checks` does not is about
-    # to stop being required. That is the plan line an operator most needs
-    # to see before saying yes: everything else here tightens the gate,
-    # and this is the one that loosens it (Codex review,
-    # mikelward/repo#45).
-    wanted_names = {c for c, _ in entries}
-    checks_removed = sorted(c for c in existing_contexts if c not in wanted_names)
+    checks_added = [
+        c for c, iid in entries if _newly_required(c, iid) and c not in checks_deferred
+    ]
     newly_enforced = _newly_enforced(original.get("rules"), new_rules)
     return (
         target != original,
@@ -1374,14 +1728,18 @@ def _build_update_body(repo, existing_id, checks, ruleset_name):
         has_pull_request,
         scope_added,
         checks_added,
-        checks_removed,
+        checks_kept,
         newly_enforced,
+        checks_deferred,
+        newly_covers_default,
+        widening_deferred,
     )
 
 
-def _plan_write(repo, existing_id, checks, ruleset_name):
+def _plan_write(repo, existing_id, checks, ruleset_name, deferred=(), default_branch=None):
     """Returns (needs_write, target_body, introduces_pr_protection,
-    scope_added, checks_added): the
+    scope_added, checks_added, checks_kept, newly_enforced,
+    checks_deferred, newly_covers_default, widening_deferred): the
     full API body this step would PUT to `existing_id` (or POST as a new
     ruleset, when `existing_id` is falsy) to reach `checks`, whether that
     differs from what's there now, and whether writing it would be what
@@ -1398,7 +1756,15 @@ def _plan_write(repo, existing_id, checks, ruleset_name):
     is already inside target_body, and travels separately only so the
     plan can name what changed. checks_added -- which of `checks` the
     ruleset does not require today -- rides along for the same reason, and
-    is every check for a ruleset being created fresh."""
+    is every check for a ruleset being created fresh. checks_deferred --
+    which of `deferred` this write leaves out (or leaves as it was) rather
+    than newly requiring; see apply_ruleset's `defer`. newly_covers_default
+    -- whether the widening is what first brings the default branch into
+    the ruleset's scope, so that every check it already carries becomes
+    newly effective there -- refused in _build_update_body when it
+    carries any. widening_deferred -- context -> reason for the checks
+    that widening alone left out of this write (see _build_update_body),
+    which `deferred` does not name."""
     if existing_id:
         (
             changed,
@@ -1406,28 +1772,40 @@ def _plan_write(repo, existing_id, checks, ruleset_name):
             had_pull_request,
             scope_added,
             checks_added,
-            checks_removed,
+            checks_kept,
             newly_enforced,
-        ) = _build_update_body(repo, existing_id, checks, ruleset_name)
+            checks_deferred,
+            newly_covers_default,
+            widening_deferred,
+        ) = _build_update_body(
+            repo, existing_id, checks, ruleset_name, deferred=deferred, default_branch=default_branch
+        )
         return (
             changed,
             target,
             not had_pull_request,
             scope_added,
             checks_added,
-            checks_removed,
+            checks_kept,
             newly_enforced,
+            checks_deferred,
+            newly_covers_default,
+            widening_deferred,
         )
     # A create enforces all of it for the first time, so the plan lists
     # everything rather than a diff -- None means "list them all".
+    entries = _as_entries(checks)
     return (
         True,
-        _create_body(ruleset_name, checks),
+        _create_body(ruleset_name, checks, deferred),
         True,
         [],
-        [context for context, _ in _as_entries(checks)],
+        [context for context, _ in entries if context not in deferred],
         [],
         None,
+        [context for context, _ in entries if context in deferred],
+        False,
+        {},
     )
 
 
@@ -1470,6 +1848,16 @@ def _scope_result(scope_added):
     return "now also targeting " + ", ".join(scope_added)
 
 
+def _deferred_lines(deferred):
+    """One line per check a write leaves for a later run, with its reason
+    -- the same words in the plan, in the log and beside the write, since
+    it is the same fact in each (SPEC.md, *The ladder*)."""
+    return [
+        f"deferred, not required yet: {reason} -- a later run requires it once it has passed"
+        for _context, reason in deferred
+    ]
+
+
 def _describe_plan(
     repo,
     existing_id,
@@ -1483,10 +1871,11 @@ def _describe_plan(
     needs_write=True,
     deletions=(),
     checks_added=(),
-    checks_removed=(),
+    checks_kept=(),
     newly_enforced=None,
     full=False,
     differing=(),
+    deferred=(),
 ):
     lines = []
     if existing_id and not needs_write:
@@ -1523,9 +1912,9 @@ def _describe_plan(
                 "  would newly require: "
                 + ", ".join(_context_label(c, binding.get(c)) for c in checks_added)
             )
-        if checks_removed:
+        if checks_kept:
             lines.append(
-                "  would NO LONGER require: " + ", ".join(checks_removed)
+                "  keeps requiring, beyond the standard: " + ", ".join(checks_kept)
             )
         lines += [f"  {added}" for added in newly_enforced]
         if scope_added:
@@ -1557,12 +1946,12 @@ def _describe_plan(
         if full:
             # The full rendering is the short plan PLUS the resulting
             # state, never the state instead of it. Swapping one for the
-            # other silently dropped "would NO LONGER require" -- the one
-            # line that reports protection being weakened -- from
+            # other silently dropped the kept-beyond-the-standard line from
             # --verbose and from the log, which is where an operator is
             # most likely to be reading (Codex review, mikelward/repo#45).
             lines.append("  after this write the ruleset holds:")
             lines += _enforced_lines((target_body or {}).get("rules"), indent="    ")
+    lines += [f"  {line}" for line in _deferred_lines(deferred)]
     note = _bypass_actor_note(bypass_actors)
     if note:
         lines.append(note)
@@ -1614,9 +2003,8 @@ def apply_ruleset(
     expected_fingerprint=_NO_EXPECTATION,
     report=None,
     skip_confirm=False,
-    refuse_if_introduces_pr_protection=False,
-    refuse_if_adds_required_checks=False,
-    refuse_if_widens_scope=False,
+    defer=None,
+    refuse_if_newly_effective=False,
     verify_scaffold_before_requiring_checks=None,
     quiet=False,
     record=None,
@@ -1680,10 +2068,29 @@ def apply_ruleset(
     set on the no-op return, the one thing an already-compliant ruleset
     still has to say, so a caller that hides idle steps does not hide it.
     report["needs_write"], report["deletions"], report["existing_id"]
-    (also fingerprint[0]), report["fingerprint"]. report["never_reported"]
-    is set instead, and the others left absent, when this refuses over the
-    never-reported-check guard without force -- the one refusal reason that
-    isn't a real problem with the request, only something to wait out.
+    (also fingerprint[0]), report["fingerprint"]. report["held"] -- set
+    with the reason when the ruleset cannot be written until a person
+    acts (RulesetHeld: a widening that would enforce on the branch what
+    nothing here can tell it satisfies), so a caller skips this step and
+    no other. report["deferred"] --
+    (context, reason) pairs for the checks this write leaves for a later
+    run, see `defer` below -- is set on every path that got as far as
+    planning, so a caller can say what is waiting even when nothing else
+    needs writing.
+
+    defer: {context: reason} -- checks the caller knows cannot be newly
+    required yet, whatever they have reported (setup_cmd.py passes the
+    ones whose publishing workflow its own scaffold pull request is still
+    adding). Joined here with the checks that have never PASSED on this
+    repository (never_passed): requiring either would block every merge
+    with nothing able to satisfy it, which is the permanent wedge SPEC.md
+    forbids. A deferred check is not refused and not removed: the write
+    goes ahead with everything else, a check the ruleset already requires
+    stays required as it is, and the plan names each deferred one with its
+    reason so a later run's requiring it is no surprise. There is no
+    override -- `force` used to waive the never-reported guard, and a
+    guard the fleet loop's own flag turns off is not a guard (SPEC.md,
+    *Flags*).
 
     record: where the body of a ruleset this deletes is written before it
     goes, so the deletion can be undone (see _record_deleted_ruleset). A
@@ -1691,45 +2098,27 @@ def apply_ruleset(
     None sends it to stdout instead.
 
     skip_confirm: True skips this function's own interactive _confirm()
-    unconditionally, independent of `force`. The two are different
-    things: `force` authorizes overriding the never-reported-check guard
-    above; skip_confirm only says "don't ask a question here" -- for a
-    caller (setup_cmd.py's real apply) whose own confirmation already
-    happened, with nothing left on stdin to answer a second one.
+    unconditionally, independent of `force`. `force` is the command-line
+    "apply without asking"; skip_confirm is for a caller (setup_cmd.py's
+    real apply) whose own confirmation already happened, with nothing
+    left on stdin to answer a second one.
 
-    refuse_if_introduces_pr_protection: checked against the FRESH
-    recompute right before the real write, not the earlier preview --
-    setup_cmd.py's own bootstrap-failure gate already skips calling this
-    function at all when the PREVIEW says a write would introduce
-    pull-request protection, but a preview-time answer is a snapshot: an
-    administrator could edit the existing ruleset during the confirmation
-    wait (removing its pull_request rule from one that otherwise still
-    needed a write) such that _plan_write's fresh call now answers True
-    where the preview said False, and _build_update_body would silently
-    reconstruct the same target body regardless -- passing the ordinary
-    fingerprint check, since that compares WHAT would be written, not why.
-    refuse_if_adds_required_checks: the same window, for the same reason,
-    over the other half of what a caller may be holding this write back
-    for. An administrator removing a required CHECK during the wait makes
-    the fresh recompute name it in checks_added where the preview named
-    nothing -- and the target body is unchanged by that (it rebuilds the
-    same wanted contexts either way, and an entry with no integration_id
-    reconstructs byte for byte), so the fingerprint passes and the write
-    silently re-adds a check nothing may be able to report yet (Codex
-    review, mikelward/repo#42).
-
-    refuse_if_widens_scope: the third way a write can newly impose this
-    ruleset's rules on a branch that did not have them -- not by changing
-    the rules at all, but by widening the ruleset's SCOPE to cover that
-    branch. A ruleset carrying pull_request and `codex` but targeting only
-    `refs/heads/release` answers False to both flags above, while
-    _build_update_body widens it to the hardened three refs and makes both
-    newly effective on the default branch (Codex review,
-    mikelward/repo#42).
-
-    Refusing this here, from the same fresh recompute the fingerprint
-    check itself uses, is what actually closes that window rather than
-    narrowing it (Codex review, mikelward/repo#14).
+    refuse_if_newly_effective: refuse, from the FRESH recompute right
+    before the real write, a write that would make this ruleset's rules
+    newly effective on the branch in any of the three ways -- introducing
+    pull-request protection for the first time, newly requiring a check,
+    or widening the ruleset's scope onto the branch. setup_cmd.py passes
+    this for a branch with no commits that nothing this run will push
+    one to: pull-request protection there can never be satisfied (no
+    direct push may create the branch, and no pull request can target a
+    branch that does not exist), and the preview's answer is a snapshot
+    -- an administrator could remove the existing pull_request rule or a
+    required check during the confirmation wait, and _build_update_body
+    would rebuild the same target body regardless, passing the
+    fingerprint check since that compares WHAT would be written, not why
+    (Codex review, mikelward/repo#14, #42). Refusing here, from the same
+    fresh recompute the fingerprint check itself uses, is what actually
+    closes that window rather than narrowing it.
 
     verify_scaffold_before_requiring_checks: when given, called with the
     FRESH default_branch (the same re-read this function's own fresh
@@ -1779,35 +2168,22 @@ def apply_ruleset(
 
     try:
         # A bound entry is satisfied only by the App it names, an unbound one by
-        # any producer of that context -- never_reported and _collect_reported
+        # any producer of that context -- never_passed and _collect_reported
         # read the binding, so an App-bound `lanes` that nothing has yet posted
-        # AS that App is held back here exactly like a name nothing reports.
-        missing = never_reported(repo, entries)
+        # AS that App is deferred here exactly like a name nothing has passed.
+        missing = never_passed(repo, entries)
     except RulesetError as e:
-        error_lines(f"could not read which checks have reported on {repo}:", e.detail)
-        error("Refusing to guess: an incomplete answer here either rejects a valid")
-        error("check or, with --force, requires one on the strength of a safety")
-        error("check that did not finish.")
+        error_lines(f"could not read which checks have passed on {repo}:", e.detail)
+        error("Refusing to guess: an incomplete answer here either defers a check")
+        error("that is fine or requires one on the strength of a safety check that")
+        error("did not finish.")
         return 1
-    if missing:
-        if force:
-            # Not a refusal: the run proceeds and the required check simply
-            # blocks merges until each one reports, so this is a caveat.
-            warn(f"never reported on {repo}: {describe_missing(missing)}")
-            warn("(--force given; a merge will block until each one reports)")
-        else:
-            error(f"never reported on {repo}: {describe_missing(missing)}")
-            error("Add the check first. Pass --force to require it anyway.")
-            # Distinct from every other reason this function refuses: there
-            # is nothing wrong with the repository or the request, only a
-            # check that hasn't run yet -- recoverable by waiting, not by
-            # anything the caller can fix now. setup_cmd.py reads this back
-            # to tell that apart from a genuine preview failure, so it can
-            # skip only the ruleset step rather than refusing to apply
-            # anything else this run could otherwise finish.
-            if report is not None:
-                report["never_reported"] = missing
-            return 1
+    # The caller's reasons first: a check whose publisher is not on the
+    # branch waits for that whichever way its runs went, and one reason per
+    # check is enough for a reader.
+    deferred = dict(defer or {})
+    for item in missing:
+        deferred.setdefault(item[0], deferral_reason(item))
 
     try:
         existing, adopted_legacy, duplicates = _resolve_ruleset(repo, ruleset_name)
@@ -1833,11 +2209,26 @@ def apply_ruleset(
             introduces_pr_protection,
             scope_added,
             checks_added,
-            checks_removed,
+            checks_kept,
             newly_enforced,
-        ) = _plan_write(repo, existing, entries, ruleset_name)
+            checks_deferred,
+            _newly_covers_default,
+            widening_deferred,
+        ) = _plan_write(repo, existing, entries, ruleset_name, deferred, default_branch)
+    except RulesetHeld as e:
+        # A person's call, not a failure of the request: said, handed back,
+        # and the caller's other steps go on (SPEC.md, invariant 1).
+        error(f"{repo}: {e.detail}")
+        if report is not None:
+            report["held"] = e.detail
+        return 1
     except RulesetError:
         return 1
+    # Only the checks this write actually leaves out, in the requested
+    # order: one the ruleset already requires is not deferred, whatever
+    # its runs say, since leaving it alone changes nothing.
+    reasons = {**widening_deferred, **deferred}
+    deferred_now = [(context, reasons[context]) for context in checks_deferred]
 
     try:
         deletions, differing = _plan_legacy_deletion(
@@ -1854,6 +2245,7 @@ def apply_ruleset(
         report["introduces_pr_protection"] = introduces_pr_protection
         report["checks_added"] = list(checks_added)
         report["scope_added"] = list(scope_added)
+        report["deferred"] = deferred_now
 
     if not needs_write and not deletions:
         # Outside the quiet guard, like the one on the write path below and
@@ -1876,7 +2268,26 @@ def apply_ruleset(
             _report_excluded_hardened(repo, ruleset_name, target_body, default_branch)
             if note:
                 print(note)
+        # Not gated on quiet: a check still waiting is the one thing an
+        # otherwise-idle step has to say, on every run until it lands
+        # (SPEC.md: a run says what a later run will do and what that is
+        # waiting on).
+        for line in _deferred_lines(deferred_now):
+            print(f"{repo}: {line}")
         return 0
+
+    # A real branch named main or master beside the default holds the write
+    # (a person's call: delete it, or widen by hand), after the no-op return
+    # above since an already-compliant ruleset has nothing to hold.
+    try:
+        _hold_for_sibling_branch(repo, default_branch, ruleset_name)
+    except RulesetHeld as e:
+        error(f"{repo}: {e.detail}")
+        if report is not None:
+            report["held"] = e.detail
+        return 1
+    except RulesetError:
+        return 1
 
     plan_lines = _describe_plan(
         repo,
@@ -1891,9 +2302,10 @@ def apply_ruleset(
         needs_write,
         deletions,
         checks_added,
-        checks_removed,
+        checks_kept,
         newly_enforced,
         differing=differing,
+        deferred=deferred_now,
     )
     if report is not None:
         # The same plan rendered in full, for a caller that shows the
@@ -1915,10 +2327,11 @@ def apply_ruleset(
             needs_write,
             deletions,
             checks_added,
-            checks_removed,
+            checks_kept,
             newly_enforced,
             full=True,
             differing=differing,
+            deferred=deferred_now,
         )
 
     if dry_run:
@@ -1967,36 +2380,53 @@ def apply_ruleset(
             fresh_introduces_pr_protection,
             fresh_scope_added,
             fresh_checks_added,
-            _fresh_checks_removed,
+            _fresh_checks_kept,
             _fresh_newly_enforced,
-        ) = _plan_write(repo, fresh_existing, entries, ruleset_name)
+            _fresh_checks_deferred,
+            _fresh_newly_covers_default,
+            _fresh_widening_deferred,
+        ) = _plan_write(repo, fresh_existing, entries, ruleset_name, deferred, default_branch)
+    except RulesetHeld as e:
+        error(f"{repo}: {e.detail}")
+        if report is not None:
+            report["held"] = e.detail
+        return 1
     except RulesetError:
         error(f"could not re-read ruleset '{ruleset_name}' to write it")
         return 1
 
-    if fresh_introduces_pr_protection and refuse_if_introduces_pr_protection:
-        error(
-            f"ruleset '{ruleset_name}' on {repo} would now introduce pull-request protection "
-            "(it didn't when this was last checked -- its existing pull_request rule was "
-            "removed, or the ruleset itself, while this was waiting), and the caller asked to "
-            "refuse exactly that. Not writing it. Rerun to re-check."
-        )
-        return 1
-    if fresh_scope_added and refuse_if_widens_scope:
-        error(
-            f"ruleset '{ruleset_name}' on {repo} would widen its scope to also target "
-            f"{', '.join(fresh_scope_added)}, making its existing rules newly effective there, "
-            "and the caller asked to refuse exactly that. Not writing it. Rerun to re-check."
-        )
-        return 1
-    if fresh_checks_added and refuse_if_adds_required_checks:
-        error(
-            f"ruleset '{ruleset_name}' on {repo} would now newly require "
-            f"{quoted(fresh_checks_added)} (it didn't when this was last checked -- the ruleset "
-            "was edited while this was waiting), and the caller asked to refuse exactly that. "
-            "Not writing it. Rerun to re-check."
-        )
-        return 1
+    if fresh_needs_write:
+        # Read again, past the run's memo: a branch created during the
+        # confirmation wait is exactly what this last look is for.
+        try:
+            _hold_for_sibling_branch(repo, default_branch, ruleset_name, fresh=True)
+        except RulesetHeld as e:
+            error(f"{repo}: {e.detail}")
+            if report is not None:
+                report["held"] = e.detail
+            return 1
+        except RulesetError:
+            return 1
+
+    if refuse_if_newly_effective:
+        newly = []
+        if fresh_introduces_pr_protection:
+            newly.append("now introduce pull-request protection")
+        if fresh_checks_added:
+            newly.append(f"now newly require {quoted(fresh_checks_added)}")
+        if fresh_scope_added:
+            newly.append(
+                f"now widen its scope to also target {', '.join(fresh_scope_added)}, making its "
+                "existing rules newly effective there"
+            )
+        if newly:
+            error(
+                f"ruleset '{ruleset_name}' on {repo} would {' and '.join(newly)} -- the caller "
+                "asked to refuse exactly that (the branch has no commits for it to be satisfied "
+                "on), and the ruleset was edited while this was waiting if the preview did not "
+                "say so. Not writing it. Rerun to re-check."
+            )
+            return 1
     if (
         fresh_introduces_pr_protection or fresh_checks_added or fresh_scope_added
     ) and verify_scaffold_before_requiring_checks is not None:
@@ -2029,6 +2459,7 @@ def apply_ruleset(
         error("Rerun to re-check.")
         return 1
 
+    required_now = ", ".join(_binding_map(fresh_target_body)) or "none yet"
     if not fresh_needs_write:
         # Deletion-only: the ruleset already holds everything it should,
         # and the whole change is removing the duplicate beside it.
@@ -2046,13 +2477,12 @@ def apply_ruleset(
             print(
                 f"{repo}: adopted the ruleset named '{fresh_adopted_legacy}' and renamed "
                 f"it '{ruleset_name}' ({_scope_result(fresh_scope_added)}; its bypass actors "
-                f"and any other rules are unchanged); "
-                f"required checks: {', '.join(context for context, _ in entries)}"
+                f"and any other rules are unchanged); required checks: {required_now}"
             )
         else:
             print(
                 f"{repo}: updated ruleset '{ruleset_name}' ({_scope_result(fresh_scope_added)}); "
-                f"required checks: {', '.join(context for context, _ in entries)}"
+                f"required checks: {required_now}"
             )
     else:
         try:
@@ -2065,8 +2495,13 @@ def apply_ruleset(
             return 1
         print(
             f"{repo}: created ruleset '{ruleset_name}' on {default_branch}, main and master; "
-            f"required checks: {', '.join(context for context, _ in entries)}"
+            f"required checks: {required_now}"
         )
+    # What a later run will add, said beside the write it was left out of
+    # -- and not gated on quiet, since it is the step's own change in
+    # progress, not a recital of state.
+    for line in _deferred_lines(deferred_now):
+        print(f"{repo}: {line}")
 
     # After the write, never before: what makes a legacy ruleset safe to
     # delete is that the SURVIVING one holds everything it held, and until
@@ -2147,56 +2582,108 @@ def apply_ruleset(
     return 0
 
 
-def check_master_branch(repo, quiet=False):
-    """Warns on stderr if `repo` has an actual branch literally named
-    'master' -- the backdoor the hardened ~DEFAULT_BRANCH/main/master
-    targeting above exists to close, worth flagging independent of any
-    ruleset since deleting the branch removes it outright. Advisory, not a
-    precondition for the ruleset write: never raises, and a read failure
-    here is reported but does not fail the rest of `repo setup`.
+def sibling_branch(repo, default_branch, fresh=False):
+    """Which hardened literal ref names a REAL branch that is not the
+    default: ("exists", name) | ("absent", None) | ("error", detail).
 
-    Returns ("exists" | "absent" | "error", detail) -- detail is gh's raw
-    stderr text for "error", else None. `repo setup` (quiet=False, the
-    default) ignores the return value and relies on this function's own
-    stderr reporting, unchanged. `repo audit` (quiet=True) needs to decide
-    for itself whether an unreadable check should fail the whole audit
-    closed rather than merely warn, so it takes the outcome and detail
-    back and reports the finding in its own [ok]/[GAP] format instead --
-    quiet=True suppresses this function's own printing so the two reports
-    don't duplicate (and word) the same finding differently."""
-    # Ask for the branch's own name back, and require it to be literally
-    # "master" -- a 200 is not enough. GitHub 301-redirects a renamed
-    # branch's old name to its new one, and `gh api` follows redirects, so
-    # on a repository renamed master -> main this endpoint answers 200 with
-    # main's record. Reading only the exit status turns every such rename
-    # into a standing false "master exists" -- the exact backdoor finding
-    # that is supposed to mean something, reported on repositories that
-    # closed it by renaming. The name in the response settles it whatever
-    # the redirect did: only a real master branch answers to that name.
-    ok, result = gh.try_run(["api", f"repos/{repo}/branches/master", "--jq", ".name"])
-    if ok:
-        name = result.strip()
-        if name == "master":
-            if not quiet:
-                warn(f"{repo} has a branch literally named 'master' -- this can bypass a")
-                warn("ruleset scoped only to the default branch. Delete it, or confirm the")
-                warn("ruleset above also targets refs/heads/master.")
-            return "exists", None
-        if name:
-            # A different name means the request was redirected off a
-            # renamed master, so there is no master branch to report.
-            return "absent", None
-        # 200 with no name is neither -- "could not tell" is its own
-        # finding here, never quietly folded into a clean result.
-        detail = f"gh: repos/{repo}/branches/master returned no branch name\n"
+    The standard targets `refs/heads/main` and `refs/heads/master` by name
+    whatever the default branch is called, as a lock against renaming the
+    default out from under a ruleset scoped to it. A real branch by the
+    other name, beside the default, is the branch that lock exists to
+    close -- and a ruleset written onto it enforces rules there that
+    nothing here can tell it satisfies (SPEC.md, *The standard*).
+
+    Read with the singular git/ref/heads/{name}, which answers only for a
+    ref that exists. The branches endpoint does not: GitHub 301-redirects
+    a renamed branch's old name to its new one, and `gh api` follows
+    redirects, so `repos/{repo}/branches/master` answers 200 with main's
+    record on every repository renamed master -> main -- a standing false
+    "master exists" on exactly the repositories that closed the backdoor.
+    Memoized for the run (see _evidence_cache): the ruleset step asks up
+    to four times per run and the answer rarely changes inside one. A
+    404 is the answer, not a failure, so it is memoized too; only another
+    error is tried again where it is asked again. `fresh` reads past the
+    memo and replaces it: the check right before the write asks again,
+    like every other precondition apply_ruleset re-reads there, since a
+    branch created while the operator was confirming would otherwise be
+    widened onto on the strength of the preview's 404 (Codex review,
+    mikelward/repo#56)."""
+    for ref in _HARDENED_INCLUDE:
+        if not ref.startswith("refs/heads/"):
+            continue
+        name = ref[len("refs/heads/"):]
+        if name == default_branch:
+            continue
+        key = ("sibling", repo, name)
+        if fresh or key not in _evidence_cache:
+            ok, raw = gh.try_run(["api", f"repos/{repo}/git/ref/heads/{name}"])
+            if not ok and "HTTP 404" not in raw and "Git Repository is empty" not in raw:
+                return "error", raw
+            _evidence_cache[key] = ok
+        if _evidence_cache[key]:
+            return "exists", name
+    return "absent", None
+
+
+def _hold_for_sibling_branch(repo, default_branch, ruleset_name, fresh=False):
+    """RulesetHeld when `repo` has a branch named `main` or `master` beside
+    its default branch; RulesetError (reported) when that cannot be read.
+    Called only once a write is planned: an already-compliant ruleset has
+    nothing to hold, and the branch is said by check_sibling_branch.
+    `fresh` is the pre-write check's re-read (sibling_branch)."""
+    status, value = sibling_branch(repo, default_branch, fresh=fresh)
+    if status == "error":
+        error_lines(
+            f"could not check whether {repo} has a branch named 'main' or 'master' beside "
+            f"'{default_branch}':",
+            value,
+        )
+        raise RulesetError()
+    if status == "exists":
+        raise RulesetHeld(
+            f"not writing ruleset '{ruleset_name}' -- {repo} has a branch named '{value}' beside "
+            f"its default branch '{default_branch}'. The ruleset targets '{value}' by name, as a "
+            f"lock against renaming '{default_branch}' out from under it, so writing it would "
+            f"enforce on '{value}' rules nothing here can tell that branch satisfies, and a pull "
+            f"request into '{value}' could be blocked by a check that never runs there. Delete or "
+            f"rename '{value}' -- it is the branch the lock exists to close -- or widen the "
+            "ruleset by hand, then rerun."
+        )
+
+
+def check_sibling_branch(repo, default_branch=None, quiet=False):
+    """Warns on stderr if `repo` has a real branch named `main` or `master`
+    beside its default branch -- the backdoor the hardened targeting
+    exists to close, worth flagging independent of any ruleset since
+    deleting the branch removes it outright (and, while it exists, the
+    ruleset step is held: _hold_for_sibling_branch). Advisory here: never
+    raises, and a read failure is reported but does not fail the rest of
+    `repo setup`. The default branch is read when not given.
+
+    Returns ("exists" | "absent" | "error", detail) -- detail is the
+    branch name for "exists", gh's raw stderr for "error", else None.
+    `repo setup` (quiet=False, the default) relies on this function's own
+    stderr reporting. `repo audit` (quiet=True) decides for itself whether
+    an unreadable check fails the whole audit closed rather than merely
+    warns, so it takes the outcome back and reports the finding in its own
+    [ok]/[GAP] format -- quiet=True suppresses this function's printing so
+    the two reports don't word the same finding differently."""
+    if default_branch is None:
+        try:
+            default_branch = _read_default_branch(repo)
+        except RulesetError:
+            return "error", f"could not read {repo}'s default branch\n"
+    status, value = sibling_branch(repo, default_branch)
+    if status == "exists":
         if not quiet:
-            warn(f"could not check whether {repo} has a branch named 'master':")
-            warn(f"  {detail.strip()}")
-        return "error", detail
-    if "HTTP 404" in result:
-        return "absent", None
-    if not quiet:
-        warn(f"could not check whether {repo} has a branch named 'master':")
-        for line in result.splitlines():
-            warn(f"  {line}")
-    return "error", result
+            warn(f"{repo} has a branch named '{value}' beside its default branch '{default_branch}'")
+            warn(f"-- the branch the ruleset's targeting of '{value}' by name exists to lock out.")
+            warn(f"The ruleset step is held while it exists: delete or rename '{value}'.")
+        return "exists", value
+    if status == "error":
+        if not quiet:
+            warn(f"could not check whether {repo} has a branch named 'main' or 'master' beside '{default_branch}':")
+            for line in value.splitlines():
+                warn(f"  {line}")
+        return "error", value
+    return "absent", None
