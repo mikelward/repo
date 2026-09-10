@@ -23,6 +23,25 @@
       `rules.DEFAULT_CHECKS` is reused for the same default-check list
       `repo setup` uses, so the two can't drift.
 
+- [ ] **Warn about branches that could expose a fleet credential.** `repo
+      setup` now reads the default branch only (see "repo setup: fleet
+      credentials"), so the branch scan lives only in `repo audit`, which
+      already reads every branch. Have audit name a non-default branch whose
+      workflow could actually reach a fleet credential -- a caller/publisher
+      on that branch while the credential is reachable from it (a repository-
+      level copy, or an environment whose policy admits the branch) -- as an
+      exposure warning, distinct from setup's own credential-state report.
+      This is the visibility half of the main-only setup change (maintainer,
+      2026-09-10): setup acts on `main`, audit surfaces branch risk. Own PR.
+      Part of the same follow-up (Codex, mikelward/repo#55): move audit's
+      credential-state analysis/remediation to the default-branch scope so it
+      agrees with setup -- a credential reached only from a non-default branch
+      reads as unused / any `repo setup` recommendation matches what setup
+      would do (default-only), rather than an `[ok]` or a "rerun setup" that
+      setup would treat as unused and delete. Audit keeps reading every
+      branch, but that scan feeds the exposure warning, not the used/unused
+      verdict.
+
 ## repo setup
 
 - [x] Port `repo-rules`'s ruleset composition from mikelward/scripts, with

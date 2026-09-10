@@ -398,7 +398,7 @@ def _plan_credentials(repo, specs):
     try:
         repo_secrets = credentials.repository_secrets(repo)
         environments = credentials.environments(repo)
-        default, texts = credentials.workflow_snapshot(repo)
+        default, texts = credentials.workflow_snapshot(repo, default_only=True)
         held = {
             env: credentials.environment_secrets(repo, environments, env)
             for env in (*credentials.BATCH_HUBS, credentials.COMMIT_ARTIFACT_ENV, credentials.LANES_ENV)
@@ -410,9 +410,13 @@ def _plan_credentials(repo, specs):
         return plan
 
     def reread():
-        """The workflows' texts as they are now, on every branch, for a
-        recheck."""
-        return credentials.workflow_texts(repo)
+        """The default branch's workflow texts as they are now, for a
+        recheck -- default branch only, matching the plan read above: setup
+        reasons about the repository and its default branch alone (see
+        credentials.workflow_texts). Callers pair this with a fresh
+        default-branch read to catch a repoint since the plan (the lanes
+        recheck does; `now` does for the batch/commit path)."""
+        return credentials.workflow_texts(repo, default_only=True)
 
     def guarded(check):
         """Wraps a recheck so a failed read reads as "no longer holds"
@@ -559,6 +563,14 @@ def _plan_credentials(repo, specs):
         def now():
             """(reason, callers) as the workflows read now, for a recheck."""
             texts_now = reread()
+            # reread reads the default branch only, so a repoint since the plan
+            # would leave this recheck reading the FORMER default and missing a
+            # caller on the NEW one -- deleting a credential it uses. Confirm
+            # the default has not moved, the same check the lanes recheck makes
+            # (Codex, mikelward/repo#55).
+            default_now = credentials.default_branch(repo)
+            if default_now != default:
+                return f"the default branch is now '{default_now}', not '{default}'", {}
             callers_now = credentials.callers(texts_now, prefix)
             if credentials.unread_mentions(texts_now, prefix):
                 return f"a workflow now mentions {prefix} in a shape this cannot read as a caller", callers_now

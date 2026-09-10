@@ -4940,11 +4940,13 @@ class LanesCredentialStepTest(unittest.TestCase):
         self.assertIn("not fixed: lanes: ci publishes the lanes status", err)
         self.assertEqual(fake.deleted_secrets, [])
 
-    def test_a_publisher_only_on_a_branch_keeps_the_pair_and_says_so(self):
-        # The pull request adopting lanes: nothing on the default branch
-        # publishes yet, the branch copy will once merged. The pair moves
-        # and the environment is restricted -- what that merge needs -- and
-        # the plan says no publisher reaches it yet (Codex, mikelward/repo#36).
+    def test_a_publisher_only_on_a_branch_is_not_seen_so_the_pair_is_cleaned_up(self):
+        # setup reasons about the default branch alone (main-only): a publisher
+        # that exists only on a feature branch is not read, so nothing on the
+        # default branch uses the pair and it is cleaned up -- repository and
+        # environment copies both. Recoverable: a rerun with --credential
+        # re-places it once the publisher is on the default branch (maintainer:
+        # main-only + delete, 2026-09-10).
         fake = FakeGh()
         fake.workflow_files = ["ci.yml"]
         fake.workflow_texts = {"ci.yml": "jobs: {}\n"}
@@ -4953,32 +4955,13 @@ class LanesCredentialStepTest(unittest.TestCase):
         fake.env_secret_names = {"lanes": set(self.PAIR)}
         code, out, err = _run(fake, ["--force", "--no-rules", "-v", REPO])
         self.assertEqual(code, 0, err)
-        self.assertIn(
-            "lanes: no workflow on the default branch publishes the lanes status as the App; ci on "
-            "feature does from a branch, which reaches the environment once merged -- the pair is "
-            "kept for it",
-            out + err,
-        )
-        self.assertNotIn("nothing uses it", out + err)
-        self.assertEqual(sorted(fake.deleted_secrets), [("LANES_APP_ID", None), ("LANES_APP_PRIVATE_KEY", None)])
-        self.assertEqual(len(fake.restricted), 1)
-
-    def test_a_branch_only_publisher_that_went_away_holds_the_apply_back(self):
-        # The plan rested on the branch copy alone; gone while the prompt
-        # sat, the apply would otherwise leave a pair nothing uses (Codex,
-        # mikelward/repo#36).
-        fake = FakeGh()
-        fake.workflow_files = ["ci.yml"]
-        fake.workflow_texts = {"ci.yml": "jobs: {}\n"}
-        fake.branch_workflows = {"feature": {"ci.yml": self.PUBLISHER}}
-        fake.secret_names = set(self.PAIR)
-        fake.env_secret_names = {"lanes": set(self.PAIR)}
-        fake.branch_workflows_after_recheck = {"feature": {"ci.yml": "jobs: {}\n"}}
-        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
-        self.assertEqual(code, 1)
-        self.assertIn("the publishing workflows changed since the plan was built (none now)", err)
-        self.assertEqual(fake.deleted_secrets, [])
-        self.assertEqual(fake.restricted, [])
+        self.assertIn("nothing uses it", out + err)
+        # The feature branch is never read -- setup only touches the repo and
+        # its default branch.
+        self.assertFalse(any("ref=feature" in " ".join(c) for c in fake.calls))
+        # The environment copy is removed too, not just the repository one.
+        self.assertIn(("LANES_APP_ID", "lanes"), fake.deleted_secrets)
+        self.assertIn(("LANES_APP_PRIVATE_KEY", "lanes"), fake.deleted_secrets)
 
     def test_half_the_pair_handed_to_the_action_holds_everything(self):
         # Neither unused nor a publisher: the pair stays where it is, and the
@@ -5154,23 +5137,6 @@ class LanesCredentialStepTest(unittest.TestCase):
             "no status -- `classify`, or a `mode` the action refuses to start on --",
             err,
         )
-
-    def test_a_branch_only_publisher_raises_no_classify_finding(self):
-        # Nothing on the default branch publishes at all, which the plan
-        # already says; the branch copy's mode is its own pull request's
-        # business until it merges.
-        fake = FakeGh()
-        fake.workflow_files = ["ci.yml"]
-        fake.workflow_texts = {"ci.yml": "jobs: {}\n"}
-        fake.branch_workflows = {
-            "feature": {"ci.yml": self.PUBLISHER.replace("          mode: init\n", "          mode: classify\n")}
-        }
-        fake.secret_names = set(self.PAIR)
-        fake.env_secret_names = {"lanes": set(self.PAIR)}
-        code, out, err = _run(fake, ["--force", "-v", "--no-rules", REPO])
-        self.assertEqual(code, 0, err)
-        self.assertIn("lanes: no workflow on the default branch publishes the lanes status as the App", out + err)
-        self.assertNotIn("only to steps that publish no status", out + err)
 
     def test_a_publisher_that_stopped_publishing_a_status_while_the_plan_waited_holds_it_back(self):
         # Same workflow, same job, one word changed: `init` to `classify`
@@ -5638,10 +5604,16 @@ class CredentialsStepTest(unittest.TestCase):
         )
         self.assertEqual(fake.deleted_secrets, [])
 
-    def test_a_caller_on_another_branch_is_read_too(self):
-        # A push to `feature` runs its workflows from `feature`, so a caller
-        # that exists only there still needs the credential: not unused,
-        # and held to the same `inherit` test as one on the default branch.
+    def test_a_caller_on_another_branch_is_not_read(self):
+        # setup reads the default branch only, so a caller that exists only on
+        # a feature branch is not read: it never fails the run with "passes its
+        # secrets by name" (a throwaway variant on a feature branch must not
+        # block a fleet-wide run), and the branch is not fetched at all (no
+        # per-branch quota cost). With no caller on the default branch the
+        # credential reads as unused and is cleaned up -- recoverable by a
+        # rerun once the caller is on the default branch (maintainer: main-only
+        # + delete, 2026-09-10). `repo audit`, which does read every branch,
+        # is where such a branch is surfaced.
         fake = FakeGh()
         fake.workflow_files = ["ci.yml"]
         fake.workflow_texts = {"ci.yml": "jobs: {}\n"}
@@ -5649,33 +5621,14 @@ class CredentialsStepTest(unittest.TestCase):
         fake.secret_names = {"GRADLE_UPDATE_PAT"}
         fake.env_secret_names = {"gradle-update": {"GRADLE_UPDATE_PAT"}}
         code, out, err = _run(fake, ["--force", "--no-rules", REPO])
-        self.assertEqual(code, 1)
-        self.assertIn("gradle-update: weekly on feature passes its secrets by name", out + err)
-        self.assertEqual(fake.deleted_secrets, [])
-        # The unchanged ci.yml is not re-read on the branch: same blob.
-        self.assertFalse(any("ci.yml?ref=feature" in " ".join(c) for c in fake.calls))
-        # A branch name with URL metacharacters reaches the API encoded;
-        # sent raw, `feature/x#1` would read as `feature/x`.
-        fake = FakeGh()
-        fake.workflow_files = ["ci.yml"]
-        fake.branch_workflows = {"feature/x": {}, "feature/x#1": {"weekly.yml": self.NAMING}}
-        fake.secret_names = {"GRADLE_UPDATE_PAT"}
-        fake.env_secret_names = {"gradle-update": {"GRADLE_UPDATE_PAT"}}
-        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
-        self.assertEqual(code, 1)
-        self.assertIn("gradle-update: weekly on feature/x#1 passes its secrets by name", out + err)
-        self.assertTrue(any("?ref=feature%2Fx%231" in " ".join(c) for c in fake.calls))
-        self.assertEqual(fake.deleted_secrets, [])
-        # Inheriting there, the caller lets the move go ahead.
-        fake = FakeGh()
-        fake.workflow_files = ["ci.yml"]
-        fake.branch_workflows = {"feature": {"weekly.yml": self.INHERITING}}
-        fake.secret_names = {"GRADLE_UPDATE_PAT"}
-        fake.env_secret_names = {"gradle-update": {"GRADLE_UPDATE_PAT"}}
-        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
         self.assertEqual(code, 0, err)
-        self.assertEqual(fake.deleted_secrets, [("GRADLE_UPDATE_PAT", None)])
-        self.assertNotIn("nothing uses it", out + err)
+        self.assertNotIn("passes its secrets by name", out + err)
+        # No branch is read.
+        self.assertFalse(any("ref=feature" in " ".join(c) for c in fake.calls))
+        # Unused on the default branch -> the repository and environment copies
+        # are removed.
+        self.assertIn(("GRADLE_UPDATE_PAT", None), fake.deleted_secrets)
+        self.assertIn(("GRADLE_UPDATE_PAT", "gradle-update"), fake.deleted_secrets)
 
     def test_a_credential_already_in_place_is_left_alone(self):
         fake = self._consumer()
@@ -5801,6 +5754,27 @@ class CredentialsStepTest(unittest.TestCase):
         code, out, err = _run(fake, ["--force", "--no-rules", REPO])
         self.assertEqual(code, 1)
         self.assertIn("NPM_UPDATE_PAT kept: npm-update appeared since the plan was built", err)
+        self.assertEqual(fake.deleted_secrets, [])
+
+    def test_a_default_branch_repoint_between_plan_and_recheck_holds_the_delete(self):
+        # setup reads the default branch only, so a repoint between the plan
+        # and the pre-delete recheck would otherwise let the recheck read the
+        # FORMER default and delete a credential a caller on the NEW default
+        # uses. The recheck re-reads through a consistent snapshot and refuses
+        # when the default has moved since the plan, holding the delete (Codex,
+        # mikelward/repo#55). The all-branch scan used to cover this
+        # incidentally; default-only catches it explicitly.
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        fake.workflow_texts = {"ci.yml": "jobs: {}\n"}  # no caller on main -> plan deletes the PAT
+        fake.secret_names = {"NPM_UPDATE_PAT"}
+        # main for the plan's two name reads (snapshot: name + confirm), trunk
+        # for the recheck's snapshot.
+        fake.default_branch_after_bootstrap_plan = "trunk"
+        fake.default_branch_renamed_after_read = 2
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("the default branch is now 'trunk', not 'main'", err)
         self.assertEqual(fake.deleted_secrets, [])
 
     def test_a_delete_that_cannot_be_re_validated_does_not_happen(self):

@@ -216,12 +216,17 @@ not fail the audit yet (see `TODO.md`): the layout is being rolled out through
 `repo setup` makes the move, and enables auto-merge and delete-branch-on-merge
 on the repository where either is off. Its fleet-credentials step is always on: for
 each batch the repository runs (by whichever workflows call it from a job,
-whatever they are named, on any branch) and for the
+whatever they are named, on the default branch) and for the
 commit-back workflow (by a job calling it), a value passed as
 `--credential NAME=PATH` is set in the environment the name belongs in, the
 repository-level copy is deleted once the environment holds a usable
 credential, and a copy for a workflow the repository does not use is deleted
-wherever it sits. A value for a workflow the repository does not use is left
+wherever it sits. "Uses" is read from the default branch alone -- setup only
+ever touches the repository and its default branch -- so a caller that exists
+only on a non-default branch counts as not-used, and its credential is
+cleaned up (a rerun with `--credential` restores it once the workflow is on
+the default branch; `repo audit` still reads every branch, and is where such
+a branch is surfaced). A value for a workflow the repository does not use is left
 unset, which is the difference from `--secret` (which refuses a fleet
 credential's name outright, whatever scope it names: `--credential` is the
 one flag that places it). It refuses -- and says so, as
