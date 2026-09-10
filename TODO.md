@@ -1003,3 +1003,17 @@
   `check_master_branch` to return a failure signal and have `setup_cmd.run`
   fold it into the exit code, if the owner wants this check held to the
   same fail-closed standard as the rest of the module.
+
+- **`repo cleanup`'s curses picker measures label width with `len()`, not
+  terminal columns.** A branch name with double-width characters (CJK, some
+  emoji) occupies more cells than `len()` counts, so the too-small width
+  gate (`width - 1 < 4 + max_label`) can under-count and let such a label
+  clip or wrap into the next checkbox row, blurring which branch is which.
+  Deferred (Codex review, mikelward/repo#54): this account's branch names
+  are ASCII and the picker only runs in an interactive terminal, so it does
+  not arise in practice. If it ever does, measure display width with
+  `unicodedata.east_asian_width` (stdlib -- W/F count as two columns) in
+  place of `len()` for both the gate and the `addnstr` cap, or fall back to
+  the text prompt when a label's safe column width can't be established.
+  Reversible: it only tightens an existing fallback and changes nothing for
+  ASCII labels.

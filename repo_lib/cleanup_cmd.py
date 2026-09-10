@@ -40,10 +40,10 @@ Deleting a branch is not quite reversible from here, so:
   differ in kind: a merged branch is provably redundant and the only
   question is whether you want it gone, while an unmerged one is a judgment
   call per branch. One combined list would put those one keystroke apart.
-- **Where prompt_toolkit is installed the stages are checkbox lists**, and
-  where it is not they are the same question in plain text. It is imported
-  lazily and its absence is not an error: `repo` runs from a checkout with
-  no install step, and that stays true.
+- **On a terminal the stages are checkbox lists**, drawn with the standard
+  library's `curses` -- no dependency, so the tool stays PyYAML-only.
+  Off a terminal (or where curses cannot drive it) they are the same
+  question in plain text; the picker is never required.
 - **The plan prints; the deletion stream after it does not.** The plan is
   what the confirmation is about. The two lines each deletion writes are
   not, and hundreds of them scrolled past are not a record either, so they
@@ -639,6 +639,10 @@ def _describe_plan(repo, plan, default_branch, older_than, offer_unmerged):
 # `_select` could not build a picker at all -- the library is absent, or the
 # terminal cannot host one. Distinct from None, which is the user saying no.
 _NO_PICKER = object()
+# Returned by the curses picker when the terminal is too short to show even
+# one entry row; _select_widgets turns it into _NO_PICKER so the caller
+# drops to the text prompt rather than a picker that can't display the list.
+_TOO_SMALL = object()
 
 
 def _label(entry):
@@ -647,53 +651,214 @@ def _label(entry):
 
 
 def _select_widgets(entries, title):
-    """A checkbox list, everything ticked, via prompt_toolkit.
-
-    Imported here rather than at module scope, and its absence is not an
-    error: `repo` runs from a checkout with no install step, and that has to
-    keep being true. Installed, you get widgets; not installed, the caller
-    falls back to the prompt below and nothing is lost but the scrolling.
+    """A checkbox list over `entries`, everything ticked, via stdlib curses.
 
     Returns the chosen entries, None if the user canceled, or _NO_PICKER
-    when no dialog could be shown -- which is also what a non-terminal gets,
-    since a full-screen dialog needs a real one at every end.
+    when no full-screen picker can be shown -- a non-terminal (which is also
+    what a redirected stream gets), a terminal curses cannot drive, or one
+    too short to fit even a single entry row. The caller then falls back to
+    the plain-text prompt, and nothing is lost but the scrolling.
 
-    All THREE streams are checked, stdout included, because that is where
-    prompt_toolkit draws by default. Checking only the two this command
-    talks on would enable the dialog under `repo cleanup owner/repo >out`
-    and paint it into the file, leaving the command waiting on input to a
-    dialog nobody can see (Codex review, mikelward/repo#27).
+    Standard library only, on purpose. This was prompt_toolkit's
+    `checkboxlist_dialog` until two things pushed it back to curses: its
+    dialogs enable mouse support by default, so a pointer merely entering
+    the terminal emitted a click that unticked the first row, and it forced
+    white-on-black instead of the terminal's own colors. curses draws only
+    what it is told, takes no mouse unless asked, and via
+    use_default_colors() inherits the user's fg/bg -- and it costs no second
+    dependency, keeping the tool PyYAML-only.
+
+    All THREE streams are checked, stdout included, because curses draws on
+    the terminal. Checking only the two this command talks on would paint a
+    full-screen UI into the file under `repo cleanup owner/repo >out` and
+    leave the command waiting on input nobody can see to give (Codex review,
+    mikelward/repo#27).
     """
     if not (sys.stdin.isatty() and sys.stdout.isatty() and sys.stderr.isatty()):
         return _NO_PICKER
     try:
-        from prompt_toolkit.shortcuts import checkboxlist_dialog
+        import curses
     except ImportError:
-        # A terminal, but the picker's optional extra isn't installed. Say so
-        # once and name it, rather than silently dropping to the text prompt
-        # and leaving the user wondering where the checkbox list went.
-        warn("install prompt_toolkit (or run with `uv run --extra tui`) for a "
-             "checkbox picker; using the text prompt for now.")
+        # No curses (a stripped or non-Unix Python). Fall back to the prompt
+        # rather than failing between the plan and the deletions.
         return _NO_PICKER
-    by_name = {e["name"]: e for e in entries}
+    labels = [_label(e) for e in entries]
     try:
-        chosen = checkboxlist_dialog(
-            title=title,
-            text="space toggles, tab moves to the buttons, enter confirms.",
-            values=[(e["name"], _label(e)) for e in entries],
-            default_values=[e["name"] for e in entries],
-        ).run()
-    except Exception as e:
-        # A dialog that cannot draw must not take the command down: fall
-        # back to asking in plain text rather than dying between the plan
-        # and the deletions. Broad on purpose -- prompt_toolkit raises its
-        # own types for an unsupported terminal, and an older release may
-        # not accept default_values at all (TypeError).
-        warn(f"could not show the selection dialog ({e}); asking in plain text.")
+        picked = curses.wrapper(_curses_checkbox, title, labels)
+    except curses.error:
+        # A terminal curses cannot drive -- no terminfo, or a window too
+        # small to initialize. Ask in plain text rather than dying here.
         return _NO_PICKER
-    if chosen is None:
+    if picked is _TOO_SMALL:
+        # A terminal too short to fit even one entry row: the text prompt
+        # shows the whole list a line at a time, so fall back to it.
+        return _NO_PICKER
+    if picked is None:
         return None
-    return [by_name[name] for name in chosen]
+    return [entries[i] for i in picked]
+
+
+class _Checkbox:
+    """Selection state for the picker, driven by semantic actions so the
+    logic is testable without a terminal.
+
+    Everything starts ticked: the common case is "yes, all of these", so the
+    user unticks the exceptions rather than ticking the rule."""
+
+    def __init__(self, count):
+        self.selected = [True] * count
+        self.idx = 0
+        self._count = count
+
+    def act(self, action):
+        """Apply one action; return "confirm"/"cancel", or None to keep going."""
+        span = self._count or 1  # never divide by zero on an empty list
+        if action == "up":
+            self.idx = (self.idx - 1) % span
+        elif action == "down":
+            self.idx = (self.idx + 1) % span
+        elif action == "toggle":
+            if self._count:
+                self.selected[self.idx] = not self.selected[self.idx]
+        elif action == "all":
+            self.selected = [True] * self._count
+        elif action == "none":
+            self.selected = [False] * self._count
+        elif action in ("confirm", "cancel"):
+            return action
+        return None
+
+    def chosen(self):
+        return [i for i, on in enumerate(self.selected) if on]
+
+
+def _key_action(ch, curses):
+    """Map a curses key code to one of _Checkbox's actions, or None to ignore.
+
+    Takes the curses module rather than importing it, so the caller's single
+    lazy import is reused and a test can pass the real module in."""
+    if ch in (curses.KEY_UP, ord("k")):
+        return "up"
+    if ch in (curses.KEY_DOWN, ord("j")):
+        return "down"
+    if ch == ord(" "):
+        return "toggle"
+    if ch == ord("a"):
+        return "all"
+    if ch == ord("n"):
+        return "none"
+    if ch in (curses.KEY_ENTER, ord("\n"), ord("\r")):
+        return "confirm"
+    if ch in (27, ord("q")):  # esc or q
+        return "cancel"
+    return None
+
+
+def _scroll_top(top, idx, view, count):
+    """First visible index so `idx` stays inside a `view`-row window.
+
+    Keeps the previous `top` while the cursor is already on screen, and
+    scrolls only when it moves off an edge -- so a fleet-sized list (simmo
+    reached 184 branches) is fully reachable rather than clipped, which is
+    the whole point of a picker that precedes a destructive delete."""
+    if view <= 0 or count <= 0:
+        return 0
+    if idx < top:                       # cursor moved above the window
+        return idx
+    if idx >= top + view:               # cursor moved below the window
+        return idx - view + 1
+    # On screen already: keep top, but clamp if the list shrank under it.
+    return max(0, min(top, count - view)) if count > view else 0
+
+
+def _curses_checkbox(stdscr, title, labels):
+    """Draw the checkbox list and drive it to confirm/cancel; return the
+    selected indices, or None if canceled.
+
+    A scrolling viewport keeps the cursor's row visible when the list is
+    taller than the terminal, so every entry can be inspected and unticked
+    before the delete. The selection logic is `_Checkbox` and the scroll
+    math is `_scroll_top`, both tested on their own; this is terminal I/O."""
+    import curses
+
+    # "[x] " marker sits before each label.
+    widest = 4 + max((len(s) for s in labels), default=0)
+
+    def _too_small(height, width):
+        # 2 header rows, a blank, and a footer leave height-4 for entries, so
+        # a shorter window fits none. And a width that cannot show the marker
+        # plus the full longest label would clip branch names into ambiguity
+        # (below ~5 columns, into just the checkbox), while they stay ticked
+        # for deletion. Either way the text prompt -- which wraps and shows
+        # every name in full -- is the safer way to present the list.
+        return height - 4 < 1 or width - 1 < widest
+
+    # Checked before any curses state, so the caller (and a test) needs only
+    # getmaxyx(); the caller turns _TOO_SMALL into the text-prompt fallback.
+    if _too_small(*stdscr.getmaxyx()):
+        return _TOO_SMALL
+
+    curses.curs_set(0)
+    # Decode arrow keys into KEY_UP/KEY_DOWN rather than raw escape bytes
+    # (wrapper() already does this, but be explicit -- a lone ESC byte would
+    # otherwise read as the cancel binding).
+    stdscr.keypad(True)
+    # Inherit the terminal's own colors rather than forcing white-on-black:
+    # use_default_colors() lets unstyled cells use the user's fg/bg, and the
+    # A_REVERSE cursor reverses those, so the picker matches the theme.
+    try:
+        curses.start_color()
+        curses.use_default_colors()
+    except (curses.error, AttributeError):
+        # AttributeError: some curses builds don't expose
+        # use_default_colors. Either way, fall through with default colors
+        # rather than taking the command down.
+        pass
+    state = _Checkbox(len(labels))
+    help_line = "space toggle | a all | n none | enter confirm | q cancel"
+    top = 0
+    while True:
+        stdscr.erase()
+        height, width = stdscr.getmaxyx()
+
+        def put(row, text, attr=curses.A_NORMAL):
+            if 0 <= row < height:
+                stdscr.addnstr(row, 0, text, max(0, width - 1), attr)
+
+        # rows 0/1 header, row 2 blank, entries from row 3, footer on the
+        # last row -- so the viewport is height-4 rows tall. Re-check size
+        # each draw so a resize below usable dimensions falls back too.
+        if _too_small(height, width):
+            return _TOO_SMALL
+        view = height - 4
+        top = _scroll_top(top, state.idx, view, len(labels))
+        last = min(top + view, len(labels))
+
+        put(0, title, curses.A_BOLD)
+        put(1, help_line)
+        for offset, i in enumerate(range(top, last)):
+            mark = "[x] " if state.selected[i] else "[ ] "
+            put(
+                3 + offset,
+                mark + labels[i],
+                curses.A_REVERSE if i == state.idx else curses.A_NORMAL,
+            )
+        footer = f"{sum(state.selected)} selected"
+        more = []
+        if top > 0:
+            more.append(f"{top} above")
+        if last < len(labels):
+            more.append(f"{len(labels) - last} below")
+        if more:
+            footer += "  (" + ", ".join(more) + " -- move the cursor to scroll)"
+        put(height - 1, footer)
+
+        action = _key_action(stdscr.getch(), curses)
+        outcome = state.act(action) if action is not None else None
+        if outcome == "confirm":
+            return state.chosen()
+        if outcome == "cancel":
+            return None
 
 
 def _can_ask():
@@ -719,10 +884,11 @@ def _ask(prompt):
 
 
 def _select_prompts(entries, title):
-    """The no-dependency fallback: all, none, or one at a time.
+    """The fallback for when no curses picker can be shown: all, none, or
+    one at a time.
 
     This is the path the tests drive, so the two-stage behavior is covered
-    whether or not prompt_toolkit is installed anywhere.
+    without standing up a terminal.
     """
     info(title)
     for line in _grouped_lines(entries):

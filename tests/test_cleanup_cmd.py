@@ -6,7 +6,6 @@ import json
 import os
 import sys
 import tempfile
-import types
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import patch
@@ -14,6 +13,19 @@ from urllib.parse import unquote
 
 from repo_lib import cleanup_cmd, gh
 from repo_lib.cli import main
+
+try:
+    import curses  # noqa: F401
+
+    HAS_CURSES = True
+except ImportError:
+    # Production explicitly supports this: the curses picker falls back to
+    # the text prompt where curses is unavailable (Windows, a stripped
+    # build). The tests that exercise the picker skip rather than error, so
+    # `make test` stays usable on that same path.
+    HAS_CURSES = False
+
+requires_curses = unittest.skipUnless(HAS_CURSES, "curses is not available")
 
 REPO = "owner/repo"
 NOW = datetime.datetime(2026, 9, 3, tzinfo=datetime.timezone.utc)
@@ -285,11 +297,10 @@ class CleanupTestCase(unittest.TestCase):
             except StopIteration:
                 raise EOFError
 
-        # stdout stays a plain buffer (isatty() False): the widget picker
-        # requires a terminal there, so the suite drives the prompt path
-        # whether or not prompt_toolkit happens to be installed. stderr's
-        # answer is a parameter because it decides whether a question can
-        # be asked at all.
+        # stdout stays a plain buffer (isatty() False): the curses picker
+        # requires a terminal there, so the suite drives the prompt path.
+        # stderr's answer is a parameter because it decides whether a
+        # question can be asked at all.
         out, err = io.StringIO(), _CaptureStream(stderr_isatty)
         argv = list(argv)
         with tempfile.TemporaryDirectory() as tmp:
@@ -1091,48 +1102,118 @@ def _every_stream_a_terminal():
         yield err
 
 
-@contextlib.contextmanager
-def _fake_checkboxlist(result, raises=None):
-    """A stand-in `prompt_toolkit.shortcuts` so the dialog path itself is
-    executed and asserted on.
+class CheckboxStateTest(unittest.TestCase):
+    """`_Checkbox` is the picker's selection logic, split out from the curses
+    I/O so it is tested without a terminal."""
 
-    prompt_toolkit is not a dependency and must not become one (AGENTS.md:
-    standard library only), but "not installed here" is why the constructor,
-    its defaults, cancellation and the name-to-entry mapping had no coverage
-    at all -- the path could break for everyone who does have it while the
-    suite stayed green (Codex review, mikelward/repo#27). Injecting the
-    module answers that without installing anything.
+    def test_everything_starts_selected(self):
+        self.assertEqual(cleanup_cmd._Checkbox(3).chosen(), [0, 1, 2])
 
-    Yields the dict of keyword arguments the dialog was built with.
-    """
-    recorded = {}
+    def test_toggle_unticks_and_reticks_the_cursor_row(self):
+        state = cleanup_cmd._Checkbox(3)
+        state.act("down")            # cursor now on index 1
+        state.act("toggle")
+        self.assertEqual(state.chosen(), [0, 2])
+        state.act("toggle")
+        self.assertEqual(state.chosen(), [0, 1, 2])
 
-    class _Dialog:
-        def run(self):
-            if raises is not None:
-                raise raises
-            return result
+    def test_all_and_none(self):
+        state = cleanup_cmd._Checkbox(3)
+        state.act("none")
+        self.assertEqual(state.chosen(), [])
+        state.act("all")
+        self.assertEqual(state.chosen(), [0, 1, 2])
 
-    def checkboxlist_dialog(**kwargs):
-        recorded.update(kwargs)
-        return _Dialog()
+    def test_the_cursor_wraps(self):
+        state = cleanup_cmd._Checkbox(2)
+        state.act("up")              # from 0, wraps to the last row
+        self.assertEqual(state.idx, 1)
+        state.act("down")            # and back to the first
+        self.assertEqual(state.idx, 0)
 
-    shortcuts = types.ModuleType("prompt_toolkit.shortcuts")
-    shortcuts.checkboxlist_dialog = checkboxlist_dialog
-    package = types.ModuleType("prompt_toolkit")
-    package.shortcuts = shortcuts
-    with patch.dict(
-        sys.modules,
-        {"prompt_toolkit": package, "prompt_toolkit.shortcuts": shortcuts},
-    ):
-        yield recorded
+    def test_confirm_and_cancel_are_reported_other_actions_are_not(self):
+        state = cleanup_cmd._Checkbox(1)
+        self.assertEqual(state.act("confirm"), "confirm")
+        self.assertEqual(state.act("cancel"), "cancel")
+        self.assertIsNone(state.act("toggle"))
+
+    def test_an_empty_list_does_not_divide_by_zero(self):
+        # The caller skips empty stages, but a stray up/down must still not
+        # crash the picker.
+        state = cleanup_cmd._Checkbox(0)
+        state.act("up")
+        state.act("down")
+        self.assertEqual(state.chosen(), [])
+
+
+@requires_curses
+class KeyActionTest(unittest.TestCase):
+    """`_key_action` maps curses key codes to `_Checkbox` actions."""
+
+    def setUp(self):
+        import curses
+        self.curses = curses
+
+    def test_the_bindings(self):
+        c = self.curses
+        cases = {
+            c.KEY_UP: "up",
+            ord("k"): "up",
+            c.KEY_DOWN: "down",
+            ord("j"): "down",
+            ord(" "): "toggle",
+            ord("a"): "all",
+            ord("n"): "none",
+            ord("\n"): "confirm",
+            ord("\r"): "confirm",
+            c.KEY_ENTER: "confirm",
+            27: "cancel",            # esc
+            ord("q"): "cancel",
+        }
+        for ch, action in cases.items():
+            self.assertEqual(cleanup_cmd._key_action(ch, c), action, ch)
+
+    def test_an_unbound_key_is_ignored(self):
+        self.assertIsNone(cleanup_cmd._key_action(ord("z"), self.curses))
+
+
+class ScrollTopTest(unittest.TestCase):
+    """`_scroll_top` keeps the cursor visible in a fixed-height viewport so a
+    list taller than the terminal is fully reachable, not clipped."""
+
+    def test_a_cursor_already_on_screen_does_not_move_the_window(self):
+        self.assertEqual(cleanup_cmd._scroll_top(0, 2, 5, 10), 0)
+
+    def test_the_window_follows_the_cursor_off_the_bottom(self):
+        # idx 7, 5 rows visible -> top so 7 is the last row: 7 - 5 + 1.
+        self.assertEqual(cleanup_cmd._scroll_top(0, 7, 5, 10), 3)
+
+    def test_the_window_follows_the_cursor_off_the_top(self):
+        self.assertEqual(cleanup_cmd._scroll_top(5, 3, 5, 10), 3)
+
+    def test_a_list_shorter_than_the_view_pins_to_the_top(self):
+        self.assertEqual(cleanup_cmd._scroll_top(0, 2, 10, 3), 0)
+
+    def test_a_stale_top_past_the_end_is_clamped(self):
+        # top 8 but only 10 entries and a 5-row view: clamp so the window
+        # ends at the last entry rather than showing blank rows.
+        self.assertEqual(cleanup_cmd._scroll_top(8, 8, 5, 10), 5)
+
+    def test_degenerate_sizes_are_zero(self):
+        self.assertEqual(cleanup_cmd._scroll_top(3, 3, 0, 10), 0)
+        self.assertEqual(cleanup_cmd._scroll_top(0, 0, 5, 0), 0)
 
 
 class WidgetPickerTest(CleanupTestCase):
-    def test_a_redirected_stdout_means_no_dialog(self):
-        # prompt_toolkit draws on stdout. `repo cleanup owner/repo >out`
-        # leaves stdin and stderr terminals, so checking only those would
-        # paint the dialog into the file and then wait on input to it.
+    ENTRIES = [
+        {"name": "claude/a", "why": "merged by PR #1"},
+        {"name": "claude/b", "why": "contained in main"},
+    ]
+
+    def test_a_redirected_stdout_means_no_picker(self):
+        # curses draws on stdout. `repo cleanup owner/repo >out` leaves stdin
+        # and stderr terminals, so checking only those would paint the picker
+        # into the file and then wait on input to it.
         with patch.object(cleanup_cmd.sys, "stdin") as stdin, patch.object(
             cleanup_cmd.sys, "stdout"
         ) as stdout, patch.object(cleanup_cmd.sys, "stderr") as stderr:
@@ -1143,83 +1224,91 @@ class WidgetPickerTest(CleanupTestCase):
                 cleanup_cmd._select_widgets([], "t"), cleanup_cmd._NO_PICKER
             )
 
-    def test_the_dialog_is_built_with_everything_ticked(self):
-        entries = [
-            {"name": "claude/a", "why": "merged by PR #1"},
-            {"name": "claude/b", "why": "contained in main"},
-        ]
-        with _every_stream_a_terminal(), _fake_checkboxlist(["claude/a"]) as recorded:
-            chosen = cleanup_cmd._select_widgets(entries, "Pick some")
-        self.assertEqual(recorded["title"], "Pick some")
-        # (value, label) pairs, and every value preselected: the common
-        # case is "yes, all of these", so the user unticks exceptions
-        # rather than ticking the rule.
-        self.assertEqual(
-            recorded["values"],
-            [
-                ("claude/a", "claude/a -- merged by PR #1"),
-                ("claude/b", "claude/b -- contained in main"),
-            ],
-        )
-        self.assertEqual(recorded["default_values"], ["claude/a", "claude/b"])
-        # Names come back from the dialog; entries go out, so the caller
-        # never has to map them itself.
-        self.assertEqual(chosen, [entries[0]])
-
-    def test_unticking_everything_is_not_canceling(self):
-        # An empty list means "delete none of these" and is a real answer;
-        # None means the dialog was dismissed. Collapsing the two would
-        # make Escape silently delete nothing while reporting success, or
-        # an empty selection abort the second stage.
-        entries = [{"name": "claude/a", "why": "merged by PR #1"}]
-        with _every_stream_a_terminal(), _fake_checkboxlist([]):
-            self.assertEqual(cleanup_cmd._select_widgets(entries, "t"), [])
-
-    def test_a_canceled_dialog_is_none(self):
-        entries = [{"name": "claude/a", "why": "merged by PR #1"}]
-        with _every_stream_a_terminal(), _fake_checkboxlist(None):
-            self.assertIsNone(cleanup_cmd._select_widgets(entries, "t"))
-
-    def test_a_dialog_that_cannot_draw_falls_back(self):
-        # Broad on purpose: an unsupported terminal raises prompt_toolkit's
-        # own types, and an older release may not accept default_values at
-        # all. Either way the command must ask in plain text rather than
-        # dying between the plan and the deletions.
-        entries = [{"name": "claude/a", "why": "merged by PR #1"}]
-        with _every_stream_a_terminal() as err, _fake_checkboxlist(
-            None, raises=TypeError("no default_values")
-        ):
-            result = cleanup_cmd._select_widgets(entries, "t")
-        self.assertIs(result, cleanup_cmd._NO_PICKER)
-        self.assertIn("could not show the selection dialog", err.getvalue())
-        self.assertIn("no default_values", err.getvalue())
-
-    def test_an_absent_library_is_a_warning_naming_the_extra_not_an_error(self):
-        # `repo` runs from a checkout with no install step, and that has to
-        # keep being true: not installed is the documented fallback, not a
-        # failure. It is a warning, not an error, and it names the optional
-        # extra so the fallback isn't a silent surprise.
-        entries = [{"name": "claude/a", "why": "merged by PR #1"}]
-        with _every_stream_a_terminal() as err, patch.dict(
-            sys.modules, {"prompt_toolkit": None, "prompt_toolkit.shortcuts": None}
-        ):
-            result = cleanup_cmd._select_widgets(entries, "t")
-        self.assertIs(result, cleanup_cmd._NO_PICKER)
-        msg = err.getvalue()
-        self.assertIn("warning:", msg)
-        self.assertIn("prompt_toolkit", msg)
-        self.assertNotIn("error:", msg)
-
-    def test_no_terminal_means_no_dialog(self):
-        # The widget path needs a real terminal at both ends; without one it
-        # reports that rather than trying to draw, so the caller falls back
-        # to the prompt the test suite drives.
+    def test_no_terminal_means_no_picker(self):
         with patch.object(cleanup_cmd.sys, "stdin") as stdin:
             stdin.isatty.return_value = False
             self.assertIs(
                 cleanup_cmd._select_widgets([], "t"), cleanup_cmd._NO_PICKER
             )
 
+    @requires_curses
+    def test_selected_indices_map_back_to_entries(self):
+        # The curses layer returns indices; entries go out, so the caller
+        # never has to map them itself.
+        with _every_stream_a_terminal(), patch("curses.wrapper", return_value=[0]):
+            chosen = cleanup_cmd._select_widgets(self.ENTRIES, "t")
+        self.assertEqual(chosen, [self.ENTRIES[0]])
+
+    @requires_curses
+    def test_unticking_everything_is_not_canceling(self):
+        # An empty list means "delete none of these" and is a real answer;
+        # None means the picker was dismissed. Collapsing the two would make
+        # Escape silently delete nothing while reporting success.
+        with _every_stream_a_terminal(), patch("curses.wrapper", return_value=[]):
+            self.assertEqual(cleanup_cmd._select_widgets(self.ENTRIES, "t"), [])
+
+    @requires_curses
+    def test_a_canceled_picker_is_none(self):
+        with _every_stream_a_terminal(), patch("curses.wrapper", return_value=None):
+            self.assertIsNone(cleanup_cmd._select_widgets(self.ENTRIES, "t"))
+
+    @requires_curses
+    def test_a_terminal_curses_cannot_drive_falls_back(self):
+        # No terminfo, or a window too small to initialize, raises
+        # curses.error. The command asks in plain text rather than dying
+        # between the plan and the deletions.
+        import curses
+        with _every_stream_a_terminal(), patch(
+            "curses.wrapper", side_effect=curses.error("setupterm failed")
+        ):
+            self.assertIs(
+                cleanup_cmd._select_widgets(self.ENTRIES, "t"),
+                cleanup_cmd._NO_PICKER,
+            )
+
+    @requires_curses
+    def test_a_window_too_short_for_a_row_signals_too_small(self):
+        # 2 header rows, a blank, and a footer leave height-4 for entries, so
+        # a 3-row window fits none. The picker must bail to _TOO_SMALL before
+        # drawing rather than clip the whole (still-preselected) list. Checked
+        # with a fake screen: the bail happens before any curses state, so it
+        # needs only getmaxyx().
+        class FakeScreen:
+            def getmaxyx(self):
+                return (3, 80)
+
+        self.assertIs(
+            cleanup_cmd._curses_checkbox(FakeScreen(), "t", ["a", "b"]),
+            cleanup_cmd._TOO_SMALL,
+        )
+
+    @requires_curses
+    def test_a_window_too_narrow_for_a_label_signals_too_small(self):
+        # A width that cannot show "[x] " plus the full longest label would
+        # clip branch names into ambiguity, so the picker bails rather than
+        # present a list it can't identify. 10 columns, a 28-char label.
+        class FakeScreen:
+            def getmaxyx(self):
+                return (40, 10)
+
+        self.assertIs(
+            cleanup_cmd._curses_checkbox(
+                FakeScreen(), "t", ["claude/some-long-branch-name"]
+            ),
+            cleanup_cmd._TOO_SMALL,
+        )
+
+    @requires_curses
+    def test_too_small_falls_back_to_the_text_prompt(self):
+        # _TOO_SMALL from the picker becomes _NO_PICKER, so `_select` asks in
+        # plain text (which shows the whole list a line at a time).
+        with _every_stream_a_terminal(), patch(
+            "curses.wrapper", return_value=cleanup_cmd._TOO_SMALL
+        ):
+            self.assertIs(
+                cleanup_cmd._select_widgets(self.ENTRIES, "t"),
+                cleanup_cmd._NO_PICKER,
+            )
 
 class OfferTest(CleanupTestCase):
     def _two_stale(self):
