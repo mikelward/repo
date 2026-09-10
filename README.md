@@ -9,6 +9,13 @@ migration, and the shell versions remain the source of truth for behavior
 until this catches up. `repo create` and `repo cleanup` have no shell-script
 counterparts; they're new here.
 
+`repo setup` is a convergence loop: run it repeatedly over the fleet and
+every repository ends at the standard, with nothing waiting on a person
+that a later run could settle and nothing left in a state a later run
+cannot fix. `SPEC.md` is that contract -- what the standard is, the order
+things land in, what a run defers and why -- and the place a change to
+any of that goes first.
+
 ## Why Python, not another shell rewrite
 
 `repo-setup` (the most complex of the three) had grown past what shell makes
@@ -132,8 +139,10 @@ uses, ensuring GitHub App installation membership, and (always on, like
 the fleet-credentials and auto-merge steps below; `--no-bootstrap` skips
 it) adding whichever of the fleet's own CI scaffold files an
 already-existing repository is still missing -- reusing `repo create
---scaffold`'s own generated files, never overwriting one already there,
-as one commit on a branch of its own, opened as a pull request against
+--scaffold`'s own generated files, never overwriting one already there
+except codex-review's three workflow files, which every consumer pins
+byte for byte and which are brought up to the current template when they
+differ -- as one commit on a branch of its own, opened as a pull request against
 the default branch (or, for a repository whose branch has no commits yet
 and so has no base for a pull request to target, the same two-commit
 bootstrap `repo create --scaffold` uses, written directly). A pull
@@ -141,34 +150,48 @@ request rather than a direct push for two reasons that point the same
 way: it is the only write a branch an earlier run already protected
 accepts at all, and it is what makes the checks the scaffold installs
 actually run -- `lanes` and `zizmor` report on that pull request, and a
-ruleset cannot require a check that has never reported. A scaffold pull
-request an earlier run left open is reported and reused, never reopened
-beside itself, so this stays safe to run over a fleet on a loop. Until
-it merges, the ruleset step holds back a ruleset write that would need the
-scaffold to have landed -- one requiring pull requests for the first time,
-or newly requiring a check -- but only where what is still missing
-actually stops a required check reporting. The question is
+ruleset cannot require a check that has never passed. A scaffold pull
+request an earlier run left open -- its own, by branch prefix and by
+author -- is never reopened beside itself: a later run merges it once its
+head is exactly the commit this run would generate (the branch's tree plus
+the generated files, compared by blob sha), every check on it has passed
+and GitHub reports it mergeable (rebase, conditional on the head it read);
+replaces it when its head is anything else (the base moved, a template
+moved, something was pushed to it); and otherwise says what it is waiting
+on -- or, for a failed check, a conflict, a draft or a review block, that
+it needs a person. So this
+stays safe to run over a fleet on a loop, and the loop closes on its own.
+The ruleset step never waits for the scaffold as a whole: it writes what is
+safe now and DEFERS, by name and with the reason, each check that cannot be
+newly required yet -- one that has never passed on this repository (run,
+or run and failed, which the run tells apart), or one whose publishing
+workflow is still inside the scaffold pull request. The second question is
 asked of the branch, never of the pending pull request: a publisher among
 the missing paths is one the branch cannot report from, and whether some
 pull request would supply it is not a question with a durable answer --
 a pull request is editable by anyone at any moment. So a gap containing
-`ci.yml`, `zizmor.yml` or codex-review's check workflow waits for that
-pull request to merge, and a gap of only `AGENTS.md` holds nothing back. Where the branch ALREADY requires a check
+`ci.yml`, `zizmor.yml` or codex-review's check workflow defers that check
+until the pull request has merged, and a gap of only `AGENTS.md` defers
+nothing. A check the ruleset already requires is never dropped -- not by a
+deferral, and not by its absence from the standard: the standard is a
+floor, and this tool only adds requirements. Where the branch ALREADY requires a check
 whose publisher is one of the missing files, the repository is wedged
 before this tool arrives -- nothing can merge -- and `repo setup` says
 so rather than leaving it to be discovered. This is what makes `repo setup --force`
-fix a repository regardless of its starting state in the common case: a
+fix a repository regardless of its starting state: a
 brand-new repo, one only partway set up, and one already complete all
 converge on the same result -- behind one combined plan and a single
-confirmation for the whole repository. By default it prints only what it
+confirmation for the whole repository -- with `--force` meaning only
+"apply without asking"; it waives no guard. By default it prints only what it
 actually changed, so `repo list | xargs -n1 repo setup --force` stays
 quiet across an already-in-shape fleet; `-v`/`--verbose` shows the full
 plan (what a repository already has, not just what moved) and a
 progress line per step, for a closer look at one repository or a run
 you're debugging. Converging a repository that was missing scaffold
-files takes more than one run, and always will: the pull request has to
-merge before the ruleset step can require the checks it installs, and
-`codex` reports a run later still (see TODO.md). `repo
+files takes a few runs, one rung each (see SPEC.md's ladder): the pull
+request opens, a later run merges it, a later run requires the checks it
+publishes once they have passed, and `codex` follows from the first pull
+request the sweep sees with its workflow on the default branch. `repo
 audit` is the read-only counterpart: it reports whether a branch's rules
 (required checks, conversation resolution, up-to-date merges, force-push
 and deletion protection, bypass actors, and -- when auditing the
