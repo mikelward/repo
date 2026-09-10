@@ -353,7 +353,7 @@ def _is_workflow(name):
     return name.endswith((".yml", ".yaml"))
 
 
-def workflow_texts(repo, default=None):
+def workflow_texts(repo, default=None, default_only=False):
     """Every workflow's text: the default branch's under its file name,
     and, under `<name> on <branch>`, each workflow on another branch whose
     blob differs from the default branch's copy (new there, or changed).
@@ -364,6 +364,20 @@ def workflow_texts(repo, default=None):
     reads the same. `default` is the default branch's name when the caller
     has already read it, so a plan that needs the name for its own reasons
     reads it once.
+
+    `default_only` reads just the default branch, skipping the per-branch
+    scan. `repo setup` passes it: setup only ever touches the repository and
+    its default branch, so it should reason about that branch alone -- a
+    throwaway workflow variant on a feature branch must not fail a run or
+    drive a credential decision, and the per-branch Contents reads are a
+    quota cost on every repo. The trade is the #13 unused-delete guard: a
+    workflow living ONLY on a non-default branch is not seen, so its
+    credential can be deleted as unused. That is recoverable -- fleet
+    credentials are placed from files the operator holds, so a rerun with
+    `--credential` restores one; the deletion is a disruption, not a
+    permanent loss (maintainer, 2026-09-10). `repo audit`, which only
+    reports and never acts, keeps the full scan: surfacing a branch whose
+    workflow could reach a credential is the point of an audit.
 
     The default branch's own reads name that branch explicitly rather than
     letting the Contents API resolve "the default" itself. Unqualified,
@@ -382,18 +396,21 @@ def workflow_texts(repo, default=None):
         for name in entries
         if _is_workflow(name)
     }
-    for branch in branches(repo):
-        if branch == default:
-            continue
-        for name, sha in workflow_entries(repo, branch).items():
-            if _is_workflow(name) and entries.get(name) != sha:
-                texts[WorkflowName(name, branch)] = workflow_text(repo, name, branch)
+    if not default_only:
+        for branch in branches(repo):
+            if branch == default:
+                continue
+            for name, sha in workflow_entries(repo, branch).items():
+                if _is_workflow(name) and entries.get(name) != sha:
+                    texts[WorkflowName(name, branch)] = workflow_text(repo, name, branch)
     return texts
 
 
-def workflow_snapshot(repo):
+def workflow_snapshot(repo, default_only=False):
     """`(default branch, every workflow's text)` as one consistent
-    reading, for a command that needs both.
+    reading, for a command that needs both. `default_only` passes through to
+    `workflow_texts` -- `repo setup` reads just the default branch, `repo
+    audit` scans every branch (see `workflow_texts`).
 
     The name is confirmed AFTER the texts, not just read before them. The
     reads are pinned to it (see `workflow_texts`), so a repoint to a
@@ -408,7 +425,7 @@ def workflow_snapshot(repo):
     already carries. A repoint after every read is nobody's to catch
     without a transaction, and the next run reads it."""
     default = default_branch(repo)
-    texts = workflow_texts(repo, default)
+    texts = workflow_texts(repo, default, default_only=default_only)
     again = default_branch(repo)
     if again != default:
         raise ReadError(
