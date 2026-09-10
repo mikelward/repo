@@ -45,12 +45,15 @@ one that has stopped biting.
   own; `./repo` checks for it first and names the install otherwise, and
   `ci.yml` installs it before `make test`. Anything else is still a
   conversation about the tradeoff, not a quiet `pip install`.
-- One *optional* extra, `prompt_toolkit`, for `repo cleanup`'s checkbox
-  picker (the tradeoff discussed and approved 2026-09-08). It is declared
-  under `[project.optional-dependencies] tui`, never required: without it
-  `cleanup` falls back to the plain-text prompt and says so. The required
-  footprint stays PyYAML-only -- a *second required* dependency is still the
-  conversation above.
+- No optional extras either. `repo cleanup`'s checkbox picker is the
+  standard library's `curses`. prompt_toolkit was tried for it (approved
+  2026-09-08) and removed 2026-09-10: its dialogs enable mouse support by
+  default, so a pointer entering the terminal toggled the first row, and it
+  forced white-on-black over the terminal's own colors. curses draws only
+  what it is told, takes no mouse unless asked, and inherits the user's
+  fg/bg via `use_default_colors()`; off a terminal `cleanup` falls back to
+  the plain-text prompt. The whole footprint stays PyYAML-only -- any new
+  dependency, required or optional, is the conversation above.
 - `argparse` for option parsing (handles `--flag value` and `--flag=value`
   both, for free). `subprocess` for shelling out to `gh`. Prefer real data
   structures (lists, dicts, dataclasses) over string-encoding a collection

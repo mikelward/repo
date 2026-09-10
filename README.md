@@ -42,15 +42,13 @@ subcommand's parser is built up front regardless of which one is invoked,
 so an older interpreter fails on any command, not just that one (Codex
 review, mikelward/repo#14).
 
-One optional extra: `repo cleanup`'s interactive checkbox picker uses
-[prompt_toolkit](https://python-prompt-toolkit.readthedocs.io/). It is not
-required -- without it `cleanup` falls back to a plain-text prompt (all /
-select one-by-one / none) and says so. Enable it with `uv run --extra tui
-./repo cleanup ...` (uv reads the extra from this checkout's
-`pyproject.toml`), or install the library directly with
-`python3 -m pip install prompt_toolkit`. `pip install 'repo[tui]'` does
-NOT work: `repo` runs from the checkout and is never published as a
-distribution, so pip has no `repo` package to read the extra from.
+No optional extras: `repo cleanup`'s interactive checkbox picker uses the
+standard library's `curses`, so on a terminal you get a checkbox list (space
+toggles, `a`/`n` select all/none, enter confirms, `q`/esc cancels), with
+everything preselected. Off a terminal -- or where `curses` cannot drive
+the terminal -- `cleanup` falls back to a plain-text prompt (all / select
+one-by-one / none) and says so. Either way there is nothing extra to
+install; the tool stays PyYAML-only.
 
 ## Usage
 
