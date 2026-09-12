@@ -408,8 +408,10 @@ one that has stopped biting.
   to the last page, since all three page oldest first -- and they block
   the merge until fixed, rebutted, or deferred (see *Deferring a finding*
   above); an acknowledgment is not an answer.
-  Nothing from Codex since the push, five minutes on, means it never
-  picked it up -- comment `@codex review`, once. The `codex` commit status
+  Nothing from Codex since the push, five minutes on, or a clean review
+  that left no reaction, leaves the `codex` status pending -- comment
+  `@codex review`, once; if that has not landed five minutes
+  on, escalate rather than poking again. The `codex` commit status
   (`get_status`, a separate surface from check runs) is the authoritative
   gate; if it's still `pending` a while after a finding was resolved with
   no unresolved threads left, a single `@codex review` nudge is
