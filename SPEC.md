@@ -81,8 +81,20 @@ every other rule here:
    invariant exists to forbid: it is how a repository with one unreadable
    thing converges on nothing, run after run, since nothing about it
    changes on its own. The one exception is a usage error -- a malformed
-   flag value -- where the request itself is wrong and no step is worth
-   attempting.
+   flag value, or credentials that cannot do what this invocation asks --
+   where the request itself is wrong and no step is worth attempting.
+
+   **Credentials are checked before anything is touched.** A run whose
+   credentials GitHub *refuses* can only fail, so it fails once, at the
+   top, naming `gh auth login` -- not step by step, which buries the one
+   line that explains every one of those failures. Same for a flag whose
+   own endpoint this token may never call: `--app` needs the account's App
+   installations listed, so a run passing it stops there rather than
+   failing that step on every repository in the fleet. What a token cannot
+   do is a usage error. What a read merely could not complete this time is
+   not: a 500, a rate limit or a dropped connection says nothing about the
+   token, so either check reports it and the run carries on to make its
+   other progress, exactly as above.
 2. **No run leaves a repository in a state a later run cannot fix.**
    Nothing wedges merges permanently: a check is never required before it
    has passed on this repository, or while its publishing workflow is
@@ -301,6 +313,13 @@ do, and none of them is caused by a run:
   workflow has nothing to run, and merges on GitHub's word).
 - A scaffold path occupied by something that is not a plain file.
 - A gh token without the `workflow` scope, which cannot write workflows.
+- A token GitHub will not let list the account's App installations. That
+  read answers only to a GitHub App user-to-server token, so the token
+  `gh auth login` issues is refused whatever its scopes, and
+  re-authenticating with gh does not change it. Everything not about Apps
+  still converges; `--app` stops the run at the top (above), and a `lanes`
+  binding whose evidence is a status cannot be verified until someone
+  supplies a token that can make that read.
 - A legacy-named ruleset whose merge methods conflict with rebase.
 - A branch that already requires a check whose publisher is missing from
   it (a state that predates the tool): every pull request there is stuck

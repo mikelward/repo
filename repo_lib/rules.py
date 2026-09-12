@@ -280,8 +280,14 @@ def _collect_reported(repo, wanted, ref=None, passed=False, shas=None, passing=f
                 slug = apps.app_slug_for_id(owner, iid)
             except gh.GhError as e:
                 # A failed read is can't-tell, never "the App never posted":
-                # the same discipline the scans below hold to.
-                raise RulesetError(f"resolving the App with id {iid} on {owner}:\n{e.stderr}")
+                # the same discipline the scans below hold to. The one 403
+                # worth naming is the App-token one: no rerun and no scope
+                # change clears it, so say so rather than leaving an
+                # operator to re-authenticate at it (see apps.APP_TOKEN_HINT).
+                detail = e.stderr
+                if apps.is_missing_app_token(detail):
+                    detail = f"{detail}\n{apps.APP_TOKEN_HINT}"
+                raise RulesetError(f"resolving the App with id {iid} on {owner}:\n{detail}")
             login_for[iid] = f"{slug}[bot]" if slug else None
         return login_for[iid]
 

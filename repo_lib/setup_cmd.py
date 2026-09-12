@@ -1541,6 +1541,15 @@ def _run(args, log=None):
     _validate_app_slugs(args.app)
 
     gh.require_gh()
+    # Before any repository read or write: a run with no usable credentials
+    # can only fail, and failing per step buries the one line that explains
+    # every one of those failures. `--app` gets its own check because the
+    # endpoint it needs is refused to the tokens gh issues, which no amount
+    # of rerunning fixes. Both are usage errors -- invariant 1's one
+    # exception (SPEC.md) -- so they stop the run rather than a step.
+    gh.require_auth()
+    if args.app:
+        apps.require_installations_readable(args.app)
 
     repo = args.repo
     repo_owner = repo.split("/", 1)[0]

@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import time
 
-from repo_lib.common import error, warn
+from repo_lib.common import error, error_lines, warn, warn_lines
 
 
 class GhError(Exception):
@@ -26,6 +26,58 @@ def require_gh():
         error("gh is not installed. It carries the authentication this needs;")
         error("installing it is less work than reimplementing that with curl.")
         raise SystemExit(1)
+
+
+def _is_auth_rejection(stderr):
+    """True if `stderr` is GitHub (or gh) REFUSING the credentials, rather
+    than any other way the same read can fail. Only a refusal is proof the
+    token is the problem: a 500, an exhausted rate limit or a dropped
+    connection say nothing about it, and treating those as "no credentials"
+    would stop every step over one unlucky read (Codex, mikelward/repo#60).
+    """
+    text = (stderr or "").lower()
+    return (
+        "http 401" in text
+        or "bad credentials" in text
+        or "requires authentication" in text
+        # gh's own wording when nothing is logged in at all.
+        or "gh auth login" in text
+    )
+
+
+def require_auth():
+    """The authenticated login, or exit 2 before the run touches anything.
+
+    A run whose credentials GitHub refuses cannot read a repository, let
+    alone write one, so it fails here rather than at whichever step
+    happened to read first -- by which point the operator has a wall of
+    per-step failures to read backwards instead of the one line that
+    explains them. That is a usage error, the one thing SPEC.md's
+    invariant 1 lets stop a whole run.
+
+    Any OTHER failure of the probe is not: the token may be perfectly good
+    and this one read unlucky, so it is reported and the run goes on to
+    make whatever progress it can, each step reporting its own failure.
+    Returns the login, or None when the probe could not answer.
+
+    One `user` read: the cheapest call that proves a token is BOTH present
+    and still accepted. `gh auth status` is not that -- it reports the
+    stored login without proving GitHub still honors it, so an expired or
+    revoked token passes it.
+    """
+    ok, out = try_run(["api", "user", "--jq", ".login"])
+    if ok:
+        return out.strip()
+    if _is_auth_rejection(out):
+        error_lines("GitHub refused these credentials, so nothing this run does can work:", out)
+        error("Run `gh auth login` (or set GH_TOKEN to a token with repo access), then rerun.")
+        raise SystemExit(2)
+    warn_lines(
+        "could not check this gh token before starting (continuing -- each step reports "
+        "its own failure):",
+        out,
+    )
+    return None
 
 
 # GitHub's two rate limits (docs.github.com/rest/using-the-rest-api/rate-

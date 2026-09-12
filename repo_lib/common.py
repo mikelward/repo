@@ -29,6 +29,14 @@ def info(message):
     print(message, file=sys.stderr)
 
 
+def warn_lines(headline, text):
+    """warn() + the same indented relay error_lines gives an error: for a
+    failure the run carries on past, whose own wording still matters."""
+    warn(headline)
+    for line in (text or "").splitlines():
+        print(f"  {line}", file=sys.stderr)
+
+
 def error_lines(headline, text):
     """`headline` as an error, then each line of `text` indented under it --
     for relaying a gh error message without losing its own line breaks. Only

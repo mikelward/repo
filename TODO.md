@@ -68,6 +68,27 @@
       flow, alongside the ruleset step. See "Decisions needing review"
       below for where this diverges from the porting source and why.
 
+- [ ] **Reach the App-installation facts without `user/installations`.**
+      Every App read in `repo_lib/apps.py` -- `app_slug_for_id`,
+      `app_covers_repo`, `resolve_installation`, and the `--app` membership
+      writes -- goes through `user/installations`, which GitHub serves only
+      to a GitHub App user-to-server token. `gh auth login` issues an
+      OAuth-App token and a PAT belongs to no App, so both are refused with
+      a 403 no matter their scopes (maintainer's own run, 2026-09-12: "You
+      must authenticate with an access token authorized to a GitHub App").
+      So on an ordinary gh login `--app` cannot run at all, and a `lanes`
+      binding whose only evidence is a commit status cannot be verified --
+      the Statuses API hides the creating App, so the id has to be resolved
+      to a `{slug}[bot]` login somehow. The preflight added with this entry
+      makes both fail early and say why; it does not make them work. Worth
+      finding out what a gh-obtainable token CAN answer: a check run
+      carries `app.id` directly (already used), `GET /apps/{slug}` is public
+      but takes a slug rather than an id, and the installation endpoints
+      that take a repo need an App JWT. If nothing closes the gap, the
+      honest fix may be to state that App membership and bound-status
+      verification need their own token, and let the rest converge without
+      them.
+
 ## repo audit and repo setup: the fleet credentials
 
 - [x] Audit where the fleet credentials live (`repo_lib/credentials.py`,
