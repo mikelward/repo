@@ -1249,7 +1249,11 @@ def _binding_app_will_cover(repo, repo_owner, app_id, app_plans):
     # read raced), which does not cover (Codex, mikelward/repo#52). Match plans
     # by slug: an App not installed on the owner at all has no slug (and --app
     # only adds a repo to an existing installation, never creates one).
-    slug = apps.app_slug_for_id(repo_owner, app_id)
+    # use_known=False: coverage is ground truth to read, not the operator's
+    # config assertion -- a mis-paired app_logins slug must not make a planned
+    # --app ADD for a different App look like coverage here (Codex,
+    # mikelward/repo#63).
+    slug = apps.app_slug_for_id(repo_owner, app_id, use_known=False)
     if slug is None:
         return False
     return any(plan.slug == slug and plan.verdict == "ADD" for plan in app_plans)
@@ -1565,6 +1569,17 @@ def _apply_config(args, cfg):
 
 def run(args):
     rules.reset_evidence_cache()  # one run's evidence, never an earlier one's
+    try:
+        return _run_logged(args)
+    finally:
+        # The App id->slug pairing _run registers is process-global; clear it
+        # on every exit so it is scoped to this invocation and can never be
+        # read by a later command (an `audit` after a `setup`) sharing the
+        # interpreter (Codex, mikelward/repo#63).
+        apps.register_known_slugs({})
+
+
+def _run_logged(args):
     if args.dry_run or args.no_log or not OWNER_REPO_RE.match(args.repo):
         # A dry run changes nothing, so there is nothing to record; a name
         # this has already rejected is _run's error to report, not a path
@@ -1605,6 +1620,7 @@ def _run(args, log=None):
 
     # The fleet config supplies the stable flags so they need not be
     # retyped every run; the command line overrides it (see SPEC.md).
+    config_app_logins = {}
     if not args.no_config:
         try:
             cfg = config.load(args.config)
@@ -1613,8 +1629,14 @@ def _run(args, log=None):
             raise SystemExit(2)
         if cfg is not None:
             _apply_config(args, cfg)
+            config_app_logins = cfg.app_logins
     if args.force is None:
         args.force = False
+    # Operator-supplied App id -> slug pairings let a bound check's status
+    # creator be verified without user/installations (see
+    # apps.register_known_slugs). Always set -- {} when there is no config --
+    # so a prior run's pairings never leak into this one.
+    apps.register_known_slugs(config_app_logins)
 
     secret_specs = _validate_secret_specs(args.secret)
     credential_specs = _validate_credential_specs(args.credential)

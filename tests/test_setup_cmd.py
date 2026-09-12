@@ -10881,6 +10881,72 @@ class BootstrapStepTest(unittest.TestCase):
         self.assertIn("required check 'lanes' (needs App 12345) has not passed on its head", err)
         self.assertEqual(fake.merged_pulls, [])
 
+    def test_config_app_logins_do_not_outlive_the_setup_run(self):
+        # The pairing is process-global; a setup run must clear it on exit so
+        # a later command in the same interpreter can't read it (Codex,
+        # mikelward/repo#63).
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _config_file(tmp, 'app_logins:\n  "4650916": mikelward-lanes\n')
+            fake = FakeGh()
+            fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+            code, _, err = _run(fake, ["--force", "--no-bootstrap", "--config", cfg, REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(apps._known_slugs, {})  # cleared on exit
+
+    def test_a_config_login_pairing_verifies_a_bound_status_without_installations(self):
+        # 2b: with the operator's App id->slug pairing (config `app_logins`,
+        # registered via apps.register_known_slugs), a bound `lanes` status is
+        # matched by its `{slug}[bot]` creator WITHOUT the user/installations
+        # read -- so the evidence scan works on a token that can't call it
+        # (the yaml-lite 403). The id-keyed installations read is wired to
+        # fail here to prove it is never reached.
+        fake = FakeGh()
+        fake.check_runs = {fake.default_head_sha: ["codex", "zizmor"]}
+        fake.statuses = {fake.default_head_sha: [("lanes", "success")]}
+        fake.status_creators = {fake.default_head_sha: [("lanes", "lanes-app[bot]")]}
+        fake.app_coverage_fails = _APP_TOKEN_403
+        apps.register_known_slugs({"12345": "lanes-app"})
+        try:
+            with patch("repo_lib.gh.run", fake.run), patch("repo_lib.gh.try_run", fake.try_run):
+                rules.reset_evidence_cache()
+                self.assertEqual(rules.never_passed(REPO, [("lanes", 12345)]), [])
+        finally:
+            apps.register_known_slugs({})
+
+    def test_coverage_prediction_ignores_the_config_login_pairing(self):
+        # The pairing is EVIDENCE only: whether an App covers a repo is ground
+        # truth to read, not an operator assertion. use_known=False makes
+        # app_slug_for_id skip the registry, so a mis-paired slug can't make a
+        # planned ADD for a different App look like coverage (Codex,
+        # mikelward/repo#63).
+        apps.register_known_slugs({"12345": "wrong-slug"})
+        try:
+            fake = FakeGh()
+            fake.app_coverage = {}  # id 12345 not installed on the owner
+            with patch("repo_lib.gh.run", fake.run), patch("repo_lib.gh.try_run", fake.try_run):
+                self.assertIsNone(
+                    apps.app_slug_for_id("owner", 12345, use_known=False)
+                )
+                # The default path still honors the assertion (evidence use).
+                self.assertEqual(apps.app_slug_for_id("owner", 12345), "wrong-slug")
+        finally:
+            apps.register_known_slugs({})
+
+    def test_without_the_pairing_the_bound_status_read_still_needs_installations(self):
+        # The control: no pairing, and the id-keyed installations read fails,
+        # so the same scan is a can't-tell (RulesetError), which is the 403
+        # the pairing exists to avoid.
+        fake = FakeGh()
+        fake.check_runs = {fake.default_head_sha: ["codex", "zizmor"]}
+        fake.statuses = {fake.default_head_sha: [("lanes", "success")]}
+        fake.status_creators = {fake.default_head_sha: [("lanes", "lanes-app[bot]")]}
+        fake.app_coverage_fails = _APP_TOKEN_403
+        apps.register_known_slugs({})
+        with patch("repo_lib.gh.run", fake.run), patch("repo_lib.gh.try_run", fake.try_run):
+            rules.reset_evidence_cache()
+            with self.assertRaises(rules.RulesetError):
+                rules.never_passed(REPO, [("lanes", 12345)])
+
     def test_a_bound_apps_superseded_success_still_counts_as_ever_passed(self):
         # The same status history asked two ways. Of the repository, the
         # question is whether the App has EVER passed `lanes` here: it did,

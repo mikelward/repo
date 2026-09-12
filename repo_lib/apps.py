@@ -102,6 +102,27 @@ def installations_readable():
     return gh.try_run(["api", "user/installations", "--jq", ".total_count"])
 
 
+# App id -> slug pairings the operator supplies (config `app_logins`), so a
+# bound check's status creator can be matched without reading
+# `user/installations` -- the endpoint GitHub serves only to a GitHub App
+# user-to-server token (see app_slug_for_id / APP_TOKEN_HINT). Populated once
+# per run from the config; empty otherwise, in which case resolution falls
+# back to the API exactly as before.
+_known_slugs = {}
+
+
+def register_known_slugs(mapping):
+    """Replace the operator-supplied App id -> slug pairings. Keys coerce to
+    positive ints; a non-positive/non-integer key or an empty slug is dropped
+    (config validation already rejects those, so this is only belt-and-braces).
+    Call with {} to clear -- one run's pairings must never leak into another."""
+    _known_slugs.clear()
+    for app_id, slug in (mapping or {}).items():
+        numeric = _positive_int(app_id)
+        if numeric is not None and slug:
+            _known_slugs[numeric] = slug
+
+
 def require_installations_readable(slugs):
     """Exit 2 before the run touches anything when `--app` was passed and
     this token can NEVER list App installations.
@@ -137,7 +158,7 @@ def require_installations_readable(slugs):
     )
 
 
-def app_slug_for_id(owner, app_id):
+def app_slug_for_id(owner, app_id, use_known=True):
     """The slug of the GitHub App whose numeric id is `app_id`, as installed
     on `owner`'s account, or None if no installation of it is visible there.
 
@@ -161,6 +182,14 @@ def app_slug_for_id(owner, app_id):
     numeric = _positive_int(app_id)
     if numeric is None:
         return None
+    if use_known and numeric in _known_slugs:
+        # The operator asserted this id's slug (config `app_logins`), so the
+        # match needs no `user/installations` read -- and the assertion is
+        # account-agnostic, so it stands ahead of the owner filter below. Only
+        # for EVIDENCE (matching a status creator): coverage prediction passes
+        # use_known=False, since whether an App covers a repo is ground truth
+        # to read, not an operator assertion (Codex, mikelward/repo#63).
+        return _known_slugs[numeric]
     if not SLUG_RE.match(owner or ""):
         # `owner` is spliced into the --jq text below; anything outside the
         # slug character class cannot be, so refuse rather than guess -- a

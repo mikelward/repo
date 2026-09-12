@@ -38,7 +38,9 @@ repository does not call is reported unused and not written.
 Those flags are fleet constants -- the same on every repository and every
 run -- so they live in a **fleet config file** (`$XDG_CONFIG_HOME/repo/
 config.yaml`, read by default) rather than being retyped: `credentials`
-(name to the path its value is read from), `rules`, `apps`, `force`. With
+(name to the path its value is read from), `rules`, `apps`, `force`, and
+`app_logins` (an App id to its bot slug, so a bound check's status creator
+is matched without reading the account's App installations -- below). With
 it in place the loop is `repo list | xargs -n1 repo setup`. The command
 line overrides the file by replacing or adding a value (a `--rule`/`--app`
 set, a `--credential` path), and `--no-config` ignores the file entirely;
@@ -335,9 +337,11 @@ do, and none of them is caused by a run:
   read answers only to a GitHub App user-to-server token, so the token
   `gh auth login` issues is refused whatever its scopes, and
   re-authenticating with gh does not change it. Everything not about Apps
-  still converges; `--app` stops the run at the top (above), and a `lanes`
-  binding whose evidence is a status cannot be verified until someone
-  supplies a token that can make that read.
+  still converges; `--app` stops the run at the top (above). A `lanes`
+  binding whose evidence is a status is verified from the config's
+  `app_logins` pairing when one is supplied (the operator naming the App's
+  slug for its id, which the status carries as `{slug}[bot]`); without that
+  pairing it waits for a token that can make the installations read.
 - A legacy-named ruleset whose merge methods conflict with rebase.
 - A branch that already requires a check whose publisher is missing from
   it (a state that predates the tool): every pull request there is stuck

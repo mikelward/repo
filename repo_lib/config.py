@@ -21,12 +21,15 @@ a command or a secret manager is a tracked follow-up (TODO.md).
 """
 
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 
 import yaml
 
 DEFAULT_RELPATH = "repo/config.yaml"
+_SLUG_RE = re.compile(r"\A[A-Za-z0-9._-]+\Z")  # a GitHub App slug; \Z, not $,
+                      # so a trailing newline is rejected, not accepted before it
 
 
 class _BadConfig(Exception):
@@ -66,7 +69,7 @@ def _construct_mapping(loader, node, deep=False):
 _StrictLoader.add_constructor(
     yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_mapping
 )
-_KNOWN_KEYS = {"credentials", "rules", "apps", "force"}
+_KNOWN_KEYS = {"credentials", "rules", "apps", "force", "app_logins"}
 
 
 class ConfigError(Exception):
@@ -85,6 +88,9 @@ class SetupConfig:
     rules: Optional[list] = None
     apps: Optional[list] = None
     force: bool = False
+    # App id (as a string) -> bot slug, for verifying a bound check's status
+    # creator without user/installations (see apps.register_known_slugs).
+    app_logins: dict = field(default_factory=dict)
 
 
 def default_path():
@@ -174,6 +180,46 @@ def load(path=None):
                     f"config file {resolved}: '{key}' must be a list of strings"
                 )
             setattr(cfg, key, value)
+    if "app_logins" in data:
+        logins = data["app_logins"]
+        if not isinstance(logins, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in logins.items()
+        ):
+            raise ConfigError(
+                f"config file {resolved}: 'app_logins' must be a mapping of App id "
+                "to a bot slug"
+            )
+        seen_slugs = {}
+        for app_id, slug in logins.items():
+            try:
+                numeric = int(app_id)
+            except ValueError:
+                numeric = None
+            # str(numeric) != app_id rejects leading zeros, signs and whitespace
+            # -- non-canonical spellings that would alias onto another id once
+            # normalized and silently overwrite its slug (Codex, mikelward/repo#63).
+            if numeric is None or numeric <= 0 or str(numeric) != app_id:
+                raise ConfigError(
+                    f"config file {resolved}: app_logins key {app_id!r} must be a "
+                    "positive integer App id in its plain decimal form"
+                )
+            if not _SLUG_RE.match(slug):
+                raise ConfigError(
+                    f"config file {resolved}: app_logins[{app_id!r}] slug {slug!r} is "
+                    "not a valid App slug"
+                )
+            # A bot slug names exactly one App, so the pairing must be
+            # one-to-one: two ids sharing a slug would let one App's status
+            # satisfy the evidence check for the other id (Codex,
+            # mikelward/repo#63).
+            if slug in seen_slugs:
+                raise ConfigError(
+                    f"config file {resolved}: app_logins maps both "
+                    f"{seen_slugs[slug]!r} and {app_id!r} to slug {slug!r}; a bot slug "
+                    "names one App"
+                )
+            seen_slugs[slug] = app_id
+        cfg.app_logins = logins
     if cfg.rules == []:
         raise ConfigError(
             f"config file {resolved}: 'rules' must not be empty; omit it to use "
