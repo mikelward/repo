@@ -68,6 +68,26 @@
       flow, alongside the ruleset step. See "Decisions needing review"
       below for where this diverges from the porting source and why.
 
+- [x] **Fleet config file for `repo setup`.** The convergence flags
+      (`credentials`, `rules`, `apps`, `force`) are fleet constants, so they
+      live in `$XDG_CONFIG_HOME/repo/config.yaml` (read by default) instead
+      of being retyped every run; the command line overrides it, `--no-config`
+      ignores it (`repo_lib/config.py`). YAML because it is the one existing
+      dependency; TOML's `tomllib` is 3.11+ and the floor is 3.9. safe_load
+      + strict schema (unknown key / wrong type = usage error). Holds paths,
+      never secret values, never `--secret`.
+- [ ] **Config value resolution beyond a path (secret manager).** A
+      credential entry is currently a path the value is read from, same as
+      `--credential NAME=PATH`. The maintainer expects to want a real secret
+      store; the pluggable form is to let a value be sourced from a **command**
+      whose stdout is the secret (`op read ...`, `pass ...`, `aws
+      secretsmanager get-secret-value ...`) -- the escape hatch to any manager
+      with no new dependency. Cost/reliability to weigh first (AGENTS.md): a
+      command resolver runs an external process, and a network-backed one is a
+      visible pause on this interactive CLI's hot path, plus a new failure mode
+      if the manager is down. Design the shape so `NAME: path` stays the simple
+      case and `NAME: {command: [...]}` (or similar) is the opt-in. Still an
+      open conversation, not a decided build.
 - [ ] **Reach the App-installation facts without `user/installations`.**
       Every App read in `repo_lib/apps.py` -- `app_slug_for_id`,
       `app_covers_repo`, `resolve_installation`, and the `--app` membership
@@ -88,6 +108,17 @@
       honest fix may be to state that App membership and bound-status
       verification need their own token, and let the rest converge without
       them.
+      *Investigated 2026-09-12:* `GET /apps/{slug}` (public, no installation
+      access) resolves a public App's slug->id and would replace the
+      `user/installations` lookup on the evidence path -- but the fleet's
+      lanes App is PRIVATE, so it 404s for it, and making it public is a real
+      change (anyone could install it; its scopes become readable). The
+      private-App path is **2b**: pass the App's `id <-> {slug}[bot]` pairing
+      (a fleet constant) so the bound-status check is a local compare against
+      the configured login -- no `user/installations`, no network. With the
+      config file landed that pairing is one more entry, not an extra flag, so
+      2b is the leading option; `--app` membership WRITES still need a real
+      App token (option 4) and stay parked.
 
 ## repo audit and repo setup: the fleet credentials
 
