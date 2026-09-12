@@ -172,6 +172,50 @@ class LoadTest(unittest.TestCase):
                 with self.assertRaises(config.ConfigError, msg=bad):
                     config.load(_write(tmp, bad))
 
+    def test_app_logins_parses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = config.load(_write(tmp, 'app_logins:\n  "4650916": mikelward-lanes\n'))
+        self.assertEqual(cfg.app_logins, {"4650916": "mikelward-lanes"})
+
+    def test_app_logins_key_must_be_a_positive_integer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(config.ConfigError) as caught:
+                config.load(_write(tmp, "app_logins:\n  not-a-number: some-app\n"))
+        self.assertIn("positive integer", str(caught.exception))
+
+    def test_app_logins_aliased_ids_are_rejected(self):
+        # "123" and "0123" both normalize to int 123 -- the second slug would
+        # silently win; the non-canonical spelling is rejected instead (Codex,
+        # mikelward/repo#63).
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(config.ConfigError) as caught:
+                config.load(_write(tmp, 'app_logins:\n  "123": a\n  "0123": b\n'))
+        self.assertIn("plain decimal form", str(caught.exception))
+
+    def test_app_logins_slug_with_trailing_newline_is_rejected(self):
+        # `$` matches before a trailing newline; the slug pattern uses \Z so
+        # "lanes-app\n" is rejected rather than registered as "lanes-app\n[bot]"
+        # (Codex, mikelward/repo#63).
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(config.ConfigError) as caught:
+                config.load(_write(tmp, 'app_logins:\n  "4650916": "lanes-app\\n"\n'))
+        self.assertIn("slug", str(caught.exception))
+
+    def test_app_logins_slug_must_be_valid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(config.ConfigError) as caught:
+                config.load(_write(tmp, 'app_logins:\n  "4650916": "not a slug"\n'))
+        self.assertIn("slug", str(caught.exception))
+
+    def test_app_logins_duplicate_slug_across_ids_is_rejected(self):
+        # A bot slug names one App, so two ids sharing a slug would let one
+        # App's status satisfy the evidence check for the other id -- the
+        # pairing must stay one-to-one (Codex, mikelward/repo#63).
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(config.ConfigError) as caught:
+                config.load(_write(tmp, 'app_logins:\n  "123": lanes-app\n  "456": lanes-app\n'))
+        self.assertIn("names one App", str(caught.exception))
+
     def test_safe_load_refuses_arbitrary_tags(self):
         # The hardening: safe_load raises on a python-object tag rather than
         # constructing it, so a config file can never execute code.

@@ -66,7 +66,10 @@ each value is read from, plus `rules`/`apps`/`force` -- can live in a config
 file at `$XDG_CONFIG_HOME/repo/config.yaml` (or `~/.config/repo/config.yaml`),
 read by default, so they are not retyped every run; a command-line flag
 overrides it and `--no-config` ignores it. It holds paths, never secret
-values. See `SPEC.md`.
+values. An optional `app_logins` mapping (App id to its bot slug) lets a
+bound check's status creator be verified without reading the account's App
+installations -- the endpoint a `gh auth login` token cannot call. See
+`SPEC.md`.
 
 `repo setup` checks those credentials before it touches a repository: a
 token GitHub refuses stops the run at the top naming `gh auth login`,

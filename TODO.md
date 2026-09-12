@@ -119,6 +119,20 @@
       config file landed that pairing is one more entry, not an extra flag, so
       2b is the leading option; `--app` membership WRITES still need a real
       App token (option 4) and stay parked.
+      *2b DONE (mikelward/repo#63, chosen 2026-09-12):* config `app_logins`
+      (App id -> bot slug) registered via `apps.register_known_slugs`, which
+      `app_slug_for_id` consults before the `user/installations` read -- so a
+      bound `lanes` check's `{slug}[bot]` status creator is verified with no
+      installations call. Wired into `repo setup` only (it reads the config).
+      **Remaining:** (a) `repo audit` does not read the config, so its own
+      bound-`lanes` verification still hits `user/installations` -- wire the
+      same pairing in when audit grows a config read; (b) BINDING a lanes
+      check still runs the coverage precondition (`apps.app_covers_repo`,
+      also `user/installations`), so first-bind/rebind on a gh-auth token
+      still can't proceed -- that needs option 4 (a real App token) and the
+      pairing does not address it. Coverage cannot be asserted from config
+      the way a slug can: it is current-state ("can this App act here now"),
+      not a stable fact.
 
 ## repo audit and repo setup: the fleet credentials
 
