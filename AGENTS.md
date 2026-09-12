@@ -156,8 +156,8 @@ one that has stopped biting.
   each commit that lands is one coherent change, with fix-ups and review
   responses folded into the commit they belong to. `wip` / `address review`
   churn doesn't survive into `main`.
-- `git push --force-with-lease` to your own live feature branch after a
-  rebase is routine hygiene -- don't ask. Never a bare `--force`.
+- After a rebase, force-push with `--force-with-lease`, never a bare
+  `--force`.
 - **Merge cue (`merged` / `I merged` / `landed` / merge webhook) runs
   hygiene *before* engaging with the rest of the message:** `git fetch
   origin`, cut a fresh `<agent>/<short-topic>` branch off `origin/main`,
