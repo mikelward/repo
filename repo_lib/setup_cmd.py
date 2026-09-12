@@ -94,7 +94,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
 from typing import Optional
 
-from repo_lib import apps, common, credentials, gh, rules, scaffold, secrets_cmd
+from repo_lib import apps, common, config, credentials, gh, rules, scaffold, secrets_cmd
 from repo_lib.common import error, error_lines, info, warn
 
 # The lookaheads reject `.` and `..` components: made of allowed
@@ -137,6 +137,19 @@ def add_arguments(parser):
     )
     parser.add_argument(
         "--no-log", action="store_true", help="do not write a record of this run to a file"
+    )
+    parser.add_argument(
+        "--config",
+        metavar="FILE",
+        help=(
+            "fleet config file with the stable flags (credentials, rules, "
+            "apps, force), so they need not be retyped every run; a flag "
+            "given on the command line overrides it (default: "
+            "$XDG_CONFIG_HOME/repo/config.yaml, or ~/.config/repo/config.yaml)"
+        ),
+    )
+    parser.add_argument(
+        "--no-config", action="store_true", help="ignore the fleet config file"
     )
     parser.add_argument("--no-rules", action="store_true", help="skip the ruleset step")
     parser.add_argument(
@@ -1502,6 +1515,33 @@ class _Tee:
         return self._stream.fileno()
 
 
+def _apply_config(args, cfg):
+    """Fill the stable flags from `cfg` where the command line did not.
+
+    Credentials merge by name, the command line winning: config entries for
+    names no --credential set are prepended, so _validate_credential_specs
+    still sees one entry per name (and still catches a real duplicate within
+    the command line's own args). rules/apps/force are defaults the command
+    line replaces when given -- an empty list or a false flag reads as "not
+    given", which is what a repeated append flag and a store_true leave.
+    Config rules are skipped under --no-rules: the step is off, so its
+    default is moot and must not trip the contradiction check.
+    """
+    cli_cred_names = {
+        raw.split("=", 1)[0].upper() for raw in args.credential if "=" in raw
+    }
+    from_config = [
+        f"{name}={path}"
+        for name, path in cfg.credentials.items()
+        if name.upper() not in cli_cred_names
+    ]
+    args.credential = from_config + args.credential
+    if not args.no_rules:
+        args.rule = args.rule or (cfg.rules or [])
+    args.app = args.app or (cfg.apps or [])
+    args.force = args.force or cfg.force
+
+
 def run(args):
     rules.reset_evidence_cache()  # one run's evidence, never an earlier one's
     if args.dry_run or args.no_log or not OWNER_REPO_RE.match(args.repo):
@@ -1530,6 +1570,21 @@ def _run(args, log=None):
     if not OWNER_REPO_RE.match(args.repo):
         error(f"'{args.repo}' is not OWNER/REPO")
         raise SystemExit(2)
+
+    # The fleet config supplies the stable flags so they need not be
+    # retyped every run; the command line overrides it (see SPEC.md). Read
+    # before the checks below so a config-provided --rule is validated the
+    # same as a typed one -- and only when --no-rules is off, so a run
+    # turning rules off for debugging is not tripped by the contradiction
+    # check against config it is about to ignore.
+    if not args.no_config:
+        try:
+            cfg = config.load(args.config)
+        except config.ConfigError as e:
+            error(str(e))
+            raise SystemExit(2)
+        if cfg is not None:
+            _apply_config(args, cfg)
 
     if args.no_rules and args.rule:
         error("--no-rules and --rule are contradictory")

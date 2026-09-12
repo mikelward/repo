@@ -35,6 +35,17 @@ set (and `--rule`/`--app` where the fleet wants them). Those are safe to
 pass to every repository: a `--credential` for a reusable workflow this
 repository does not call is reported unused and not written.
 
+Those flags are fleet constants -- the same on every repository and every
+run -- so they live in a **fleet config file** (`$XDG_CONFIG_HOME/repo/
+config.yaml`, read by default) rather than being retyped: `credentials`
+(name to the path its value is read from), `rules`, `apps`, `force`. With
+it in place the loop is `repo list | xargs -n1 repo setup`. A command-line
+flag still overrides the file for a one-off (`--no-config` ignores it
+entirely), so the file *is* the one invocation, not a second way to vary
+it. The file names paths, never secret values, and never `--secret` (which
+is not a convergence flag, below); an unknown key or a wrong type in it is
+a usage error, so a typo drops nothing silently.
+
 The lanes App pair (`LANES_APP_ID`, `LANES_APP_PRIVATE_KEY`) is the one
 exception, and deliberate: supplied, it is placed even where nothing
 publishes the lanes status yet, so the workflow can authenticate the

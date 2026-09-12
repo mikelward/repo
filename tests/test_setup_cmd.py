@@ -1493,7 +1493,13 @@ def _run(fake, argv, isatty=False, log_dir=None):
     """
     out, err = StringIO(), StringIO()
     with tempfile.TemporaryDirectory() as state:
-        with patch.dict(os.environ, {"XDG_STATE_HOME": log_dir or state}):
+        # Point XDG_CONFIG_HOME at an empty temp dir too, so a run reads no
+        # fleet config unless the test passes one with --config: a real
+        # ~/.config/repo/config.yaml on the developer's machine must not
+        # leak into these tests.
+        with patch.dict(
+            os.environ, {"XDG_STATE_HOME": log_dir or state, "XDG_CONFIG_HOME": state}
+        ):
             return _run_captured(fake, argv, isatty, out, err)
 
 
@@ -3578,6 +3584,89 @@ class CredentialPreflightTest(unittest.TestCase):
         self.assertTrue(fake.patches, "the auto-merge step still applied")
 
 
+def _config_file(tmpdir, text):
+    path = os.path.join(tmpdir, "config.yaml")
+    with open(path, "w") as f:
+        f.write(text)
+    return path
+
+
+class SetupConfigFileTest(unittest.TestCase):
+    def test_no_config_ignores_a_named_config(self):
+        # --no-config wins even over an explicit --config: the config's
+        # rules are never read, so the default checks are used instead.
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _config_file(tmp, "rules:\n  - lanes\n")
+            fake = FakeGh()
+            fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+            code, out, err = _run(
+                fake,
+                ["--force", "--no-bootstrap", "--no-config", "--config", cfg, REPO],
+            )
+        self.assertEqual(code, 0, err)
+        contexts = [
+            c["context"]
+            for rule in fake.posts[0][1]["rules"]
+            if rule["type"] == "required_status_checks"
+            for c in rule["parameters"]["required_status_checks"]
+        ]
+        self.assertEqual(contexts, ["lanes", "codex", "zizmor"])  # defaults, not config
+
+    def test_config_force_lets_the_bare_command_apply_without_confirming(self):
+        # force: true in the config is what makes `repo setup <repo>` (no
+        # --force) the convergence invocation.
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _config_file(tmp, "force: true\n")
+            fake = FakeGh()
+            fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+            code, out, err = _run(fake, ["--no-bootstrap", "--config", cfg, REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(fake.posts), 1)  # the ruleset was created, unprompted
+
+    def test_config_rules_replace_the_default_checks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _config_file(tmp, "rules:\n  - lanes\n  - zizmor\n")
+            fake = FakeGh()
+            fake.check_runs = {fake.default_head_sha: ["lanes", "zizmor"]}
+            code, out, err = _run(fake, ["--force", "--no-bootstrap", "--config", cfg, REPO])
+        self.assertEqual(code, 0, err)
+        contexts = [
+            c["context"]
+            for rule in fake.posts[0][1]["rules"]
+            if rule["type"] == "required_status_checks"
+            for c in rule["parameters"]["required_status_checks"]
+        ]
+        self.assertEqual(contexts, ["lanes", "zizmor"])
+
+    def test_config_rules_are_ignored_under_no_rules(self):
+        # --no-rules turns the step off; config rules must not resurrect it
+        # or trip the --no-rules/--rule contradiction check.
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _config_file(tmp, "rules:\n  - lanes\n")
+            fake = FakeGh()
+            code, out, err = _run(
+                fake, ["--force", "--no-rules", "--no-bootstrap", "--config", cfg, REPO]
+            )
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.posts, [])  # no ruleset written
+
+    def test_a_missing_named_config_is_a_usage_error(self):
+        fake = FakeGh()
+        code, _, err = _run(fake, ["--force", "--config", "/no/such/config.yaml", REPO])
+        self.assertEqual(code, 2)
+        self.assertIn("not found", err)
+        self.assertEqual(fake.calls, [])
+
+    def test_a_config_naming_a_non_fleet_credential_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            key = _secret_file(tmp, "v.txt")
+            cfg = _config_file(tmp, f"credentials:\n  NOT_A_FLEET_CRED: {key}\n")
+            fake = FakeGh()
+            code, _, err = _run(fake, ["--force", "--config", cfg, REPO])
+        self.assertEqual(code, 2)
+        self.assertIn("fleet credential", err)
+
+
 class AppSlugValidationTest(unittest.TestCase):
     def test_empty_slug_is_a_usage_error(self):
         fake = FakeGh()
@@ -4699,6 +4788,47 @@ class LanesCredentialStepTest(unittest.TestCase):
         # Never the unused path: not declined, not deleted.
         self.assertNotIn("nothing uses it", err)
         self.assertNotIn("not set", err)
+
+    def test_a_config_supplied_pair_is_placed_like_a_command_line_one(self):
+        # The pair read from the fleet config provisions exactly as the
+        # typed --credential pair does -- this is what lets the convergence
+        # loop drop the two --credential flags.
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            cfg = _config_file(
+                tmp,
+                f"credentials:\n  LANES_APP_ID: {app_id}\n  LANES_APP_PRIVATE_KEY: {key}\n",
+            )
+            fake = self._publisher(self.AMBIENT)
+            code, out, err = _run(fake, ["--force", "--no-rules", "--config", cfg, REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(
+            [w[:3] for w in fake.written_secrets],
+            [("LANES_APP_ID", REPO, "lanes"), ("LANES_APP_PRIVATE_KEY", REPO, "lanes")],
+        )
+
+    def test_a_command_line_credential_overrides_the_config_for_the_same_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_id = _secret_file(tmp, "cfg_id.txt", b"11111")
+            cli_id = _secret_file(tmp, "cli_id.txt", b"22222")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            cfg = _config_file(
+                tmp,
+                f"credentials:\n  LANES_APP_ID: {cfg_id}\n  LANES_APP_PRIVATE_KEY: {key}\n",
+            )
+            fake = self._publisher(self.AMBIENT)
+            code, out, err = _run(
+                fake,
+                [
+                    "--force", "--no-rules", "--config", cfg,
+                    "--credential", f"LANES_APP_ID={cli_id}",
+                    REPO,
+                ],
+            )
+        self.assertEqual(code, 0, err)
+        written_id = [v for name, _r, _e, v in fake.written_secrets if name == "LANES_APP_ID"]
+        self.assertEqual(written_id, [b"22222"])  # the command line's value, not the config's
 
     def test_a_supplied_pair_already_in_the_environment_is_kept_not_deleted(self):
         # conf's case: the pair was provisioned into the restricted lanes

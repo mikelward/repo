@@ -61,6 +61,13 @@ subcommand's parser is built up front regardless of which one is invoked,
 so an older interpreter fails on any command, not just that one (Codex
 review, mikelward/repo#14).
 
+The fleet's stable `repo setup` flags -- which credentials exist and where
+each value is read from, plus `rules`/`apps`/`force` -- can live in a config
+file at `$XDG_CONFIG_HOME/repo/config.yaml` (or `~/.config/repo/config.yaml`),
+read by default, so they are not retyped every run; a command-line flag
+overrides it and `--no-config` ignores it. It holds paths, never secret
+values. See `SPEC.md`.
+
 `repo setup` checks those credentials before it touches a repository: a
 token GitHub refuses stops the run at the top naming `gh auth login`,
 rather than failing once per step. `--app` is checked there too, because
@@ -89,9 +96,9 @@ repo list [--owner OWNER] [--include-forks] [--include-archived]
 repo create (--private|--public) [--no-scaffold] OWNER/REPO
 repo secrets --name NAME [--env ENV] --file PATH [--force] OWNER/REPO...
 repo setup [--dry-run] [--force] [-v|--verbose] [--no-rules] [--no-bootstrap]
-           [--log FILE] [--no-log] [--rule CHECK]...
-           [--secret NAME[@ENV]=PATH]... [--credential NAME=PATH]...
-           [--app SLUG]... OWNER/REPO
+           [--config FILE] [--no-config] [--log FILE] [--no-log]
+           [--rule CHECK]... [--secret NAME[@ENV]=PATH]...
+           [--credential NAME=PATH]... [--app SLUG]... OWNER/REPO
 repo audit [--branch NAME] OWNER/REPO [CHECK...]
 repo cleanup [--dry-run] [--force] [--older-than DAYS]
              [--log FILE] OWNER/REPO
