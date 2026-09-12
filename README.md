@@ -61,6 +61,17 @@ subcommand's parser is built up front regardless of which one is invoked,
 so an older interpreter fails on any command, not just that one (Codex
 review, mikelward/repo#14).
 
+`repo setup` checks those credentials before it touches a repository: a
+token GitHub refuses stops the run at the top naming `gh auth login`,
+rather than failing once per step. `--app` is checked there too, because
+listing an account's App installations answers only to a GitHub App
+user-to-server token -- the token `gh auth login` issues is refused
+whatever its scopes. Either check failing for any other reason (a 500, a
+rate limit) says nothing about the token, so it is reported and the run
+carries on. Everything not about Apps still converges on an ordinary
+token; only `--app` and verifying a `lanes` binding whose evidence is a
+commit status need that read.
+
 No optional extras: `repo cleanup`'s interactive checkbox picker uses the
 standard library's `curses`, so on a terminal you get a checkbox list (space
 toggles, `a`/`n` select all/none, enter confirms, `q`/esc cancels), with

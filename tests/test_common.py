@@ -42,5 +42,16 @@ class ErrorLinesTest(unittest.TestCase):
         self.assertEqual(_stderr(common.error_lines, "headline", None), "error: headline\n")
 
 
+class WarnLinesTest(unittest.TestCase):
+    def test_the_headline_is_a_warning_and_details_are_indented(self):
+        # The error_lines shape at warning level, for a failure the run
+        # carries on past -- gh's own wording kept intact under it.
+        got = _stderr(common.warn_lines, "could not check this token:", "line one\nline two")
+        self.assertEqual(got, "warning: could not check this token:\n  line one\n  line two\n")
+
+    def test_none_detail_prints_just_the_headline(self):
+        self.assertEqual(_stderr(common.warn_lines, "headline", None), "warning: headline\n")
+
+
 if __name__ == "__main__":
     unittest.main()

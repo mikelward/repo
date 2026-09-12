@@ -33,7 +33,7 @@ from typing import Optional
 import re
 
 from repo_lib import gh
-from repo_lib.common import error, error_lines
+from repo_lib.common import error, error_lines, warn_lines
 
 # The character class this module (and the App-membership PUT endpoint it
 # calls) is prepared to handle in a slug -- refusing rather than guessing
@@ -72,6 +72,69 @@ def _positive_int(value):
     except (TypeError, ValueError):
         return None
     return numeric if numeric > 0 else None
+
+
+# Every App read in this module goes through `user/installations`, which
+# GitHub serves only to a GitHub App USER-TO-SERVER token. The token `gh
+# auth login` issues belongs to an OAuth App, and a PAT to no App at all,
+# so both get a 403 no matter which scopes they carry -- not a permission
+# an operator can grant themselves. Worth saying in full wherever that 403
+# surfaces: "403" alone sends people to re-authenticate, which cannot fix
+# it (mikelward/repo, maintainer's run 2026-09-12).
+APP_TOKEN_HINT = (
+    "`user/installations` answers only to a GitHub App user-to-server token. "
+    "The token `gh auth login` issues is an OAuth-App token, so GitHub refuses "
+    "it whatever its scopes -- re-authenticating with gh will not change this."
+)
+
+
+def is_missing_app_token(stderr):
+    """True if `stderr` is GitHub's "not a GitHub App token" 403 rather than
+    some other failure of the same read. Matched on the message, since gh
+    relays the API's body and not a distinguishable status: a plain 403 can
+    also mean a suspended install or a blocked account, which ARE worth
+    retrying and must not be reported as the hopeless case."""
+    return "authorized to a GitHub App" in (stderr or "")
+
+
+def installations_readable():
+    """(ok, detail) for the one endpoint every read below goes through."""
+    return gh.try_run(["api", "user/installations", "--jq", ".total_count"])
+
+
+def require_installations_readable(slugs):
+    """Exit 2 before the run touches anything when `--app` was passed and
+    this token can NEVER list App installations.
+
+    `--app` has nothing to fall back on -- listing installations is how a
+    slug becomes an installation id -- so with the wrong kind of token it
+    fails that step on every repository in the fleet, one repository at a
+    time, and no rerun changes that. Said once, up front, instead.
+
+    Only for the token refusal, which is the request being impossible: any
+    other failure of the same read may be this read's bad luck, so it is
+    reported and the run goes on to make its other progress, the App step
+    failing alone (SPEC.md, invariant 1). The `lanes` binding reads this
+    endpoint too and is never checked here -- it has other evidence to fall
+    back on, so it holds its own step either way.
+    """
+    ok, detail = installations_readable()
+    if ok:
+        return
+    if is_missing_app_token(detail):
+        error_lines(
+            f"--app {' '.join(slugs)} needs to list this account's App installations, "
+            "and this token may not:",
+            detail,
+        )
+        error(APP_TOKEN_HINT)
+        error("Drop --app to run everything else, or supply a GitHub App user token.")
+        raise SystemExit(2)
+    warn_lines(
+        f"could not list this account's App installations, which --app {' '.join(slugs)} "
+        "needs (continuing -- the App step reports its own failure):",
+        detail,
+    )
 
 
 def app_slug_for_id(owner, app_id):

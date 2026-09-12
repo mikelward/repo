@@ -359,6 +359,10 @@ class FakeGh:
         # repo list from install_members[str(app_id)].
         self.app_coverage = {}
         self.app_coverage_fails = None  # gh stderr for the id-keyed installs read, or None
+        # The credential preflight's two reads: gh stderr to fail them
+        # with, or None for "this token works".
+        self.auth_fails = None
+        self.installations_read_fails = None
 
         # -- bootstrap/scaffold step state --
         # Fake content for the two external template sources -- what it
@@ -776,6 +780,8 @@ class FakeGh:
             )
 
         if endpoint == "user" and jq == ".login":
+            if self.auth_fails is not None:
+                raise gh.GhError(self.auth_fails)
             return self.login + "\n"
 
         if _ACTIONS_PERMISSIONS_RE.match(endpoint) and jq == ".enabled":
@@ -1006,6 +1012,12 @@ class FakeGh:
             raise gh.GhError(f"gh: HTTP 404: Not Found (.../{endpoint})\n")
 
         if _USER_INSTALLATIONS_RE.match(endpoint):
+            if jq == ".total_count":
+                # apps.installations_readable's probe: whether this token
+                # may list installations at all, not which ones.
+                if self.installations_read_fails is not None:
+                    raise gh.GhError(self.installations_read_fails)
+                return f"{len(self.installations)}\n"
             aid_m = re.search(r"app_id == (\d+)", jq or "")
             if aid_m:
                 # Id-keyed lookups: app_covers_repo (projects
@@ -3466,6 +3478,104 @@ class SecretSpecValidationTest(unittest.TestCase):
             )
         self.assertEqual(code, 0, err)
         self.assertNotIn("repeats an earlier --secret", err)
+
+
+# GitHub's own refusal when a token that is not a GitHub App user token
+# asks for installations -- the wording apps.is_missing_app_token keys on.
+_APP_TOKEN_403 = (
+    "gh: You must authenticate with an access token authorized to a GitHub App "
+    "in order to list installations (HTTP 403)\n"
+)
+
+
+class CredentialPreflightTest(unittest.TestCase):
+    def test_a_run_whose_credentials_are_refused_touches_nothing(self):
+        fake = FakeGh()
+        fake.auth_fails = "gh: To get started with GitHub CLI, please run: gh auth login\n"
+        code, _, err = _run(fake, ["--force", REPO])
+        self.assertEqual(code, 2)
+        self.assertIn("gh auth login", err)
+        # The preflight read itself, and nothing after it: no repository
+        # read, and above all no write.
+        self.assertEqual(fake.calls, [["api", "user", "--jq", ".login"]])
+
+    def test_an_expired_token_is_a_refusal_too(self):
+        fake = FakeGh()
+        fake.auth_fails = "gh: HTTP 401: Bad credentials (https://api.github.com/user)\n"
+        code, _, err = _run(fake, ["--force", REPO])
+        self.assertEqual(code, 2)
+        self.assertEqual(fake.calls, [["api", "user", "--jq", ".login"]])
+
+    def test_a_probe_failure_that_is_not_a_refusal_does_not_stop_the_run(self):
+        # A 500 says nothing about the token (Codex, mikelward/repo#60).
+        # Stopping here would cost every step of every repository in the
+        # fleet over one unlucky read -- exactly what invariant 1 forbids.
+        fake = FakeGh()
+        fake.auth_fails = "gh: HTTP 500: Internal Server Error (https://api.github.com/user)\n"
+        fake.allow_auto_merge = "false"
+        code, _, err = _run(fake, ["--force", "--no-rules", "--no-bootstrap", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("could not check this gh token", err)
+        self.assertIn("500", err)
+        self.assertTrue(fake.patches, "the run went on to do its work")
+
+    def test_working_credentials_cost_one_read(self):
+        fake = FakeGh()
+        code, _, err = _run(fake, ["--force", "--no-rules", "--no-bootstrap", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.calls.count(["api", "user", "--jq", ".login"]), 1)
+
+    def test_app_without_installation_access_stops_the_run(self):
+        fake = FakeGh()
+        fake.installations_read_fails = _APP_TOKEN_403
+        code, _, err = _run(fake, ["--force", "--app", "some-app", REPO])
+        self.assertEqual(code, 2)
+        self.assertIn("--app some-app", err)
+        # The hopeless case says so: re-authenticating cannot grant this.
+        self.assertIn("GitHub App user-to-server token", err)
+        self.assertIn("Drop --app", err)
+        self.assertNotIn(["api", "--method", "PUT"], [c[:3] for c in fake.calls])
+
+    def test_an_ordinary_installations_failure_leaves_the_run_going(self):
+        # Same reasoning as the auth probe: only "this token never may" is
+        # the request being impossible. A 500 leaves the App step to fail
+        # on its own, with every other step still making its progress.
+        fake = FakeGh()
+        fake.installations_read_fails = "gh: HTTP 500: Internal Server Error\n"
+        code, _, err = _run(fake, ["--force", "--no-rules", "--no-bootstrap", "--app", "some-app", REPO])
+        self.assertNotEqual(code, 2)
+        self.assertNotIn("GitHub App user-to-server token", err)
+        self.assertIn("could not list this account's App installations", err)
+
+    def test_the_app_token_403_is_explained_where_the_binding_evidence_needs_it(self):
+        # The status-creator resolution reads the same endpoint, and there
+        # it fails only its own step. It still has to say WHY: a bare 403
+        # reads as something a rerun or a scope change fixes, and this one
+        # is neither.
+        fake = FakeGh()
+        fake.check_runs = {fake.default_head_sha: ["codex", "zizmor"]}
+        fake.statuses = {fake.default_head_sha: [("lanes", "success")]}
+        fake.status_creators = {fake.default_head_sha: [("lanes", "lanes-app[bot]")]}
+        fake.app_coverage_fails = _APP_TOKEN_403
+        with patch("repo_lib.gh.run", fake.run), patch("repo_lib.gh.try_run", fake.try_run):
+            rules.reset_evidence_cache()
+            with self.assertRaises(rules.RulesetError) as caught:
+                rules.never_passed(REPO, [("lanes", 12345)])
+        self.assertIn("GitHub App user-to-server token", str(caught.exception))
+
+    def test_without_app_an_unreadable_installations_list_holds_only_its_own_step(self):
+        # Invariant 1 (SPEC.md): the binding evidence needs the same
+        # endpoint, but the scaffold, credential and settings steps do not,
+        # so the run makes their progress rather than stopping.
+        fake = FakeGh()
+        fake.installations_read_fails = _APP_TOKEN_403
+        fake.app_coverage_fails = _APP_TOKEN_403
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+        fake.allow_auto_merge = "false"
+        code, out, err = _run(fake, ["--force", "--no-bootstrap", REPO])
+        self.assertEqual(fake.calls.count(["api", "user/installations", "--jq", ".total_count"]), 0)
+        self.assertIn("auto-merge", (out + err).lower())
+        self.assertTrue(fake.patches, "the auto-merge step still applied")
 
 
 class AppSlugValidationTest(unittest.TestCase):
