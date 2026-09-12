@@ -383,8 +383,8 @@ one that has stopped biting.
   above. A finding with no thread (top-level comment or review body) still
   gets the `TODO.md` record, the push, and the reply -- only the resolve is
   skipped. The push re-triggers Codex, so don't also poke it unless five
-  minutes pass with nothing back; escalate only if the re-review re-raises
-  it.
+  minutes pass with nothing back; escalate if the re-review re-raises it,
+  or stays silent.
 - **`resolve_review_thread` works -- pass the `PRRT_*` thread node ID**
   from `pull_request_read` / `get_review_comments`
   (`review_threads[].id`) as `threadId`. A comment's `PRRC_*` node ID
