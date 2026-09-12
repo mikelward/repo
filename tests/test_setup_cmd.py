@@ -3053,11 +3053,12 @@ class SetupCmdTest(unittest.TestCase):
         self.assertNotIn("held for a person", err)
         self.assertIn(["api", f"repos/{REPO}/git/ref/heads/main"], fake.calls)
 
-    def test_sibling_branch_check_failure_fails_the_ruleset_preview(self):
+    def test_sibling_branch_check_failure_fails_the_ruleset_step_only(self):
         # The advisory check says it could not tell and goes on; the
         # ruleset step, which would write onto that branch, fails rather
-        # than guessing -- a failed preview, like any other unreadable
-        # precondition of the write, not a hold.
+        # than guessing. It fails alone -- a preview that cannot finish
+        # skips its own step, like a hold, and leaves every other step to
+        # make its progress (SPEC.md, invariant 1).
         fake = FakeGh()
         fake.check_runs = {fake.default_head_sha: ["lanes"]}
         fake.sibling_error = "gh: HTTP 403: Resource protected by organization SAML enforcement\n"
@@ -3065,7 +3066,9 @@ class SetupCmdTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("could not check whether", err)
         self.assertIn("403", err)
-        self.assertIn("the preview above failed", err)
+        self.assertIn("its preview could not finish", err)
+        self.assertIn("failed on: ruleset", err)
+        self.assertNotIn("the preview above failed", err)
         self.assertNotIn("held for a person", err)
         self.assertEqual(fake.puts, [])
 
@@ -3880,10 +3883,12 @@ class CombinedPlanTest(unittest.TestCase):
         self.assertNotIn("app:codex", err)
         self.assertEqual(fake.written_secrets, [("TOKEN", REPO, None, b"sekrit")])
 
-    def test_a_secret_dry_run_failure_blocks_the_whole_apply_including_the_ruleset(self):
-        # A secret whose plan-build read fails ("error" state) makes the
-        # combined preview fail -- nothing is applied at all, not even the
-        # ruleset step whose own preview succeeded.
+    def test_a_secret_dry_run_failure_does_not_block_the_other_steps(self):
+        # A secret whose plan-build read fails ("error" state) fails its
+        # own step and nothing else. SPEC.md invariant 1: a step that
+        # cannot finish does not hold back the parts that can, which is
+        # what makes one fleet-wide invocation converge the repositories
+        # it can rather than abort on whichever step is unhappy.
         with tempfile.TemporaryDirectory() as tmp:
             path = _secret_file(tmp, "value.txt")
             fake = FakeGh()
@@ -3891,9 +3896,33 @@ class CombinedPlanTest(unittest.TestCase):
             fake.repo_missing = True  # makes the secret's own plan-build read fail
             code, _, err = _run(fake, ["--force", "--secret", f"TOKEN={path}", REPO])
         self.assertEqual(code, 1)
-        self.assertIn("the preview above failed", err)
-        self.assertEqual(fake.posts, [])
+        self.assertIn("secret:TOKEN", err)
+        self.assertNotIn("the preview above failed", err)
         self.assertEqual(fake.written_secrets, [])
+
+    def test_a_ruleset_preview_failure_does_not_block_the_other_steps(self):
+        # The case a fleet run actually hits: one unreadable precondition
+        # of the ruleset write (here a 403 on the sibling-branch read; in
+        # the field, a check-runs or App read the token cannot make) used
+        # to abort the whole run, so a repository with one unreadable
+        # thing converged on nothing -- run after run, since nothing about
+        # it changes on its own. The secret step still writes; the ruleset
+        # step alone is skipped and counted (SPEC.md, invariant 1).
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _secret_file(tmp, "value.txt")
+            fake = FakeGh()
+            fake.check_runs = {fake.default_head_sha: ["lanes"]}
+            fake.sibling_error = "gh: HTTP 403: Resource protected by organization SAML enforcement\n"
+            code, _, err = _run(
+                fake, ["--force", "--rule", "lanes", "--secret", f"TOKEN={path}", REPO]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("its preview could not finish", err)
+        self.assertIn("failed on: ruleset", err)
+        self.assertNotIn("secret:TOKEN", err)
+        self.assertEqual(fake.written_secrets, [("TOKEN", REPO, None, b"sekrit")])
+        # And the ruleset itself is untouched -- skipped, not guessed at.
+        self.assertEqual(fake.puts, [])
 
     def test_an_app_plan_error_does_not_block_the_other_steps_from_applying(self):
         # Unlike a ruleset/secret preview failure, an App-plan error is an

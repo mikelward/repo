@@ -2171,18 +2171,20 @@ def _run(args, log=None):
             raise SystemExit(1)
         return 0
 
-    if ruleset_preview_failed or secrets_preview_failed or binding_preview_failed:
-        # App-plan errors do NOT gate this: an App-plan ERROR is a genuine
-        # per-step runtime outcome (no installation found, a listing call
-        # that failed), not a usage-shaped problem with the whole plan --
-        # it's exactly the kind of independent step failure "every step is
-        # attempted regardless of an earlier one" exists to let the other
-        # steps proceed past, and apply_step already reports it as a
-        # failure the normal way.
-        for line in describe_combined_plan():
-            info(line)
-        error(f"the preview above failed; nothing was changed on {repo}.")
-        raise SystemExit(1)
+    # A failed preview stops its own step, never the run. Every non-usage
+    # return from apply_ruleset is a per-repository runtime outcome -- a
+    # read that did not complete, a ruleset this tool does not own -- and
+    # none of it makes the secrets, credentials or settings steps unsafe.
+    # Aborting on one broke SPEC.md's first invariant, which outranks
+    # everything else here: a step that cannot finish must not hold back
+    # the parts that can. It also made the one fleet-wide invocation
+    # unusable, since any repository with one unreadable thing converged
+    # on nothing (maintainer, 2026-09-12).
+    #
+    # So these route exactly where RulesetHeld already goes: said in the
+    # plan, the step skipped and counted failed, every other step run. A
+    # usage error still exits, above and before any of this -- there the
+    # REQUEST is wrong, so no step is worth attempting.
 
     # Codex review: whether there is anything for the confirmation gate
     # below to even ask about. A --secret step never counts as a no-op --
@@ -2215,17 +2217,22 @@ def _run(args, log=None):
         # steps that could still run (Codex review, mikelward/repo#42).
         and not empty_branch_would_strand_ruleset
         and not ruleset_held
+        and not ruleset_preview_failed
         and (ruleset_report.get("needs_write", True) or bool(ruleset_report.get("deletions")))
     )
     # The App binding is a ruleset write too; when the main ruleset step is
     # otherwise idle, this is what makes the run ask about it (and print the
     # plan) rather than binding silently.
-    binding_needs_mutation = not args.no_rules and binding_needs_write
+    binding_needs_mutation = (
+        not args.no_rules and binding_needs_write and not binding_preview_failed
+    )
     apps_need_mutation = any(p.verdict == "ADD" for p in app_plans)
     needs_confirmation = (
         ruleset_needs_mutation
         or binding_needs_mutation
-        or bool(secret_previews)
+        # A secret whose own preview errored is excluded for the same
+        # reason: the Apply section records it failed without a write.
+        or any(entry[1] != "error" for _spec, entry, _lines in secret_previews)
         or apps_need_mutation
         or bool(credentials_plan.moves)
         or auto_merge_state == "enable"
@@ -2496,6 +2503,11 @@ def _run(args, log=None):
         # Already said in full when the preview held it; one line here so
         # the run's record names the step that did not happen and why.
         error(f"{repo}: skipping the ruleset step -- held for a person (see above)")
+        failed.append("ruleset")
+    elif not args.no_rules and (ruleset_preview_failed or binding_preview_failed):
+        # Same shape as a hold, different cause: the preview reported why
+        # it could not finish, and a later run retries it from scratch.
+        error(f"{repo}: skipping the ruleset step -- its preview could not finish (see above)")
         failed.append("ruleset")
     elif not args.no_rules:
         # expected_fingerprint carries forward what the preview call
