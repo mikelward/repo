@@ -9,12 +9,24 @@ migration, and the shell versions remain the source of truth for behavior
 until this catches up. `repo create` and `repo cleanup` have no shell-script
 counterparts; they're new here.
 
-`repo setup` is a convergence loop: run it repeatedly over the fleet and
-every repository ends at the standard, with nothing waiting on a person
-that a later run could settle and nothing left in a state a later run
-cannot fix. `SPEC.md` is that contract -- what the standard is, the order
-things land in, what a run defers and why -- and the place a change to
-any of that goes first.
+`repo setup` is a convergence loop, and one command run one way: the same
+invocation, with the same flags, over every repository --
+
+    repo list | xargs -n1 repo setup --force --credential NAME=PATH ...
+
+-- repeated until nothing is left deferred or held. Every repository ends
+at the standard, fully set up and with every protection in place, with
+nothing waiting on a person that a later run could settle and nothing left
+in a state a later run cannot fix. The command is never tailored per
+repository; a `--credential` for a reusable workflow this repository does
+not call is reported unused rather than written. (`--secret` is not a
+convergence flag -- it writes its value to every repository it is given --
+and the lanes App pair is placed ahead of its workflow by design. Re-pointing
+an existing lanes binding to a different App is the one hold a rerun does not
+clear; it is done by hand, and the rest of the run still lands. See
+`SPEC.md`.) `SPEC.md` is that contract -- what the standard
+is, the order things land in, what a run defers and why -- and the place a
+change to any of that goes first.
 
 ## Why Python, not another shell rewrite
 
