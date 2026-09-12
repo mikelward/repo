@@ -7,10 +7,62 @@ on, or adds a flag is a change to this file first.
 
 ## The contract
 
-`repo setup` is a convergence loop, not a one-shot configurator. Run it on
-a loop over the fleet (`repo list | xargs -n1 repo setup --force`, or a
-cron) and, after a few runs, every repository is at the fleet standard.
-Two invariants hold on every run, and they outrank every other rule here:
+`repo setup` is a convergence loop, not a one-shot configurator, and it is
+**one command run one way**: the same invocation, with the same flags, over
+every repository --
+
+    repo list | xargs -n1 repo setup --force --credential NAME=PATH ...
+
+-- repeated until every repository reports nothing deferred and nothing
+held, and the run exits 0. After a few passes every repository is at the
+fleet standard: fully set up, with every protection in place.
+
+The stopping condition is "no gaps left", not "wrote nothing". A supplied
+`--credential` is rewritten on every pass: GitHub never reveals a secret's
+value, so whether the one already there matches is unanswerable and the
+write is always attempted. A loop that waited for a run to make no writes
+at all would never stop.
+
+That is the whole product. An operator never tailors the command to a
+repository -- never `--no-rules` for this one and a shorter `--credential`
+set for that one, never a list of which repositories are ready for which
+flags. If converging the fleet needs anyone to vary the invocation, or to
+run it once with one set of flags and again with another, the tool is
+broken, not the workflow.
+
+The convergence invocation is `--force` plus the fleet's `--credential`
+set (and `--rule`/`--app` where the fleet wants them). Those are safe to
+pass to every repository: a `--credential` for a reusable workflow this
+repository does not call is reported unused and not written.
+
+The lanes App pair (`LANES_APP_ID`, `LANES_APP_PRIVATE_KEY`) is the one
+exception, and deliberate: supplied, it is placed even where nothing
+publishes the lanes status yet, so the workflow can authenticate the
+moment it lands. It is never placed loose -- it goes into the `lanes`
+environment, restricted to the trusted base branch, and the run says so.
+An operator putting that pair in the fleet loop is choosing to provision
+it everywhere, which is the point of passing it, but it is a choice rather
+than a no-op.
+
+Supplying a *different* App's pair where `lanes` is already bound to one is
+the other lanes case, and it is the one hold a rerun cannot clear: the run
+refuses to switch the credential or move the binding, leaves the working App
+in place, and says so. Re-pointing is done by hand until the atomic switch
+lands (`TODO.md`, "Re-point / rotate the lanes App binding"), so rotating the
+fleet's lanes App is not something the loop does -- every other step of the
+run still makes its progress. Every repository not already bound elsewhere
+converges on the same invocation.
+
+`--secret` is NOT one of them -- it
+writes its value to every repository it is given, with no usage test and
+no way to tell an existing value already matches, so putting one in the
+loop broadcasts it fleet-wide. It is a targeted operation, run on the
+repositories that need it. `--no-rules` and `--no-bootstrap` hold a
+repository back from the standard, so they are for debugging a single run,
+never part of the loop.
+
+The two invariants below are what make that possible, and they outrank
+every other rule here:
 
 1. **Every run makes progress.** Whatever a repository is missing, the run
    does the part it can verify is safe now, and says exactly what a later
@@ -20,6 +72,17 @@ Two invariants hold on every run, and they outrank every other rule here:
    pull request goes in with what is missing today. "Rerun once X has
    happened" is a valid outcome; "skipped" with nothing changed is not,
    unless nothing at all is safe.
+
+   **A step that fails, fails alone.** A read that does not complete, a
+   precondition that cannot be verified, a ruleset this tool does not own
+   -- the run reports it, skips that step, counts it in the exit status,
+   and every other step still makes its progress. Refusing to apply
+   anything because one step could not be *planned* is the failure this
+   invariant exists to forbid: it is how a repository with one unreadable
+   thing converges on nothing, run after run, since nothing about it
+   changes on its own. The one exception is a usage error -- a malformed
+   flag value -- where the request itself is wrong and no step is worth
+   attempting.
 2. **No run leaves a repository in a state a later run cannot fix.**
    Nothing wedges merges permanently: a check is never required before it
    has passed on this repository, or while its publishing workflow is
@@ -209,10 +272,18 @@ request it did not open.
 a guard: there is no flag that requires a check before it has passed, and
 none is wanted -- a guard a fleet loop turns off with the flag it always
 passes is not a guard. `--dry-run` previews the same decisions, the same
-deferrals and the same exit status as the run would have. `--no-rules`,
-`--no-bootstrap`, `--rule`, `--secret`, `--credential` and `--app` shape
-what the standard means for one repository; none of them changes the
+deferrals and the same exit status as the run would have. `--rule`, `--credential`
+and `--app` shape what the standard means for the *fleet*, not for one
+repository in it: passed identically everywhere, and a `--credential` no
+workflow there calls is reported unused rather than written. A flag that
+has to be varied per repository, or left off for some, contradicts the
 contract above.
+
+`--secret` is the exception and is not a convergence flag: it writes to
+every repository it is given, unconditionally (GitHub never returns a
+secret's value, so "already matches" is unanswerable and every write is
+attempted). `--no-rules` and `--no-bootstrap` turn a step off, which is
+the opposite of converging. Neither belongs in the fleet loop.
 
 ## What still needs a person
 
@@ -234,3 +305,10 @@ do, and none of them is caused by a run:
 - A branch that already requires a check whose publisher is missing from
   it (a state that predates the tool): every pull request there is stuck
   until someone who can bypass the rule lands the workflow.
+- A `lanes` check bound to a different App than the supplied
+  `LANES_APP_ID`: the run refuses to switch the credential and to re-point
+  the binding, so the switch never leads the requirement. Re-point by hand;
+  automating it safely is the tracked follow-up above. A binding this run
+  could not *read* is held the same way, for the same reason (it might be
+  a re-point), but it does not belong on this list: nothing needs doing,
+  and the next run that can read it settles it.
