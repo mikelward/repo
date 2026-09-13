@@ -359,6 +359,11 @@ class FakeGh:
         # repo list from install_members[str(app_id)].
         self.app_coverage = {}
         self.app_coverage_fails = None  # gh stderr for the id-keyed installs read, or None
+        # When the App's own key is supplied, coverage and slug read AS the App
+        # (a JWT against GitHub's app endpoints) instead of user/installations.
+        # api_get_as_app translates the SAME app_coverage data into those
+        # endpoints' responses; app_jwt_fails makes that read fail (a can't-tell).
+        self.app_jwt_fails = None
         # The credential preflight's two reads: gh stderr to fail them
         # with, or None for "this token works".
         self.auth_fails = None
@@ -1308,6 +1313,43 @@ class FakeGh:
         except gh.GhError as e:
             return False, e.stderr
 
+    def api_get_as_app(self, jwt, path):
+        """Stand-in for apps._api_get_as_app: the App-JWT reads coverage and slug
+        use when the App's own key is supplied. Driven by the SAME app_coverage
+        data as the user/installations path, so a test states coverage once and it
+        works whichever path the run takes. The patched _mint_app_jwt embeds the id
+        as `FAKEJWT:<id>`, so no real signing happens here."""
+        if self.app_jwt_fails is not None:
+            raise gh.GhError(self.app_jwt_fails)
+        app_id = int(jwt.split(":", 1)[1])
+        entry = self.app_coverage.get(app_id)
+        if path == "app":
+            # `GET /app` returns the App's own record; the App exists whenever its
+            # key is held, so this answers even when it covers no repo here.
+            slug = entry[0] if entry else f"app-{app_id}"
+            return "200", json.dumps({"id": app_id, "slug": slug})
+        m = re.match(r"repos/(.+)/installation$", path)
+        if m:
+            repo = m.group(1)
+            if entry is None:
+                return "404", json.dumps({"message": "Not Found"})
+            slug, selection = entry[0], entry[1]
+            suspended = bool(entry[2]) if len(entry) > 2 else False
+            if selection == "selected":
+                members = {r.lower() for r in self.install_members.get(str(app_id), set())}
+                if repo.lower() not in members:
+                    return "404", json.dumps({"message": "Not Found"})
+            return "200", json.dumps(
+                {
+                    "id": 999,
+                    "app_id": app_id,
+                    "app_slug": slug,
+                    "repository_selection": selection,
+                    "suspended_at": "2020-01-01T00:00:00Z" if suspended else None,
+                }
+            )
+        raise AssertionError(f"unexpected app-JWT path: {path!r}")
+
     def run_with_input(self, args, input_bytes):
         self.calls.append(list(args))
         if args[:2] == ["secret", "set"]:
@@ -1507,6 +1549,12 @@ def _run_captured(fake, argv, isatty, out, err):
     with patch("repo_lib.gh.run", fake.run), patch("repo_lib.gh.try_run", fake.try_run), patch(
         "repo_lib.gh.run_with_input", fake.run_with_input
     ), patch("shutil.which", return_value="/usr/bin/gh"), patch(
+        # The App-JWT boundary: mint embeds the id (no real signing), and the
+        # read is answered from FakeGh.app_coverage -- so a test states coverage
+        # once and it holds whether the run reads it via the App JWT (key
+        # supplied) or user/installations (not).
+        "repo_lib.apps._mint_app_jwt", lambda app_id, pem: f"FAKEJWT:{app_id}"
+    ), patch("repo_lib.apps._api_get_as_app", fake.api_get_as_app), patch(
         "sys.stdin.isatty", return_value=isatty
     ), redirect_stdout(out), redirect_stderr(err):
         try:
@@ -6372,6 +6420,108 @@ class LanesCredentialStepTest(unittest.TestCase):
                 {"context": "codex"},
                 {"context": "zizmor"},
             ],
+        )
+
+    def test_a_supplied_key_covers_via_the_app_jwt_without_user_installations(self):
+        # Option 4: with the App's own key supplied, the binding's coverage
+        # precondition reads AS the App (a signed JWT against the repo-scoped
+        # installation endpoint), so it works on a gh-auth token that
+        # user/installations refuses. That endpoint is wired to 403 here to prove
+        # it is never reached; the bind still lands.
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = self._publisher()
+            fake.env_secret_names = {"lanes": set(self.PAIR)}
+            fake.env_policies = {"lanes": ["main"]}
+            self._ruleset_requiring(
+                fake, [{"context": "lanes"}, {"context": "codex"}, {"context": "zizmor"}]
+            )
+            fake.check_runs = {fake.default_head_sha: [("lanes", 12345), "codex", "zizmor"]}
+            fake.app_coverage = {12345: ("lanes-app", "all")}
+            fake.app_coverage_fails = _APP_TOKEN_403  # user/installations refused, as on a gh token
+            code, out, err = _run(
+                fake,
+                [
+                    "--force",
+                    "--credential", f"LANES_APP_ID={app_id}",
+                    "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                    REPO,
+                ],
+            )
+        self.assertEqual(code, 0, err)
+        checks_rule = next(
+            r for r in fake.puts[-1][1]["rules"] if r["type"] == "required_status_checks"
+        )
+        self.assertIn(
+            {"context": "lanes", "integration_id": 12345},
+            checks_rule["parameters"]["required_status_checks"],
+        )
+
+    def test_supplied_app_keys_do_not_outlive_the_run(self):
+        # The id->key pairing is process-global (mirrors app_logins); a run must
+        # clear it on exit so it can't leak into a later command in the same
+        # interpreter (Codex, mikelward/repo#63).
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = self._publisher()
+            fake.env_secret_names = {"lanes": set(self.PAIR)}
+            fake.env_policies = {"lanes": ["main"]}
+            self._ruleset_requiring(
+                fake, [{"context": "lanes"}, {"context": "codex"}, {"context": "zizmor"}]
+            )
+            fake.check_runs = {fake.default_head_sha: [("lanes", 12345), "codex", "zizmor"]}
+            fake.app_coverage = {12345: ("lanes-app", "all")}
+            code, out, err = _run(
+                fake,
+                [
+                    "--force",
+                    "--credential", f"LANES_APP_ID={app_id}",
+                    "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                    REPO,
+                ],
+            )
+        self.assertEqual(code, 0, err)
+        self.assertEqual(apps._app_keys, {})  # cleared on exit
+        self.assertEqual(apps._app_slug_cache, {})
+
+    def test_missing_jwt_tooling_warns_and_falls_back_rather_than_halting(self):
+        # A missing signer holds only the JWT coverage read, which has a fallback
+        # (user/installations), so the run does NOT stop: it warns, leaves the key
+        # unregistered, and every other step makes its progress. Here the fallback
+        # itself serves coverage (FakeGh.app_coverage), so the bind still lands --
+        # proving the fall-through path, not a halt (SPEC.md, invariant 1).
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = self._publisher()
+            fake.env_secret_names = {"lanes": set(self.PAIR)}
+            fake.env_policies = {"lanes": ["main"]}
+            self._ruleset_requiring(
+                fake, [{"context": "lanes"}, {"context": "codex"}, {"context": "zizmor"}]
+            )
+            fake.check_runs = {fake.default_head_sha: [("lanes", 12345), "codex", "zizmor"]}
+            fake.app_coverage = {12345: ("lanes-app", "all")}
+            with patch("repo_lib.apps.app_jwt_tooling_missing", return_value=["openssl"]):
+                code, out, err = _run(
+                    fake,
+                    [
+                        "--force",
+                        "--credential", f"LANES_APP_ID={app_id}",
+                        "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                        REPO,
+                    ],
+                )
+        self.assertEqual(code, 0, err)  # not exit 2 -- the run kept going
+        self.assertIn("openssl", err)
+        self.assertIn("falling back to user/installations", err)
+        checks_rule = next(
+            r for r in fake.puts[-1][1]["rules"] if r["type"] == "required_status_checks"
+        )
+        self.assertIn(
+            {"context": "lanes", "integration_id": 12345},
+            checks_rule["parameters"]["required_status_checks"],
         )
 
     def test_a_binding_held_by_a_sibling_branch_holds_the_ruleset_step(self):

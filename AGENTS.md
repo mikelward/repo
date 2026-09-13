@@ -64,6 +64,15 @@ one that has stopped biting.
   both, for free). `subprocess` for shelling out to `gh`. Prefer real data
   structures (lists, dicts, dataclasses) over string-encoding a collection
   the way the shell scripts had to.
+- The one-dependency rule above is about Python packages; external
+  *binaries* the tool shells out to are a separate axis. Those are `gh`,
+  `git`, and -- since the App-JWT lanes path (mikelward/repo#65) -- `openssl`,
+  used only to RS256-sign the App JWT because the standard library has no
+  RSA (maintainer's call, 2026-09-13: a standard-distro binary, likely
+  present out of the box, and its absence is a warn-and-fall-back, never a
+  crash). The HTTP call there is stdlib `urllib`, deliberately not a second
+  binary. A new external binary is a smaller commitment than a Python
+  package but still a footprint decision -- name it here when one is added.
 - Match the porting source's behavior and messages where there's no reason
   to diverge, but don't port shell idioms that exist only because shell has
   no better option (manual exit-status checks where Python would raise;

@@ -331,6 +331,25 @@ def _validate_credential_specs(raw_specs):
     return specs
 
 
+def _lanes_app_keys(credential_specs):
+    """{numeric App id: private-key PEM bytes} from a supplied LANES_APP_ID +
+    LANES_APP_PRIVATE_KEY pair, or {} when either half is absent or the id is not a
+    positive integer. Both halves are required: the id names which App the key
+    signs for, and a key with no id (or an id with no key) cannot mint a JWT. A
+    malformed id is dropped silently here -- _plan_credentials reports it as an
+    unusable pair against the repository (setup_cmd:724), which is where the
+    operator sees it -- so this simply falls back to user/installations."""
+    by_name = {spec.name: spec for spec in credential_specs}
+    id_spec = by_name.get(credentials.LANES_APP_ID)
+    key_spec = by_name.get(credentials.LANES_APP_PRIVATE_KEY)
+    if not (id_spec and key_spec and id_spec.value and key_spec.value):
+        return {}
+    text = id_spec.value.decode(errors="replace").strip()
+    if not (text.isascii() and text.isdigit() and int(text) > 0):
+        return {}
+    return {int(text): key_spec.value}
+
+
 @dataclass
 class CredentialMove:
     """One reusable workflow's credential brought into line: the
@@ -1572,11 +1591,12 @@ def run(args):
     try:
         return _run_logged(args)
     finally:
-        # The App id->slug pairing _run registers is process-global; clear it
-        # on every exit so it is scoped to this invocation and can never be
-        # read by a later command (an `audit` after a `setup`) sharing the
-        # interpreter (Codex, mikelward/repo#63).
+        # The App id->slug pairing and the App id->key pairing _run registers are
+        # both process-global; clear them on every exit so they are scoped to this
+        # invocation and can never be read by a later command (an `audit` after a
+        # `setup`) sharing the interpreter (Codex, mikelward/repo#63).
         apps.register_known_slugs({})
+        apps.register_app_keys({})
 
 
 def _run_logged(args):
@@ -1642,6 +1662,33 @@ def _run(args, log=None):
     credential_specs = _validate_credential_specs(args.credential)
     _reject_fleet_credentials_under_secret(secret_specs)
     _validate_app_slugs(args.app)
+
+    # When the lanes App's own id and private key are supplied, setup can
+    # authenticate AS the App (a signed JWT) to read its slug and repo coverage --
+    # the two reads gh's own token is refused (user/installations, APP_TOKEN_HINT) --
+    # which is what lets a `lanes` binding be established and verified on a plain
+    # gh-auth token. Registered here, cleared on every exit path (see run()).
+    app_keys = _lanes_app_keys(credential_specs)
+    if app_keys:
+        missing = apps.app_jwt_tooling_missing()
+        if missing:
+            names = " and ".join(missing)
+            # NOT a usage error that stops the run: the App-JWT path has a
+            # fallback (user/installations), so a missing signer holds only the
+            # lanes binding, which defers exactly as it did before this path
+            # existed -- every other step still makes its progress (SPEC.md,
+            # invariant 1). Warned, not silent, so the operator can install the
+            # tool and a later run binds; the credentials themselves are still
+            # placed. The pair is left unregistered so coverage takes the
+            # fallback rather than a signer that is not there.
+            warn(
+                f"{names} is not installed, so the lanes App credentials cannot be used to sign a "
+                "JWT and read coverage as the App; falling back to user/installations for the "
+                f"`lanes` binding (which a gh-auth token is refused -- install {names} so a later "
+                "run can bind it)"
+            )
+            app_keys = {}
+    apps.register_app_keys(app_keys)
 
     gh.require_gh()
     # Before any repository read or write: a run with no usable credentials

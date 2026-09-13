@@ -337,11 +337,22 @@ do, and none of them is caused by a run:
   read answers only to a GitHub App user-to-server token, so the token
   `gh auth login` issues is refused whatever its scopes, and
   re-authenticating with gh does not change it. Everything not about Apps
-  still converges; `--app` stops the run at the top (above). A `lanes`
-  binding whose evidence is a status is verified from the config's
-  `app_logins` pairing when one is supplied (the operator naming the App's
-  slug for its id, which the status carries as `{slug}[bot]`); without that
-  pairing it waits for a token that can make the installations read.
+  still converges; `--app` stops the run at the top (above), since it has
+  nothing to fall back on. The `lanes` binding does not need that read: when
+  the App's own pair is supplied (`LANES_APP_ID` + `LANES_APP_PRIVATE_KEY`),
+  the run authenticates **as the App** -- a short-lived JWT signed with the
+  key -- to read both the App's slug (to match the `{slug}[bot]` status
+  creator) and whether the App covers the repository (the binding
+  precondition). Neither read touches `user/installations`, so a `lanes`
+  binding is established and verified on a plain gh-auth token. Signing
+  shells out to `openssl` (the standard library has no RSA); the read is
+  stdlib `urllib`, so it adds no second binary and the bearer token never
+  enters a process's argv. If `openssl` is missing the run warns and falls
+  back to `user/installations` for that binding -- the binding defers, every
+  other step still converges. Without
+  the key, the slug half can still come from the config's `app_logins`
+  pairing (the operator naming the App's slug for its id), but coverage then
+  waits for a token that can make the installations read.
 - A legacy-named ruleset whose merge methods conflict with rebase.
 - A branch that already requires a check whose publisher is missing from
   it (a state that predates the tool): every pull request there is stuck

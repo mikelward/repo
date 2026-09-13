@@ -133,6 +133,43 @@
       pairing does not address it. Coverage cannot be asserted from config
       the way a slug can: it is current-state ("can this App act here now"),
       not a stable fact.
+      *Option 4 (lanes reads) DONE (mikelward/repo#TBD, 2026-09-13):* the
+      operator already hands `repo setup` the lanes App's own id and private
+      key (`LANES_APP_ID` + `LANES_APP_PRIVATE_KEY`), so setup now authenticates
+      AS the App -- a short-lived RS256 JWT signed with `openssl` (the HTTP
+      call is stdlib `urllib`, no second binary) -- to answer both reads lanes
+      needs WITHOUT `user/installations`:
+      `GET /app` for the slug (evidence, ground truth so it also serves coverage
+      prediction and outranks the `app_logins` assertion) and
+      `GET /repos/{owner}/{repo}/installation` for coverage (200=covers,
+      404=not, `suspended_at`=not). Registered per run from the supplied
+      credentials (`apps.register_app_keys`), cleared on exit, keyed on the id;
+      absent the key it falls back to `user/installations` exactly as before.
+      `openssl` missing is a warn-and-fall-back, not a halt (a step that
+      fails, fails alone). So a `lanes` binding is first-bound and verified on a
+      plain gh-auth token, and the fleet loop covers lanes.
+      **Still parked:** (a) `repo audit`'s own bound-`lanes` verification still
+      reads `user/installations` -- when audit grows a credential/config read,
+      wire in both `app_logins` and the App-JWT reads the same way; (b) `--app`
+      membership WRITES (`resolve_installation` + the membership PUT) still go
+      through `user/installations` -- those MUTATE an installation, so the App
+      JWT would have to mint an installation access token first; left for when
+      `--app` on a gh-auth token is actually needed.
+- [ ] **Skip re-writing an unchanged secret (safe idempotency).** One
+      invocation with the same flags runs over the whole fleet every time
+      (SPEC.md), so the credential values are passed on every run and a used
+      credential is re-written every run -- GitHub never returns a secret's
+      value, so setup cannot diff to skip it. Harmless (idempotent) but it adds
+      to the write burst on repeated convergence runs, which is what risks the
+      secondary rate limit. A possible safe skip: compare the local value
+      file's mtime against the secret's `updated_at` (the secrets API returns
+      it, and setup already lists env secrets), and re-write only when the file
+      is newer. Edge cases to weigh before building: file *content* newer than
+      its mtime (a restore or an mtime-preserving copy), and a sub-second
+      rotation across a skewed clock -- both would skip a needed write and leave
+      a stale key the App can't authenticate with, the silent failure the
+      credential path fights. Overwriting is accepted as fine for now
+      (maintainer, 2026-09-13); this is the lever if the write burst ever bites.
 
 ## repo audit and repo setup: the fleet credentials
 
