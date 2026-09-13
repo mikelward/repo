@@ -79,8 +79,15 @@ user-to-server token -- the token `gh auth login` issues is refused
 whatever its scopes. Either check failing for any other reason (a 500, a
 rate limit) says nothing about the token, so it is reported and the run
 carries on. Everything not about Apps still converges on an ordinary
-token; only `--app` and verifying a `lanes` binding whose evidence is a
-commit status need that read.
+token. `--app` is the one step with no fallback, so it stops the run. The
+`lanes` binding has one: when the App's own key is supplied
+(`LANES_APP_PRIVATE_KEY` beside `LANES_APP_ID`), `repo setup` authenticates
+*as the App* -- a short-lived JWT signed with `openssl` (the one new external
+tool; the HTTP call is stdlib `urllib`) -- to check both the App's slug and
+its coverage of the repo, so a `lanes`
+binding is established and verified without `user/installations`. Only when
+that key is absent does verifying a `lanes` binding fall back to that read
+(or to the config `app_logins` slug pairing).
 
 No optional extras: `repo cleanup`'s interactive checkbox picker uses the
 standard library's `curses`, so on a terminal you get a checkbox list (space
@@ -340,6 +347,9 @@ is a separate precondition, kept out of that evidence scan: `repo setup` refuses
 to bind `lanes` to an App that does not cover the repo -- a hard failure
 `--force` does NOT override, since binding to an App that cannot report would
 wedge every merge -- and `repo audit` reports such a binding as its own gap.
+When the App's key is supplied that coverage is read *as the App* (the
+repo-scoped installation endpoint over an App JWT), so the precondition holds
+on a gh-auth token; otherwise it reads `user/installations`.
 Across a fleet:
 `repo list | xargs -n1 repo setup --force --credential NPM_UPDATE_PAT=pat.txt --credential GRADLE_UPDATE_PAT=pat.txt --credential RUST_UPDATE_PAT=pat.txt --credential CI_COMMIT_ARTIFACT_TOKEN=token.txt --credential LANES_APP_ID=app-id.txt --credential LANES_APP_PRIVATE_KEY=app.pem`.
 `repo cleanup` deletes the branches a repository has finished with. It exists
