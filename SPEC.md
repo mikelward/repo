@@ -159,7 +159,21 @@ setup`, always on unless a flag opts the repository out:
   App once that App publishes it. The standard is a floor: a check the
   ruleset already requires beyond it stays required, since this tool only
   ever adds a requirement, and removing one is a person's decision made
-  in the ruleset by hand. A ruleset that does not reach the default branch
+  in the ruleset by hand. The one `integration_id` that is not a binding
+  is GitHub Actions': every workflow in the repository posts its check
+  runs as that App, a pull request's own included, so requiring a check
+  FROM it excludes nobody who could already produce it. GitHub's ruleset
+  UI attaches it whenever a check is picked from the suggestion list, so
+  it arrives looking like a binding. A run says so on every repository
+  where it still stands once the run is over -- judged from what the run
+  left behind, not from what it planned, since a binding write it
+  intended and then could not make leaves the entry exactly where it
+  was. Binding the check to the App that should publish
+  it REPLACES the Actions entry rather than landing beside it -- kept,
+  the check would be required from both, and the App cannot satisfy the
+  Actions half. Nothing drops it on its own: that would loosen the check
+  from "Actions produced it" to "anyone did", which is the one direction
+  this tool never moves. A ruleset that does not reach the default branch
   yet is widened onto it only when it carries nothing that could block a
   pull request there -- no required check, no approval requirement, no
   rule type this tool does not write: a check's history on this

@@ -1327,8 +1327,13 @@ def _bind_checks(checks, lanes_binding):
 
 
 def _binding_app_will_cover(repo, repo_owner, app_id, app_plans):
-    """Whether the App `app_id` covers `repo` -- now, or by the time the
-    binding is written. The binding's coverage precondition (see the Apply
+    """`(covers, rests_on_slug)`: whether the App `app_id` covers `repo` --
+    now, or by the time the binding is written -- and, when the answer
+    rests on a planned `--app` ADD rather than on coverage it already has,
+    that plan's slug. A caller applying the plan re-checks THAT step alone:
+    the coverage it was promised is the one that step delivers, and an
+    unrelated `--app` slug failing says nothing about it (Codex,
+    mikelward/repo#70). The binding's coverage precondition (see the Apply
     section) is enforced AFTER the --app step, so an App this run is about to
     add to the repo (`app_plans`) will cover it by then even if it does not
     yet. The dry-run previews this so `--dry-run`'s exit status matches the
@@ -1336,7 +1341,7 @@ def _binding_app_will_cover(repo, repo_owner, app_id, app_plans):
     (Codex, mikelward/repo#52). Raises gh.GhError (can't-tell) rather than
     guessing on a read failure, exactly as app_covers_repo does."""
     if apps.app_covers_repo(repo_owner, app_id, repo):
-        return True
+        return True, None
     # A planned --app step covers it too, but only a fresh ADD: this run adds
     # the repo to an existing (active) installation, so it covers by binding
     # time. An ALREADY_MEMBER/ALREADY_ALL verdict is NOT taken as coverage here
@@ -1351,18 +1356,31 @@ def _binding_app_will_cover(repo, repo_owner, app_id, app_plans):
     # mikelward/repo#63).
     slug = apps.app_slug_for_id(repo_owner, app_id, use_known=False)
     if slug is None:
-        return False
-    return any(plan.slug == slug and plan.verdict == "ADD" for plan in app_plans)
+        return False, None
+    if any(plan.slug == slug and plan.verdict == "ADD" for plan in app_plans):
+        return True, slug
+    return False, None
 
 
-def _lanes_repoint_state(repo, target_binding):
+def _lanes_repoint_state(repo, target_binding, superseded_in_ruleset_id=None):
     """Read `lanes`'s current required-check binding and classify it against
     `target_binding` (the App this run would switch the credential to).
     Returns `(repoint_from, repoint_unknown)`: `repoint_from` is the App id
     `lanes` is already bound to when that is a DIFFERENT App than the target
     (a re-point), else None; `repoint_unknown` is True when the binding could
-    not be read. A first bind (unbound) and an idempotent rerun (already bound
-    to the target App) yield `(None, False)`.
+    not be read. A first bind (unbound) and an idempotent rerun (already
+    bound to the target App) yield `(None, False)`.
+
+    `superseded_in_ruleset_id` is the id of the ruleset this run is about to
+    write a real binding into. An entry bound to GitHub Actions THERE is not
+    a re-point: it is the ambient producer, and that write replaces it
+    (rules.ACTIONS_APP_ID, rules._build_update_body). One anywhere else is
+    -- an inherited or organization ruleset, or any ruleset this run does
+    not write, and every one of them under `--no-rules` or with no binding
+    write planned. Nothing will replace those, the App cannot satisfy them,
+    and switching the credential under one wedges every merge; the exemption
+    has to name the requirement this run actually supersedes, not the App id
+    alone (Codex, mikelward/repo#70).
 
     Shared by the plan-time snapshot and the apply-time recheck right before
     the credential move, so a re-point that appears only after the plan is
@@ -1371,14 +1389,27 @@ def _lanes_repoint_state(repo, target_binding):
     target, not the source (Codex J, mikelward/repo#52)."""
     repoint_from = None
     try:
-        for context, integration_id in rules.effective_required_checks(
-            repo, credentials.default_branch(repo)
-        ):
-            if (
-                context == credentials.LANES_CHECK
-                and integration_id
-                and integration_id != target_binding
-            ):
+        # The rules as GitHub sends them, not the flattened
+        # (context, App) set: which RULESET an entry sits in is what says
+        # whether this run's write can replace it, and the flattened form
+        # drops it.
+        for rule in rules.effective_rules(repo, credentials.default_branch(repo)):
+            if rule.get("type") != "required_status_checks":
+                continue
+            for entry in (rule.get("parameters") or {}).get("required_status_checks") or []:
+                if entry.get("context") != credentials.LANES_CHECK:
+                    continue
+                integration_id = entry.get("integration_id") or None
+                if not integration_id or integration_id == target_binding:
+                    continue
+                if (
+                    integration_id == rules.ACTIONS_APP_ID
+                    and superseded_in_ruleset_id is not None
+                    # str on both sides: GitHub sends a number, and a
+                    # caller's id has been through JSON of its own.
+                    and str(rule.get("ruleset_id")) == str(superseded_in_ruleset_id)
+                ):
+                    continue
                 repoint_from = integration_id
     except (rules.RulesetError, credentials.ReadError):
         return None, True
@@ -1990,7 +2021,9 @@ def _run(args, log=None):
         # e.g. `repo setup --no-rules OWNER/REPO` (a legitimate way to run
         # just the sibling-branch check across a fleet) refused outright
         # ("stdin is not a terminal") over a question with no actual
-        # mutation behind it to confirm.
+        # mutation behind it to confirm. Nothing is said about an
+        # Actions-bound check here either: this return is reached only
+        # under --no-rules, where no ruleset was read at all.
         return 0
 
     # ---- Preview: every step's own dry-run/plan, before anything is shown ----
@@ -2053,7 +2086,12 @@ def _run(args, log=None):
         buf = io.StringIO()
         with redirect_stdout(buf):
             code = rules.apply_ruleset(
-                repo, checks, dry_run=True, force=args.force, report=ruleset_report, defer=defer
+                repo,
+                checks,
+                dry_run=True,
+                force=args.force,
+                report=ruleset_report,
+                defer=defer,
             )
         if code == 2:
             # A usage error (an empty or control-character check/ruleset
@@ -2135,13 +2173,66 @@ def _run(args, log=None):
         for move in credentials_plan.moves
         for name, *_ in move.writes
     )
+    if args.app:
+        _progress(args, f"{repo}: checking App installation membership")
+    app_plans = [apps.plan_app_step(repo, repo_owner, slug) for slug in args.app]
+    app_plan_has_error = any(p.verdict == "ERROR" for p in app_plans)
+
+    # The binding's coverage precondition, PREVIEWED here so `--dry-run`'s exit
+    # status and plan match the real run: setup refuses to bind `lanes` to an
+    # App that does not cover the repo (a hard, non-`--force` failure applied in
+    # the Apply section), and the preview must reflect that -- including a
+    # planned --app addition that would cover it by binding time (Codex,
+    # mikelward/repo#52). Gated on `binding_needs_write`, exactly as the Apply
+    # section's precondition is: coverage is only a precondition for a binding
+    # this run would actually write, so the preview flags it only then, and
+    # dry-run and real run agree. Standing drift on an already-bound repo whose
+    # App lost coverage is `repo audit`'s to report, not a bind this run is
+    # making (Codex, mikelward/repo#52).
+    binding_uncovered = False
+    binding_coverage_unreadable = False
+    # The `--app` step this coverage answer rests on, when it rests on one:
+    # the Apply section re-checks that step alone before treating the
+    # coverage as delivered.
+    binding_coverage_slug = None
+    if want_binding and not args.no_rules and binding_needs_write:
+        try:
+            covers, binding_coverage_slug = _binding_app_will_cover(
+                repo, repo_owner, credentials_plan.lanes_binding, app_plans
+            )
+            binding_uncovered = not covers
+        except gh.GhError:
+            binding_uncovered = True
+            binding_coverage_unreadable = True
+
+    # Both of the above sit here, ahead of the re-point guard, because
+    # that guard needs the coverage answer: an exemption granted on a
+    # binding write that coverage then refuses is the same ordering fault
+    # three earlier rounds of this found in other forms (Codex,
+    # mikelward/repo#70). Neither reads anything the guard produces, so
+    # the move is an ordering change only.
     repoint_from = None
     repoint_unknown = False
     if credentials_plan.lanes_binding is not None and (
         (want_binding and not args.no_rules) or lanes_move_planned
     ):
         repoint_from, repoint_unknown = _lanes_repoint_state(
-            repo, credentials_plan.lanes_binding
+            repo,
+            credentials_plan.lanes_binding,
+            # Only a binding write this run actually makes supersedes an
+            # Actions-bound entry, and only in the ruleset it writes.
+            # A binding this run WRITES, not one it wants: one the
+            # never-reported hold defers, or one the coverage precondition
+            # refuses, is wanted and not written, and exempting on the wish
+            # moves the credential to an App the branch will not accept a
+            # status from -- or that cannot act on the repository at all
+            # (Codex, mikelward/repo#70). `binding_needs_write` carries the
+            # --no-rules case too, being computed only inside that guard.
+            superseded_in_ruleset_id=(
+                ruleset_report.get("existing_id")
+                if binding_needs_write and not binding_uncovered
+                else None
+            ),
         )
     refuse_repoint = (
         want_binding and not args.no_rules and (repoint_from is not None or repoint_unknown)
@@ -2236,32 +2327,26 @@ def _run(args, log=None):
             secrets_preview_failed = True
         secret_previews.append((spec, entry, secrets_cmd._describe_plan(spec.name, spec.env, plan)))
 
-    if args.app:
-        _progress(args, f"{repo}: checking App installation membership")
-    app_plans = [apps.plan_app_step(repo, repo_owner, slug) for slug in args.app]
-    app_plan_has_error = any(p.verdict == "ERROR" for p in app_plans)
-
-    # The binding's coverage precondition, PREVIEWED here so `--dry-run`'s exit
-    # status and plan match the real run: setup refuses to bind `lanes` to an
-    # App that does not cover the repo (a hard, non-`--force` failure applied in
-    # the Apply section), and the preview must reflect that -- including a
-    # planned --app addition that would cover it by binding time (Codex,
-    # mikelward/repo#52). Gated on `binding_needs_write`, exactly as the Apply
-    # section's precondition is: coverage is only a precondition for a binding
-    # this run would actually write, so the preview flags it only then, and
-    # dry-run and real run agree. Standing drift on an already-bound repo whose
-    # App lost coverage is `repo audit`'s to report, not a bind this run is
-    # making (Codex, mikelward/repo#52).
-    binding_uncovered = False
-    binding_coverage_unreadable = False
-    if want_binding and not args.no_rules and binding_needs_write:
-        try:
-            binding_uncovered = not _binding_app_will_cover(
-                repo, repo_owner, credentials_plan.lanes_binding, app_plans
-            )
-        except gh.GhError:
-            binding_uncovered = True
-            binding_coverage_unreadable = True
+    # A managed check required from GitHub Actions reads as an App binding
+    # and is not one (rules._ambient_bindings). This is the PLAN's answer to
+    # whether to say so -- a prediction, like every other line of a plan:
+    # the binding write this run intends would supersede the entry, and the
+    # things that can cancel that write from here (the never-reported
+    # deferral, the coverage precondition, the re-point guard) are settled
+    # above. What no plan can know is whether the write then lands, so the
+    # end of the run says what actually happened and this is not the last
+    # word on it (Codex, mikelward/repo#70).
+    binding_supersedes = (
+        binding_needs_write
+        and not refuse_repoint
+        and not binding_uncovered
+        and not binding_deferred
+    )
+    ambient_bindings = [
+        context
+        for context in ruleset_report.get("ambient_bindings") or []
+        if not (binding_supersedes and context == credentials.LANES_CHECK)
+    ]
 
     def describe_combined_plan(full=None):
         """The plan, one section per step.
@@ -2285,6 +2370,10 @@ def _run(args, log=None):
             # here that reports a gap rather than a state (Codex review,
             # mikelward/repo#45).
             or ruleset_report.get("bypass_note")
+            # Worth the section on its own: the repository this is true of
+            # is usually one with nothing else to do, so the line would
+            # otherwise never print.
+            or ambient_bindings
             or empty_branch_would_strand_ruleset
             or ruleset_held
             # A check deferred to a later run is the step's change in
@@ -2310,6 +2399,7 @@ def _run(args, log=None):
                     "    SKIPPED: would strand this repository -- its branch has no commits "
                     f"yet and {empty_branch_reason}"
                 )
+            lines += [f"    {line}" for line in rules.ambient_binding_lines(ambient_bindings)]
             if ruleset_held:
                 lines.append(f"    HELD: {ruleset_held}")
             if refuse_repoint:
@@ -2531,6 +2621,7 @@ def _run(args, log=None):
     if show_plan:
         for line in describe_combined_plan():
             info(line)
+
     if log is not None and needs_confirmation:
         # Unconditionally, not just when the terminal was shown the short
         # version: an interactive run tees its abbreviated plan into the
@@ -2966,6 +3057,27 @@ def _run(args, log=None):
         if not apps.apply_step(repo, repo_owner, plan):
             failed.append(f"app:{plan.slug}")
 
+    # Whether the binding write that supersedes an Actions-bound `lanes`
+    # entry is still going to happen at all. `binding_wanted_this_run`
+    # already carries the ruleset step's own outcome and the re-point
+    # refusal; the fingerprint is what the deferred write is pinned to, and
+    # without one that write is skipped; coverage is checked again in the
+    # binding block itself. An exemption granted where any of those has
+    # fallen through moves the credential to the target App while the
+    # branch goes on requiring an Actions-produced check -- the same fault
+    # four rounds of this have found through four different cancellations,
+    # so this reads the signal that gates the write rather than
+    # re-deriving one (Codex, mikelward/repo#70).
+    # Set by the binding write below when it actually lands. Everything
+    # before that is a prediction, and the advisory is not a prediction.
+    binding_written = False
+    binding_will_supersede = (
+        binding_wanted_this_run
+        and binding_apply_fingerprint is not None
+        and not binding_uncovered
+        and (binding_coverage_slug is None or f"app:{binding_coverage_slug}" not in failed)
+    )
+
     for move in credentials_plan.moves:
         lanes_move = any(
             name in (credentials.LANES_APP_ID, credentials.LANES_APP_PRIVATE_KEY)
@@ -2985,7 +3097,11 @@ def _run(args, log=None):
             # (refuse_credential_repoint) as well: a plan that already HELD the
             # switch keeps holding even if the reread now reads clean.
             move_repoint_from, move_repoint_unknown = _lanes_repoint_state(
-                repo, credentials_plan.lanes_binding
+                repo,
+                credentials_plan.lanes_binding,
+                superseded_in_ruleset_id=(
+                    ruleset_report.get("existing_id") if binding_will_supersede else None
+                ),
             )
             if (
                 refuse_credential_repoint
@@ -3379,6 +3495,10 @@ def _run(args, log=None):
                 != 0
             ):
                 failed.append("ruleset-binding")
+            else:
+                # The one place the Actions entry is actually gone (see
+                # `binding_will_supersede`): this write is what replaces it.
+                binding_written = True
 
     if auto_merge_state == "enable":
         try:
@@ -3417,6 +3537,27 @@ def _run(args, log=None):
             for line in delete_branch_lines:
                 error(line)
         failed.append("delete-branch-on-merge")
+
+    # Said last, from what the run actually left behind rather than from
+    # what it planned. Six rounds went on deciding it earlier and each was
+    # one cancellation short, because until the write returns there is no
+    # fact to report -- a refused binding, a coverage change, a credential
+    # write that did not land all leave the entry standing after a plan
+    # that promised otherwise (Codex, mikelward/repo#70). `binding_written`
+    # is the only thing here that is not a prediction. Whatever the plan
+    # already put on the terminal is dropped rather than repeated; the
+    # remainder is what the plan got wrong, plus -- on a quiet run, where
+    # the plan printed nothing -- the whole of it.
+    said_in_plan = set(ambient_bindings) if show_plan else set()
+    for line in rules.ambient_binding_lines(
+        [
+            context
+            for context in ruleset_report.get("ambient_bindings") or []
+            if context not in said_in_plan
+            and not (binding_written and context == credentials.LANES_CHECK)
+        ]
+    ):
+        warn(f"{repo}: {line}")
 
     if failed:
         error("failed on: " + " ".join(failed))

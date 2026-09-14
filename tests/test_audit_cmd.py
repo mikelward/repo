@@ -8,7 +8,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from unittest.mock import patch
 
-from repo_lib import gh
+from repo_lib import gh, rules
 from repo_lib.cli import main
 
 REPO = "owner/repo"
@@ -1103,6 +1103,110 @@ class AuditCmdTest(unittest.TestCase):
         code, out, err = _run(fake, [REPO])
         self.assertEqual(code, 0, err)
         self.assertIn("[ok] every required check has reported", out)
+
+    def test_a_check_bound_to_github_actions_is_named_not_a_coverage_gap(self):
+        # App 15368 is GitHub Actions: there is no installation to find, so
+        # asking whether it covers the repository reports a gap that is not
+        # one (or aborts where the token cannot list installations at all).
+        # The real fault is that the binding excludes nobody, and that is
+        # what audit says (Codex, mikelward/repo#70).
+        fake = FakeGh()
+        fake.effective_rules = [
+            _pull_request_rule(),
+            _status_checks_rule([("lanes", rules.ACTIONS_APP_ID), "codex", "zizmor"]),
+            {"type": "required_linear_history", "parameters": {}},
+            {"type": "non_fast_forward", "parameters": {}},
+            {"type": "deletion", "parameters": {}},
+        ]
+        fake.check_runs = {
+            fake.default_head_sha: [("lanes", rules.ACTIONS_APP_ID), "codex", "zizmor"]
+        }
+        # No installations at all -- and the evidence scan's own App lookup
+        # goes through user/installations, which an ordinary OAuth token
+        # refuses. The Actions entry is kept out of that scan, so the read
+        # never happens and the run reaches its finding (Codex,
+        # mikelward/repo#70).
+        fake.installations = []
+        fake.installations_read_fails = "gh: HTTP 403: Forbidden\n"
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 1, err)
+        self.assertNotIn("does not cover this repo", out)
+        self.assertIn(
+            f"required from App {rules.ACTIONS_APP_ID} (GitHub Actions), which every workflow "
+            "here posts its check runs as, so the binding excludes nobody: 'lanes'",
+            out,
+        )
+
+    def test_an_actions_bound_context_nothing_produces_is_still_missing(self):
+        # `lanes` is Actions-bound and nothing has ever produced it -- a
+        # typo, or a workflow since deleted. Dropping the entry from the
+        # scan would leave only the ambient advisory, whose own remedy
+        # (drop the binding) still leaves a phantom context required and
+        # every merge blocked (Codex, mikelward/repo#70).
+        fake = FakeGh()
+        fake.effective_rules = [
+            _pull_request_rule(),
+            _status_checks_rule([("lanes", rules.ACTIONS_APP_ID), "codex", "zizmor"]),
+            {"type": "required_linear_history", "parameters": {}},
+            {"type": "non_fast_forward", "parameters": {}},
+            {"type": "deletion", "parameters": {}},
+        ]
+        fake.check_runs = {fake.default_head_sha: ["codex", "zizmor"]}
+        fake.installations = []
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 1, err)
+        self.assertIn(f"required from App {rules.ACTIONS_APP_ID} (GitHub Actions)", out)
+        self.assertIn("required but never reported", out)
+        self.assertIn("lanes", out)
+
+    def test_an_ambient_check_is_not_also_told_to_re_point_by_hand(self):
+        # `lanes` is Actions-bound and has never reported FROM Actions --
+        # another App published it -- so never_reported puts it in the
+        # wrong-App bucket, whose advice ("re-point by hand; `repo setup`
+        # does not re-point") contradicts the ambient line beside it, and
+        # is wrong besides: setup does replace an Actions-bound entry when
+        # it binds (Codex, mikelward/repo#70).
+        fake = FakeGh()
+        fake.effective_rules = [
+            _pull_request_rule(),
+            _status_checks_rule([("lanes", rules.ACTIONS_APP_ID), "codex", "zizmor"]),
+            {"type": "required_linear_history", "parameters": {}},
+            {"type": "non_fast_forward", "parameters": {}},
+            {"type": "deletion", "parameters": {}},
+        ]
+        fake.check_runs = {fake.default_head_sha: [("lanes", 999), "codex", "zizmor"]}
+        fake.installations = []
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 1, err)
+        self.assertIn(f"required from App {rules.ACTIONS_APP_ID} (GitHub Actions)", out)
+        self.assertNotIn("re-point the ruleset entry", out)
+        # And no all-clear beside the gap.
+        self.assertNotIn("every required check has reported", out)
+
+    def test_a_co_bound_app_keeps_its_own_evidence_gap(self):
+        # `lanes` is required from Actions AND from App 42, which covers
+        # the repo but has never reported. Dropping every entry sharing the
+        # name would bury that merge-blocking finding behind the ambient
+        # line, so only the (context, Actions) entry comes out (Codex,
+        # mikelward/repo#70).
+        fake = FakeGh()
+        fake.effective_rules = [
+            _pull_request_rule(),
+            _status_checks_rule(
+                [("lanes", rules.ACTIONS_APP_ID), ("lanes", 42), "codex", "zizmor"]
+            ),
+            {"type": "required_linear_history", "parameters": {}},
+            {"type": "non_fast_forward", "parameters": {}},
+            {"type": "deletion", "parameters": {}},
+        ]
+        fake.check_runs = {
+            fake.default_head_sha: [("lanes", rules.ACTIONS_APP_ID), "codex", "zizmor"]
+        }
+        fake.installations = [(42, "lanes-app", REPO.split("/", 1)[0], "all", ())]
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 1, err)
+        self.assertIn(f"required from App {rules.ACTIONS_APP_ID} (GitHub Actions)", out)
+        self.assertIn("App 42", out)
 
     def test_bound_gate_seen_but_uncovered_is_still_a_coverage_gap(self):
         # The bound App reported `lanes` historically (a check run carries its
