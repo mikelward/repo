@@ -224,6 +224,334 @@
       nothing is broken by the lax reading, only less isolated than it
       will be.
 
+- [ ] **One App for the weekly batches, in a shared `update` environment.**
+      Each hub reads its own credential today -- `<HUB>_PAT`, or
+      `<HUB>_APP_ID` + `<HUB>_APP_PRIVATE_KEY`, from an environment named
+      after the hub -- and every consumer is on the PAT: each hub's
+      `docs/PAT.md` calls itself "the currently used path", and the PAT wins
+      wherever both are present. Replace all three with ONE GitHub App,
+      installed on the account for **all repositories**, read from one
+      `update` environment as `UPDATE_APP_ID` + `UPDATE_APP_PRIVATE_KEY`
+      (maintainer, 2026-09-14).
+      *Why the App over the PAT:* scope (two permissions, Contents and Pull
+      requests), lifetime (what is stored mints hour-long installation
+      tokens rather than being the access itself), revocation per
+      installation -- and the one that decides it, attribution. Under the
+      PAT the batch opens its pull requests AS the repository owner, so the
+      merge gate below cannot tell a weekly bump from a hand-written change.
+      *Why account-wide, not selected repositories:* per-repository
+      membership cannot be automated on the credentials this fleet has (see
+      "Reach the App-installation facts without `user/installations`" above:
+      the membership writes need a user-to-server token authorized to the
+      App, and an App JWT cannot extend its own installation), so selecting
+      repositories is exactly the toil this removes. The wide installation
+      grants nothing by itself -- the App acts only where its private key is
+      presented, and that key lives in an environment only the publish job
+      declares. What widens is the blast radius if the key leaks.
+      *Why not an organization:* org-level secrets would delete the per-repo
+      secret entirely, but GitHub Free for organizations does not serve them
+      to private repositories and the fleet has private members; a personal
+      Pro plan does not extend to an org, and rulesets cover those private
+      repositories today only because of it. The transfer itself is cheap
+      (redirects, not renames) but `mikelward/...` is hardcoded across the
+      fleet -- every `uses:`, `scaffold.TEMPLATE_REPO`, codex-review's
+      byte-pinned template fetches, and the Maven repository four apps
+      resolve from `raw.githubusercontent.com`. Declined 2026-09-14.
+      *The order is not the obvious one.* Teaching this repository the new
+      shape first would make `credentials.usable()` -- and so `repo audit`
+      -- report a repository green while its batch is still running on a PAT
+      that has been deleted: a false pass in the tool whose whole job is
+      saying the fleet is configured. And a job declares exactly ONE
+      environment, so a hub that switches to `update` stops being able to
+      read `<HUB>_PAT` at all -- the old name survives, the secret behind it
+      does not (Codex, mikelward/repo#71). There is no cross-environment
+      fallback to roll back to, which is what forces the credential to exist
+      before anything reads it:
+      1. Register the App and install it account-wide.
+      2. `SPEC.md` FIRST: this adds a rung to the ladder -- an environment
+         created and restricted by one fleet pass, its credential written by
+         a later one -- and SPEC.md is the contract for what a run may land
+         and what a later run settles, so the order changes there before it
+         changes in code (Codex, mikelward/repo#71). Then this repository
+         learns where `update` LIVES -- `home_environment`
+         and the default-branch restriction -- and `repo setup` runs, so
+         every consumer has a restricted `update` environment before it holds
+         anything. Not `usable()`, which stays on the old shape until step
+         4: this half cannot produce the false pass above. Split out because
+         `repo secrets` creates an environment at GitHub's defaults, which
+         admit EVERY branch, and writes the value immediately
+         (`secrets_cmd._ensure_environment` / `_write_secret`);
+         `restrict_environment` runs only from `repo setup`. Writing first
+         would leave an account-wide App's private key readable by any
+         branch that declares the environment, for as long as the rollout
+         takes (Codex, mikelward/repo#71).
+      3. `repo setup --credential UPDATE_APP_ID=... --credential
+         UPDATE_APP_PRIVATE_KEY=...` writes the pair, through the
+         convergence path rather than a `repo secrets` fan-out: setup's
+         fleet-credentials step already writes a credential only where the
+         repository actually calls the workflow, and `repo secrets` has no
+         such filter. That difference matters here in a way it does not for
+         a PAT -- this key is account-wide, and an environment's policy
+         restricts which BRANCHES may reach it, not which jobs may declare
+         it, so a copy sitting in a repository that runs no batch is a
+         default-branch workflow away from minting a token over the whole
+         installation (Codex, mikelward/repo#71). Nothing reads it yet, so
+         this step cannot break a batch.
+      4. The hubs (`mikelward/rust-update`, `gradle-update`, `npm-update`)
+         switch their publish job to `environment: update` and read
+         `UPDATE_APP_*`. This is the cutover, not a fallback-guarded step;
+         the rollback is reverting the workflow, which is why one hub is
+         piloted against one consumer before the other two follow. Each has
+         a workflow-shape test suite to extend.
+      5. `usable()` is satisfied by the shared pair, and `repo audit` grows
+         a finding for a repository still on the old shape.
+      6. Delete the PATs and the per-hub environments they lived in, once
+         every consumer has run a batch on the App.
+      *Cost and reliability (AGENTS.md asks for this up front).* Free: an
+      installation token is minted by signing a JWT locally and one POST to
+      `/app/installations/{id}/access_tokens`, with no billing attached at
+      any volume. Rate limits are nowhere near: the mint is a JWT-
+      authenticated call against the App's own hourly budget, and the token
+      it returns carries the installation's own 5,000/hour, against a batch
+      that spends a handful of calls once a week. Latency is one signature
+      and one round trip on a scheduled job -- not a hot path, and nothing
+      interactive waits on it.
+      What is new is a failure mode: a GitHub API outage, a revoked
+      installation, or a rotated key that was not re-published leaves the
+      publish job unable to mint, so it cannot push the branch or open the
+      pull request. It fails there, loudly and whole -- the update job's
+      work is simply not published, nothing lands half-written, and the next
+      week's run retries -- which is the same shape as a revoked PAT, one
+      API call earlier. The token also expires in an hour, so it is minted
+      in the job that uses it rather than passed between jobs. Not a new
+      code path either: each hub already supports the App pair
+      (`docs/GITHUB_APP.md`), so this makes a tested path the default rather
+      than introducing one.
+      The environment is named for the role a job takes by declaring it,
+      as `lanes` and `ci-commit-artifact` are, and not for what it holds --
+      every environment holds credentials, so a `-creds` suffix would say
+      nothing. `update` over `batch` is the maintainer's call (2026-09-14);
+      `BATCH_HUBS` stays as this repository's own constant for the three
+      hubs. Should the App ever take on work that is not an update, renaming
+      an environment and moving two secrets is one `repo setup` run.
+
+## The merge gate: only a collaborator's work merges unattended
+
+- [ ] **Arm auto-merge only for work a collaborator or a fleet bot wrote.**
+      The original ask was "auto-merge when the author is a collaborator OR
+      a collaborator approved it". GitHub cannot express that: ruleset
+      requirements combine with AND, no rule or condition reads the pull
+      request's author, and the bypass list keys on who MERGES rather than
+      who authored -- and is not honored on auto-merge's asynchronous path
+      anyway, so a bypassing actor's armed pull request sits `BLOCKED`.
+      Required approvals cannot do it either: nobody can approve their own
+      pull request, so every one of the owner's would wait for a second
+      human.
+      Six review rounds then established what computing the OR ourselves
+      would cost, and the approval half is where all of it lives (see the
+      deferred item below). The authorship half does not: **the decision
+      is made where auto-merge is ARMED, not published as a status**
+      (maintainer, 2026-09-14 -- shape (b) of three, with (a) deferred and
+      (c), GitHub's native `required_approving_review_count: 1`, declined
+      for costing a second human on every self-authored pull request).
+      *What it is.* One workflow. On `pull_request_target` (opened,
+      reopened, ready_for_review, and `edited` when `changes.base` is
+      present -- GitHub disables auto-merge outright when a pull request is
+      retargeted, and no other activity type fires for that edit, so without
+      it a retargeted pull request silently stops being armed; Codex,
+      mikelward/repo#71) it reads the pull request's `author_association`
+      and arms auto-merge (`--rebase`, matching the ruleset's
+      `allowed_merge_methods`) only when that reads `OWNER`, `MEMBER` or
+      `COLLABORATOR`, or the author's login is an allowlisted bot. Everything else is simply never armed: an outside pull request
+      waits for a person to read it and merge it, which is what a person
+      does with an outside contribution anyway. `pull-requests: write` to
+      arm, and NO checkout, so nothing pull-request-controlled runs beside
+      the token.
+      *Arming must not race the verdicts it is arming against.* The
+      `codex` status is sha-scoped like any other, so a pull request opened
+      on a sha another pull request already turned green inherits those
+      successes, and `gh pr merge --auto` waits only for requirements NOT
+      yet met -- so arming on `opened` can merge a pull request no reviewer
+      ever looked at, as soon as its last unfinished check lands.
+      codex-review's sweep resets `codex` to pending within about a minute
+      of a pull request opening, but that is an Actions job racing merge
+      eligibility, which is exactly why codex-review also carries a rule
+      against opening a pull request on a commit that already carried one.
+      So this workflow arms only AFTER the verdicts have been re-established
+      for this pull request, and that needs a MECHANISM rather than a stated
+      intention: triggered by `workflow_run` on codex-review's own
+      completion, correlated to the pull requests carried in that payload,
+      not by a second independent `pull_request_target` subscription to the
+      same event -- which is what an earlier revision of this entry
+      described, and which leaves the two racing exactly as before (Codex,
+      mikelward/repo#71). Two conditions on that trigger, since
+      `workflow_run` fires on a FAILED source run as readily as a successful
+      one: the source run's conclusion must be success, AND the `codex`
+      status must have been updated by that run. "Not a success predating
+      this pull request" is not enough -- a retargeted pull request's stale
+      success postdates its creation, so a codex-review run that failed
+      before resetting the status would let the armer merge against green
+      checks that never saw the changed diff (Codex, mikelward/repo#71).
+      Authorship is still decided per pull request; it
+      is the timing of the arming call that has to respect the sha-scoped
+      statuses around it.
+      *Why this shape has none of the OTHER failure modes.* The decision is per
+      pull request and never published anywhere shared, so the whole class
+      the review rounds found -- a commit status is a mutable,
+      last-writer-wins cell keyed on a sha, while the predicate is per pull
+      request -- does not arise: nothing to share between two pull requests
+      on one sha, nothing to race, nothing to invalidate later. Authorship
+      also does not change under a pull request, unlike an approval.
+      *The bot allowlist is not optional.* No bot identity is ever a
+      collaborator in GitHub's model -- confirmed on a weekly batch pull
+      request opened under `github-actions[bot]`, whose `author_association`
+      reads `CONTRIBUTOR` -- so without it the weekly batches stop merging
+      the day they move onto the `update` App above. Policy lives beside the
+      repository's own, `lanes.conf`-shaped, not in the engine.
+      *What it does not cover, deliberately.* A collaborator can still arm
+      auto-merge by hand on an outside pull request; that is a collaborator's
+      deliberate act, and it is the same trust boundary that lets them merge
+      it outright. Closing that would need the required-status form -- which
+      also BLOCKS the maintainer from merging an outside pull request
+      normally, since a required check that reads failure holds a human
+      merge too. Not worth it for a fleet whose outside contributions are
+      rare and read by a person regardless.
+      *A one-shot arming run is not enough.* If the `opened` run times out
+      or the arming call fails transiently, none of these activity types
+      necessarily fires again and an eligible pull request sits silently
+      unarmed (Codex, mikelward/repo#71). It fails in the SAFE direction --
+      unarmed means a person merges it -- but silently defeating the point
+      is still defeating the point. So the workflow takes a retry around the
+      arming call and a scheduled backstop sweep over open pull requests,
+      the same shape codex-review already uses for a verdict that never
+      arrives, and at the same low frequency: what it catches is a missed
+      run, not a fast-moving condition.
+      The sweep repairs a missed run; it never overrides a decision. A
+      maintainer who deliberately disables auto-merge on an eligible pull
+      request looks identical to a pull request whose arming run was lost,
+      and a sweep that cannot tell them apart re-arms work someone put on
+      hold and merges it when the checks finish (Codex,
+      mikelward/repo#71). So the sweep READS the disable rather than
+      inferring it: the pull request's timeline records that auto-merge was
+      disabled and by whom, so a person's hold is a fact to look up, not a
+      state to deduce. Disabled by a human, the sweep leaves it alone;
+      disabled by GitHub -- which is what a retarget does -- or never armed
+      at all, the sweep arms it.
+      ONE precondition, shared by both paths. "Unarmed and nobody held it"
+      is not sufficient on its own: the sweep runs on a schedule, outside
+      the `workflow_run` sequencing above, so a pull request opened on a sha
+      whose requirements are already green from another one would be armed
+      by the sweep against inherited checks and merge before anything
+      reviewed it -- the same race the event path was rebuilt to avoid
+      (Codex, mikelward/repo#71). So arming has exactly one gate, whichever
+      path reaches it: a successful codex-review run for THIS pull request
+      that refreshed the `codex` status. The sweep decides WHEN to
+      re-check, never what qualifies.
+      Three attempts at deducing it instead are recorded here because the
+      pattern is the lesson rather than the individual bugs (all Codex,
+      mikelward/repo#71): an ATTEMPT marker made an exhausted-retry failure
+      indistinguishable from a hold, so the sweep skipped the one state it
+      exists to repair; a SUCCESS marker fixed that but read GitHub's own
+      post-retarget disarm as a hold, and that signal cannot be relayed
+      through the `workflow_run` trigger the sequencing above requires,
+      since that payload carries the completed run and its pull requests,
+      not `changes.base`; and comparing a RECORDED BASE against the current
+      one re-armed genuinely held work whenever someone held a pull request
+      and then retargeted it. Every one is the same mistake -- deducing a
+      cause from a state that has more than one cause -- and the timeline is
+      where the cause is actually written down.
+      Cost and reliability for this path too, and the scheduled half is
+      what costs rather than the per-pull-request work (Codex,
+      mikelward/repo#71): the sweep fires whether or not anything is open.
+      Public repositories are free outright. The fleet's private ones draw
+      on the account's included minutes, so keep the sweep to a few firings
+      a day and let it exit as soon as it sees no open pull request -- at
+      four a day and well under a minute a run that is roughly two hours per
+      private repository per month, comfortably inside GitHub Pro's 3,000
+      included minutes for private repositories even across all of them, and
+      $0 unless the fleet's private half grows several times over. The
+      per-pull-request work is the cheap part: a handful of API requests
+      against 5,000/hour, and latency does not matter since nothing waits on
+      it. Its failure mode
+      is the same safe one -- no arming, so the pull request waits for a
+      person -- and the sweep is what stops that from being permanent.
+      *It pairs with arming by default.* `allow_auto_merge` only permits
+      auto-merge; nothing arms it, and GitHub offers the button only on a
+      pull request that is currently blocked -- so this workflow is also
+      what makes "auto-merge on by default" real, rather than a second
+      opinion on pull requests that already merge. The weekly batches keep
+      arming their own (`gh pr merge --auto --rebase --match-head-commit`,
+      only on their own passing checks and only where the ruleset requires
+      branches up to date); this covers everything else.
+      *Two constraints the implementation carries, recorded rather than
+      designed further (Codex, mikelward/repo#71; fifteen review rounds in,
+      these are build-time detail, not open questions).* Every arming call
+      passes `--match-head-commit` with the sha whose verdict was actually
+      validated, so a head that changes between validating and arming cannot
+      be armed on the strength of the old one -- the weekly batches already
+      do exactly this. And the batches are a THIRD arming path: their own
+      `gh pr merge --auto` call runs from the hub, outside both paths above,
+      so it either enforces the same PR-specific verdict gate or stops
+      arming and lets this workflow do it. Left as one gate reached three
+      ways, not three gates.
+      Two more of the same grain, recorded the same way: a retarget
+      PRESERVES the head sha, so `--match-head-commit` alone does not catch
+      a base that moved between validating and arming -- capture and
+      revalidate the base beside the sha. And `workflow_run.pull_requests`
+      is EMPTY when the upstream run was triggered by `issue_comment`, which
+      is codex-review's normal completed-verdict path, so correlating by
+      that array alone would leave eligible pull requests unarmed: the
+      implementation enumerates and validates candidate pull requests
+      instead of trusting the payload.
+      That is where this entry stops. Sixteen review rounds found sixteen
+      real defects, and the last several were each introduced by the fix
+      before them -- the sign that the remaining detail belongs beside the
+      code and its tests, not in more prose. Build it from here.
+      *Open:* whether `repo setup` scaffolds this workflow into the fleet
+      like the codex-review trio, and whether `repo audit` reports a
+      repository missing it.
+
+- [ ] **Consider the approval half later: "or a collaborator approved
+      it".** Deferred from the item above, not rejected. It needs the
+      verdict published as a commit status a ruleset requires -- the only
+      way to hold a merge on something GitHub does not evaluate itself --
+      and six Codex rounds on mikelward/repo#71 mapped what that costs, all
+      of it one shape: a commit status is a mutable, last-writer-wins cell
+      keyed on (repository, sha), while the predicate is per pull request
+      and changes with every review.
+      - Two open pull requests can share a head sha, so the predicate has to
+        be quantified over every OPEN pull request on that sha, with
+        `closed` in the triggers because closing one changes the answer for
+        the rest.
+      - The approval half must read each reviewer's LATEST non-comment
+        review, since GitHub keeps withdrawn approvals and they carry the
+        same `commit_id`.
+      - Recomputing per event does not order the writes: it needs a
+        `concurrency` group keyed on the sha and a re-read immediately
+        before publishing, and even then the statuses API has no
+        compare-and-set, so the window narrows rather than closes.
+      - The write-capable `pull_request_target` run fires BEFORE any
+        approval exists, and a fork's `pull_request_review` run has neither
+        a write-capable token nor secrets -- so the approval path can
+        publish nothing by itself, and needs an untrusted recorder plus a
+        trusted no-checkout `workflow_run` publisher.
+      - That invalidation path cannot be made fail-closed: if the recorder
+        or the publisher fails, an earlier SUCCESS stays authoritative and
+        the pull request merges on it.
+      - A gate status does not reliably start `pending` either -- a new
+        pull request on a sha that already carries SUCCESS inherits it --
+        so arming must run only after the publisher has evaluated that pull
+        request.
+      Three workflows, an App and an environment per repository, and a
+      residual race, to automate a case that happens rarely and that a
+      person is already reading. One decision is already made against that
+      day: the App would be the gate's OWN, with its own environment, never
+      the `lanes` one -- a job declares one environment, so reusing lanes'
+      would let any flaw in the gate read the key behind lanes' own verdict
+      (maintainer, 2026-09-14). Worth revisiting if outside contributions
+      become common, or if GitHub ever evaluates a custom gate per pull
+      request rather than per sha.
+
 ## repo setup: fleet CI scaffold
 
 - [x] `repo setup` fills in whichever of the fleet's own CI scaffold
