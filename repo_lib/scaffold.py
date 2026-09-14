@@ -113,16 +113,22 @@ pull request instead -- see push_initial_commit's own docstring for why).
 One more read, only when something missing is under .github/workflows/:
 _missing_workflow_scope checks this gh token's own OAuth scopes before
 attempting the write at all (see its own docstring, mikelward/repo#18).
+One listing of the repository's Actions workflows, plus one blob read per
+LIVE workflow on the branch, only where a MISSING file is one of the
+three that publish a required check (CHECK_PUBLISHERS) -- a converged
+repository, and a brand-new one with no workflows at all, both pay none
+of them (see _publisher_conflicts).
 """
 
 import base64
+import fnmatch
 import hashlib
 import json
 import re
 import urllib.parse
 from dataclasses import dataclass, field
 
-from repo_lib import gh, rules
+from repo_lib import credentials, gh, rules
 from repo_lib.common import error, error_lines, info, warn
 
 # A prior version of this module retried a git-data CREATE call (blob/
@@ -1652,6 +1658,167 @@ def checks_no_pull_request_can_report(missing, checks):
     ]
 
 
+def active_workflow_paths(repo):
+    """`(paths, ok)`: the workflow files GitHub will actually run on
+    `repo` -- the Actions API's own list, filtered to `active`.
+
+    Asked rather than inferred from the tree, because two of the ways a
+    file under `.github/workflows/` is not a live workflow are invisible
+    in it: GitHub loads only the DIRECT children of that directory, so an
+    archived copy under `.github/workflows/archive/` never runs; and a
+    workflow disabled through the Actions UI (`disabled_manually`) or by
+    sixty days of repository inactivity (`disabled_inactivity`) keeps its
+    file, triggers and all. Either one read as a live publisher holds a
+    scaffold file back over a workflow that will never report (Codex,
+    mikelward/repo#69).
+
+    One paginated read, made only where a scaffold publisher is missing.
+    `ok` False means the read failed, already reported: what is live is
+    then unknown, and this fails rather than guessing."""
+    try:
+        out = gh.run(
+            [
+                "api",
+                "--paginate",
+                f"repos/{repo}/actions/workflows?per_page=100",
+                "--jq",
+                ".workflows[] | [.path, .state] | @json",
+            ]
+        )
+    except gh.GhError as e:
+        error_lines(f"could not list {repo}'s workflows:", e.stderr)
+        return set(), False
+    paths = set()
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        try:
+            workflow_path, state = json.loads(line)
+        except (ValueError, TypeError):
+            error(f"could not list {repo}'s workflows: unexpected response")
+            return set(), False
+        if state == "active":
+            paths.add(workflow_path)
+    return paths, True
+
+
+def _publisher_conflicts(repo, missing, workflow_blobs):
+    """`(path -> why it is not added, ok)` for the missing scaffold
+    workflows that would publish a check some workflow ALREADY on the
+    branch publishes under the same name.
+
+    `.github/workflows/ci.yml` is absent from a repository whose lane
+    wiring simply lives in a file by another name -- mikelward/conf had it
+    in `test.yml` -- and adding the scaffold's copy there puts a SECOND
+    job named `lanes` on every pull request. Which of the two a
+    required-check context then names is ambiguous, so a pull request can
+    sit blocked with the real one green (Codex, mikelward/conf#307). The
+    check is the gate, not the file name: one already publishing it is the
+    scaffold's purpose already met, the same way a CLAUDE.md symlink is its
+    content by another route, so this reports the collision and adds
+    nothing rather than duplicating the gate.
+
+    Asked of every check in CHECK_PUBLISHERS, not of `lanes` alone: the
+    same shape is there for `zizmor` and `codex` the moment a repository
+    keeps one of those in a file of its own naming, and a second finding
+    in one mechanism is the mechanism to fix (AGENTS.md, *Reviews*).
+
+    Returned as (conflicts, unvouched, ok). `unvouched` is the subset this
+    tool cannot say publishes its check on ordinary PULL REQUESTS: a job
+    named `lanes` in a push-only workflow publishes it on the default
+    branch and never on a pull request, so a ruleset requiring it there
+    would block every merge -- the permanent wedge SPEC.md's invariant 2
+    forbids, and the trap of holding a file back on a same-named job alone
+    (Codex, mikelward/repo#69). The file is still held back, since adding
+    a second job of that name is the duplicate gate this exists to
+    prevent; what changes is that the ruleset step does not newly require
+    the check (setup_cmd, `defer`), so neither answer wedges the
+    repository and the collision goes to a person either way.
+
+    Only the workflows GitHub will actually run are read: what is under
+    `.github/workflows/` is not the same set (active_workflow_paths).
+
+    `ok` is False when a read failed, already reported -- a caller
+    that cannot read what is on the branch cannot tell either way.
+    An unreadable workflow (one PyYAML rejects, a job name only run time
+    resolves -- credentials.job_check_names) is the same "cannot tell",
+    and holds the same files back, since the alternative is publishing a
+    duplicate gate on a guess."""
+    contested = {path: check for check, (path, _where) in CHECK_PUBLISHERS.items() if path in missing}
+    if not contested:
+        return {}, [], True
+    active, ok = active_workflow_paths(repo)
+    if not ok:
+        return {}, [], False
+    workflow_blobs = {path: sha for path, sha in workflow_blobs.items() if path in active}
+    declared = {}  # check name -> (the workflow already publishing it, on pull requests?)
+    maybe = []  # (workflow, a pattern its job names match only at run time)
+    unreadable = []
+    for path, sha in sorted(workflow_blobs.items()):
+        ok, raw = gh.try_run(["api", f"repos/{repo}/git/blobs/{sha}"])
+        if not ok:
+            error_lines(f"could not read {repo}'s {path} ({sha}):", raw)
+            return {}, [], False
+        # The whole object, not `--jq .content`: a blob GitHub declines to
+        # inline answers with an encoding of its own and an empty
+        # `content`, which as a bare string would read as a workflow
+        # publishing nothing -- the one answer this must never invent.
+        try:
+            blob = json.loads(raw)
+            content = blob["content"] if blob.get("encoding") == "base64" else None
+        except (ValueError, KeyError, TypeError):
+            content = None
+        text = None if not isinstance(content, str) else base64.b64decode(content).decode(
+            "utf-8", errors="replace"
+        )
+        read = None if text is None else credentials.job_check_names(text)
+        if read is None:
+            unreadable.append(path)
+            continue
+        names, patterns = read
+        on_pull_requests = credentials.publishes_on_pull_requests(text)
+        for name in names:
+            # A workflow that does publish on pull requests wins the slot:
+            # with two declaring the name, the one a pull request actually
+            # runs is the one the collision is about.
+            if declared.get(name, (None, None))[1] is not True:
+                declared[name] = (path, on_pull_requests)
+        maybe += [(path, pattern) for pattern in patterns]
+    conflicts = {}
+    unvouched = []
+    for path, check in sorted(contested.items()):
+        if check in declared:
+            where, on_pull_requests = declared[check]
+            conflicts[path] = (
+                f"{where} already declares a job publishing '{check}', and a second "
+                "one makes the required check ambiguous -- consolidate the two by hand, or "
+                "leave the gate where it is"
+            )
+            if on_pull_requests is not True:
+                unvouched.append(path)
+                conflicts[path] += (
+                    f"; {where} does not run on every pull request, so '{check}' is not required "
+                    "on this repository until it does"
+                )
+        else:
+            # A job whose published name only run time resolves -- an
+            # expression, or an unnamed matrix job -- and a workflow that
+            # cannot be read at all are one answer: this cannot say
+            # whether the name is taken, and must not guess either way.
+            cannot_tell = unreadable + [
+                where for where, pattern in maybe if fnmatch.fnmatchcase(check, pattern)
+            ]
+            if not cannot_tell:
+                continue
+            conflicts[path] = (
+                f"cannot tell whether {_quoted(cannot_tell)} already publishes '{check}' -- "
+                f"adding {path} could put a second '{check}' gate on every pull request, so it "
+                f"is left out, and '{check}' is not required on this repository meanwhile"
+            )
+            unvouched.append(path)
+    return conflicts, unvouched, True
+
+
 def _docs_lane_only(paths):
     """True if every path rides the docs lane under the lanes.conf this
     scaffold itself writes -- `*.md` and `**/docs/*.md`, so root markdown
@@ -1731,6 +1898,21 @@ class GapPlan:
     # BRANCH cannot publish yet (checks_a_gap_leaves_unpublished) -- an
     # outdated copy still runs.
     outdated: dict = field(default_factory=dict)
+    # Missing by path, and deliberately NOT added: another workflow on the
+    # branch already publishes the check this one would, so adding it
+    # would put a second same-named gate on every pull request (path ->
+    # why, already warned by plan_gaps). Kept off `missing` rather than
+    # noted beside it: every consumer of `missing` -- the commit, the
+    # pull request, checks_no_pull_request_can_report -- is asking what
+    # this run writes, and it writes none of these.
+    conflicts: dict = field(default_factory=dict)
+    # The conflicts whose existing publisher this tool cannot say runs on
+    # ordinary pull requests (a push-only workflow, a path-filtered one,
+    # one it cannot read). The ruleset step must not newly require their
+    # checks: nothing on the repository would report them on a pull
+    # request, and requiring one there blocks every merge (Codex,
+    # mikelward/repo#69).
+    unvouched: list = field(default_factory=list)
     open_pull_request: GapPullRequest = None
     # On a branch that is already complete: every open pull request of
     # this tool's own, with nothing left for it to add -- a duplicate a
@@ -1773,7 +1955,10 @@ def plan_gaps(repo, default_branch):
     (UPDATED_PATHS) -- read-only: builds the scaffold (same as
     build_scaffold_files) and compares it against the branch's current
     tree, by path for presence and by blob sha for the pinned set, so no
-    file content is read. Returns a GapPlan --
+    file content is read -- except where a missing file is one of the
+    fleet's check publishers, whose already-present workflows are read to
+    make sure that check is not published under another file name already
+    (see _publisher_conflicts). Returns a GapPlan --
     `error` set (with the failure already reported) if fetching the
     scaffold's own template sources fails, if reading the branch's
     current state does, or if a scaffold path (or an ancestor directory
@@ -1912,6 +2097,32 @@ def plan_gaps(repo, default_branch):
             error(f"{repo}: cannot add {path} to the scaffold: {occupied[path]}; add it by hand")
         return GapPlan(error=True)
 
+    # A scaffold workflow is missing by PATH, and a check it publishes can
+    # still be on the branch under another file name -- which is the one
+    # case where adding the file makes the repository worse (see
+    # _publisher_conflicts). Read only where such a file is actually
+    # missing: a converged repository, and one with no workflows at all,
+    # both pay nothing.
+    conflicts, unvouched, readable = _publisher_conflicts(
+        repo,
+        missing,
+        {
+            path: sha
+            for path, sha in blob_shas.items()
+            if path.startswith(".github/workflows/")
+            and path.endswith((".yml", ".yaml"))
+            and is_regular_file(path)
+        },
+    )
+    if not readable:
+        return GapPlan(error=True)
+    for path in sorted(conflicts):
+        # Warned rather than only put in the plan: dropping these can
+        # leave the step with nothing to do at all, and setup prints an
+        # idle step's plan lines only under --verbose.
+        warn(f"{repo}: not adding {path}: {conflicts[path]}")
+        del missing[path]
+
     plan = GapPlan(
         default_branch=default_branch,
         base_commit_sha=commit_sha,
@@ -1920,6 +2131,8 @@ def plan_gaps(repo, default_branch):
         present=sorted(present),
         missing=missing,
         outdated=outdated,
+        conflicts=conflicts,
+        unvouched=unvouched,
     )
     # Asked on every run, complete branch included -- one listing, on a
     # repository that has converged -- since a pull request of this tool's
@@ -1989,6 +2202,8 @@ def describe_gap_plan(plan):
             f"close pull request #{pr.number}: this tool's own, and the scaffold is complete "
             f"-- nothing left for it to add ({pr.url})"
         )
+    for path in sorted(plan.conflicts):
+        lines.append(f"not adding {path}: a workflow already on the branch publishes its check (see above)")
     if plan.present:
         lines.append(f"already present, untouched: {len(plan.present)} file(s)")
     if not lines:

@@ -242,6 +242,40 @@ reaches the fleet. Everything else -- `ci.yml`, both zizmor files,
 `lanes.conf`, `AGENTS.md`, `CLAUDE.md` -- may carry a project's own
 decisions, and is left exactly as found.
 
+A file is also **not added** when a workflow already on the branch
+publishes the check that file would publish. `ci.yml`, `zizmor.yml` and
+`codex-review-check.yml` each publish one of the three required checks,
+and a repository can keep the same wiring in a file of its own naming --
+mikelward/conf had the lane jobs in `test.yml`. Adding the scaffold's copy
+there publishes a SECOND check of that name, which makes the required
+check ambiguous and can leave a pull request blocked with the real one
+green. The check is the gate, not the file name, so the scaffold reports
+the collision and adds nothing: consolidating the two is a decision about
+the project's own CI, which is a person's. A workflow that cannot be read
+as YAML holds the same files back, for the same reason in the other
+direction -- "cannot tell" is not "publishes nothing".
+
+Holding a file back never makes the check required. A job named for one
+in a `push`-only workflow publishes it on the default branch and never on
+a pull request, and a path-filtered one publishes it on some pull requests
+and not others; requiring either there blocks every merge, which is the
+permanent wedge invariant 2 forbids. So the ruleset step does not newly
+require a check whose scaffold file was held back unless the workflow
+holding it back runs on every pull request -- which means an unfiltered
+`pull_request` trigger, or a `types:` that still carries `opened` and
+`synchronize`; one narrowed to `closed` runs only after the pull request
+is gone. The job has to publish the check's exact name, too, and that is
+read conservatively: only a plain job -- a mapping, with no `strategy:`,
+no job-level `uses:` and a name with nothing in it that run time
+resolves -- publishes exactly what it appears to. A matrix job publishes
+`lanes (ubuntu)`, a reusable call publishes `lanes / test`, and neither
+is the bare name; where the shape cannot settle which of those it is, it
+reads as "cannot tell". Only the
+workflows GitHub will actually run count at all: the Actions API's own
+list, so a file archived in a subdirectory (which GitHub never loads) and
+one disabled through the Actions UI hold nothing back. The repository converges to
+"the collision is reported, and nothing is wedged while it stands".
+
 ## Its own pull requests
 
 `repo setup` opens pull requests for the scaffold and merges them itself on
