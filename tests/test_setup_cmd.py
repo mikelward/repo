@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -3637,6 +3638,152 @@ def _config_file(tmpdir, text):
     with open(path, "w") as f:
         f.write(text)
     return path
+
+
+class ResolveCredentialCommandsTest(unittest.TestCase):
+    """The config `{ command: argv }` credential resolver, tested directly by
+    patching subprocess.run -- the same boundary test_gh.py uses for gh.py."""
+
+    def _completed(self, code, out=b"", err=b""):
+        return subprocess.CompletedProcess(["cmd"], code, stdout=out, stderr=err)
+
+    def test_runs_argv_and_strips_a_trailing_newline(self):
+        seen = {}
+
+        def fake_run(argv, **kwargs):
+            seen["argv"] = argv
+            return self._completed(0, out=b"s3cret\n")
+
+        with patch("repo_lib.setup_cmd.subprocess.run", side_effect=fake_run):
+            specs = setup_cmd._resolve_credential_commands(
+                {"NPM_UPDATE_PAT": ["op", "read", "op://vault/npm/pat"]}, set()
+            )
+        self.assertEqual(seen["argv"], ["op", "read", "op://vault/npm/pat"])  # argv, no shell
+        self.assertEqual(len(specs), 1)
+        self.assertEqual(specs[0].name, "NPM_UPDATE_PAT")
+        self.assertEqual(specs[0].value, b"s3cret")  # trailing newline stripped
+
+    def test_a_name_the_command_line_already_supplied_is_skipped(self):
+        called = []
+        with patch("repo_lib.setup_cmd.subprocess.run", side_effect=lambda *a, **k: called.append(1)):
+            specs = setup_cmd._resolve_credential_commands(
+                {"NPM_UPDATE_PAT": ["op"]}, {"NPM_UPDATE_PAT"}
+            )
+        self.assertEqual(specs, [])
+        self.assertEqual(called, [])  # not even run -- the command line won
+
+    def test_a_nonzero_exit_is_a_usage_error_naming_the_credential(self):
+        err = StringIO()
+        with patch("repo_lib.setup_cmd.subprocess.run", return_value=self._completed(1)):
+            with redirect_stderr(err), self.assertRaises(SystemExit) as caught:
+                setup_cmd._resolve_credential_commands({"NPM_UPDATE_PAT": ["op"]}, set())
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("NPM_UPDATE_PAT", err.getvalue())  # names which fetch failed
+
+    def test_stderr_is_left_visible_not_captured(self):
+        # An interactive resolver prompts on stderr/tty; capturing it would hide
+        # the prompt behind a hang. stdout (the secret) is captured, stderr is
+        # left to inherit the terminal (Codex, mikelward/repo#68).
+        seen = {}
+
+        def fake_run(argv, **kwargs):
+            seen["kwargs"] = kwargs
+            return self._completed(0, out=b"s3cret\n")
+
+        with patch("repo_lib.setup_cmd.subprocess.run", side_effect=fake_run):
+            setup_cmd._resolve_credential_commands({"NPM_UPDATE_PAT": ["op"]}, set())
+        self.assertEqual(seen["kwargs"].get("stdout"), subprocess.PIPE)  # secret captured
+        self.assertIsNone(seen["kwargs"].get("stderr"))  # prompt/warnings stay visible
+
+    def test_a_command_that_will_not_start_is_a_usage_error(self):
+        with patch("repo_lib.setup_cmd.subprocess.run", side_effect=FileNotFoundError("op")):
+            with redirect_stderr(StringIO()), self.assertRaises(SystemExit) as caught:
+                setup_cmd._resolve_credential_commands({"NPM_UPDATE_PAT": ["op"]}, set())
+        self.assertEqual(caught.exception.code, 2)
+
+    def test_an_embedded_nul_in_the_argv_is_a_usage_error_not_a_traceback(self):
+        # A YAML argv item with an escaped NUL passes the schema but subprocess.run
+        # raises ValueError, not OSError -- caught the same as the path reader
+        # (Codex, #68).
+        with patch("repo_lib.setup_cmd.subprocess.run", side_effect=ValueError("embedded null byte")):
+            with redirect_stderr(StringIO()), self.assertRaises(SystemExit) as caught:
+                setup_cmd._resolve_credential_commands({"NPM_UPDATE_PAT": ["op", "a\x00b"]}, set())
+        self.assertEqual(caught.exception.code, 2)
+
+    def test_empty_output_is_a_usage_error(self):
+        with patch("repo_lib.setup_cmd.subprocess.run", return_value=self._completed(0, out=b"\n")):
+            with redirect_stderr(StringIO()), self.assertRaises(SystemExit) as caught:
+                setup_cmd._resolve_credential_commands({"NPM_UPDATE_PAT": ["op"]}, set())
+        self.assertEqual(caught.exception.code, 2)
+
+    def test_a_non_fleet_credential_name_is_a_usage_error(self):
+        err = StringIO()
+        with patch("repo_lib.setup_cmd.subprocess.run", return_value=self._completed(0, out=b"x")):
+            with redirect_stderr(err), self.assertRaises(SystemExit) as caught:
+                setup_cmd._resolve_credential_commands({"NOT_A_CRED": ["op"]}, set())
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("is not a fleet credential", err.getvalue())
+
+    def test_end_to_end_a_config_command_credential_runs_during_setup(self):
+        seen = {}
+
+        def fake_run(argv, **kwargs):
+            seen["argv"] = argv
+            return subprocess.CompletedProcess(argv, 0, stdout=b"tok3n\n", stderr=b"")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _config_file(
+                tmp, "credentials:\n  NPM_UPDATE_PAT:\n    command: [op, read, 'op://v/npm']\n"
+            )
+            fake = FakeGh()
+            fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+            with patch("repo_lib.setup_cmd.subprocess.run", side_effect=fake_run):
+                code, out, err = _run(fake, ["--force", "--no-bootstrap", "--config", cfg, REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(seen["argv"], ["op", "read", "op://v/npm"])  # resolved at run time
+
+    def test_a_usage_error_aborts_before_the_command_is_run(self):
+        # A config command must not be launched (a possibly paid/interactive fetch)
+        # for a run a usage error will abort -- an invalid --app here exits 2 first
+        # (Codex, #68). The command is resolved only after the invocation validates.
+        ran = []
+
+        def fake_run(argv, **kwargs):
+            ran.append(argv)
+            return subprocess.CompletedProcess(argv, 0, stdout=b"x\n", stderr=b"")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _config_file(
+                tmp, "credentials:\n  NPM_UPDATE_PAT:\n    command: [op, read, x]\n"
+            )
+            fake = FakeGh()
+            with patch("repo_lib.setup_cmd.subprocess.run", side_effect=fake_run):
+                code, _, _ = _run(
+                    fake, ["--force", "--no-bootstrap", "--config", cfg, "--app", "bad/slug", REPO]
+                )
+        self.assertEqual(code, 2)
+        self.assertEqual(ran, [])  # the resolver command never launched
+
+    def test_a_bad_command_credential_name_fails_before_the_gh_preflight(self):
+        # A config command with an unknown name is a usage error that must report
+        # itself before the gh auth preflight (which is wired to fail here), not
+        # surface as an auth failure -- and the command must never run (Codex, #68).
+        ran = []
+
+        def fake_run(argv, **kwargs):
+            ran.append(argv)
+            return subprocess.CompletedProcess(argv, 0, stdout=b"x\n", stderr=b"")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _config_file(tmp, "credentials:\n  NOT_A_CRED:\n    command: [op, read, x]\n")
+            fake = FakeGh()
+            fake.auth_fails = "gh: HTTP 401: Bad credentials (https://api.github.com/user)\n"
+            with patch("repo_lib.setup_cmd.subprocess.run", side_effect=fake_run):
+                code, out, err = _run(fake, ["--force", "--no-bootstrap", "--config", cfg, REPO])
+        self.assertEqual(code, 2)
+        self.assertIn("is not a fleet credential", err)  # the config error, not the auth one
+        self.assertNotIn("Bad credentials", err)
+        self.assertEqual(ran, [])
 
 
 class SetupConfigFileTest(unittest.TestCase):

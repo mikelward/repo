@@ -90,6 +90,7 @@ import io
 import json
 import os
 import re
+import subprocess
 import sys
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
@@ -300,12 +301,7 @@ def _validate_credential_specs(raw_specs):
         if not path:
             error(f"'--credential {raw}' has an empty PATH")
             raise SystemExit(2)
-        if name not in credentials.FLEET_CREDENTIALS:
-            error(f"'{name}' (from --credential {raw}) is not a fleet credential; those are:")
-            for known in credentials.FLEET_CREDENTIALS:
-                error(f"  {known} (environment '{credentials.home_environment(known)}')")
-            error("For any other secret, --secret NAME[@ENV]=PATH sets it where you say.")
-            raise SystemExit(2)
+        _require_fleet_credential(name, f"from --credential {raw}")
         if name in seen:
             error(f"'--credential {raw}' repeats an earlier --credential's NAME ({name})")
             error("-- the second would silently win; drop one of them.")
@@ -327,6 +323,87 @@ def _validate_credential_specs(raw_specs):
         if not spec.value:
             error(f"the value at '{spec.path}' (from --credential {raw}) is empty")
             raise SystemExit(2)
+        specs.append(spec)
+    return specs
+
+
+def _require_fleet_credential(name, source):
+    """Exit 2 unless `name` (already upper-cased) is a fleet credential -- the
+    only kind setup knows where to place. `source` names where it came from, for
+    the message. Shared by the path form (--credential / config path) and the
+    config `command` form."""
+    if name not in credentials.FLEET_CREDENTIALS:
+        error(f"'{name}' ({source}) is not a fleet credential; those are:")
+        for known in credentials.FLEET_CREDENTIALS:
+            error(f"  {known} (environment '{credentials.home_environment(known)}')")
+        error("For any other secret, --secret NAME[@ENV]=PATH sets it where you say.")
+        raise SystemExit(2)
+
+
+def _validate_credential_command_names(commands, already_supplied):
+    """Exit 2 for a config `command` credential whose name is empty or not a fleet
+    credential. Run up front, with the path/CLI name checks -- a malformed config
+    is a usage error that must report itself before the gh preflight, not surface
+    later as an auth failure or a rate-limit retry while resolving (Codex,
+    mikelward/repo#68). The command itself still runs only once the run is viable
+    (see _resolve_credential_commands). A name the command line already supplied is
+    skipped -- it wins, and its command never runs."""
+    for name in commands:
+        upper = name.upper()
+        if upper not in already_supplied:
+            _require_fleet_credential(upper, f"config credential {name!r}")
+
+
+def _resolve_credential_commands(commands, already_supplied):
+    """Config `{ command: argv }` credentials resolved to CredentialSpecs by
+    running each argv and taking its stdout as the value -- the command form of
+    reading a file, done once up front so a failed fetch stops the run before it
+    touches a repository (same as an unreadable path). `commands` is NAME -> argv
+    list; a NAME in `already_supplied` (a --credential or config path won it) is
+    skipped, so the command line still overrides the file.
+
+    argv is exec'd directly (no shell), so nothing quotes or injects. A trailing
+    newline is stripped: `op read` / `pass` / `bw` print `value\\n`, and a secret
+    must not carry it (a PAT with a `\\n` fails auth) -- the same as `$(...)`. A
+    nonzero exit, a command that will not start, or empty output is a usage error:
+    the credential the run needs is not available, so it fails once here rather
+    than per repository."""
+    specs = []
+    for name, argv in commands.items():
+        upper = name.upper()
+        if upper in already_supplied:
+            continue  # a --credential on the command line won it: the CLI overrides the file
+        _require_fleet_credential(upper, f"config credential {name!r}")
+        try:
+            # Capture stdout (the secret) but leave stderr inherited, so an
+            # interactive resolver's unlock prompt (`op`/`bw`) and any warning
+            # reach the terminal live -- capture_output would pipe stderr too and
+            # a prompt behind it would look like a hang, since stdin is inherited
+            # and the command is waiting on input the operator can't see. The
+            # value is on stdout, so it never lands on the terminal (Codex,
+            # mikelward/repo#68).
+            proc = subprocess.run(argv, stdout=subprocess.PIPE)
+        except (OSError, ValueError) as e:
+            # OSError: the command could not start (not found, not executable).
+            # ValueError: an argv item with an embedded NUL -- the path reader
+            # catches it the same way (setup_cmd:318). Both are malformed input, a
+            # usage error, not a traceback out of the run (Codex, mikelward/repo#68).
+            error(f"could not run the command for credential '{name}' ({argv[0]!r}): {e}")
+            raise SystemExit(2)
+        if proc.returncode != 0:
+            # The command's own stderr already streamed to the terminal; just name
+            # which credential's fetch failed and its exit status.
+            error(
+                f"the command for credential '{name}' ({argv[0]!r}) failed "
+                f"(exit {proc.returncode})"
+            )
+            raise SystemExit(2)
+        value = proc.stdout.rstrip(b"\r\n")
+        if not value:
+            error(f"the command for credential '{name}' ({argv[0]!r}) produced no value")
+            raise SystemExit(2)
+        spec = CredentialSpec(name=upper, path=f"<command: {argv[0]}>", raw=f"{upper}=<command>")
+        spec.value = value
         specs.append(spec)
     return specs
 
@@ -1641,6 +1718,7 @@ def _run(args, log=None):
     # The fleet config supplies the stable flags so they need not be
     # retyped every run; the command line overrides it (see SPEC.md).
     config_app_logins = {}
+    config_credential_commands = {}
     if not args.no_config:
         try:
             cfg = config.load(args.config)
@@ -1650,6 +1728,7 @@ def _run(args, log=None):
         if cfg is not None:
             _apply_config(args, cfg)
             config_app_logins = cfg.app_logins
+            config_credential_commands = cfg.credential_commands
     if args.force is None:
         args.force = False
     # Operator-supplied App id -> slug pairings let a bound check's status
@@ -1662,6 +1741,35 @@ def _run(args, log=None):
     credential_specs = _validate_credential_specs(args.credential)
     _reject_fleet_credentials_under_secret(secret_specs)
     _validate_app_slugs(args.app)
+    # Validate config `command` credential NAMES now, with the other usage checks;
+    # their EXECUTION is postponed until after the gh preflight (below). A config
+    # typo should report its own error before any network request.
+    _validate_credential_command_names(
+        config_credential_commands, {spec.name for spec in credential_specs}
+    )
+
+    gh.require_gh()
+    # Before any repository read or write: a run with no usable credentials
+    # can only fail, and failing per step buries the one line that explains
+    # every one of those failures. `--app` gets its own check because the
+    # endpoint it needs is refused to the tokens gh issues, which no amount
+    # of rerunning fixes. Both are usage errors -- invariant 1's one
+    # exception (SPEC.md) -- so they stop the run rather than a step.
+    gh.require_auth()
+    if args.app:
+        apps.require_installations_readable(args.app)
+
+    # A config `{ command: [...] }` credential resolves its value by running the
+    # command -- only NOW, once the invocation is validated and gh is
+    # authenticated, so a possibly paid, slow, or interactive fetch is never spent
+    # on a run a usage error or a refused token would abort (Codex,
+    # mikelward/repo#68). A path credential is read up front instead
+    # (_validate_credential_specs, above): that read is local and free. A
+    # --credential of the same NAME wins, so config commands run only for names
+    # the command line did not already supply.
+    credential_specs += _resolve_credential_commands(
+        config_credential_commands, {spec.name for spec in credential_specs}
+    )
 
     # When the lanes App's own id and private key are supplied, setup can
     # authenticate AS the App (a signed JWT) to read its slug and repo coverage --
@@ -1689,17 +1797,6 @@ def _run(args, log=None):
             )
             app_keys = {}
     apps.register_app_keys(app_keys)
-
-    gh.require_gh()
-    # Before any repository read or write: a run with no usable credentials
-    # can only fail, and failing per step buries the one line that explains
-    # every one of those failures. `--app` gets its own check because the
-    # endpoint it needs is refused to the tokens gh issues, which no amount
-    # of rerunning fixes. Both are usage errors -- invariant 1's one
-    # exception (SPEC.md) -- so they stop the run rather than a step.
-    gh.require_auth()
-    if args.app:
-        apps.require_installations_readable(args.app)
 
     repo = args.repo
     repo_owner = repo.split("/", 1)[0]

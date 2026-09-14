@@ -38,7 +38,9 @@ repository does not call is reported unused and not written.
 Those flags are fleet constants -- the same on every repository and every
 run -- so they live in a **fleet config file** (`$XDG_CONFIG_HOME/repo/
 config.yaml`, read by default) rather than being retyped: `credentials`
-(name to the path its value is read from), `rules`, `apps`, `force`, and
+(name to where its value is read from -- a file path, or a `command:` that
+prints it, so a password manager holds the value and the config names only
+how to fetch it), `rules`, `apps`, `force`, and
 `app_logins` (an App id to its bot slug, so a bound check's status creator
 is matched without reading the account's App installations -- below). With
 it in place the loop is `repo list | xargs -n1 repo setup`. The command
@@ -51,8 +53,9 @@ and `--no-app` (skip the App step). There is deliberately no
 written nowhere, and the one that is always written -- the lanes pair --
 is not something to drop for a single repository, so the case the flag
 would serve does not arise. Either way the file *is* the one invocation,
-not a second way to vary it. It names paths, never secret values, and
-never `--secret` (not a convergence flag, below); an unknown key or a
+not a second way to vary it. It names paths or resolver commands, never
+secret values, and never `--secret` (not a convergence flag, below); an
+unknown key or a
 wrong type in it is a usage error, so a typo drops nothing silently.
 
 The lanes App pair (`LANES_APP_ID`, `LANES_APP_PRIVATE_KEY`) is the one

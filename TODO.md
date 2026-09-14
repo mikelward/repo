@@ -76,18 +76,23 @@
       dependency; TOML's `tomllib` is 3.11+ and the floor is 3.9. safe_load
       + strict schema (unknown key / wrong type = usage error). Holds paths,
       never secret values, never `--secret`.
-- [ ] **Config value resolution beyond a path (secret manager).** A
-      credential entry is currently a path the value is read from, same as
-      `--credential NAME=PATH`. The maintainer expects to want a real secret
-      store; the pluggable form is to let a value be sourced from a **command**
-      whose stdout is the secret (`op read ...`, `pass ...`, `aws
-      secretsmanager get-secret-value ...`) -- the escape hatch to any manager
-      with no new dependency. Cost/reliability to weigh first (AGENTS.md): a
-      command resolver runs an external process, and a network-backed one is a
-      visible pause on this interactive CLI's hot path, plus a new failure mode
-      if the manager is down. Design the shape so `NAME: path` stays the simple
-      case and `NAME: {command: [...]}` (or similar) is the opt-in. Still an
-      open conversation, not a decided build.
+- [x] **Config value resolution beyond a path (secret manager).** *DONE
+      (mikelward/repo#TBD, 2026-09-14, maintainer chose "let's do both").* A
+      config `credentials:` value can now be `{ command: [argv...] }` instead of
+      a path: `repo setup` runs the argv (exec'd directly, no shell), takes
+      stdout as the value, strips a trailing newline, and a failed fetch
+      (nonzero exit / won't-start / empty) is a usage error that stops the run
+      before it touches a repository. A `--credential NAME=PATH` still wins over
+      a config command of the same name. Sync the config file across machines --
+      it names commands, never secrets; the secrets stay in `op`/`pass`/`bw`/
+      `bws`/`aws`/`vault`. README also documents the two no-code paths that need
+      no feature (process substitution `--credential NAME=<(op read ...)`, and a
+      0400 `mktemp` wrapper). The per-repo exec cost of a network-backed manager
+      is noted there. Not built: a CLI `--credential-command` flag (process
+      substitution already covers the command line) and auto-detecting the form
+      inside `--credential` (a path and a command are not distinguishable
+      without a sigil, so it stays explicit -- the config mapping key is the
+      signal).
 - [ ] **Reach the App-installation facts without `user/installations`.**
       Every App read in `repo_lib/apps.py` -- `app_slug_for_id`,
       `app_covers_repo`, `resolve_installation`, and the `--app` membership
