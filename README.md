@@ -71,6 +71,102 @@ bound check's status creator be verified without reading the account's App
 installations -- the endpoint a `gh auth login` token cannot call. See
 `SPEC.md`.
 
+### Keeping credential values in a password manager
+
+The value behind `--credential NAME=PATH` (and a config `credentials:` entry)
+is read once from `PATH`, so the durable copy can live in a password manager
+-- synced across machines, not lost as a stray `~/pat.txt` -- and be
+materialized only for the run. Three ways, cheapest first:
+
+- **Config `command` form (declare once, sync the config).** A credential's
+  value can be a command instead of a path:
+
+  ```yaml
+  credentials:
+    NPM_UPDATE_PAT:
+      command: [op, read, "op://vault/npm/pat"]
+    GRADLE_UPDATE_PAT:
+      command: [pass, show, fleet/gradle]
+  ```
+
+  `repo setup` runs the argv (a list, exec'd directly -- no shell to quote or
+  inject into) and takes its stdout as the value, stripping a trailing
+  newline. Sync the config file across machines: it names *commands*, never
+  secrets. A failed fetch -- a nonzero exit, a command that will not start, or
+  empty output -- stops the run with the command's own error, before it
+  touches a repository.
+
+- **Process substitution (no config, nothing on disk).** On the command line,
+  hand `--credential` a process-substitution path -- the value streams through
+  a pipe, never a file:
+
+  ```sh
+  ./repo setup --credential NPM_UPDATE_PAT=<(op read op://vault/npm/pat) ... "$repo"
+  ```
+
+  `repo setup` reads each path exactly once, which is what process
+  substitution supports. Its gap is failure detection: process substitution
+  discards the command's exit status, so setup catches a fetch that outputs
+  **nothing** (its "empty value" error) but not one that prints partial or
+  diagnostic bytes and *then* fails -- those bytes are read as the credential.
+  If a fetch can fail that way, prefer the config `command` form (which checks
+  the exit status) or the temp-file wrapper below (which guards it with
+  `|| exit`).
+
+- **A 0400 temp file (a wrapper you control).** For a slow or interactive
+  fetch, or a shell without process substitution, pull the values into
+  `mktemp` files and remove them on exit:
+
+  ```sh
+  umask 077                                   # 0600 temp files
+  tmp=$(mktemp -d) || exit                    # abort if the temp dir can't be made
+  trap 'rm -rf "$tmp"' EXIT
+  op read op://vault/npm/pat > "$tmp/npm" || exit   # a failed fetch aborts before the loop
+  for repo in $(cat ~/repos); do
+    ./repo setup --credential NPM_UPDATE_PAT="$tmp/npm" ... "$repo"
+  done
+  ```
+
+  The `|| exit` matters: `op read` failing after it has written partial or
+  diagnostic bytes would otherwise leave a non-empty file, and `repo setup`
+  rejects only an *empty* credential file -- so without the guard a bad fetch
+  could be written to every repository. (The config `command` form checks the
+  exit status for you; this is the wrapper's job to do by hand.)
+
+Any manager that prints a secret to stdout works: `op read`, `pass show`,
+`bw get password <id>` (with `BW_SESSION` exported and `--nointeraction`) or
+Bitwarden Secrets Manager's `bws secret get <id>`, `aws secretsmanager
+get-secret-value --query SecretString --output text`, `vault kv get
+-field=...`.
+
+The tool takes on no new dependency of its own -- the argv is a manager *you*
+already run. Cost and reliability are that manager's, and worth a glance
+before you pick one:
+
+- **`pass`** (GPG) and a **self-hosted Vault** are free; the fetch is local
+  (or your own network), so no per-call charge and effectively no latency once
+  the agent/token is unlocked.
+- **1Password** and **Bitwarden** are existing personal/team subscriptions
+  (roughly $3-8/user/month; Bitwarden has a free personal tier, `bws`/Secrets
+  Manager a free machine-account tier) -- you are not adding a service, just
+  reading from one you have. `op`/`bw`/`bws` sync from the cloud, so the first
+  call after an unlock pays a round-trip; a warm session is near-instant.
+- **AWS Secrets Manager** bills per call -- a fraction of a US cent each
+  ($0.05 per 10k API calls) plus ~$0.40/month per stored secret -- and each
+  call is a network round-trip.
+- **HCP Vault** (HashiCorp's hosted Vault) is *not* per-call: HCP Vault Secrets
+  has a free tier for a small number of secrets, then a capacity/tier
+  subscription, so its cost is a recurring plan charge, not a per-fetch one --
+  check the plan you are on. (A self-hosted Vault, above, has no such charge.)
+
+Reliability: the command runs once per credential *per repository* in the
+fleet loop, so a network-backed manager is a visible pause on each repo and a
+new failure mode -- if it is down, rate-limited, or locked, that repository's
+run stops up front with the command's own error (it never half-configures the
+repo). A local or warm-session manager (`pass`, an unlocked `op`/`bw`) is
+effectively instant and offline. For a 50-repo loop, prefer one that is warm
+and local, or accept the per-repo pause.
+
 `repo setup` checks those credentials before it touches a repository: a
 token GitHub refuses stops the run at the top naming `gh auth login`,
 rather than failing once per step. `--app` is checked there too, because

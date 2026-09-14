@@ -81,6 +81,11 @@ class ConfigError(Exception):
 class SetupConfig:
     # NAME -> path the value is read from (the config form of --credential).
     credentials: dict = field(default_factory=dict)
+    # NAME -> argv list whose stdout is the value (the config form of a
+    # `{ command: [...] }` credential, so a password manager holds the value
+    # and the config names only how to fetch it). Disjoint from `credentials`:
+    # a credential is a path OR a command, never both.
+    credential_commands: dict = field(default_factory=dict)
     # None means "unset" -- fall through to the CLI default. An empty
     # `rules` is rejected at load (the tool has no zero-checks mode), so
     # callers never see the None/empty ambiguity for it; empty `apps` is
@@ -158,20 +163,59 @@ def load(path=None):
     cfg = SetupConfig()
     if "credentials" in data:
         creds = data["credentials"]
-        if not isinstance(creds, dict) or not all(
-            isinstance(k, str) and isinstance(v, str) for k, v in creds.items()
-        ):
+        if not isinstance(creds, dict):
             raise ConfigError(
-                f"config file {resolved}: 'credentials' must be a mapping of NAME "
-                "to a path string"
+                f"config file {resolved}: 'credentials' must be a mapping of NAME to a "
+                "path string or a {{ command: [...] }} mapping"
             )
-        for name in creds:
+        # Keys are strings (the loader enforces it); each value is either a path
+        # string (read from disk) or a one-key `{command: [argv...]}` mapping (run,
+        # stdout is the value). The argv is a LIST, not a shell string -- it is
+        # exec'd directly, so there is no shell to quote or inject into.
+        seen_norm = {}
+        for name, value in creds.items():
             if "=" in name:
                 raise ConfigError(
                     f"config file {resolved}: credential name {name!r} must not "
                     "contain '='"
                 )
-        cfg.credentials = creds
+            # Credential names are case-insensitive (GitHub matches secret names
+            # that way, and setup upper-cases them). Two entries that normalize to
+            # the same name -- across BOTH forms, path and command -- are an
+            # ambiguity a later step would silently resolve by dict order, so it is
+            # rejected here where both maps are built (Codex, mikelward/repo#68).
+            norm = name.upper()
+            if norm in seen_norm:
+                raise ConfigError(
+                    f"config file {resolved}: credentials {seen_norm[norm]!r} and {name!r} both "
+                    f"name the credential {norm} -- names are case-insensitive; keep one"
+                )
+            seen_norm[norm] = name
+            if isinstance(value, str):
+                cfg.credentials[name] = value
+            elif isinstance(value, dict):
+                unknown = set(value) - {"command"}
+                if unknown:
+                    raise ConfigError(
+                        f"config file {resolved}: credential {name!r} has unknown key(s) "
+                        f"{', '.join(sorted(unknown))}; a command credential takes only 'command'"
+                    )
+                argv = value.get("command")
+                if (
+                    not isinstance(argv, list)
+                    or not argv
+                    or not all(isinstance(a, str) and a for a in argv)
+                ):
+                    raise ConfigError(
+                        f"config file {resolved}: credential {name!r} 'command' must be a "
+                        "non-empty list of non-empty strings (an argv, not a shell string)"
+                    )
+                cfg.credential_commands[name] = argv
+            else:
+                raise ConfigError(
+                    f"config file {resolved}: credential {name!r} must be a path string or a "
+                    f"{{ command: [...] }} mapping, not {type(value).__name__}"
+                )
     for key in ("rules", "apps"):
         if key in data:
             value = data[key]

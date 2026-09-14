@@ -81,6 +81,68 @@ class LoadTest(unittest.TestCase):
             with self.assertRaises(config.ConfigError):
                 config.load(_write(tmp, "credentials:\n  LANES_APP_ID: 12345\n"))
 
+    def test_a_command_credential_parses(self):
+        text = (
+            "credentials:\n"
+            "  NPM_UPDATE_PAT:\n"
+            "    command: [op, read, 'op://vault/npm/pat']\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = config.load(_write(tmp, text))
+        self.assertEqual(cfg.credential_commands, {"NPM_UPDATE_PAT": ["op", "read", "op://vault/npm/pat"]})
+        self.assertEqual(cfg.credentials, {})  # a command is not a path
+
+    def test_a_path_and_a_command_credential_coexist(self):
+        text = (
+            "credentials:\n"
+            "  NPM_UPDATE_PAT: /keys/npm\n"
+            "  GRADLE_UPDATE_PAT:\n"
+            "    command: [pass, show, gradle]\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = config.load(_write(tmp, text))
+        self.assertEqual(cfg.credentials, {"NPM_UPDATE_PAT": "/keys/npm"})
+        self.assertEqual(cfg.credential_commands, {"GRADLE_UPDATE_PAT": ["pass", "show", "gradle"]})
+
+    def test_a_command_must_be_a_nonempty_list_of_nonempty_strings(self):
+        for bad in (
+            "credentials:\n  NPM_UPDATE_PAT:\n    command: op read\n",   # a string, not a list
+            "credentials:\n  NPM_UPDATE_PAT:\n    command: []\n",          # empty
+            "credentials:\n  NPM_UPDATE_PAT:\n    command: [op, 5]\n",     # non-string item
+            "credentials:\n  NPM_UPDATE_PAT:\n    command: [op, '']\n",    # empty-string item
+        ):
+            with tempfile.TemporaryDirectory() as tmp:
+                with self.assertRaises(config.ConfigError, msg=bad) as caught:
+                    config.load(_write(tmp, bad))
+            self.assertIn("'command' must be a non-empty list", str(caught.exception))
+
+    def test_a_command_credential_rejects_unknown_keys(self):
+        text = "credentials:\n  NPM_UPDATE_PAT:\n    command: [op]\n    shell: true\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(config.ConfigError) as caught:
+                config.load(_write(tmp, text))
+        self.assertIn("unknown key", str(caught.exception))
+
+    def test_a_credential_value_that_is_neither_path_nor_command_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(config.ConfigError) as caught:
+                config.load(_write(tmp, "credentials:\n  NPM_UPDATE_PAT: [a, list]\n"))
+        self.assertIn("path string or a", str(caught.exception))
+
+    def test_credential_names_that_collide_by_case_are_rejected(self):
+        # Names are case-insensitive, so two entries normalizing to one credential
+        # are an ambiguity a later step would resolve by dict order -- rejected
+        # across BOTH forms, path and command (Codex, mikelward/repo#68).
+        for text in (
+            "credentials:\n  npm_update_pat: /a\n  NPM_UPDATE_PAT: /b\n",   # path / path
+            "credentials:\n  npm_update_pat: /a\n  NPM_UPDATE_PAT:\n    command: [op]\n",  # path / command
+            "credentials:\n  npm_update_pat:\n    command: [a]\n  NPM_UPDATE_PAT:\n    command: [b]\n",  # command / command
+        ):
+            with tempfile.TemporaryDirectory() as tmp:
+                with self.assertRaises(config.ConfigError, msg=text) as caught:
+                    config.load(_write(tmp, text))
+            self.assertIn("case-insensitive", str(caught.exception))
+
     def test_rules_must_be_a_list_of_strings(self):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(config.ConfigError):
