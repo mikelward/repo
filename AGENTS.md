@@ -370,8 +370,9 @@ one that has stopped biting.
   it; where the rule really does forbid what the product needs, that
   conflict is the maintainer's call, not one to settle either way
   yourself. Declining doesn't clear the required `codex` status: post
-  the rebuttal, then poke as *Read the Codex verdict* allows — a push
-  does the same if the rebuttal is up first. Escalate if it re-raises.
+  the rebuttal, then poke as *Read the Codex verdict* allows — or let
+  the next push do it, if the rebuttal is up first. Escalate if it
+  re-raises.
 - **A second verified finding in the same mechanism is evidence about the
   design, not another bug.** Before fixing it, look for the same shape
   elsewhere and ask whether a different design would delete the class rather
@@ -414,16 +415,16 @@ one that has stopped biting.
   review -- read `get_review_comments`, `get_comments` and `get_reviews`
   to the last page, since all three page oldest first -- and they block
   the merge until fixed, rebutted, or deferred (see *Deferring a finding*
-  above); an acknowledgment is not an answer.
-  A pending `codex` status is one of three things. Findings to address —
-  address them. A clean review that left no reaction, or a rebuttal it
-  hasn't answered — poke `@codex review` once, now. Nothing back at all —
-  poke once, five minutes after the push. Escalate five minutes after the
-  poke rather than poking a second time. The `codex` commit status
-  (`get_status`, a separate surface from check runs) is the authoritative
-  gate; if it's still `pending` a while after a finding was resolved with
-  no unresolved threads left, a single `@codex review` nudge is
-  reasonable before assuming something's stuck.
+  above); an acknowledgment is not an answer. A pending `codex` status is
+  one of three things. Findings to address — address them. A clean review
+  that left no reaction, or a rebuttal it hasn't answered — poke `@codex
+  review` once, five minutes after that review or rebuttal. Nothing back
+  at all — poke once, five minutes after the push. Escalate five minutes
+  after the poke rather than poking a second time. The `codex` commit
+  status (`get_status`, a separate surface from check runs) is the
+  authoritative gate; if it's still `pending` a while after a finding was
+  resolved with no unresolved threads left, a single `@codex review` nudge
+  is reasonable before assuming something's stuck.
 - **Skip echo events silently.** Replies posted via the GitHub MCP come
   back moments later as webhook events authored by the same identity; if
   the body matches a comment you just posted, it's your own echo --
