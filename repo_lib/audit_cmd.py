@@ -1020,6 +1020,16 @@ def run(args):
             for context, integration_id in required_entries:
                 if integration_id is None:
                     continue
+                if integration_id == rules.ACTIONS_APP_ID:
+                    # GitHub Actions is not an installed App: it has no
+                    # installation to find, so asking whether it covers the
+                    # repository reports a gap that is not one -- or aborts
+                    # where the token cannot list installations at all. An
+                    # entry bound to it is a requirement that excludes
+                    # nobody rather than one nothing can satisfy, which the
+                    # ambient-binding gap below is what says (Codex,
+                    # mikelward/repo#70).
+                    continue
                 try:
                     covers = apps.app_covers_repo(owner, integration_id, repo)
                 except gh.GhError as e:
@@ -1031,8 +1041,39 @@ def run(args):
                 if not covers:
                     uncovered.append((context, integration_id))
             uncovered_contexts = {context for context, _ in uncovered}
+            ambient = sorted(
+                context
+                for context, integration_id in required_entries
+                if integration_id == rules.ACTIONS_APP_ID
+            )
             try:
-                unseen = rules.never_reported(repo, required_entries, ref=branch)
+                # The Actions-bound entry is kept out of the SCAN, not only
+                # out of its result: never_reported resolves a bound App's
+                # bot login through user/installations, which an ordinary
+                # OAuth token refuses -- and that raises, so audit would
+                # exit before reaching the ambient line that is the whole
+                # point of reading this repository (Codex,
+                # mikelward/repo#70). Nothing is lost by skipping it: what
+                # an Actions entry has or has not reported does not change
+                # what the line says.
+                unseen = rules.never_reported(
+                    repo,
+                    # The Actions-bound entry is scanned as an UNBOUND name
+                    # rather than dropped: unbound needs no App lookup, so
+                    # the user/installations read that would abort the run
+                    # never happens, and a context nothing has ever
+                    # produced -- a typo, a workflow since deleted -- still
+                    # gets its merge-blocking "never reported" finding.
+                    # Dropping the entry outright suppressed that, and the
+                    # ambient advisory's own remedy (drop the binding)
+                    # would have left the phantom context required (Codex,
+                    # mikelward/repo#70).
+                    [
+                        (context, None if integration_id == rules.ACTIONS_APP_ID else integration_id)
+                        for context, integration_id in required_entries
+                    ],
+                    ref=branch,
+                )
             except rules.RulesetError as e:
                 error_lines(
                     f"could not tell which of {repo}'s checks have ever reported:",
@@ -1052,6 +1093,17 @@ def run(args):
             # not the remedy on its own.
             wrong_app = [i for i in reportable if rules.bound_to_another_app(i)]
             absent = [i for i in reportable if not rules.bound_to_another_app(i)]
+            if ambient:
+                # Not a coverage gap and not a missing check: the entry is
+                # satisfied on every pull request and secures nothing,
+                # which is exactly the sort of thing an audit exists to
+                # name (Codex, mikelward/repo#70).
+                gap(
+                    f"required from App {rules.ACTIONS_APP_ID} (GitHub Actions), which every "
+                    f"workflow here posts its check runs as, so the binding excludes nobody: "
+                    f"{rules.quoted(ambient)} -- bind each to the App that should publish it, "
+                    "or drop the binding in the ruleset by hand"
+                )
             if uncovered:
                 named = ", ".join(
                     f"'{context}' (App {integration_id})" for context, integration_id in uncovered
@@ -1073,7 +1125,10 @@ def run(args):
                     "to the publishing App by hand; `repo setup` does not re-point an "
                     "existing binding to a different App (a tracked follow-up)"
                 )
-            if not unseen and not uncovered:
+            # `ambient` too: an all-clear beside its own gap line reads as
+            # a contradiction, and the Actions entry was deliberately kept
+            # out of the scan above, so `unseen` says nothing about it.
+            if not unseen and not uncovered and not ambient:
                 ok(
                     "every required check has reported: "
                     + rules.quoted(c for c, _ in required_entries)

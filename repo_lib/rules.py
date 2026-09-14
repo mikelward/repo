@@ -61,6 +61,15 @@ LEGACY_RULESET_NAMES = ("merge gates",)
 # review verdict, zizmor's workflow-injection scan -- used when --rule was
 # never given, matching repo-rules' own default.
 DEFAULT_CHECKS = ["lanes", "codex", "zizmor"]
+# GitHub Actions' own App id, and the one `integration_id` that is not a
+# binding. Every workflow in a repository posts its check runs as this App
+# -- a pull request's own workflow included -- so requiring a check FROM it
+# excludes nobody who could already produce it. It arrives looking like a
+# binding because GitHub's ruleset UI attaches the producing App when a
+# check is picked from the suggestion list, which is how this fleet's own
+# rulesets came to carry it. A real App binding supersedes it (see
+# _build_update_body); nothing else here reads it as one.
+ACTIONS_APP_ID = 15368
 # The rule types this module manages. Everything else in a ruleset it
 # updates is carried through untouched (see _build_update_body), so this
 # set says what gets written, not what may be present.
@@ -117,7 +126,17 @@ class RulesetHeld(RulesetError):
     failed read or a bad request, and not a reason for any other step to
     stop. `.detail` says what and why; apply_ruleset reports it and hands
     it back as report["held"], and setup_cmd skips only the ruleset step
-    (SPEC.md, invariant 1: every other step still makes its progress)."""
+    (SPEC.md, invariant 1: every other step still makes its progress).
+
+    `.body` is the ruleset AS IT STANDS where the raiser had it read --
+    a hold writes nothing, so that body is also the outcome, and it is
+    what report["ambient_bindings"] is computed from on this path (see
+    _ambient_bindings). None where the hold fires before any ruleset was
+    read, which is honest: that run cannot know what the ruleset carries."""
+
+    def __init__(self, detail=None, body=None):
+        super().__init__(detail)
+        self.body = body
 
 
 def _valid_no_control_chars(value, what):
@@ -1296,6 +1315,65 @@ def _binding_map(target_body):
     return mapping
 
 
+def _ambient_bindings(body):
+    """The checks `body` requires from GitHub Actions (ACTIONS_APP_ID) --
+    a requirement that reads as an App binding and is not one.
+
+    `body` is whatever the run will leave standing: the planned write's
+    target body where one was planned, and the ruleset as it stands on a
+    hold, which writes nothing. Taking a body rather than reading one is
+    what lets every path answer from the state it has, instead of one
+    late call site every earlier return skips past.
+
+    Reported, never printed from here. Whether it is worth saying depends
+    on something this module cannot see: whether a LATER write in the same
+    run binds the check to a real App, which supersedes the entry. That
+    answer arrives after this preview -- it needs the binding preview, the
+    coverage precondition and the re-point guard, each of which runs later
+    and any of which can cancel the write. Three rounds of review went on
+    a `superseding` argument passed in from the caller and were each
+    right that it was one case short, because the caller could not know
+    either at the moment it had to answer (Codex, mikelward/repo#70). So
+    the caller renders the line once, at the end, when it knows.
+
+    Reported rather than rewritten. Dropping the id would LOOSEN what
+    satisfies the check, from "Actions produced it" to "anyone did", and
+    this module only ever adds (see checks_kept). Tightening it to the App
+    that should publish the check is the fix, and that supersedes the
+    Actions entry on its own; removing it outright is a person's decision,
+    made in the ruleset by hand."""
+    # Every entry the body carries, not only the checks this run was asked
+    # for: one the ruleset requires beyond the standard is preserved by
+    # checks_kept and stands exactly as hard, so `repo setup --rule codex`
+    # on a ruleset that also requires an Actions-bound `lanes` has to say
+    # so too -- SPEC promises every repository this is true of is told
+    # (Codex, mikelward/repo#70).
+    return sorted(
+        {
+            entry["context"]
+            for rule in (body or {}).get("rules") or []
+            if rule.get("type") == "required_status_checks"
+            for entry in (rule.get("parameters") or {}).get("required_status_checks") or []
+            if entry.get("context") and entry.get("integration_id") == ACTIONS_APP_ID
+        }
+    )
+
+
+def ambient_binding_lines(contexts):
+    """One HEADS UP line per context in `contexts` -- report["ambient_bindings"],
+    less whatever the caller knows this run supersedes. The wording lives
+    here, beside ACTIONS_APP_ID; the decision to say it lives with the
+    caller, which is the only place that knows whether the binding write
+    lands (see _ambient_bindings)."""
+    return [
+        f"HEADS UP: '{context}' is required from App {ACTIONS_APP_ID} (GitHub Actions), "
+        "which every workflow in this repository posts its check runs as -- so it reads as an "
+        "App binding while excluding nobody who could already produce the check. Bind it to the "
+        "App that should publish it, or drop the binding in the ruleset by hand."
+        for context in contexts
+    ]
+
+
 def _create_body(ruleset_name, checks, deferred=()):
     """The body a fresh ruleset is POSTed with. `deferred` names the
     checks left out of it this time (see apply_ruleset's `defer`): a
@@ -1611,7 +1689,12 @@ def _build_update_body(repo, existing_id, checks, ruleset_name, deferred=(), def
                 f"not writing ruleset '{ruleset_name}' (id {existing_id}) -- widening it "
                 f"onto '{default_branch}' would enforce there what nothing here can tell "
                 f"'{default_branch}' can satisfy: " + "; ".join(hazards) + ". Widen the ruleset "
-                "by hand once it is known to, or remove that from it first."
+                "by hand once it is known to, or remove that from it first.",
+                # An Actions-bound entry among those hazards stands after this
+                # run exactly as it stood before it, and this is the ruleset
+                # setup manages -- so the advisory is owed here (Codex,
+                # mikelward/repo#70).
+                body=original,
             )
 
     wanted_contexts = []
@@ -1657,12 +1740,19 @@ def _build_update_body(repo, existing_id, checks, ruleset_name, deferred=(), def
         if "integration_id" in wanted:
             # The unbound entry, if there was one, becomes this bound one
             # -- the same requirement, tightened to the App -- and an
-            # entry bound to another App stays beside it: the floor.
+            # entry bound to another App stays beside it: the floor. The
+            # exception is an entry bound to GitHub Actions, which is not
+            # another App's requirement but the ambient producer this
+            # binding exists to displace (ACTIONS_APP_ID): kept beside the
+            # new one, the check would be required from BOTH, and the App
+            # cannot satisfy the Actions half, so the branch would be
+            # wedged by the very write that was meant to tighten it.
             wanted_contexts.append(wanted)
             wanted_contexts.extend(
                 h
                 for h in have_entries.get(context, [])
-                if (h.get("integration_id") or None) not in (None, integration_id)
+                if (h.get("integration_id") or None)
+                not in (None, integration_id, ACTIONS_APP_ID)
             )
         else:
             wanted_contexts.extend(have_entries.get(context) or [wanted])
@@ -2078,7 +2168,15 @@ def apply_ruleset(
     with the reason when the ruleset cannot be written until a person
     acts (RulesetHeld: a widening that would enforce on the branch what
     nothing here can tell it satisfies), so a caller skips this step and
-    no other. report["deferred"] --
+    no other. report["ambient_bindings"] -- the checks the
+    ruleset is left requiring from GitHub Actions, which is not a binding
+    (see _ambient_bindings): from the planned write where one was planned,
+    and from the ruleset as it stands where a hold writes nothing, so a
+    held step still says it. A caller shows the step for it
+    even where nothing else needs saying. It is a report and not a printed
+    line: only the caller knows whether a later write of its own binds the
+    check to a real App and so replaces the entry, and it renders
+    ambient_binding_lines() for whatever is left once it does. report["deferred"] --
     (context, reason) pairs for the checks this write leaves for a later
     run, see `defer` below -- is set on every path that got as far as
     planning, so a caller can say what is waiting even when nothing else
@@ -2227,9 +2325,22 @@ def apply_ruleset(
         error(f"{repo}: {e.detail}")
         if report is not None:
             report["held"] = e.detail
+            report["ambient_bindings"] = _ambient_bindings(e.body)
         return 1
     except RulesetError:
         return 1
+
+    # Assigned the moment the fact is known, not once the rest of the plan
+    # is. The late assignment below was a second way to lose it -- the
+    # legacy-deletion read can fail between here and there, and the
+    # widening hold above returns earlier still, both leaving a repository
+    # whose ruleset still requires a check from Actions told nothing at all
+    # (Codex, mikelward/repo#70, the same class twice). target_body is the
+    # post-write state, so where the ruleset write itself supersedes the
+    # entry this is already empty.
+    if report is not None:
+        report["ambient_bindings"] = _ambient_bindings(target_body)
+
     # Only the checks this write actually leaves out, in the requested
     # order: one the ruleset already requires is not deferred, whatever
     # its runs say, since leaving it alone changes nothing.
