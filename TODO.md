@@ -1787,3 +1787,53 @@
   the text prompt when a label's safe column width can't be established.
   Reversible: it only tightens an existing fallback and changes nothing for
   ASCII labels.
+
+- **`repo setup`'s ambient-binding advisory reads only the ruleset it
+  manages.** An Actions-bound required check (`rules.ACTIONS_APP_ID`) in an
+  organization or inherited ruleset, or in a second repository ruleset, is
+  effective on the branch and cannot be superseded by this run's binding
+  write -- and `_ambient_bindings` reads the managed ruleset's target body,
+  so `repo setup` never names it. Deferred (Codex review,
+  mikelward/repo#70): `repo audit` already reports the whole effective set
+  and does name it, which is the split between the two commands -- setup
+  reports on what it manages, audit on what the branch enforces. If that
+  stops being enough, setup already has the effective rules in hand
+  (`_lanes_repoint_state` fetches them) and the advisory could be computed
+  from that set instead, suppressing only the exact managed entry an
+  eligible binding write replaces. Reversible: `_ambient_bindings` is one
+  function with one caller.
+
+- **The credential move can outrun a coverage change.** `repo setup`
+  decides the Actions exemption (`binding_will_supersede`) from the plan's
+  coverage answer plus the `--app` step's outcome, and the binding block's
+  own final coverage read happens after the credential move. An
+  administrator removing the App between the two leaves the publisher
+  switched and the requirement unmoved. Deferred (Codex review,
+  mikelward/repo#70): this is the rerun-converging window the maintainer
+  already accepted for this mechanism (2026-09-10, see "Accepted:
+  rerun-converging windows in the split credential/binding mechanism") --
+  the move runs before the bind on purpose, so a failed bind after a
+  successful move is the shape of every race here, and the exemption joins
+  that window rather than opening one. Closing it means the same
+  class-deleting redesign that entry names: never let the publisher lead
+  the requirement. A cheaper half-measure, if it is wanted before then: an
+  apply-time coverage read immediately before the move, at the cost of one
+  more API call per repository on the fleet loop's hot path.
+
+- **`repo audit` does not check whether GitHub Actions is enabled.** Every
+  managed check is published by an Actions workflow, so a repository with
+  Actions disabled can never satisfy any of them -- and audit's coverage
+  loop skips `rules.ACTIONS_APP_ID` outright (`audit_cmd.py`), while the
+  evidence scan can still be satisfied by a check run from before it was
+  turned off. The branch is wedged and audit reports only the
+  ambient-binding advisory, whose remedies (bind the check, or drop the
+  binding by hand) cannot make a disabled workflow run. Deferred (Codex
+  review, mikelward/repo#70): reading `actions/permissions` is a new API
+  call on every audit and a new failure mode of its own -- a token without
+  the scope, an organization policy that answers for the repository -- so
+  it is a liveness check to design rather than a line to add here, and it
+  is a gap this change found rather than one it opened: the skipped call
+  was `app_covers_repo`, which for Actions looks for an installation that
+  does not exist and so never reported liveness either. `scaffold.py`
+  already reads workflow state for the publisher-collision check, which is
+  where the same question is asked of a single workflow.
