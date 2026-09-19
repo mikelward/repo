@@ -108,6 +108,8 @@ class FakeGh:
         self.auto_merge_fails = None  # gh stderr text, or None
         self.delete_branch_on_merge = "true"
         self.delete_branch_on_merge_fails = None  # gh stderr text, or None
+        self.pull_request_creation_policy = "collaborators_only"
+        self.pull_request_creation_policy_fails = None  # gh stderr text, or None
         self.effective_rules = list(DEFAULT_EFFECTIVE_RULES)
         self.effective_rules_fails = None  # gh stderr text, or None
         # None means "one page" (self.effective_rules as a whole). Set to a
@@ -190,6 +192,10 @@ class FakeGh:
             if self.delete_branch_on_merge_fails is not None:
                 raise gh.GhError(self.delete_branch_on_merge_fails)
             return self.delete_branch_on_merge + "\n"
+        if m and jq == ".pull_request_creation_policy":
+            if self.pull_request_creation_policy_fails is not None:
+                raise gh.GhError(self.pull_request_creation_policy_fails)
+            return self.pull_request_creation_policy + "\n"
 
         m = _RULES_RE.match(endpoint)
         if m:
@@ -1720,6 +1726,62 @@ class DeleteBranchOnMergeAuditTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn(f"could not read whether {REPO} deletes branches on merge:", err)
         self.assertNotIn("deletes branches on merge", out)
+
+
+class PullRequestCreationPolicyAuditTest(unittest.TestCase):
+    def test_restricted_to_collaborators_is_ok(self):
+        code, out, err = _run(FakeGh(), [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[ok] only collaborators may open a pull request", out)
+
+    def test_anyone_may_open_one_is_a_fix_naming_setup(self):
+        fake = FakeGh()
+        fake.pull_request_creation_policy = "all"
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            f"[FIX] anyone may open a pull request on {REPO} -- a fork's branch can become a "
+            f"head this fleet's checks run against; `repo setup {REPO}` restricts it to "
+            "collaborators",
+            out,
+        )
+
+    def test_a_value_this_tool_does_not_know_fails_the_audit(self):
+        # The failure worth guarding: a null field or a value GitHub adds
+        # later reads exactly like a correctly configured repository, so
+        # anything but the two known values has to be said out loud rather
+        # than folded into the [ok]. It is a [GAP] and not a [FIX]: a
+        # [FIX] is a gap `repo setup` closes and deliberately does not
+        # fail the audit, but no setup run resolves a value nobody
+        # understands, and exiting 0 would call the boundary audited.
+        fake = FakeGh()
+        fake.pull_request_creation_policy = "null"
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            f"[GAP] could not tell who may open a pull request on {REPO} -- GitHub reported "
+            "'null', which this tool does not recognize; check the setting by hand",
+            out,
+        )
+        self.assertNotIn("only collaborators may open a pull request", out)
+
+    def test_the_open_state_stays_a_fix_that_does_not_fail_the_audit(self):
+        # The other side of that line, pinned so the two tiers cannot be
+        # collapsed: `all` is a real gap but one `repo setup` closes, so
+        # it reports without failing while the fleet is rolled out.
+        fake = FakeGh()
+        fake.pull_request_creation_policy = "all"
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[FIX] anyone may open a pull request", out)
+
+    def test_a_failed_pull_request_policy_read_exits_1(self):
+        fake = FakeGh()
+        fake.pull_request_creation_policy_fails = "gh: HTTP 500: boom\n"
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(f"could not read who may open a pull request on {REPO}:", err)
+        self.assertNotIn("may open a pull request", out)
 
 
 class LanesCredentialAuditTest(unittest.TestCase):

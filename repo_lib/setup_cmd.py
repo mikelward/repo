@@ -1468,6 +1468,37 @@ def _plan_delete_branch_on_merge(repo):
     return "enable", ["delete a pull request's head branch automatically once it merges"]
 
 
+def _plan_pull_request_creation_policy(repo):
+    """Who may open a pull request: ("restricted" | "restrict" | "error",
+    the plan lines). Same shape as the two settings above, and always on
+    for the same reason -- there is nothing to request, only a setting
+    with one right value.
+
+    `all` lets anyone with a fork open a pull request against the
+    repository; `collaborators_only` limits it to people who already have
+    access, and unlike an interaction limit it does not expire. Anything
+    else is an error rather than a pass: a null field or a value added
+    after this was written reads exactly like a correctly configured
+    repository, and reporting one as "already restricted" is the only way
+    this step can quietly claim a boundary that is not there."""
+    try:
+        value = gh.run(
+            ["api", f"repos/{repo}", "--jq", ".pull_request_creation_policy"]
+        ).strip()
+    except gh.GhError as e:
+        lines = [f"could not read who may open a pull request on {repo}:"]
+        lines += [f"  {line}" for line in (e.stderr or "").splitlines()]
+        return "error", lines
+    if value == "collaborators_only":
+        return "restricted", ["already restricted to collaborators"]
+    if value == "all":
+        return "restrict", ["restrict opening a pull request to collaborators (anyone may today)"]
+    return "error", [
+        f"could not tell who may open a pull request on {repo} -- GitHub reported "
+        f"'{value}', which this tool does not recognize"
+    ]
+
+
 def _reject_fleet_credentials_under_secret(secret_specs):
     """A fleet credential has one place, and --credential is the flag that
     puts it there; a --secret naming one is refused whatever scope it
@@ -1870,6 +1901,8 @@ def _run(args, log=None):
     auto_merge_state, auto_merge_lines = _plan_auto_merge(repo)
     _progress(args, f"{repo}: checking delete-branch-on-merge")
     delete_branch_state, delete_branch_lines = _plan_delete_branch_on_merge(repo)
+    _progress(args, f"{repo}: checking who may open a pull request")
+    pr_policy_state, pr_policy_lines = _plan_pull_request_creation_policy(repo)
 
     # Always on, like credentials and auto-merge: there is nothing to
     # request here either, only one right state (the fleet's scaffold
@@ -1980,6 +2013,7 @@ def _run(args, log=None):
         and credentials_idle
         and auto_merge_state == "allowed"
         and delete_branch_state == "allowed"
+        and pr_policy_state == "restricted"
         and bootstrap_idle
     )
     if would_skip_everything and bootstrap_plan is not None and not bootstrap_plan.error:
@@ -2474,6 +2508,9 @@ def _run(args, log=None):
         if full or delete_branch_state != "allowed":
             lines.append("  delete-branch-on-merge:")
             lines += [f"    {line}" for line in delete_branch_lines]
+        if full or pr_policy_state != "restricted":
+            lines.append("  pull request creation:")
+            lines += [f"    {line}" for line in pr_policy_lines]
         wedged = wedged_branch_warning() if not args.no_bootstrap else None
         if not args.no_bootstrap and (full or not bootstrap_idle or wedged):
             lines.append("  bootstrap (fleet CI scaffold):")
@@ -2500,6 +2537,7 @@ def _run(args, log=None):
             or credentials_plan.unfixed
             or auto_merge_state == "error"
             or delete_branch_state == "error"
+            or pr_policy_state == "error"
             or (bootstrap_plan is not None and bootstrap_plan.error)
             or (bootstrap_plan is not None and bootstrap_plan.missing_workflow_scope)
             or empty_branch_would_strand_ruleset
@@ -2583,6 +2621,7 @@ def _run(args, log=None):
         or bool(credentials_plan.moves)
         or auto_merge_state == "enable"
         or delete_branch_state == "enable"
+        or pr_policy_state == "restrict"
         or (
             bootstrap_plan is not None
             and not bootstrap_plan.error
@@ -3537,6 +3576,25 @@ def _run(args, log=None):
             for line in delete_branch_lines:
                 error(line)
         failed.append("delete-branch-on-merge")
+
+    if pr_policy_state == "restrict":
+        try:
+            gh.run_with_input(
+                ["api", "--method", "PATCH", f"repos/{repo}", "--input", "-"],
+                json.dumps({"pull_request_creation_policy": "collaborators_only"}).encode(),
+            )
+        except gh.GhError as e:
+            error_lines(
+                f"could not restrict pull request creation on {repo}:", e.stderr
+            )
+            failed.append("pull-request-creation")
+        else:
+            print(f"{repo}: restricted pull request creation to collaborators")
+    elif pr_policy_state == "error":
+        if not show_plan:
+            for line in pr_policy_lines:
+                error(line)
+        failed.append("pull-request-creation")
 
     # Said last, from what the run actually left behind rather than from
     # what it planned. Six rounds went on deciding it earlier and each was

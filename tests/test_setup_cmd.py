@@ -186,6 +186,8 @@ class FakeGh:
         self.fail_allow_auto_merge = False
         self.delete_branch_on_merge = "true"
         self.fail_delete_branch_on_merge = False
+        self.pull_request_creation_policy = "collaborators_only"
+        self.fail_pull_request_creation_policy = False
         self.patches = []
         self.patch_fails = False
         self.branch_count = "1"
@@ -680,6 +682,10 @@ class FakeGh:
             if self.fail_delete_branch_on_merge or self.repo_missing:
                 raise gh.GhError("gh: HTTP 404: Not Found\n")
             return self.delete_branch_on_merge + "\n"
+        if m and jq == ".pull_request_creation_policy":
+            if self.fail_pull_request_creation_policy or self.repo_missing:
+                raise gh.GhError("gh: HTTP 404: Not Found\n")
+            return self.pull_request_creation_policy + "\n"
         if m and jq == ".allow_rebase_merge":
             if self.fail_allow_rebase:
                 raise gh.GhError("gh: HTTP 500: Internal Server Error\n")
@@ -1515,6 +1521,9 @@ class FakeGh:
             self.allow_auto_merge = "true" if body.get("allow_auto_merge") else self.allow_auto_merge
             self.delete_branch_on_merge = (
                 "true" if body.get("delete_branch_on_merge") else self.delete_branch_on_merge
+            )
+            self.pull_request_creation_policy = body.get(
+                "pull_request_creation_policy", self.pull_request_creation_policy
             )
         else:
             raise AssertionError(f"unexpected method: {method}")
@@ -9020,6 +9029,103 @@ class DeleteBranchOnMergeStepTest(unittest.TestCase):
         self.assertIn("failed on: delete-branch-on-merge", err)
         self.assertEqual(fake.patches, [])
         self.assertEqual(fake.written_secrets, [("TOKEN", REPO, "lanes", b"sekrit")])
+
+
+class PullRequestCreationPolicyStepTest(unittest.TestCase):
+    """Always on, like the two settings above and for the same reason.
+    What it decides is whether a stranger's branch can become a head this
+    fleet's checks run against, and unlike an interaction limit it does
+    not expire."""
+
+    def test_a_restricted_repository_needs_nothing(self):
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        code, out, err = _run(fake, ["--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(err, "")
+        self.assertEqual(fake.patches, [])
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+        code, out, err = _run(fake, ["--dry-run", "-v", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "  pull request creation:\n    already restricted to collaborators\n", out
+        )
+
+    def test_creation_is_restricted_after_confirmation(self):
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        fake.pull_request_creation_policy = "all"
+        # A repository setting change, so it is a mutation the gate asks about.
+        code, out, err = _run(fake, ["--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("stdin is not a terminal", err)
+        self.assertEqual(fake.patches, [])
+        code, out, err = _run(fake, ["--force", "-v", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "restrict opening a pull request to collaborators (anyone may today)", err
+        )
+        self.assertEqual(len(fake.patches), 1)
+        args, body = fake.patches[0]
+        self.assertEqual(args[:4], ["api", "--method", "PATCH", f"repos/{REPO}"])
+        self.assertEqual(body, {"pull_request_creation_policy": "collaborators_only"})
+        self.assertIn(
+            f"{REPO}: restricted pull request creation to collaborators", out
+        )
+
+    def test_a_dry_run_reports_without_restricting(self):
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        fake.pull_request_creation_policy = "all"
+        code, out, err = _run(fake, ["--dry-run", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "  pull request creation:\n    restrict opening a pull request to collaborators",
+            out,
+        )
+        self.assertEqual(fake.patches, [])
+
+    def test_a_failed_restrict_fails_the_step(self):
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        fake.pull_request_creation_policy = "all"
+        fake.patch_fails = True
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(f"could not restrict pull request creation on {REPO}:", err)
+        self.assertIn("failed on: pull-request-creation", err)
+
+    def test_a_failed_read_fails_this_step_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _secret_file(tmp, "value.txt")
+            fake = FakeGh()
+            fake.workflow_files = ["ci.yml"]
+            fake.fail_pull_request_creation_policy = True
+            code, out, err = _run(fake, ["--force", "--no-rules", "--secret", f"TOKEN@lanes={path}", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(f"could not read who may open a pull request on {REPO}:", err)
+        self.assertIn("failed on: pull-request-creation", err)
+        self.assertEqual(fake.patches, [])
+        self.assertEqual(fake.written_secrets, [("TOKEN", REPO, "lanes", b"sekrit")])
+
+    def test_a_value_this_tool_does_not_know_is_an_error_not_a_pass(self):
+        # The one failure worth a test of its own: an unrecognized value
+        # reads exactly like a correctly restricted repository, so
+        # treating it as "already restricted" would have setup report
+        # success over a boundary nobody has checked. It fails the step
+        # and writes nothing instead.
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        fake.pull_request_creation_policy = "null"
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            f"could not tell who may open a pull request on {REPO} -- GitHub reported "
+            "'null', which this tool does not recognize",
+            err,
+        )
+        self.assertIn("failed on: pull-request-creation", err)
+        self.assertEqual(fake.patches, [])
 
 
 class BootstrapStepTest(unittest.TestCase):
