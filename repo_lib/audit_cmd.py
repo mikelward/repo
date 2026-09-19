@@ -362,6 +362,53 @@ def audit_delete_branch_on_merge(repo, ok, fix):
         )
 
 
+def audit_pull_request_creation_policy(repo, ok, fix, gap):
+    """Who may open a pull request. Left at `all`, anyone with a fork can
+    open one against this repository; set to `collaborators_only`, only
+    someone who already has access can. It is the setting that decides
+    whether a stranger's branch ever becomes a head this fleet's checks
+    run against, and unlike an interaction limit it does not expire. A
+    setup pass sets it, so this is a [FIX] like the two settings above.
+
+    Read strictly: `all` is the open state and `collaborators_only` the
+    wanted one, and anything else -- a null because the field went away,
+    or a value GitHub added after this was written -- is reported rather
+    than guessed at. Treating an unrecognized value as "already fine"
+    would be the one failure mode worth avoiding here, since it reads
+    exactly like a repository that is correctly configured.
+
+    That unrecognized case is a [GAP] rather than a [FIX], and the
+    distinction is the whole point of the two tiers. A [FIX] is a gap
+    this tool closes, reported without failing the audit while the
+    layout is rolled out through `repo setup`. "Could not tell" is not
+    that: no `repo setup` run resolves it, and the audit has not
+    verified the boundary, so exiting 0 would report a repository as
+    audited on a value nobody understood -- while `repo setup` refuses
+    the same value (Codex, mikelward/repo#72). A [GAP] fails the audit
+    and still lets the remaining findings print, which a raised
+    SystemExit -- the failed-read path's answer -- would cut short for a
+    read that actually succeeded."""
+    try:
+        value = gh.run(
+            ["api", f"repos/{repo}", "--jq", ".pull_request_creation_policy"]
+        ).strip()
+    except gh.GhError as e:
+        error_lines(f"could not read who may open a pull request on {repo}:", e.stderr)
+        raise SystemExit(1)
+    if value == "collaborators_only":
+        ok("only collaborators may open a pull request")
+    elif value == "all":
+        fix(
+            f"anyone may open a pull request on {repo} -- a fork's branch can become a head "
+            f"this fleet's checks run against; `repo setup {repo}` restricts it to collaborators"
+        )
+    else:
+        gap(
+            f"could not tell who may open a pull request on {repo} -- GitHub reported "
+            f"'{value}', which this tool does not recognize; check the setting by hand"
+        )
+
+
 def _setup_stops(blocked):
     """The caveat every `repo setup` recommendation in the lanes section
     carries while its planner would not get that far, or "" while it
@@ -1355,6 +1402,7 @@ def run(args):
     audit_legacy_rulesets(repo, ok, fix)
     audit_auto_merge(repo, ok, fix)
     audit_delete_branch_on_merge(repo, ok, fix)
+    audit_pull_request_creation_policy(repo, ok, fix, gap)
     audit_secrets(repo, ok, fix)
 
     if gap_found[0]:

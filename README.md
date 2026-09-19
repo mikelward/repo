@@ -370,12 +370,22 @@ can reach hands a same-repo pull request's push-triggered run the same reach
 to something else is a `[FIX]` to close by hand. A repository that does not allow auto-merge is a `[FIX]` too: the weekly
 batches arm it on their pull requests. So is one that does not delete a merged
 pull request's head branch automatically -- without it nothing sweeps the
-branches a merge leaves behind (see `repo cleanup` below). `[FIX]` findings do
+branches a merge leaves behind (see `repo cleanup` below). So is one that lets
+anyone open a pull request: set to collaborators only, a stranger's branch
+never becomes a head this fleet's checks run against, and unlike an
+interaction limit the setting does not expire. A value that is neither `all`
+nor `collaborators_only` is a `[GAP]` rather than a pass -- an absent or
+unfamiliar one reads exactly like a repository that is already restricted, and
+no `repo setup` run resolves a value nobody understands, so unlike the `[FIX]`
+findings it fails the audit.
+`[FIX]` findings do
 not fail the audit yet (see `TODO.md`): the layout is being rolled out through
 `repo setup`.
 
-`repo setup` makes the move, and enables auto-merge and delete-branch-on-merge
-on the repository where either is off. Its fleet-credentials step is always on: for
+`repo setup` makes the move, enables auto-merge and delete-branch-on-merge
+on the repository where either is off, and restricts opening a pull request to
+collaborators where anyone may. That last step fails rather than writes when
+GitHub reports a policy it does not recognize. Its fleet-credentials step is always on: for
 each batch the repository runs (by whichever workflows call it from a job,
 whatever they are named, on the default branch) and for the
 commit-back workflow (by a job calling it), a value passed as

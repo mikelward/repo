@@ -198,6 +198,17 @@ setup`, always on unless a flag opts the repository out:
 - **Fleet credentials in their environments**, each restricted to the
   default branch, with no repository-level copy left behind.
 - **Auto-merge** and **delete branch on merge** enabled.
+- **Opening a pull request restricted to collaborators.** `all` lets
+  anyone with a fork open one, and its head is then a ref the fleet's
+  checks run against; `collaborators_only` is the end state. It has no
+  place in the ladder below -- nothing waits on it and it gates nothing
+  else, unlike delete-branch-on-merge, which has to be on before the
+  scaffold's own merge. A value that is neither is read as an error and
+  fails this step alone rather than passing: the field is not in
+  GitHub's documented schema yet, so an absent or unfamiliar one is
+  indistinguishable from a repository already in the end state, and a
+  run that called it converged would be claiming a boundary nobody
+  checked.
 - **The GitHub Apps** named with `--app` installed on the repository.
 
 ## The ladder
