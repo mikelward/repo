@@ -335,6 +335,45 @@
       hubs. Should the App ever take on work that is not an update, renaming
       an environment and moving two secrets is one `repo setup` run.
 
+- [ ] **Redo the environment restriction for the batch and commit-back
+      credentials.** mikelward/repo#37 generalized #36's lanes work to every
+      credential -- one planner (`settle_environment`), one reporter, plus
+      `MERGE_REF_EVENTS`/`merge_ref_callers` so a caller on `pull_request`,
+      `pull_request_review` or `pull_request_review_comment` holds the
+      restriction while `pull_request_target` still takes it. It was closed
+      unmerged on 2026-09-19: two weeks of other work had rewritten the
+      shared files, and the branch would have deleted ~17.8k lines relative
+      to `main`, so it is a rewrite rather than a rebase. None of
+      `settle_environment`, `MERGE_REF_EVENTS` or `merge_ref_callers` is on
+      `main`; the supporting pieces it rested on (`_branch_policy_patterns`,
+      `lanes_called_workflows`, `_setup_stops`, `restrictable`) are.
+      Measured since, and worth carrying into the rewrite rather than
+      re-deriving: a deployment branch policy allowing only `main` refuses a
+      merge-ref run outright -- `Branch "refs/pull/61/merge" is not allowed
+      to deploy to probe due to environment protection rules`, the job
+      failing in a second with no step executed (run 34691527682, job
+      103547503489, 2026-09-12). So authorization is by the ref the run
+      reports, and a merge-ref run gets nothing rather than an empty secret.
+      Three findings from its last review are unfixed and go with it:
+      - `move.recheck()` re-reads the workflows and the secrets but not the
+        policy, so a blocked move -- the one path left with neither
+        `still_trusted` nor `shut` -- can still write the token and delete
+        the repository copy after an administrator narrows the policy
+        mid-run. This is the fourth finding in that mechanism, so the
+        rewrite should carry the policy into `recheck()` itself rather than
+        add a fifth per-path guard.
+      - The audit's caveat keys on the union of repository and environment
+        secrets, so an environment that is empty while a usable credential
+        sits at repository level emits no caveat -- and setup cannot read a
+        repository secret's value, so the advertised command still stops
+        first. Base it on `env_secrets` alone.
+      - A merge-ref caller whose environment carries a custom policy is told
+        the trigger change plus `repo setup` is sufficient, but setup will
+        not rewrite a policy someone else set, so the default branch stays
+        shut out. The custom-policy remediation needs naming too.
+      All three are recorded rather than verified: the code they point at is
+      not on `main`.
+
 ## The merge gate: only a collaborator's work merges unattended
 
 - [ ] **Arm auto-merge only for work a collaborator or a fleet bot wrote.**
@@ -1837,3 +1876,36 @@
   does not exist and so never reported liveness either. `scaffold.py`
   already reads workflow state for the publisher-collision check, which is
   where the same question is asked of a single workflow.
+
+- **Restricting pull request creation is the interim measure; the merge
+  gate is what lets it be lifted.** The restriction today is
+  `pull_request_creation_policy: collaborators_only`, set BY HAND -- 22
+  of the 23 fleet repositories carry it as of 2026-09-19, `snoozemo`
+  being the exception. Nothing in this tree reads or writes it;
+  mikelward/repo#72 is the open pull request that would have `repo
+  setup` maintain it, and until that lands the protection rests on
+  somebody having clicked it. Stated that way deliberately: an earlier
+  draft of this entry said `repo setup` sets it, which would have had a
+  reader delete the authorship gate on the strength of protection the
+  tool does not establish (Codex, mikelward/repo#73).
+  The maintainer's intent is to allow external pull requests later
+  (2026-09-19). So the two are a sequence, not
+  alternatives, and it is worth writing down which way round: while
+  creation is restricted every author is a collaborator by construction,
+  which makes the merge gate's authorship half temporarily redundant --
+  but it is redundant only for as long as the setting stands, and the
+  setting is meant to come off. Building the gate is therefore the
+  prerequisite for opening the repository, not work the setting replaces.
+  The reverse reading is the one to avoid: deleting the authorship
+  workflow because the setting covers it today would mean re-deriving six
+  review rounds at exactly the moment the repository is opened, with
+  nothing then standing between an outside pull request and unattended
+  auto-merge.
+  Two things to establish before the setting comes off, both measurable
+  the way the environment policy was: whether the bots that open pull
+  requests here (the weekly batches on their PAT, the scaffold,
+  Dependabot security updates) are admitted by `collaborators_only` --
+  which decides whether the interim state is even sustainable -- and
+  whether a pull request opened before the setting was applied, or by
+  someone whose access is later revoked, can still reach auto-merge,
+  since that is the gap the gate has to cover on the day it is lifted.
