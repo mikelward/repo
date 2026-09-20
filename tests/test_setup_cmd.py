@@ -2782,6 +2782,63 @@ class SetupCmdTest(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertIn("rules only on the one being deleted: required_signatures", err)
 
+    def test_the_note_names_which_checks_differ_not_just_the_parameter(self):
+        # `required_status_checks: differs in required_status_checks`
+        # named the key to go and read the JSON for, under the y/N prompt
+        # that reading it was supposed to answer. The real case that
+        # produced it: three checks required unbound on the duplicate and
+        # bound to Apps on the survivor (maintainer, 2026-09-20).
+        fake = FakeGh()
+        self._matching_pair(
+            fake,
+            legacy_rules=[
+                {
+                    "type": "required_status_checks",
+                    "parameters": {
+                        "strict_required_status_checks_policy": True,
+                        "required_status_checks": [
+                            {"context": "lanes", "integration_id": None},
+                            {"context": "zizmor", "integration_id": None},
+                        ],
+                    },
+                }
+            ],
+        )
+        with tempfile.TemporaryDirectory() as state:
+            code, out, err = _run(fake, ["--force", "--rule", "lanes", REPO], log_dir=state)
+        self.assertEqual(code, 0, err)
+        self.assertIn("required_status_checks only on the one being deleted: zizmor", err)
+        # The survivor requires `lanes` too, so it is on neither side --
+        # a membership comparison, not a dump of both lists.
+        self.assertNotIn("only on the one being deleted: lanes", err)
+        # And the vague form is gone.
+        self.assertNotIn("differs in required_status_checks", err)
+
+    def test_the_note_gives_both_values_of_a_scalar_that_differs(self):
+        # A list is compared by membership; anything else shows what it is
+        # on each side, which is the whole of the difference for a flag.
+        fake = FakeGh()
+        self._matching_pair(
+            fake,
+            legacy_rules=[
+                {
+                    "type": "required_status_checks",
+                    "parameters": {
+                        "strict_required_status_checks_policy": False,
+                        "required_status_checks": [{"context": "lanes"}],
+                    },
+                }
+            ],
+        )
+        with tempfile.TemporaryDirectory() as state:
+            code, out, err = _run(fake, ["--force", "--rule", "lanes", REPO], log_dir=state)
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "required_status_checks.strict_required_status_checks_policy: "
+            "False here, True on the one that stays",
+            err,
+        )
+
     def test_the_note_names_a_ref_the_survivor_will_not_cover(self):
         fake = FakeGh()
         self._matching_pair(

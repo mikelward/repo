@@ -875,9 +875,11 @@ def _ruleset_difference(legacy_body, target_body):
         lines.append("rules only on the one that stays: " + ", ".join(added))
     for rule_type in sorted(t for t in set(old_rules) & set(new_rules) if t):
         a, b = old_rules[rule_type], new_rules[rule_type]
-        if a != b:
-            keys = sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k))
-            lines.append(f"{rule_type}: differs in {', '.join(keys)}")
+        for key in sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k)):
+            # `required_status_checks.required_status_checks` stutters, and
+            # that is the parameter an operator reads most.
+            label = rule_type if key == rule_type else f"{rule_type}.{key}"
+            lines.extend(_parameter_difference(label, a.get(key), b.get(key)))
 
     # Ref coverage is the difference most worth spelling out: it decides
     # which branches the rules applied to at all.
@@ -893,6 +895,58 @@ def _ruleset_difference(legacy_body, target_body):
     for key in sorted((set(old) | set(new)) - {"rules", "conditions"}):
         if old.get(key) != new.get(key):
             lines.append(f"{key}: {old.get(key)!r} here, {new.get(key)!r} on the one that stays")
+    return lines
+
+
+def _difference_item(value):
+    """One member of a rule parameter's list, for the difference summary.
+    A required check reads as the plan writes it; anything else falls back
+    to repr, since this has to stay correct for a parameter shape nobody
+    has added yet."""
+    if isinstance(value, dict) and "context" in value:
+        return _context_label(value.get("context"), value.get("integration_id"))
+    return repr(value)
+
+
+def _difference_key(value):
+    """What makes two members of a rule parameter's list the same one.
+
+    A dict's null-valued keys are dropped, because GitHub writes an
+    unbound required check as `integration_id: null` in one ruleset and
+    omits the key in another -- and comparing those as written reported
+    the same check as unique to both sides at once."""
+    if isinstance(value, dict):
+        return tuple(sorted((k, repr(v)) for k, v in value.items() if v is not None))
+    return repr(value)
+
+
+def _parameter_difference(label, here, stays):
+    """How one rule parameter differs, as plain lines.
+
+    Naming the parameter was not enough: `required_status_checks: differs
+    in required_status_checks` told an operator which key to go and read
+    the JSON for, under the y/N prompt that reading it was supposed to
+    answer (maintainer, 2026-09-20). A list is compared by membership,
+    because that is what a required-checks change actually is; a scalar
+    shows both values. Still descriptive only -- see _ruleset_difference."""
+    as_list = lambda v: v if isinstance(v, list) else ([] if v is None else None)
+    here_list, stays_list = as_list(here), as_list(stays)
+    if here_list is None or stays_list is None:
+        return [f"{label}: {here!r} here, {stays!r} on the one that stays"]
+    here_keys = {_difference_key(v) for v in here_list}
+    stays_keys = {_difference_key(v) for v in stays_list}
+    only_here = sorted(_difference_item(v) for v in here_list if _difference_key(v) not in stays_keys)
+    only_stays = sorted(_difference_item(v) for v in stays_list if _difference_key(v) not in here_keys)
+    if not only_here and not only_stays:
+        # Same members either way: what is left is order, or a notation
+        # the key above normalizes. Say which, rather than leaving a bare
+        # "differs" that nothing in the summary then explains.
+        return [f"{label}: the same entries, differing only in order or notation"]
+    lines = []
+    if only_here:
+        lines.append(f"{label} only on the one being deleted: " + ", ".join(only_here))
+    if only_stays:
+        lines.append(f"{label} only on the one that stays: " + ", ".join(only_stays))
     return lines
 
 
