@@ -1909,3 +1909,39 @@
   whether a pull request opened before the setting was applied, or by
   someone whose access is later revoked, can still reach auto-merge,
   since that is the gap the gate has to cover on the day it is lifted.
+
+- **`repo audit` cannot verify an App-bound check, and that gets worse as
+  the fleet moves to the shared update App.** Coverage for a bound entry
+  reads `user/installations`, which gh's own tokens are refused, and
+  `repo audit` takes no `--app` to read as the App instead -- so on any
+  repository whose required check is bound to a real App the answer is
+  permanently "could not tell". That is now a [GAP] that lets the rest of
+  the report run (it used to abort the audit outright, which cost every
+  finding below it -- the repository-level credential exposure included).
+  It is still a finding nobody can clear, and the shared-App plan above
+  turns App-bound checks from the exception into the norm.
+  The fix is not a flag: the fleet config file already carries `apps` (the
+  App keys, as paths) and `app_logins` (id -> slug pairings, added for
+  exactly this endpoint's refusal on the evidence scan). `repo audit`
+  reads no config at all today. Having it read the same file setup does
+  would make the coverage read answerable with no new concept, no key on
+  a command line, and no divergence between what the two commands know.
+  Deferred rather than taken here: it gives a read-only command a reason
+  to load a signing key, which is worth deciding deliberately -- and
+  `app_logins` alone may settle the slug half without the keys.
+
+- **A failed evidence scan still aborts `repo audit`; a failed coverage read
+  no longer does** (2026-09-20, autopilot; Codex, mikelward/repo#75). The
+  change above turned one unverifiable read into a `[GAP]` that lets the rest
+  of the report run. The other read on that path -- which checks have ever
+  reported -- still raises `RulesetError` and exits, so a rate limit or an
+  HTTP 500 there costs every finding below it exactly as the coverage abort
+  used to. The same argument applies to it: "could not tell" is a gap, not a
+  reason to say nothing.
+  Not taken here, deliberately. Degrading it changes what `[ok] every
+  required check has reported` may claim, and getting that right on the
+  coverage read took four review rounds -- each one a place an unknown had
+  leaked into a positive statement. Widening this pull request to a second
+  read would repeat that work in the same diff rather than after it.
+  Reversible either way: the abort is one `except rules.RulesetError` in
+  `audit_cmd`, and the can't-tell machinery it would reuse is already there.

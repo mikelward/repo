@@ -274,6 +274,13 @@ def _collect_reported(repo, wanted, ref=None, passed=False, shas=None, passing=f
     reject a valid name or require one on the strength of a safety check
     that never finished."""
     found = _Reported()
+    if not wanted:
+        # Nothing asked, so nothing read -- and nothing that can fail. The
+        # walk below reads the branch head before it checks whether every
+        # entry is satisfied, so an empty scan still paid for two reads
+        # whose failure raises RulesetError and aborts the caller's whole
+        # run (Codex, mikelward/repo#75).
+        return found
     names = found.names
     app_pairs = found.app_pairs
 
