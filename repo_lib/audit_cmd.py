@@ -1064,6 +1064,10 @@ def run(args):
             # so the gate is silently broken -- audit must catch that too.
             owner = repo.split("/", 1)[0]
             uncovered = []
+            # Keyed by the FULL entry: one context can be required from two
+            # different Apps, and a coverage read that fails for one of them
+            # says nothing about the other (Codex, mikelward/repo#75).
+            cant_tell = set()
             for context, integration_id in required_entries:
                 if integration_id is None:
                     continue
@@ -1080,11 +1084,32 @@ def run(args):
                 try:
                     covers = apps.app_covers_repo(owner, integration_id, repo)
                 except gh.GhError as e:
-                    error_lines(
-                        f"could not tell whether the App bound to '{context}' covers {repo}:",
-                        e.stderr,
+                    # Can't tell is neither covered nor uncovered: a [GAP], so
+                    # the audit fails having verified nothing about this gate,
+                    # rather than a line in `uncovered` that would tell a
+                    # reader to unbind a binding which may be healthy.
+                    detail = next(
+                        (line.strip() for line in (e.stderr or "").splitlines() if line.strip()),
+                        "",
                     )
-                    raise SystemExit(1)
+                    # Only the "not a GitHub App token" 403 is permanent.
+                    # Every other failure of this read may clear on a rerun,
+                    # so it is reported with no remedy attached.
+                    why = (
+                        " -- it answers only to a GitHub App user-to-server token, which "
+                        "`repo audit` has no way to supply, so this will not clear on a rerun"
+                        if apps.is_missing_app_token(e.stderr or "")
+                        else ""
+                    )
+                    gap(
+                        f"could not tell whether the App bound to '{context}' covers {repo}"
+                        f"{why}; the binding is unverified rather than known bad"
+                        + (f":\n  {detail}" if detail else "")
+                    )
+                    # This [GAP] is the only thing the entry produces; the
+                    # scan below leaves it out.
+                    cant_tell.add((context, integration_id))
+                    continue
                 if not covers:
                     uncovered.append((context, integration_id))
             uncovered_contexts = {context for context, _ in uncovered}
@@ -1118,6 +1143,11 @@ def run(args):
                     [
                         (context, None if integration_id == rules.ACTIONS_APP_ID else integration_id)
                         for context, integration_id in required_entries
+                        # Omitted rather than unbound: unbinding it made it
+                        # indistinguishable from a genuinely unbound entry of
+                        # the SAME name, suppressing that one's provable
+                        # never-reported finding (Codex, mikelward/repo#75).
+                        if (context, integration_id) not in cant_tell
                     ],
                     ref=branch,
                 )
@@ -1130,6 +1160,8 @@ def run(args):
             # An uncovered entry is reported as a coverage gap below; drop it
             # from the evidence buckets so the same entry is not double-reported
             # (an uncovered App also never reports, so it lands in both).
+            # Nothing to filter for can't-tell: those entries never entered
+            # the scan, so `unseen` cannot carry one.
             reportable = [i for i in unseen if i[0] not in uncovered_contexts]
             # Two different faults with two different fixes. A binding supplied
             # to `repo setup` now wins over the existing entry
@@ -1175,7 +1207,12 @@ def run(args):
             # `ambient` too: an all-clear beside its own gap line reads as
             # a contradiction, and the Actions entry was deliberately kept
             # out of the scan above, so `unseen` says nothing about it.
-            if not unseen and not uncovered and not ambient:
+            # `cant_tell` too, for the reason `ambient` is here: an
+            # all-clear printed beside this run's own can't-tell gap is a
+            # contradiction, and nothing established that the bound App
+            # reported -- only that SOMETHING posted the name (Codex,
+            # mikelward/repo#75).
+            if not unseen and not uncovered and not ambient and not cant_tell:
                 ok(
                     "every required check has reported: "
                     + rules.quoted(c for c, _ in required_entries)

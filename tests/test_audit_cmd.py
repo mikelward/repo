@@ -151,6 +151,8 @@ class FakeGh:
         # covers. The synthetic installation id is the entry's 1-based index.
         self.installations = []
         self.installations_fails = None  # gh stderr text, or None
+        # str: every listing fails. dict: {installation id -> stderr}, so one
+        # App's coverage can fail while another's succeeds.
         self.install_repos_fails = None  # listing a selected install's repos
         self.open_prs = []
         self.closed_prs = []
@@ -284,7 +286,11 @@ class FakeGh:
 
         m = _INSTALL_REPOS_RE.match(endpoint)
         if m:
-            if self.install_repos_fails is not None:
+            if isinstance(self.install_repos_fails, dict):
+                err = self.install_repos_fails.get(int(m.group(1)))
+                if err:
+                    raise gh.GhError(err)
+            elif self.install_repos_fails is not None:
                 raise gh.GhError(self.install_repos_fails)
             idx = int(m.group(1)) - 1
             covered = ()
@@ -1347,6 +1353,169 @@ class AuditCmdTest(unittest.TestCase):
         self.assertEqual(code, 1, err)
         self.assertNotIn("never reported", out + err)
         self.assertNotIn("does not cover this repo", out + err)
+
+    def test_an_unreadable_coverage_read_still_audits_everything_below_it(self):
+        # It used to raise SystemExit, so a repository whose check is bound
+        # to a real App got six lines of report and nothing else -- no
+        # credential findings, no ruleset gaps. And the read it fails on
+        # needs the App's own key, which `repo audit` cannot be given, so
+        # that was permanent rather than transient: the best-configured
+        # repositories were the unauditable ones. It is a [GAP] now (the
+        # audit still fails; it has verified nothing here) and the rest of
+        # the report runs.
+        fake = FakeGh()
+        fake.effective_rules = [
+            _pull_request_rule(),
+            _status_checks_rule([("lanes", 42)]),
+            {"type": "non_fast_forward", "parameters": {}},
+            {"type": "deletion", "parameters": {}},
+        ]
+        fake.check_runs = {fake.default_head_sha: ["codex"]}
+        fake.installations = [(42, "lanes-app", REPO.split("/", 1)[0], "selected", (REPO,))]
+        fake.install_repos_fails = "gh: HTTP 500: boom\n"
+        code, out, err = _run(fake, [REPO, "lanes"])
+        self.assertEqual(code, 1, err)
+        self.assertIn(
+            f"[GAP] could not tell whether the App bound to 'lanes' covers {REPO}", out
+        )
+        self.assertIn("gh: HTTP 500: boom", out)
+        # An HTTP 500 is a retryable failure of this read, so it is reported
+        # neutrally: the token-kind explanation below belongs only to the
+        # 403 that really is permanent, and offering it here would send a
+        # reader toward a configuration change instead of a rerun (Codex,
+        # mikelward/repo#75).
+        self.assertNotIn("user-to-server token", out)
+        self.assertNotIn("will not clear on a rerun", out)
+        # What the abort used to swallow. These come from steps after the
+        # coverage check, so their presence is the regression guard.
+        self.assertIn("force pushes are blocked", out)
+        self.assertIn("a merged pull request's head branch is deleted automatically", out)
+
+    def test_the_permanent_coverage_refusal_says_why_it_is_permanent(self):
+        # The other side of that line. GitHub serves `user/installations`
+        # only to a GitHub App user-to-server token, so this 403 is the one
+        # coverage failure a rerun can never clear -- and saying "403" alone
+        # sends people to re-authenticate, which cannot fix it.
+        fake = FakeGh()
+        fake.effective_rules = [
+            _pull_request_rule(),
+            _status_checks_rule([("lanes", 42)]),
+            {"type": "non_fast_forward", "parameters": {}},
+            {"type": "deletion", "parameters": {}},
+        ]
+        fake.check_runs = {fake.default_head_sha: ["codex"]}
+        fake.installations = [(42, "lanes-app", REPO.split("/", 1)[0], "selected", (REPO,))]
+        fake.install_repos_fails = (
+            "gh: You must authenticate with an access token authorized to a GitHub App "
+            "in order to list installations (HTTP 403)\n"
+        )
+        code, out, err = _run(fake, [REPO, "lanes"])
+        self.assertEqual(code, 1, err)
+        self.assertIn("user-to-server token", out)
+        self.assertIn("will not clear on a rerun", out)
+        self.assertIn("force pushes are blocked", out)
+
+    def test_every_binding_unverifiable_still_audits_everything_below_it(self):
+        # Omitting the can't-tell entries can empty the evidence scan, and
+        # the scan read the branch head and its check runs before noticing
+        # it had nothing to look for. A failure there raises RulesetError,
+        # which aborts the audit -- reintroducing the very abort this
+        # change removes, on the repository least able to afford it: the
+        # one whose only required check is App-bound (Codex,
+        # mikelward/repo#75). With nothing wanted there is nothing to read.
+        fake = FakeGh()
+        fake.effective_rules = [
+            _pull_request_rule(),
+            _status_checks_rule([("lanes", 42)]),
+            {"type": "non_fast_forward", "parameters": {}},
+            {"type": "deletion", "parameters": {}},
+        ]
+        fake.installations = [(42, "lanes-app", REPO.split("/", 1)[0], "selected", (REPO,))]
+        fake.install_repos_fails = "gh: HTTP 500: boom\n"
+        fake.check_runs_fails = "gh: HTTP 500: the scan that is no longer made\n"
+        code, out, err = _run(fake, [REPO, "lanes"])
+        self.assertEqual(code, 1, err)
+        self.assertIn(
+            f"[GAP] could not tell whether the App bound to 'lanes' covers {REPO}", out
+        )
+        # The scan never ran, so its failure is not reported and does not
+        # abort: the report reaches the steps below it.
+        self.assertNotIn("could not tell which of", err)
+        self.assertIn("force pushes are blocked", out)
+        self.assertIn("a merged pull request's head branch is deleted automatically", out)
+        # And no all-clear: one entry is can't-tell, so nothing here
+        # established that every required check has reported.
+        self.assertNotIn("every required check has reported", out)
+
+    def test_an_unverifiable_binding_withholds_the_all_clear(self):
+        # `lanes` HAS been posted here, so the name-based scan finds nothing
+        # unseen -- but nothing established that the BOUND App posted it,
+        # which is the gate. The all-clear would otherwise print beside this
+        # run's own can't-tell gap, which is a contradiction (Codex,
+        # mikelward/repo#75).
+        fake = FakeGh()
+        fake.effective_rules = [
+            _pull_request_rule(),
+            _status_checks_rule([("lanes", 42)]),
+            {"type": "non_fast_forward", "parameters": {}},
+            {"type": "deletion", "parameters": {}},
+        ]
+        fake.statuses = {fake.default_head_sha: ["lanes"]}
+        fake.status_creators = {fake.default_head_sha: [("lanes", "lanes-app[bot]")]}
+        fake.installations = [(42, "lanes-app", REPO.split("/", 1)[0], "selected", (REPO,))]
+        fake.install_repos_fails = "gh: HTTP 500: boom\n"
+        code, out, err = _run(fake, [REPO, "lanes"])
+        self.assertEqual(code, 1, err)
+        self.assertIn("[GAP] could not tell whether the App bound to 'lanes'", out)
+        self.assertNotIn("every required check has reported", out)
+
+    def test_one_unverifiable_binding_does_not_silence_another_on_the_same_check(self):
+        # 'lanes' required from two Apps. Coverage fails for 99 only, so 42
+        # is fully known -- and its "never reported" finding must still
+        # print. Tracking can't-tell by bare context marked both unverifiable
+        # and hid a provable fault (Codex, mikelward/repo#75).
+        fake = FakeGh()
+        fake.effective_rules = [
+            _pull_request_rule(),
+            _status_checks_rule([("lanes", 42), ("lanes", 99)]),
+            {"type": "non_fast_forward", "parameters": {}},
+            {"type": "deletion", "parameters": {}},
+        ]
+        fake.check_runs = {fake.default_head_sha: ["codex"]}
+        fake.installations = [
+            (42, "lanes-app", REPO.split("/", 1)[0], "selected", (REPO,)),
+            (99, "other-app", REPO.split("/", 1)[0], "selected", (REPO,)),
+        ]
+        # Installation ids are positional in the fake: 99 is the second.
+        fake.install_repos_fails = {2: "gh: HTTP 500: boom\n"}
+        code, out, err = _run(fake, [REPO, "lanes"])
+        self.assertEqual(code, 1, err)
+        self.assertIn("[GAP] could not tell whether the App bound to 'lanes'", out)
+        self.assertIn("never reported", out)
+
+    def test_an_unverifiable_binding_does_not_hide_the_same_name_unbound(self):
+        # 'lanes' required BOTH from App 42 (coverage unreadable) and from
+        # GitHub Actions -- the shape every repository in this fleet has.
+        # Nothing has ever posted 'lanes', so the Actions entry has a
+        # provable never-reported finding, and suppressing it would leave a
+        # phantom requirement blocking every merge with the audit silent
+        # (Codex, mikelward/repo#75). Unbinding the can't-tell entry for the
+        # scan made the two indistinguishable; it is omitted from the scan
+        # instead.
+        fake = FakeGh()
+        fake.effective_rules = [
+            _pull_request_rule(),
+            _status_checks_rule([("lanes", 42), ("lanes", 15368)]),
+            {"type": "non_fast_forward", "parameters": {}},
+            {"type": "deletion", "parameters": {}},
+        ]
+        fake.check_runs = {fake.default_head_sha: ["codex"]}
+        fake.installations = [(42, "lanes-app", REPO.split("/", 1)[0], "selected", (REPO,))]
+        fake.install_repos_fails = "gh: HTTP 500: boom\n"
+        code, out, err = _run(fake, [REPO, "lanes"])
+        self.assertEqual(code, 1, err)
+        self.assertIn("[GAP] could not tell whether the App bound to 'lanes'", out)
+        self.assertIn("never reported", out)
 
     # ---- sibling branch check --------------------------------------------
 
