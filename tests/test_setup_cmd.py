@@ -7877,6 +7877,139 @@ class LanesCredentialStepTest(unittest.TestCase):
         self.assertIn("App binding waits", out)
         self.assertEqual(fake.puts, [])
 
+    def _binding_over_a_planned_write(self, fake, tmp):
+        """A repository where the main ruleset step plans a write AND the
+        lanes binding is writable -- the shape where the binding preview
+        used to reprint the main step's whole plan."""
+        app_id = _secret_file(tmp, "id.txt", b"12345")
+        key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        fake.env_policies = {"lanes": ["main"]}
+        self._ruleset_requiring(
+            fake, [{"context": "lanes"}, {"context": "codex"}, {"context": "zizmor"}]
+        )
+        # App 12345 has published `lanes`, so the binding is writable now
+        # rather than deferred.
+        fake.check_runs = {fake.default_head_sha: [("lanes", 12345), "codex", "zizmor"]}
+        fake.app_coverage = {12345: ("lanes-app", "all")}
+        return ["--credential", f"LANES_APP_ID={app_id}", "--credential", f"LANES_APP_PRIVATE_KEY={key}"]
+
+    def test_the_binding_does_not_reprint_the_ruleset_plan(self):
+        # The binding is a SECOND update to the same ruleset, previewed with
+        # its own apply_ruleset call -- so where the main step plans a write
+        # too, appending that preview whole printed the identical block
+        # twice with the ambient-binding advisories between the copies. What
+        # the binding adds is the binding (maintainer, 2026-09-20).
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = self._publisher()
+            creds = self._binding_over_a_planned_write(fake, tmp)
+            code, out, err = _run(fake, ["--dry-run", *creds, REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.count("would update ruleset 'main'"), 1, out)
+        self.assertIn("would then bind `lanes` to App 12345", out)
+        self.assertIn("written after the credential is settled", out)
+        # The main step's own plan is untouched -- only the second copy went.
+        self.assertIn("required checks: lanes, codex, zizmor", out)
+
+    def test_a_deletion_only_step_is_a_first_update_too(self):
+        # `needs_write` false with `deletions` nonempty: the managed ruleset
+        # already matches, but a superseded one has to go. The main step
+        # prints that deletion, so the preview reprinted it -- and under the
+        # OPPOSITE verdict, since the preview's own target body carries the
+        # binding: "identical to what 'main' will hold", then "NOT identical",
+        # about the same ruleset (Codex, mikelward/repo#78).
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = self._publisher()
+            creds = self._binding_over_a_planned_write(fake, tmp)
+            # Already at the hardened scope, so the step plans no write of
+            # its own -- only the deletion.
+            fake.ruleset_objects["7"]["conditions"] = {
+                "ref_name": {"include": list(_HARDENED_SCOPE), "exclude": []}
+            }
+            fake.legacy_ruleset_id = "9"
+            fake.all_ruleset_ids = ["7", "9"]
+            fake.ruleset_objects["9"] = dict(
+                fake.ruleset_objects["7"], id=9, name="merge gates"
+            )
+            code, out, err = _run(fake, ["--dry-run", *creds, REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("already matches; nothing to do itself", out)
+        self.assertEqual(out.count("would delete the superseded ruleset 'merge gates'"), 1, out)
+        self.assertNotIn("would update ruleset 'main'", out)
+        self.assertIn("would then bind `lanes` to App 12345", out)
+
+    def test_the_binding_preview_does_not_repeat_the_ruleset_warnings(self):
+        # Same second call, the other channel: the advisories a dry run
+        # raises about the rulesets it read went to stderr, which
+        # redirect_stdout does not capture -- so the superseded-ruleset
+        # note appeared twice, above its own plan. The preview is told not
+        # to raise them rather than having them filtered out of captured
+        # output: capturing stderr to dedupe it would hold gh's
+        # secondary-rate-limit warnings behind their own 60s-480s sleeps
+        # (Codex, mikelward/repo#78).
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = self._publisher()
+            creds = self._binding_over_a_planned_write(fake, tmp)
+            # A superseded ruleset the survivor will not match, so the
+            # main preview raises the note -- once.
+            fake.legacy_ruleset_id = "9"
+            fake.all_ruleset_ids = ["7", "9"]
+            fake.ruleset_objects["9"] = dict(
+                fake.ruleset_objects["7"], id=9, name="merge gates"
+            )
+            code, out, err = _run(fake, ["--dry-run", *creds, REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(err.count("'merge gates' (id 9) is NOT identical"), 1, err)
+
+    def test_an_idle_step_does_not_repeat_its_advisories_either(self):
+        # The no-op return has its OWN copies of two of these notes and
+        # leaves before the plan return's guard, so a repository that is
+        # already fully correct -- binding included -- still said them
+        # twice (Codex, mikelward/repo#78).
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = self._publisher()
+            creds = self._binding_over_a_planned_write(fake, tmp)
+            # Nothing at all to do: hardened scope, and `lanes` already
+            # bound to the App the credential names.
+            fake.ruleset_objects["7"]["conditions"] = {
+                "ref_name": {"include": list(_HARDENED_SCOPE), "exclude": []}
+            }
+            fake.ruleset_objects["7"]["rules"][0]["parameters"]["required_status_checks"] = [
+                {"context": "lanes", "integration_id": 12345},
+                {"context": "codex"},
+                {"context": "zizmor"},
+            ]
+            # A second ruleset under the managed name: the note the no-op
+            # return raises.
+            fake.existing_ruleset_ids = ["7", "8"]
+            fake.all_ruleset_ids = ["7", "8"]
+            fake.ruleset_objects["8"] = dict(fake.ruleset_objects["7"], id=8)
+            code, out, err = _run(fake, ["--dry-run", *creds, REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(err.count("more than one ruleset is named 'main'"), 1, err)
+
+    def test_the_post_apply_capture_does_not_repeat_the_advisories(self):
+        # A REAL run, which the --dry-run cases above never reach: after
+        # the main apply, the binding's fingerprint is captured with
+        # another dry run whose stdout is thrown away -- but not its
+        # advisories, so they came round again from a call whose plan
+        # nobody sees (Codex, mikelward/repo#78).
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = self._publisher()
+            creds = self._binding_over_a_planned_write(fake, tmp)
+            fake.existing_ruleset_ids = ["7", "8"]
+            fake.all_ruleset_ids = ["7", "8"]
+            fake.ruleset_objects["8"] = dict(fake.ruleset_objects["7"], id=8)
+            code, out, err = _run(fake, ["--force", *creds, REPO])
+        self.assertEqual(code, 0, err)
+        # Three, not four. Each surviving copy belongs to an action that
+        # re-read the repository to do something: the preview, the main
+        # apply, and the binding's own apply. The capture belongs to none
+        # -- its plan is discarded -- so it contributes none. Whether two
+        # writes moments apart should both re-report is a separate
+        # question, noted in TODO.md.
+        self.assertEqual(err.count("more than one ruleset is named 'main'"), 3, err)
+
     _EFFECTIVE_LANES_BOUND_55 = [
         {
             "type": "required_status_checks",

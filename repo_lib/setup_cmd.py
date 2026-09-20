@@ -2173,8 +2173,19 @@ def _run(args, log=None):
     if want_binding and not args.no_rules:
         bbuf = io.StringIO()
         with redirect_stdout(bbuf):
+            # advisories=False: the preview above already raised them for
+            # these same rulesets, and this call's copy can contradict it
+            # (see apply_ruleset). Only stdout is captured, so gh's
+            # secondary-rate-limit warnings and any error still reach the
+            # terminal as they happen rather than after a 480s sleep.
             bcode = rules.apply_ruleset(
-                repo, bound_checks, dry_run=True, force=args.force, report=binding_report, defer=defer
+                repo,
+                bound_checks,
+                dry_run=True,
+                force=args.force,
+                report=binding_report,
+                defer=defer,
+                advisories=False,
             )
         if bcode == 2:
             raise SystemExit(2)
@@ -2482,10 +2493,31 @@ def _run(args, log=None):
                         f"{repo} (`repo setup --app <slug>`), then rerun to bind."
                     )
             elif binding_needs_write:
-                lines += [f"    {line}" for line in binding_lines]
-                lines.append(
-                    "    (the App binding is written after the credential is settled)"
-                )
+                # Deletions count as a first update, not just a write of the
+                # ruleset body: where the managed ruleset already matches but
+                # a superseded one must go, `needs_write` is false and the
+                # main step still printed that deletion -- so the preview
+                # reprinted it, under a CONTRADICTORY verdict, since its own
+                # target body carries the binding ("identical", then "NOT
+                # identical", about the same ruleset). Same predicate the
+                # step's own idle test uses (Codex, mikelward/repo#78).
+                if ruleset_report.get("needs_write", True) or ruleset_report.get("deletions"):
+                    # The preview plans the SAME ruleset write the main step
+                    # above already showed, plus the binding -- printing it
+                    # whole repeated the block with the advisories between the
+                    # copies. What it adds is the binding, which is one line.
+                    lines.append(
+                        f"    would then bind `{credentials.LANES_CHECK}` to App "
+                        f"{credentials_plan.lanes_binding} -- a second update to the same "
+                        "ruleset, written after the credential is settled"
+                    )
+                else:
+                    # The main step planned nothing, so this block is the only
+                    # rendering of the write and stands on its own.
+                    lines += [f"    {line}" for line in binding_lines]
+                    lines.append(
+                        "    (the App binding is written after the credential is settled)"
+                    )
             elif binding_deferred:
                 lines.append(
                     f"    the App binding waits: {binding_deferred} -- a later run binds it "
@@ -3039,6 +3071,10 @@ def _run(args, log=None):
     if binding_wanted_this_run:
         _binding_apply_report = {}
         with redirect_stdout(io.StringIO()):
+            # A hidden read, for the fingerprint alone -- its stdout is
+            # thrown away. Its advisories are not hidden with it, so
+            # without this the main apply's warnings came round a second
+            # time from a call whose plan nobody sees.
             _binding_capture_code = rules.apply_ruleset(
                 repo,
                 bound_checks,
@@ -3046,6 +3082,7 @@ def _run(args, log=None):
                 force=args.force,
                 report=_binding_apply_report,
                 defer=defer,
+                advisories=False,
             )
         # Only a clean capture yields a fingerprint to pin the deferred write
         # to; a failed one (a transient read, say) leaves it None, and the
