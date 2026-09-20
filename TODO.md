@@ -1945,3 +1945,20 @@
   read would repeat that work in the same diff rather than after it.
   Reversible either way: the abort is one `except rules.RulesetError` in
   `audit_cmd`, and the can't-tell machinery it would reuse is already there.
+
+- **`repo setup` prints the ruleset plan twice, and its warnings twice**
+  (2026-09-20, found on a real run; not fixed here). The lanes App binding
+  is previewed with a second `rules.apply_ruleset(dry_run=True)` call
+  (`setup_cmd.py`, `binding_lines`), and where that preview plans the same
+  writes as the main ruleset step -- a scope widening, a superseded-ruleset
+  deletion -- its whole plan is appended verbatim under
+  `binding_needs_write`, so the reader sees the block twice with the
+  ambient-binding advisories between the copies. The same second call
+  re-emits the deletion warning on stderr, which `redirect_stdout` does not
+  capture, so that appears twice too: one cause, both symptoms.
+  What it should append is what the binding step adds over the main one,
+  which is not a plain line subtraction -- the main step may render its
+  full plan while the preview renders the abbreviated one, so the copies
+  are near-identical rather than identical. Worth its own change and its
+  own tests; the output is confusing rather than wrong, and nothing is
+  written twice.
