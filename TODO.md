@@ -1946,19 +1946,22 @@
   Reversible either way: the abort is one `except rules.RulesetError` in
   `audit_cmd`, and the can't-tell machinery it would reuse is already there.
 
-- **`repo setup` prints the ruleset plan twice, and its warnings twice**
-  (2026-09-20, found on a real run; not fixed here). The lanes App binding
-  is previewed with a second `rules.apply_ruleset(dry_run=True)` call
-  (`setup_cmd.py`, `binding_lines`), and where that preview plans the same
-  writes as the main ruleset step -- a scope widening, a superseded-ruleset
-  deletion -- its whole plan is appended verbatim under
-  `binding_needs_write`, so the reader sees the block twice with the
-  ambient-binding advisories between the copies. The same second call
-  re-emits the deletion warning on stderr, which `redirect_stdout` does not
-  capture, so that appears twice too: one cause, both symptoms.
-  What it should append is what the binding step adds over the main one,
-  which is not a plain line subtraction -- the main step may render its
-  full plan while the preview renders the abbreviated one, so the copies
-  are near-identical rather than identical. Worth its own change and its
-  own tests; the output is confusing rather than wrong, and nothing is
-  written twice.
+
+- **`advisories=False` is a flag every second read has to remember**
+  (2026-09-20, autopilot; Codex, mikelward/repo#78). Four rounds on that
+  pull request each found another `apply_ruleset` call repeating a note the
+  run had already made: the binding preview, then the no-op return's own
+  copies, then the hidden fingerprint capture. Each was fixed where it was
+  found, which is the shape that keeps producing the next one.
+  The class-deleting alternative is to stop passing a flag and have the
+  `_report_*` functions refuse to say the same sentence twice in one
+  process. Their text already carries the repository and the ruleset name,
+  so keying on it is exact, and a note whose text differs is a different
+  statement and still prints -- which is what the apply-time re-read exists
+  to catch.
+  Not taken, because it is a design change and those are the maintainer's
+  call. It also reaches further than the flag: the apply path deliberately
+  re-reports outside the quiet guard, so a real run still says a persistent
+  note three times (the preview, the main apply, the binding's apply), and
+  whether two writes moments apart should each repeat it is the question
+  underneath. Reversible: the flag is three call sites and two guards.

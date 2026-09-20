@@ -2228,6 +2228,7 @@ def apply_ruleset(
     refuse_if_newly_effective=False,
     verify_scaffold_before_requiring_checks=None,
     quiet=False,
+    advisories=True,
     record=None,
 ):
     """Runs the whole repo-rules port against `repo`. Returns 0 on success
@@ -2369,6 +2370,22 @@ def apply_ruleset(
     against THIS branch, not whichever one an earlier snapshot named
     (Codex review, mikelward/repo#14).
 
+    advisories: the notes a run raises about the rulesets it read -- an
+    excluded hardened ref, a second ruleset under the managed name, a
+    superseded one that is not identical -- on BOTH the plan return and
+    the no-op return, which has its own copies of two of them. False for
+    a caller
+    that has ALREADY previewed the same rulesets in another call and
+    would only say it twice: setup_cmd previews the lanes App binding as
+    a second apply_ruleset over the same repository, and the second copy
+    is not merely noise but can contradict the first -- its target body
+    carries the binding, so a legacy ruleset identical to what will
+    actually be written compares unequal to it. Suppressed at the source
+    rather than filtered out of captured output, because capturing stderr
+    to dedupe it would hold gh's secondary-rate-limit warnings -- and
+    their 60s to 480s sleeps -- behind the call that is sleeping (Codex,
+    mikelward/repo#78).
+
     quiet: suppresses the "nothing to do" no-op report (and its bypass-
     actor note) -- setup_cmd.py's real apply call passes this when the
     caller wants only what changed, not an audit trail of everything this
@@ -2495,7 +2512,8 @@ def apply_ruleset(
         # ruleset created since the preview ran, and an already-correct
         # ruleset is the steady state, so the no-op return is where a real
         # apply usually ends up (Codex review, mikelward/repo#33).
-        _report_duplicate_standard(repo, ruleset_name, existing, duplicates)
+        if advisories:
+            _report_duplicate_standard(repo, ruleset_name, existing, duplicates)
         note = _bypass_actor_note((target_body or {}).get("bypass_actors") or [])
         if report is not None:
             # Computed outside the quiet guard and reported structurally:
@@ -2507,7 +2525,8 @@ def apply_ruleset(
             report["bypass_note"] = note
         if not quiet:
             print(f"{repo}: ruleset '{ruleset_name}' (id {existing}) {NO_OP_MESSAGE}")
-            _report_excluded_hardened(repo, ruleset_name, target_body, default_branch)
+            if advisories:
+                _report_excluded_hardened(repo, ruleset_name, target_body, default_branch)
             if note:
                 print(note)
         # Not gated on quiet: a check still waiting is the one thing an
@@ -2579,9 +2598,10 @@ def apply_ruleset(
     if dry_run:
         for line in plan_lines:
             print(line)
-        _report_excluded_hardened(repo, ruleset_name, target_body, default_branch)
-        _report_duplicate_standard(repo, ruleset_name, existing, duplicates)
-        _report_differing_legacy(repo, ruleset_name, differing)
+        if advisories:
+            _report_excluded_hardened(repo, ruleset_name, target_body, default_branch)
+            _report_duplicate_standard(repo, ruleset_name, existing, duplicates)
+            _report_differing_legacy(repo, ruleset_name, differing)
         return 0
 
     if not (force or skip_confirm) and not _confirm(repo, ruleset_name, plan_lines):
