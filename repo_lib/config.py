@@ -16,8 +16,10 @@ are usage errors), so the only YAML accepted is the flat mapping documented
 here -- never an arbitrary tagged object, and never a silent last-wins drop.
 
 Secret VALUES never live here: a credential entry is a path the value is
-read from, exactly as `--credential NAME=PATH` is. Resolving a value from
-a command or a secret manager is a tracked follow-up (TODO.md).
+read from, exactly as `--credential NAME=PATH` is -- including a leading
+`~`/`~user`, which setup expands (a config path never passes through a
+shell to expand it). Resolving a value from a command or a secret manager
+is a tracked follow-up (TODO.md).
 """
 
 import os
