@@ -260,9 +260,14 @@ def _validate_secret_specs(raw_specs):
             raise SystemExit(2)
         seen[key] = True
         try:
-            with open(spec.path, "rb") as f:
+            # Expand a leading `~`/`~user` so a path carried from config, or a
+            # quoted one the shell left alone, resolves the same as a bare
+            # command-line path (see _validate_credential_specs). Inside the
+            # try because a `~user` segment with an embedded NUL raises
+            # ValueError in expanduser itself; caught here as the same exit 2.
+            with open(os.path.expanduser(spec.path), "rb") as f:
                 spec.value = f.read()
-        except OSError:
+        except (OSError, ValueError):
             error(f"cannot read '{spec.path}' (from --secret {raw})")
             raise SystemExit(2)
         if not spec.value:
@@ -309,14 +314,22 @@ def _validate_credential_specs(raw_specs):
         seen.add(name)
         spec = CredentialSpec(name=name, path=path, raw=raw)
         try:
-            with open(spec.path, "rb") as f:
+            # Expand a leading `~`/`~user` so a config credential path can use
+            # it: the shell expands it on the command line before setup sees
+            # it, but a path read from config.yaml never passes through a
+            # shell, so `~/x` would otherwise be opened literally
+            # (mikelward/repo, config-tilde). expanduser is inside the try
+            # because a `~user` segment with an embedded NUL raises ValueError
+            # in expanduser itself, before open() -- caught here as the same
+            # contextual exit 2 rather than escaping as a traceback (Codex).
+            with open(os.path.expanduser(spec.path), "rb") as f:
                 spec.value = f.read()
         except (OSError, ValueError):
             # ValueError too: a path with a NUL ("embedded null byte") or a
             # lone surrogate (UnicodeEncodeError, a ValueError subclass) can't
-            # be opened, and neither is an OSError, so both would otherwise
-            # escape as a traceback. `!r` keeps such a path printable -- a raw
-            # surrogate would make error()'s own write raise (Codex,
+            # be expanded or opened, and neither is an OSError, so both would
+            # otherwise escape as a traceback. `!r` keeps such a path printable
+            # -- a raw surrogate would make error()'s own write raise (Codex,
             # mikelward/repo#62).
             error(f"cannot read {spec.path!r} (from --credential {raw!r})")
             raise SystemExit(2)

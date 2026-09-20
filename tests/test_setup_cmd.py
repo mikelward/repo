@@ -3547,6 +3547,67 @@ class SecretSpecValidationTest(unittest.TestCase):
         self.assertNotIn("repeats an earlier --secret", err)
 
 
+class TildeExpansionTest(unittest.TestCase):
+    """A `~` in a credential or secret PATH is expanded when the file is read.
+    The command line's own `~` is expanded by the shell before setup runs, but
+    a path carried from config.yaml never passes through a shell -- so without
+    this a `NPM_UPDATE_PAT: ~/pat.txt` config entry is opened literally and
+    fails (mikelward/repo, config-tilde). _validate_credential_specs is the
+    shared path config credentials flow through (config turns each into a
+    NAME=PATH string fed to it), so exercising it directly covers the config
+    route. Expansion is inside the read's guarded block, so a bad expansion
+    (a `~user` segment with an embedded NUL, which raises in expanduser
+    itself) becomes the same contextual exit 2, not a traceback."""
+
+    def test_credential_path_tilde_is_read_via_expansion(self):
+        with tempfile.TemporaryDirectory() as home:
+            with open(os.path.join(home, "pat.txt"), "wb") as f:
+                f.write(b"tokenvalue")
+            with patch.dict(os.environ, {"HOME": home}):
+                specs = setup_cmd._validate_credential_specs(
+                    ["NPM_UPDATE_PAT=~/pat.txt"]
+                )
+        self.assertEqual(len(specs), 1)
+        # The ~ path resolved to the real file, so its bytes were read.
+        self.assertEqual(specs[0].value, b"tokenvalue")
+
+    def test_secret_path_tilde_is_read_via_expansion(self):
+        with tempfile.TemporaryDirectory() as home:
+            with open(os.path.join(home, "sec.txt"), "wb") as f:
+                f.write(b"sekrit")
+            with patch.dict(os.environ, {"HOME": home}):
+                specs = setup_cmd._validate_secret_specs(["TOKEN=~/sec.txt"])
+        self.assertEqual(len(specs), 1)
+        self.assertEqual(specs[0].value, b"sekrit")
+
+    def test_non_tilde_credential_path_is_opened_as_given(self):
+        # expanduser is a no-op on a path with no leading ~, so an absolute
+        # path is read unchanged -- the existing behavior is untouched.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "pat.txt")
+            with open(path, "wb") as f:
+                f.write(b"abs")
+            specs = setup_cmd._validate_credential_specs([f"NPM_UPDATE_PAT={path}"])
+        self.assertEqual(specs[0].path, path)
+        self.assertEqual(specs[0].value, b"abs")
+
+    def test_a_tilde_user_path_with_a_null_byte_is_a_clean_exit_2(self):
+        # A `~user` segment with an embedded NUL raises ValueError in
+        # expanduser itself, before open(). Because the expansion is inside the
+        # guarded block it is caught as the usual exit 2, not a traceback
+        # (Codex, mikelward/repo#74).
+        for specs_fn, raw in (
+            (setup_cmd._validate_credential_specs, "NPM_UPDATE_PAT=~bad\x00/pat"),
+            (setup_cmd._validate_secret_specs, "TOKEN=~bad\x00/sec"),
+        ):
+            with self.subTest(raw=raw):
+                with redirect_stderr(StringIO()) as err:
+                    with self.assertRaises(SystemExit) as cm:
+                        specs_fn([raw])
+                self.assertEqual(cm.exception.code, 2)
+                self.assertIn("cannot read", err.getvalue())
+
+
 # GitHub's own refusal when a token that is not a GitHub App user token
 # asks for installations -- the wording apps.is_missing_app_token keys on.
 _APP_TOKEN_403 = (

@@ -40,7 +40,9 @@ run -- so they live in a **fleet config file** (`$XDG_CONFIG_HOME/repo/
 config.yaml`, read by default) rather than being retyped: `credentials`
 (name to where its value is read from -- a file path, or a `command:` that
 prints it, so a password manager holds the value and the config names only
-how to fetch it), `rules`, `apps`, `force`, and
+how to fetch it; a file path's leading `~`/`~user` is expanded, as for any
+`--credential` or `--secret` PATH, since a config path reaches no shell to
+do it), `rules`, `apps`, `force`, and
 `app_logins` (an App id to its bot slug, so a bound check's status creator
 is matched without reading the account's App installations -- below). With
 it in place the loop is `repo list | xargs -n1 repo setup`. The command
