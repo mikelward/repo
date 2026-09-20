@@ -833,6 +833,62 @@ def _comparable_ruleset(body):
     return json.dumps(trimmed, sort_keys=True)
 
 
+def _ruleset_difference(legacy_body, target_body):
+    """Plain lines naming HOW a legacy ruleset differs from the body that
+    will stand, for the warning and the plan to show beside "NOT
+    identical".
+
+    DESCRIPTIVE ONLY, and that separation is the point. `_comparable_
+    ruleset`'s whole-object equality still decides whether there is a
+    difference at all, for the reason its own docstring gives: "is A at
+    least as strict as B" was reimplemented per field five times and each
+    review round found a field the last one missed. This never answers
+    "does it matter" -- only "what is not the same" -- so a summary that
+    is one item short costs a vaguer sentence, where the same mistake in
+    a gate deletes a ruleset that was holding the branch up. The recorded
+    body remains the real answer; this is what saves reading it for the
+    common case (maintainer, 2026-09-20).
+
+    Says nothing about which side is stricter, deliberately. A reader
+    comparing "only here" against "only there" is making that judgement
+    themselves, with the rule names in front of them."""
+    def trim(body):
+        return {k: v for k, v in (body or {}).items() if k not in _VOLATILE_FIELDS and k != "name"}
+
+    old, new = trim(legacy_body), trim(target_body)
+    lines = []
+
+    by_type = lambda body: {r.get("type"): r.get("parameters") or {} for r in body.get("rules") or []}
+    old_rules, new_rules = by_type(old), by_type(new)
+    gone = sorted(t for t in set(old_rules) - set(new_rules) if t)
+    added = sorted(t for t in set(new_rules) - set(old_rules) if t)
+    if gone:
+        lines.append("rules only on the one being deleted: " + ", ".join(gone))
+    if added:
+        lines.append("rules only on the one that stays: " + ", ".join(added))
+    for rule_type in sorted(t for t in set(old_rules) & set(new_rules) if t):
+        a, b = old_rules[rule_type], new_rules[rule_type]
+        if a != b:
+            keys = sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k))
+            lines.append(f"{rule_type}: differs in {', '.join(keys)}")
+
+    # Ref coverage is the difference most worth spelling out: it decides
+    # which branches the rules applied to at all.
+    refs = lambda body, which: set(((body.get("conditions") or {}).get("ref_name") or {}).get(which) or [])
+    for which in ("include", "exclude"):
+        only_old = sorted(refs(old, which) - refs(new, which))
+        only_new = sorted(refs(new, which) - refs(old, which))
+        if only_old:
+            lines.append(f"{which}s only on the one being deleted: " + ", ".join(only_old))
+        if only_new:
+            lines.append(f"{which}s only on the one that stays: " + ", ".join(only_new))
+
+    for key in sorted((set(old) | set(new)) - {"rules", "conditions"}):
+        if old.get(key) != new.get(key):
+            lines.append(f"{key}: {old.get(key)!r} here, {new.get(key)!r} on the one that stays")
+    return lines
+
+
 def _plan_legacy_deletion(repo, ruleset_name, existing, adopted_legacy, target_body):
     """(deletable, differing): every legacy-named ruleset this run will
     delete once the standard one is written, and which of them hold
@@ -878,8 +934,11 @@ def _plan_legacy_deletion(repo, ruleset_name, existing, adopted_legacy, target_b
             )
             raise RulesetError()
         deletable.append((legacy_name, legacy_id))
-        if _comparable_ruleset(json.loads(raw)) != wanted:
-            differing.append((legacy_name, legacy_id))
+        legacy_body = json.loads(raw)
+        if _comparable_ruleset(legacy_body) != wanted:
+            differing.append(
+                (legacy_name, legacy_id, _ruleset_difference(legacy_body, target_body))
+            )
     return deletable, differing
 
 
@@ -987,13 +1046,15 @@ def _report_differing_legacy(repo, ruleset_name, differing):
     repository loses, and the operator is owed the difference. The body is
     recorded before the delete, so this points at that rather than asking
     anyone to have memorized it."""
-    for legacy_name, legacy_id in differing:
+    for legacy_name, legacy_id, delta in differing:
         warn(
             f"{repo}: note -- '{legacy_name}' (id {legacy_id}) is NOT identical to "
             f"'{ruleset_name}'; deleting it drops whatever it held that the other does "
             "not. Its full body is recorded first, so it can be restored by POSTing "
             f"that JSON back to repos/{repo}/rulesets."
         )
+        for line in delta:
+            warn(f"  {line}")
 
 
 def _check_ruleset_ownership(repo, ruleset_id, ruleset_name):
@@ -2051,17 +2112,20 @@ def _describe_plan(
     note = _bypass_actor_note(bypass_actors)
     if note:
         lines.append(note)
-    differing_ids = {legacy_id for _n, legacy_id in differing}
+    deltas = {legacy_id: delta for _n, legacy_id, delta in differing}
     for legacy_name, legacy_id in deletions:
         lines.append(
             f"  would delete the superseded ruleset '{legacy_name}' (id {legacy_id}) -- "
             + (
                 f"NOT identical to what '{ruleset_name}' will hold; its full body is "
                 "recorded first"
-                if legacy_id in differing_ids
+                if legacy_id in deltas
                 else f"identical to what '{ruleset_name}' will hold"
             )
         )
+        # The plan is where the y/N is answered, so the difference belongs
+        # here and not only in the warning above it.
+        lines += [f"    {line}" for line in deltas.get(legacy_id) or []]
     return lines
 
 
@@ -2658,7 +2722,14 @@ def apply_ruleset(
             # mikelward/repo#46). Not gated on quiet, for the same reason
             # _report_duplicate_standard is not: this reads state the
             # preview could not have seen.
-            _report_differing_legacy(repo, ruleset_name, [(legacy_name, legacy_id)])
+            _report_differing_legacy(
+                repo,
+                ruleset_name,
+                # Computed from the same two bodies this branch just
+                # compared, so the difference it names is the one that is
+                # true NOW rather than at preview time.
+                [(legacy_name, legacy_id, _ruleset_difference(body, fresh_target_body))],
+            )
         try:
             _record_deleted_ruleset(record, repo, legacy_name, legacy_id, body)
         except OSError as e:

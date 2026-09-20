@@ -2769,6 +2769,42 @@ class SetupCmdTest(unittest.TestCase):
         self.assertIn("POST this back", logged)
         self.assertNotIn("required_signatures", out)
 
+    def test_the_note_names_what_actually_differs(self):
+        # "NOT identical" told an operator that something differed and
+        # left them to diff two JSON bodies under a y/N prompt. The
+        # difference itself is what the decision turns on (maintainer,
+        # 2026-09-20). Descriptive only -- it never says which side is
+        # stricter, and the equality test still decides whether to warn.
+        fake = FakeGh()
+        self._matching_pair(fake, legacy_rules=[{"type": "required_signatures"}])
+        with tempfile.TemporaryDirectory() as state:
+            code, out, err = _run(fake, ["--force", "--rule", "lanes", REPO], log_dir=state)
+        self.assertEqual(code, 0, err)
+        self.assertIn("rules only on the one being deleted: required_signatures", err)
+
+    def test_the_note_names_a_ref_the_survivor_will_not_cover(self):
+        fake = FakeGh()
+        self._matching_pair(
+            fake,
+            legacy_scope={
+                "ref_name": {"include": [*_HARDENED_SCOPE, "refs/heads/release"], "exclude": []}
+            },
+        )
+        with tempfile.TemporaryDirectory() as state:
+            code, out, err = _run(fake, ["--force", "--rule", "lanes", REPO], log_dir=state)
+        self.assertEqual(code, 0, err)
+        self.assertIn("includes only on the one being deleted: refs/heads/release", err)
+
+    def test_the_plan_shows_the_difference_where_the_prompt_is_answered(self):
+        # The warning alone is not enough: the y/N is answered against the
+        # plan, so the difference has to appear there too.
+        fake = FakeGh()
+        self._matching_pair(fake, legacy_rules=[{"type": "required_signatures"}])
+        code, out, err = _run(fake, ["--dry-run", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("would delete the superseded ruleset 'merge gates'", out)
+        self.assertIn("rules only on the one being deleted: required_signatures", out)
+
     def test_a_legacy_ruleset_covering_a_ref_the_survivor_does_not_is_deleted(self):
         # Scope differences are part of what "not identical" covers, and
         # the recorded body is what makes losing refs/heads/release
