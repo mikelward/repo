@@ -42,6 +42,10 @@ _ENVIRONMENTS_RE = re.compile(r"^repos/([^/]+/[^/]+)/environments$")
 _REPO_SECRET_ONE_RE = re.compile(r"^repos/([^/]+/[^/]+)/actions/secrets/([^/]+)$")
 _ENV_SECRET_ONE_RE = re.compile(r"^repos/([^/]+/[^/]+)/environments/([^/]+)/secrets/([^/]+)$")
 _WORKFLOWS_DIR_RE = re.compile(r"^repos/([^/]+/[^/]+)/contents/\.github/workflows(?:\?ref=(.+))?$")
+# The Actions API's own list of what GitHub will run: the bootstrap
+# step asks it which workflow files are live, since the tree cannot say
+# (a nested file never runs, a disabled one keeps its YAML).
+_ACTIONS_WORKFLOWS_RE = re.compile(r"^repos/([^/]+/[^/]+)/actions/workflows\?per_page=100$")
 _WORKFLOW_FILE_RE = re.compile(r"^repos/([^/]+/[^/]+)/contents/\.github/workflows/([^/?]+)(?:\?ref=(.+))?$")
 _ROOT_CONTENTS_RE = re.compile(r"^repos/([^/]+/[^/]+)/contents(?:\?ref=(.+))?$")
 _BRANCHES_RE = re.compile(r"^repos/([^/]+/[^/]+)/branches\?per_page=100$")
@@ -93,6 +97,11 @@ _SCAFFOLD_REF_WRITE_RE = re.compile(r"^repos/([^/]+/[^/]+)/git/refs/heads/([^/?]
 _SCAFFOLD_COMMIT_RE = re.compile(r"^repos/([^/]+/[^/]+)/git/commits/([^/?]+)$")
 _SCAFFOLD_TREE_RE = re.compile(r"^repos/([^/]+/[^/]+)/git/trees/([^/?]+)\?recursive=1$")
 _SCAFFOLD_BLOB_CREATE_RE = re.compile(r"^repos/([^/]+/[^/]+)/git/blobs$")
+# The blob READ plan_gaps makes of a workflow already on the branch, to
+# tell whether a check the scaffold would publish is published there
+# already. Its own route, like the ref pair above: create is a POST to
+# the collection, this a GET of one blob.
+_SCAFFOLD_BLOB_READ_RE = re.compile(r"^repos/([^/]+/[^/]+)/git/blobs/([^/?]+)$")
 _SCAFFOLD_TREE_CREATE_RE = re.compile(r"^repos/([^/]+/[^/]+)/git/trees$")
 _SCAFFOLD_COMMIT_CREATE_RE = re.compile(r"^repos/([^/]+/[^/]+)/git/commits$")
 _SCAFFOLD_CONTENTS_PUT_RE = re.compile(r"^repos/([^/]+/[^/]+)/contents/(.+)$")
@@ -110,6 +119,11 @@ _SCAFFOLD_PATHS = (
     "AGENTS.md",
     "CLAUDE.md",
 )
+
+# The trigger conf's own test.yml carried: a workflow whose jobs really do
+# publish their checks on every pull request, which is what lets the
+# bootstrap step hold back a scaffold file that would publish the same one.
+_WORKFLOW_ON_PULL_REQUESTS = "on:\n  push:\n    branches: [main]\n  pull_request:\n"
 
 _OWNERSHIP_JQ = ".enforcement, .target"
 
@@ -446,6 +460,22 @@ class FakeGh:
         # as an ancestor of) a scaffold path, modeling a path collision
         # plan_gaps must refuse rather than silently replace.
         self.bootstrap_occupied_entries = {}
+        # path -> its workflow YAML, for a .github/workflows/* file a test
+        # plants on the branch beside (or instead of) the scaffold's own:
+        # what plan_gaps reads, by blob sha, to tell whether a check it
+        # would publish is already published under another file name. A
+        # workflow path present in the tree with no text here reads as an
+        # empty document, which publishes nothing.
+        self.bootstrap_workflow_texts = {}
+        # path -> "active" | "disabled_manually" | "disabled_inactivity",
+        # what the Actions API reports. None (the default) means every
+        # workflow file on the branch, all active.
+        self.actions_workflows = None
+        self.actions_workflows_read_fails = False
+        self.bootstrap_blob_read_fails = False
+        # Anything but "base64" models a blob GitHub declines to inline
+        # (one too large to answer with), which carries no content to read.
+        self.bootstrap_blob_encoding = "base64"
         self.bootstrap_blob_fails = False
         self.bootstrap_tree_create_fails = False
         self.bootstrap_commit_create_fails = False
@@ -702,6 +732,27 @@ class FakeGh:
             if self.default_head_fails:
                 raise gh.GhError("gh: HTTP 409: Git Repository is empty.\n")
             return self.default_head_sha + "\n"
+
+        m = _ACTIONS_WORKFLOWS_RE.match(endpoint)
+        if m:
+            if self.actions_workflows_read_fails:
+                raise gh.GhError("gh: HTTP 500: Internal Server Error\n")
+            paths = (
+                self._present_paths()
+                if self.actions_workflows is None
+                else self.actions_workflows
+            )
+            if self.actions_workflows is None:
+                # Every workflow the branch carries, all active -- the
+                # state every other test in this file assumes.
+                paths = {
+                    p: "active"
+                    for p in paths
+                    if p.startswith(".github/workflows/") and p.endswith((".yml", ".yaml"))
+                }
+            return "".join(
+                json.dumps([workflow, state]) + "\n" for workflow, state in sorted(paths.items())
+            )
 
         m = _WORKFLOW_RUNS_RE.match(endpoint)
         if m:
@@ -1204,6 +1255,23 @@ class FakeGh:
                 }
             )
 
+        m = _SCAFFOLD_BLOB_READ_RE.match(endpoint)
+        if m and method is None and jq is None:
+            if self.bootstrap_blob_read_fails:
+                raise gh.GhError("gh: HTTP 500: Internal Server Error\n")
+            if self.bootstrap_blob_encoding != "base64":
+                # What GitHub answers for a blob it declines to inline.
+                return json.dumps({"content": "", "encoding": self.bootstrap_blob_encoding})
+            by_sha = {self._tree_sha(p): t for p, t in self.bootstrap_workflow_texts.items()}
+            # Base64 with line breaks, the way GitHub answers it.
+            raw = base64.b64encode(by_sha.get(m.group(2), "").encode()).decode()
+            return json.dumps(
+                {
+                    "content": "\n".join(raw[i:i + 60] for i in range(0, len(raw), 60)),
+                    "encoding": "base64",
+                }
+            )
+
         m = _SCAFFOLD_TREE_RE.match(endpoint)
         if m:
             if self.bootstrap_tree_read_fails:
@@ -1269,6 +1337,15 @@ class FakeGh:
         if path in scaffold.UPDATED_PATHS and path not in self.bootstrap_outdated_paths:
             return scaffold._blob_sha(self.template_contents.get(name, ""))
         return hashlib.sha1(f"present {path}".encode()).hexdigest()
+
+    def _present_paths(self):
+        """Every path the branch carries: the whole scaffold by default,
+        or exactly what bootstrap_existing_paths names."""
+        return (
+            self._all_scaffold_paths()
+            if self.bootstrap_existing_paths is None
+            else self.bootstrap_existing_paths
+        )
 
     def _all_scaffold_paths(self):
         """Every path build_scaffold_files("main") produces -- kept as its
@@ -9456,6 +9533,346 @@ class BootstrapStepTest(unittest.TestCase):
         self.assertTrue(
             fake.created_refs[0]["ref"].startswith(f"refs/heads/{scaffold.GAP_BRANCH_PREFIX}"),
             fake.created_refs[0],
+        )
+
+    def test_a_lanes_job_in_another_workflow_holds_ci_yml_back(self):
+        # mikelward/conf kept the same lane wiring in test.yml, so ci.yml
+        # read as missing by path and the scaffold pull request added a
+        # SECOND job named `lanes` -- two same-named gates, and a required
+        # check that can name either (Codex P1, mikelward/conf#307).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = (set(_SCAFFOLD_PATHS) - {".github/workflows/ci.yml"}) | {
+            ".github/workflows/test.yml"
+        }
+        fake.bootstrap_workflow_texts = {
+            ".github/workflows/test.yml": _WORKFLOW_ON_PULL_REQUESTS
+            + "jobs:\n  classify:\n    name: Classify the diff\n  lanes:\n    name: lanes\n"
+        }
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("not adding .github/workflows/ci.yml", err)
+        self.assertIn(".github/workflows/test.yml already declares a job publishing 'lanes'", err)
+        # Nothing else was missing, so nothing is written at all: no gap
+        # branch, no pull request.
+        self.assertEqual(fake.created_refs, [])
+        self.assertEqual([a for a, _b in fake.posts if a[3] == f"repos/{REPO}/pulls"], [])
+
+    def test_a_push_only_job_of_the_same_name_holds_the_check_back_too(self):
+        # The trap in holding a file back on a same-named job alone: a
+        # push-only workflow publishes `lanes` on the default branch and
+        # never on a pull request, so the check has reported (and can be
+        # required) while nothing would report it where it is needed --
+        # every merge blocked, permanently (Codex, mikelward/repo#69). The
+        # file is still held back, and the check is not required.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = (set(_SCAFFOLD_PATHS) - {".github/workflows/ci.yml"}) | {
+            ".github/workflows/test.yml"
+        }
+        fake.bootstrap_workflow_texts = {
+            ".github/workflows/test.yml": "on:\n  push:\n    branches: [main]\njobs:\n  lanes:\n    runs-on: x\n"
+        }
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+        code, out, err = _run(fake, ["--force", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("does not run on every pull request", err)
+        ruleset_posts = [b for a, b in fake.posts if a[3] == f"repos/{REPO}/rulesets"]
+        self.assertEqual(
+            ruleset_posts[0]["rules"][0]["parameters"]["required_status_checks"],
+            [{"context": "codex"}, {"context": "zizmor"}],
+        )
+        self.assertIn("'lanes' waits for a workflow that publishes it on a pull request", out)
+
+    def test_a_publisher_that_does_run_on_pull_requests_still_requires_its_check(self):
+        # The other half: where the workflow already there publishes on
+        # every pull request, holding the scaffold file back costs the
+        # repository nothing, and `lanes` is required as usual.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = (set(_SCAFFOLD_PATHS) - {".github/workflows/ci.yml"}) | {
+            ".github/workflows/test.yml"
+        }
+        fake.bootstrap_workflow_texts = {
+            ".github/workflows/test.yml": _WORKFLOW_ON_PULL_REQUESTS + "jobs:\n  lanes:\n    runs-on: x\n"
+        }
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+        code, out, err = _run(fake, ["--force", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("does not run on every pull request", err)
+        ruleset_posts = [b for a, b in fake.posts if a[3] == f"repos/{REPO}/rulesets"]
+        self.assertEqual(
+            ruleset_posts[0]["rules"][0]["parameters"]["required_status_checks"],
+            [{"context": "lanes"}, {"context": "codex"}, {"context": "zizmor"}],
+        )
+
+    def test_a_path_filtered_publisher_is_not_vouched_for_either(self):
+        # Same direction, one step subtler: the workflow runs on pull
+        # requests, but not on all of them, and which ones is not a
+        # question a static read of the filter answers.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = (set(_SCAFFOLD_PATHS) - {".github/workflows/ci.yml"}) | {
+            ".github/workflows/test.yml"
+        }
+        fake.bootstrap_workflow_texts = {
+            ".github/workflows/test.yml": "on:\n  pull_request:\n    paths: ['**.py']\njobs:\n  lanes:\n    runs-on: x\n"
+        }
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+        code, out, err = _run(fake, ["--force", REPO])
+        self.assertEqual(code, 0, err)
+        ruleset_posts = [b for a, b in fake.posts if a[3] == f"repos/{REPO}/rulesets"]
+        self.assertEqual(
+            ruleset_posts[0]["rules"][0]["parameters"]["required_status_checks"],
+            [{"context": "codex"}, {"context": "zizmor"}],
+        )
+
+    def test_a_held_back_publisher_does_not_stop_the_rest_of_the_gap(self):
+        # The conflict is one file's, not the step's: everything else the
+        # repository is missing still lands in the same pull request.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = {".github/workflows/test.yml"}
+        fake.bootstrap_workflow_texts = {
+            ".github/workflows/test.yml": _WORKFLOW_ON_PULL_REQUESTS
+            + "jobs:\n  lanes:\n    runs-on: ubuntu-latest\n"
+        }
+        code, out, err = _run(fake, ["--dry-run", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("add .github/workflows/ci.yml", out)
+        self.assertIn("add .github/workflows/zizmor.yml", out)
+        self.assertIn("add AGENTS.md", out)
+        self.assertIn(
+            "not adding .github/workflows/ci.yml: a workflow already on the branch publishes "
+            "its check (see above)",
+            out,
+        )
+
+    def test_another_workflow_publishing_other_checks_does_not_hold_ci_yml_back(self):
+        # The collision is on the CHECK NAME, not on there being another
+        # workflow: a repository whose test.yml runs its own jobs still
+        # gets the lane wiring it hasn't got.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = (set(_SCAFFOLD_PATHS) - {".github/workflows/ci.yml"}) | {
+            ".github/workflows/test.yml"
+        }
+        fake.bootstrap_workflow_texts = {
+            ".github/workflows/test.yml": _WORKFLOW_ON_PULL_REQUESTS
+            + "jobs:\n  test:\n    runs-on: ubuntu-latest\n"
+        }
+        code, out, err = _run(fake, ["--dry-run", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("add .github/workflows/ci.yml", out)
+        self.assertNotIn("not adding", out)
+
+    def test_an_unnamed_matrix_job_of_that_key_is_not_a_publisher(self):
+        # It publishes `lanes (ubuntu)`, never `lanes`, so there is no
+        # collision to hold ci.yml back over -- and reading it as one
+        # would vouch for a context nothing publishes and require it
+        # (Codex, mikelward/repo#69).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = (set(_SCAFFOLD_PATHS) - {".github/workflows/ci.yml"}) | {
+            ".github/workflows/test.yml"
+        }
+        fake.bootstrap_workflow_texts = {
+            ".github/workflows/test.yml": _WORKFLOW_ON_PULL_REQUESTS
+            + "jobs:\n  lanes:\n    strategy:\n      matrix:\n        os: [ubuntu]\n"
+        }
+        code, out, err = _run(fake, ["--dry-run", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("add .github/workflows/ci.yml", out)
+        self.assertNotIn("not adding", out)
+
+    def test_a_nested_workflow_file_is_not_a_publisher(self):
+        # GitHub loads only the direct children of .github/workflows, so
+        # an archived copy under it never runs -- reading one as a live
+        # publisher holds ci.yml back over a file nothing executes
+        # (Codex, mikelward/repo#69).
+        fake = FakeGh()
+        archived = ".github/workflows/archive/test.yml"
+        fake.bootstrap_existing_paths = (set(_SCAFFOLD_PATHS) - {".github/workflows/ci.yml"}) | {
+            archived
+        }
+        fake.bootstrap_workflow_texts = {
+            archived: _WORKFLOW_ON_PULL_REQUESTS + "jobs:\n  lanes:\n    runs-on: x\n"
+        }
+        # The Actions API does not list it, which is the whole signal.
+        fake.actions_workflows = {
+            p: "active"
+            for p in fake.bootstrap_existing_paths
+            if p.startswith(".github/workflows/") and p.count("/") == 2
+        }
+        code, out, err = _run(fake, ["--dry-run", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("add .github/workflows/ci.yml", out)
+        self.assertNotIn("not adding", out)
+
+    def test_a_disabled_workflow_is_not_a_publisher(self):
+        # Disabled through the Actions UI, its YAML still carries the job
+        # and an unfiltered pull-request trigger -- and it will never
+        # report again.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = (set(_SCAFFOLD_PATHS) - {".github/workflows/ci.yml"}) | {
+            ".github/workflows/test.yml"
+        }
+        fake.bootstrap_workflow_texts = {
+            ".github/workflows/test.yml": _WORKFLOW_ON_PULL_REQUESTS
+            + "jobs:\n  lanes:\n    runs-on: x\n"
+        }
+        fake.actions_workflows = {
+            p: ("disabled_manually" if p.endswith("/test.yml") else "active")
+            for p in fake.bootstrap_existing_paths
+            if p.startswith(".github/workflows/")
+        }
+        code, out, err = _run(fake, ["--dry-run", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("add .github/workflows/ci.yml", out)
+        self.assertNotIn("not adding", out)
+
+    def test_a_reusable_call_of_that_key_is_not_a_publisher(self):
+        # A job-level `uses:` publishes `lanes / test`, not `lanes`, so
+        # there is nothing for it to collide with (Codex,
+        # mikelward/repo#69).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = (set(_SCAFFOLD_PATHS) - {".github/workflows/ci.yml"}) | {
+            ".github/workflows/test.yml"
+        }
+        fake.bootstrap_workflow_texts = {
+            ".github/workflows/test.yml": _WORKFLOW_ON_PULL_REQUESTS
+            + "jobs:\n  lanes:\n    uses: ./.github/workflows/reusable.yml\n"
+        }
+        code, out, err = _run(fake, ["--dry-run", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("add .github/workflows/ci.yml", out)
+        self.assertNotIn("not adding", out)
+
+    def test_a_pull_request_target_publisher_is_not_vouched_for(self):
+        # Its check runs attach to the BASE commit, not the pull request's
+        # head, so requiring the context there is never satisfied.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = (set(_SCAFFOLD_PATHS) - {".github/workflows/ci.yml"}) | {
+            ".github/workflows/test.yml"
+        }
+        fake.bootstrap_workflow_texts = {
+            ".github/workflows/test.yml": "on:\n  pull_request_target:\njobs:\n  lanes:\n    runs-on: x\n"
+        }
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+        code, out, err = _run(fake, ["--force", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("does not run on every pull request", err)
+        ruleset_posts = [b for a, b in fake.posts if a[3] == f"repos/{REPO}/rulesets"]
+        self.assertEqual(
+            ruleset_posts[0]["rules"][0]["parameters"]["required_status_checks"],
+            [{"context": "codex"}, {"context": "zizmor"}],
+        )
+
+    def test_a_failed_workflow_listing_fails_the_bootstrap_step(self):
+        # Which workflows are live is then unknown, and both answers are
+        # wrong on a guess.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = (set(_SCAFFOLD_PATHS) - {".github/workflows/ci.yml"}) | {
+            ".github/workflows/test.yml"
+        }
+        fake.actions_workflows_read_fails = True
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(f"could not list {REPO}'s workflows", err)
+        self.assertIn("failed on: bootstrap", err)
+        self.assertEqual(fake.created_refs, [])
+
+    def test_a_job_name_only_run_time_resolves_is_cannot_tell(self):
+        # A `${{ }}` name that could resolve to the check either way: the
+        # file is held back and the check is not required, the same as a
+        # workflow that cannot be parsed at all.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = (set(_SCAFFOLD_PATHS) - {".github/workflows/ci.yml"}) | {
+            ".github/workflows/test.yml"
+        }
+        fake.bootstrap_workflow_texts = {
+            ".github/workflows/test.yml": _WORKFLOW_ON_PULL_REQUESTS
+            + "jobs:\n  gate:\n    name: ${{ matrix.check }}\n"
+        }
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+        code, out, err = _run(fake, ["--force", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("cannot tell whether '.github/workflows/test.yml' already publishes", err)
+        ruleset_posts = [b for a, b in fake.posts if a[3] == f"repos/{REPO}/rulesets"]
+        self.assertEqual(
+            ruleset_posts[0]["rules"][0]["parameters"]["required_status_checks"],
+            [{"context": "codex"}, {"context": "zizmor"}],
+        )
+
+    def test_a_closed_only_trigger_is_not_vouched_for(self):
+        # It runs only once the pull request is gone, so the check it
+        # publishes is one no OPEN pull request ever gets -- requiring it
+        # on the strength of a closed head's green run blocks every merge.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = (set(_SCAFFOLD_PATHS) - {".github/workflows/ci.yml"}) | {
+            ".github/workflows/test.yml"
+        }
+        fake.bootstrap_workflow_texts = {
+            ".github/workflows/test.yml": "on:\n  pull_request:\n    types: [closed]\njobs:\n  lanes:\n    runs-on: x\n"
+        }
+        fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+        code, out, err = _run(fake, ["--force", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("does not run on every pull request", err)
+        ruleset_posts = [b for a, b in fake.posts if a[3] == f"repos/{REPO}/rulesets"]
+        self.assertEqual(
+            ruleset_posts[0]["rules"][0]["parameters"]["required_status_checks"],
+            [{"context": "codex"}, {"context": "zizmor"}],
+        )
+
+    def test_an_unreadable_workflow_holds_back_the_publisher_it_might_be(self):
+        # "Cannot tell" is not "publishes nothing": a duplicate gate is
+        # what a guess in that direction lands, and nothing on the
+        # repository says which of the two a ruleset then means.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = (set(_SCAFFOLD_PATHS) - {".github/workflows/ci.yml"}) | {
+            ".github/workflows/test.yml"
+        }
+        fake.bootstrap_workflow_texts = {".github/workflows/test.yml": "jobs: [unclosed\n"}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "cannot tell whether '.github/workflows/test.yml' already publishes 'lanes'", err
+        )
+        self.assertEqual(fake.created_refs, [])
+
+    def test_a_blob_github_will_not_inline_reads_as_cannot_tell(self):
+        # An empty `content` under an encoding of its own is not a
+        # workflow with no jobs in it -- taken as one, the name would read
+        # as free and the duplicate gate would land.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = (set(_SCAFFOLD_PATHS) - {".github/workflows/ci.yml"}) | {
+            ".github/workflows/test.yml"
+        }
+        fake.bootstrap_blob_encoding = "none"
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("cannot tell whether", err)
+        self.assertEqual(fake.created_refs, [])
+
+    def test_a_failed_workflow_read_fails_the_bootstrap_step(self):
+        # Same direction again, one step stronger: a read that failed says
+        # nothing about the branch at all, so the step fails rather than
+        # writing on an answer it never got.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = (set(_SCAFFOLD_PATHS) - {".github/workflows/ci.yml"}) | {
+            ".github/workflows/test.yml"
+        }
+        fake.bootstrap_blob_read_fails = True
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("could not read owner/repo's .github/workflows/", err)
+        self.assertIn("failed on: bootstrap", err)
+        self.assertEqual(fake.created_refs, [])
+
+    def test_a_converged_repository_reads_no_workflow_blobs(self):
+        # The check costs a read per workflow on the branch, so it is
+        # asked only where one of the three publishers is actually
+        # missing -- never on the fleet's ordinary, already-scaffolded
+        # repository.
+        fake = FakeGh()
+        code, out, err = _run(fake, ["--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(
+            [c[1] for c in fake.calls if c[0] == "api" and "/git/blobs/" in c[1]], []
         )
 
     def test_a_partially_scaffolded_repository_adds_only_what_is_missing(self):

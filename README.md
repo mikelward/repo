@@ -279,7 +279,10 @@ already-existing repository is still missing -- reusing `repo create
 --scaffold`'s own generated files, never overwriting one already there
 except codex-review's three workflow files, which every consumer pins
 byte for byte and which are brought up to the current template when they
-differ -- as one commit on a branch of its own, opened as a pull request against
+differ, and never adding one whose check a workflow already on the branch
+publishes under another file name (a repository whose lane jobs live in
+`test.yml` keeps them: a second job named `lanes` makes the required check
+ambiguous) -- as one commit on a branch of its own, opened as a pull request against
 the default branch (or, for a repository whose branch has no commits yet
 and so has no base for a pull request to target, the same two-commit
 bootstrap `repo create --scaffold` uses, written directly). A pull

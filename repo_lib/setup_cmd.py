@@ -2100,30 +2100,50 @@ def _run(args, log=None):
                 "bootstrap step), since whether its workflow is on the branch is unknown"
                 for check in checks
             }
-        elif bootstrap_plan.changes and bootstrap_plan.base_commit_sha is not None:
-            # Every path the pull request carries: a publisher missing from
-            # the branch, and one present but outdated -- a pinned copy
-            # that differs from the template is one this tool does not
-            # vouch for, and a check required on the strength of what it
-            # once published could block the very pull request replacing
-            # it (Codex review, mikelward/repo#56).
-            unpublished = scaffold.checks_a_gap_leaves_unpublished(bootstrap_plan.changes, checks)
+        else:
+            if bootstrap_plan.changes and bootstrap_plan.base_commit_sha is not None:
+                # Every path the pull request carries: a publisher missing
+                # from the branch, and one present but outdated -- a pinned
+                # copy that differs from the template is one this tool does
+                # not vouch for, and a check required on the strength of
+                # what it once published could block the very pull request
+                # replacing it (Codex review, mikelward/repo#56).
+                unpublished = scaffold.checks_a_gap_leaves_unpublished(bootstrap_plan.changes, checks)
 
-            def where_for(path):
-                verb = "adding" if path in bootstrap_plan.missing else "replacing"
-                if bootstrap_plan.missing_workflow_scope:
-                    return "this gh token cannot write it (see the bootstrap step)"
-                if bootstrap_plan.open_pull_request is not None:
-                    return f"pull request #{bootstrap_plan.open_pull_request.number} is {verb} it"
-                return f"the pull request this run opens is {verb} it"
+                def where_for(path):
+                    verb = "adding" if path in bootstrap_plan.missing else "replacing"
+                    if bootstrap_plan.missing_workflow_scope:
+                        return "this gh token cannot write it (see the bootstrap step)"
+                    if bootstrap_plan.open_pull_request is not None:
+                        return f"pull request #{bootstrap_plan.open_pull_request.number} is {verb} it"
+                    return f"the pull request this run opens is {verb} it"
 
-            defer = {
-                check: (
-                    f"'{check}' waits for {scaffold.CHECK_PUBLISHERS[check][0]} to be on "
-                    f"'{bootstrap_default_branch}' -- {where_for(scaffold.CHECK_PUBLISHERS[check][0])}"
-                )
-                for check in unpublished
-            }
+                defer = {
+                    check: (
+                        f"'{check}' waits for {scaffold.CHECK_PUBLISHERS[check][0]} to be on "
+                        f"'{bootstrap_default_branch}' -- {where_for(scaffold.CHECK_PUBLISHERS[check][0])}"
+                    )
+                    for check in unpublished
+                }
+            # A publisher the bootstrap step held back because another
+            # workflow already declares its job, where that workflow is one
+            # it cannot say runs on every pull request: nothing would report
+            # the check there, so requiring it blocks every merge
+            # (scaffold.GapPlan.unvouched). Outside the branch above on
+            # purpose -- holding a file back can leave the step writing
+            # nothing at all, and the check is no more reportable for that.
+            defer.update(
+                {
+                    check: (
+                        f"'{check}' waits for a workflow that publishes it on a pull request -- "
+                        f"{scaffold.CHECK_PUBLISHERS[check][0]} was not added because another "
+                        "workflow already declares a job of that name (see the bootstrap step)"
+                    )
+                    for check in scaffold.checks_a_gap_leaves_unpublished(
+                        bootstrap_plan.unvouched, checks
+                    )
+                }
+            )
 
     ruleset_lines = []
     ruleset_preview_failed = False

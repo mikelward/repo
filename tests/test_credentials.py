@@ -1345,6 +1345,154 @@ class LanesReaderTest(unittest.TestCase):
         self.assertFalse(credentials.lanes_usable({"LANES_PAT"}))
 
 
+class JobCheckNamesTest(unittest.TestCase):
+    """What a workflow's jobs publish their check runs under -- the answer
+    scaffold.plan_gaps needs before adding a second workflow that would
+    publish one of them (mikelward/conf#307)."""
+
+    def test_a_job_publishes_under_its_key_and_its_name_wins(self):
+        self.assertEqual(
+            credentials.job_check_names(
+                "jobs:\n  classify:\n    name: Classify the diff\n  lanes:\n    runs-on: x\n"
+            ),
+            ({"Classify the diff", "lanes"}, []),
+        )
+
+    def test_an_empty_document_publishes_nothing(self):
+        self.assertEqual(credentials.job_check_names(""), (set(), []))
+        self.assertEqual(credentials.job_check_names("name: ci\n"), (set(), []))
+
+    def test_what_cannot_be_read_is_not_read_as_publishing_nothing(self):
+        # Each of these would otherwise come back as an empty set, which a
+        # caller asking "is this name taken?" reads as "no" -- the guess
+        # that lands the duplicate gate.
+        self.assertIsNone(credentials.job_check_names("jobs: [unclosed\n"))
+        self.assertIsNone(credentials.job_check_names("jobs: [a, b]\n"))
+        self.assertIsNone(credentials.job_check_names("- a\n- b\n"))
+
+    def test_an_unnamed_matrix_job_never_publishes_its_bare_key(self):
+        # GitHub publishes `lanes (ubuntu)`, not `lanes`. Reading the key
+        # as the name held the scaffold file back AND vouched for a context
+        # nothing publishes, which is the wedge in the other direction
+        # (Codex, mikelward/repo#69).
+        self.assertEqual(
+            credentials.job_check_names(
+                "jobs:\n  lanes:\n    strategy:\n      matrix:\n        os: [ubuntu]\n"
+            ),
+            (set(), ["lanes (*)"]),
+        )
+        # A matrix job with an explicit name: whether GitHub appends the
+        # leg's values to a name it was given is not something a static
+        # read settles, so the pattern covers both readings.
+        self.assertEqual(
+            credentials.job_check_names(
+                "jobs:\n  lanes:\n    name: lanes\n    strategy:\n      matrix: {os: [ubuntu]}\n"
+            ),
+            (set(), ["lanes*"]),
+        )
+        # A `strategy:` this cannot read might not be a matrix at all, so
+        # the bare name is in range too.
+        self.assertEqual(
+            credentials.job_check_names("jobs:\n  lanes:\n    strategy: nope\n"), (set(), ["lanes*"])
+        )
+        # A `strategy:` with no matrix in it is not one.
+        self.assertEqual(
+            credentials.job_check_names("jobs:\n  lanes:\n    strategy:\n      fail-fast: true\n"),
+            ({"lanes"}, []),
+        )
+        # An explicit name with no matrix is published verbatim.
+        self.assertEqual(
+            credentials.job_check_names("jobs:\n  lanes:\n    name: lanes\n"), ({"lanes"}, [])
+        )
+
+    def test_an_expression_name_becomes_a_pattern_rather_than_unreadable(self):
+        # `test ${{ matrix.os }}` is the commonest shape there is, and it
+        # can never resolve to `lanes` -- reading the whole workflow as
+        # unreadable would hold the scaffold back over an unrelated job.
+        self.assertEqual(
+            credentials.job_check_names("jobs:\n  build:\n    name: build ${{ matrix.os }}\n"),
+            (set(), ["build *"]),
+        )
+
+    def test_a_job_that_is_not_a_mapping_is_cannot_tell(self):
+        # `jobs: {lanes: null}` is not a job GitHub can run, so reading
+        # `lanes` off it as an exact publisher would vouch for a context
+        # nothing emits -- but the name may still be taken, so it is a
+        # pattern rather than nothing (Codex, mikelward/repo#69).
+        self.assertEqual(credentials.job_check_names("jobs:\n  lanes:\n"), (set(), ["lanes*"]))
+
+    def test_a_reusable_workflow_call_publishes_the_called_jobs(self):
+        # A job-level `uses:` publishes `lanes / test`, one per job of the
+        # called workflow, and never the caller's own name on its own.
+        self.assertEqual(
+            credentials.job_check_names("jobs:\n  lanes:\n    uses: ./.github/workflows/x.yml\n"),
+            (set(), ["lanes / *"]),
+        )
+        self.assertEqual(
+            credentials.job_check_names(
+                "jobs:\n  lanes:\n    uses: o/r/.github/workflows/x.yml@v1\n"
+                "    strategy:\n      matrix: {os: [ubuntu]}\n"
+            ),
+            (set(), ["lanes* / *"]),
+        )
+
+
+class PublishesOnPullRequestsTest(unittest.TestCase):
+    """Whether a check a workflow's jobs publish is one a pull request can
+    be required to pass (mikelward/repo#69)."""
+
+    def test_an_unfiltered_pull_request_trigger_publishes(self):
+        # `on:` is the YAML 1.1 boolean True once parsed, quoted or not.
+        self.assertIs(credentials.publishes_on_pull_requests("on:\n  pull_request:\n"), True)
+        self.assertIs(credentials.publishes_on_pull_requests('"on":\n  pull_request:\n'), True)
+        self.assertIs(credentials.publishes_on_pull_requests("on: pull_request\n"), True)
+        self.assertIs(credentials.publishes_on_pull_requests("on: [push, pull_request]\n"), True)
+
+    def test_a_types_filter_still_publishes(self):
+        # It narrows which activity starts a run, not which pull requests
+        # the workflow serves -- the scaffold's own ci.yml carries one.
+        self.assertIs(
+            credentials.publishes_on_pull_requests(
+                "on:\n  push:\n    branches: [main]\n  pull_request:\n    types: [opened, synchronize]\n"
+            ),
+            True,
+        )
+
+    def test_a_push_only_workflow_does_not(self):
+        self.assertIs(
+            credentials.publishes_on_pull_requests("on:\n  push:\n    branches: [main]\n"), False
+        )
+        self.assertIs(credentials.publishes_on_pull_requests("on: [push, workflow_dispatch]\n"), False)
+        self.assertIs(credentials.publishes_on_pull_requests("jobs:\n  a:\n"), False)
+
+    def test_a_filter_that_excludes_some_pull_requests_is_cannot_tell(self):
+        for on in (
+            "on:\n  pull_request:\n    paths: ['**.py']\n",
+            "on:\n  pull_request:\n    paths-ignore: ['docs/**']\n",
+            "on:\n  pull_request:\n    branches: [release]\n",
+            "on:\n  pull_request:\n    branches-ignore: [main]\n",
+            "on:\n  pull_request: [opened]\n",
+            # Only once the pull request is gone: it can never report on an
+            # open one, however green its closed heads look.
+            "on:\n  pull_request:\n    types: [closed]\n",
+            # Every later push to the branch goes unchecked without
+            # `synchronize`.
+            "on:\n  pull_request:\n    types: [opened, reopened]\n",
+            "on:\n  pull_request:\n    types: not-a-list\n",
+            # A pull_request_target run is against the BASE ref and its
+            # check runs attach to the base commit, so a check required on
+            # the pull request's head is never satisfied by one.
+            "on:\n  pull_request_target:\n",
+            "on: pull_request_target\n",
+            "on: [push, pull_request_target]\n",
+        ):
+            self.assertIsNone(credentials.publishes_on_pull_requests(on), on)
+
+    def test_what_cannot_be_parsed_is_cannot_tell(self):
+        self.assertIsNone(credentials.publishes_on_pull_requests("on: [unclosed\n"))
+        self.assertIsNone(credentials.publishes_on_pull_requests("- a\n"))
+
+
 class BranchPolicyTest(unittest.TestCase):
     """The environment's own gate: which branches may reach the lanes
     credential. Only the trusted base branch may -- protected branches,
