@@ -262,8 +262,8 @@ one that has stopped biting.
   CI failures. It cannot deliver CI *success*, a push, the merge, Codex's
   clean verdict (a reaction), or Codex never answering at all -- so keep
   exactly one check armed for as long as the PR is open (each event and
-  each check costs a model turn). Under drive, arm auto-merge at PR open
-  too -- but only where the ruleset makes the Codex verdict a required
+  each check costs a model turn). Under drive (but never under merge in order), arm auto-merge at PR
+  open too -- but only where the ruleset makes the Codex verdict a required
   check AND requires conversations resolved: where CI is the only
   requirement it merges before Codex has answered, and an open review
   comment holds nothing back on its own.
@@ -346,12 +346,13 @@ one that has stopped biting.
   flight together, each merged only once every lower-numbered active PR has.
   Waiting holds only the merge: keep driving a queued PR -- review comments,
   CI, rebases -- so it is green with Codex's `+1` the moment it is the lowest.
-  Merge by hand, never auto-merge, rechecking the lower PRs just before. A
-  merge can leave the next one `dirty` or `behind` -- rebase it per the
-  `dirty`/`behind` rule and merge on its new verdict. Active means open, not a
-  draft, and either green with a `+1` and only waiting its turn, or pushed to,
-  reviewed or commented on in the last 30 minutes; say which lower PRs you
-  skipped as stale.
+  Merge by hand, never auto-merge (disarm any already armed), rechecking the
+  lower PRs just before. Each merge moves the base, so rebase the next one per
+  the `dirty`/`behind` rule even where the ruleset allows `behind`, and merge
+  on its new verdict. Active means open, not a draft, and either green with a
+  `+1` and only waiting its turn, or opened, reopened, pushed to, reviewed or
+  commented on in the last 30 minutes; say which lower PRs you skipped as
+  stale.
 - End every reply with the open-PR link (or `.../compare/main...<branch>`
   until a PR exists). Never link to a closed or merged PR -- except when
   the reply *is* post-merge follow-up on that PR.
