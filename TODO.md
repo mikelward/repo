@@ -838,6 +838,17 @@
       wait. `--force` no longer waives any guard: it means "apply without
       asking", and the fleet loop passes it on every run.
 
+- [x] **A hold on unresolved conversations names each one.** A Codex
+      finding on the scaffold pull request (`ci.yml`'s placeholder, a P2
+      on mikelward/quickspace#4) held it for a person with only a count
+      to go on. The hold now lists each unresolved thread's opener, what
+      it says (a Codex finding by severity and title) and its link, five
+      at most (`scaffold._describe_conversation`). Resolving one stays a
+      person's call: having `repo setup` resolve low-severity Codex
+      findings itself was tried on mikelward/repo#83 and dropped
+      (maintainer, 2026-09-28), after four review rounds each found one
+      more way the finding might not be the only block.
+
 - [ ] **A scaffold pull request the codex sweep never reads waits forever.**
       The sweep sets `codex` pending when the pull request opens, and Codex
       reacts only once it reviews; when it never picks the pull request up

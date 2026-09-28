@@ -155,6 +155,17 @@ def _parse_api_args(rest):
     return endpoint, method, jq
 
 
+def _review_thread(login, body, n, resolved=False):
+    """An unresolved review thread as the review-state read returns it,
+    opened by `login` with `body`."""
+    return {
+        "isResolved": resolved,
+        "comments": [
+            {"url": f"https://github.com/owner/repo/pull/11#discussion_r{n}", "body": body, "author": {"login": login}}
+        ],
+    }
+
+
 class FakeGh:
     """Models one repository's GitHub state for repo_lib.gh.run/try_run/
     run_with_input, closely enough to exercise repo_lib.rules, apps, and
@@ -491,8 +502,10 @@ class FakeGh:
         # how many review threads are unresolved, and whether it fails.
         self.review_decision = None
         self.unresolved_threads = 0
-        # Or the threads themselves, as isResolved flags, paged 100 at a
-        # time the way GitHub pages them; None derives them from
+        # Or the threads themselves, paged 100 at a time the way GitHub
+        # pages them: bare isResolved flags (a thread with no comment
+        # read), or dicts with "isResolved" and "comments" (GraphQL comment
+        # nodes; see _review_thread). None derives them from
         # unresolved_threads.
         self.review_threads = None
         self.review_state_fails = False
@@ -638,7 +651,12 @@ class FakeGh:
                                         "hasNextPage": start + 100 < len(flags),
                                         "endCursor": str(start + 100),
                                     },
-                                    "nodes": [{"isResolved": f} for f in page],
+                                    "nodes": [
+                                        {"isResolved": f, "comments": {"nodes": []}}
+                                        if isinstance(f, bool)
+                                        else {"isResolved": f["isResolved"], "comments": {"nodes": f["comments"]}}
+                                        for f in page
+                                    ],
                                 },
                             }
                         }
@@ -12585,6 +12603,48 @@ class BootstrapStepTest(unittest.TestCase):
         code, out, err = _run(fake, ["--force", "--no-rules", REPO])
         self.assertEqual(code, 1)
         self.assertIn("needs a person: GitHub blocks it on 1 unresolved conversation(s)", err)
+
+    def test_a_hold_on_unresolved_conversations_names_each_one(self):
+        # Resolving them is a person's call, so the hold says which: who
+        # opened each, what it says -- a Codex finding by severity and title
+        # -- and where, so each is one click rather than a hunt.
+        codex = (
+            "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>"
+            "  Run the existing test suite in CI**\n\nFor every non-doc pull request..."
+        )
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.bootstrap_open_pulls = self._OPEN_11
+        fake.check_runs = {"prhead11": ["lanes", "zizmor"]}
+        fake.pulls = {11: {"mergeable_state": "blocked"}}
+        fake.effective_rules = [
+            {"type": "pull_request", "parameters": {"required_review_thread_resolution": True}}
+        ]
+        fake.review_threads = [
+            _review_thread("chatgpt-codex-connector", codex, 1),
+            _review_thread("someone", "\nPlease also pin the action to a hash.\nThanks", 2),
+            _review_thread("someone", "x" * 100, 3),
+            _review_thread("someone", "Settled already.", 4, resolved=True),
+        ]
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "needs a person: GitHub blocks it on 3 unresolved conversation(s), which this tool "
+            "cannot settle -- resolve them and rerun: chatgpt-codex-connector: P2 'Run the "
+            "existing test suite in CI' (https://github.com/owner/repo/pull/11#discussion_r1); "
+            "someone: 'Please also pin the action to a hash.' "
+            "(https://github.com/owner/repo/pull/11#discussion_r2); "
+            f"someone: '{'x' * 69}...' (https://github.com/owner/repo/pull/11#discussion_r3)",
+            err,
+        )
+        self.assertNotIn("discussion_r4", err)
+        self.assertEqual(fake.merged_pulls, [])
+
+        # Past a handful, the rest are counted rather than listed.
+        fake.review_threads = [_review_thread("someone", f"Point {n}.", n) for n in range(1, 8)]
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertIn("'Point 5.' (https://github.com/owner/repo/pull/11#discussion_r5); and 2 more", err)
+        self.assertNotIn("Point 6.", err)
 
     def test_a_merge_that_landed_elsewhere_is_reported_not_returned(self):
         # The merge API pins the head, not the base: a retarget in the
