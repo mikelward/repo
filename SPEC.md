@@ -318,7 +318,9 @@ to an App needs that App's own report, which a head that already ran
 under another does not get again -- and no rerun or rebase changes that.
 One blocked with every required check passed is asked,
 live, what holds it: a review it lacks or an unresolved conversation is
-reported as needing a person, as is a branch requiring signed commits
+reported as needing a person -- each conversation named by who opened
+it, what it says and its link, since resolving one is a person's call --
+as is a branch requiring signed commits
 (the generated commit is not one); and a block none of those explains is
 reported as needing a person to look, never waited on forever -- naming,
 as a hint only, any rule on the branch that may settle on its own (a

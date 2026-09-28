@@ -1039,7 +1039,8 @@ _GENERATED_COMMIT_CANNOT_SATISFY = frozenset({"required_signatures"})
 
 # What GitHub's review rules hold a pull request on right now, which the
 # REST pull request read does not say: `reviewDecision` is null where no
-# rule requires a review, and thread resolution is GraphQL-only.
+# rule requires a review, and thread resolution is GraphQL-only. Each
+# thread's opening comment comes too, so a hold can name what to resolve.
 _REVIEW_STATE_QUERY = """
 query($owner: String!, $name: String!, $number: Int!, $after: String) {
   repository(owner: $owner, name: $name) {
@@ -1047,18 +1048,46 @@ query($owner: String!, $name: String!, $number: Int!, $after: String) {
       reviewDecision
       reviewThreads(first: 100, after: $after) {
         pageInfo { hasNextPage endCursor }
-        nodes { isResolved }
+        nodes {
+          isResolved
+          comments(first: 1) { nodes { url body author { login } } }
+        }
       }
     }
   }
 }
 """
+# The severity badge and bold title a Codex finding opens with.
+_CODEX_FINDING_RE = re.compile(r"\s*\*\*<sub><sub>!\[(P\d) Badge\]\([^)]*\)</sub></sub>\s*(.*?)\*\*")
+# How many unresolved conversations a hold names before counting the rest.
+_NAMED_CONVERSATIONS = 5
+
+
+def _describe_conversation(node):
+    """One unresolved thread as its opener, what it says and its link --
+    for a Codex finding, the severity and title -- or None where the read
+    carried no comment."""
+    comments = node["comments"]["nodes"]
+    if not comments:
+        return None
+    first = comments[0]
+    author = (first["author"] or {}).get("login") or "ghost"
+    body = first["body"] or ""
+    m = _CODEX_FINDING_RE.match(body)
+    if m:
+        what = f"{m.group(1)} '{m.group(2).strip()}'"
+    else:
+        line = next((line.strip() for line in body.splitlines() if line.strip()), "")
+        what = f"'{line[:69]}...'" if len(line) > 72 else f"'{line}'"
+    return f"{author}: {what} ({first['url']})"
 
 
 def _review_blockers(repo, number, resolution_required):
     """What GitHub's review rules hold pull request `number` on right now,
-    as phrases for a message -- empty when nothing does -- or None with
-    the read's failure in the second element. Asked live rather than
+    as phrases for a message -- empty when nothing does -- and the
+    unresolved conversations described for a person to resolve (see
+    _describe_conversation); or None for both, with the read's failure in
+    the third element. Asked live rather than
     inferred from the rules present: a rule being on the branch says
     nothing about whether this pull request satisfies it (Codex review,
     mikelward/repo#56). Unresolved conversations count only where a rule
@@ -1078,31 +1107,42 @@ def _review_blockers(repo, number, resolution_required):
         f"number={number}",
     ]
     unresolved = 0
+    conversations = []
     after = None
     while True:
         ok, raw = gh.try_run(args + (["-F", f"after={after}"] if after is not None else []))
         if not ok:
-            return None, raw.strip()
+            return None, None, raw.strip()
         try:
             pull = json.loads(raw)["data"]["repository"]["pullRequest"]
             decision = pull["reviewDecision"]
             threads = pull["reviewThreads"]
-            unresolved += sum(1 for node in threads["nodes"] if not node["isResolved"])
+            for node in threads["nodes"]:
+                if node["isResolved"]:
+                    continue
+                unresolved += 1
+                described = _describe_conversation(node)
+                if described is not None:
+                    conversations.append(described)
             more, after = bool(threads["pageInfo"]["hasNextPage"]), threads["pageInfo"]["endCursor"]
-        except (ValueError, KeyError, TypeError):
-            return None, "unexpected response"
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return None, None, "unexpected response"
         if not more:
             break
         if not after:
-            return None, "unexpected response"  # a next page with no cursor to reach it
+            return None, None, "unexpected response"  # a next page with no cursor to reach it
     blockers = []
     if decision == "REVIEW_REQUIRED":
         blockers.append("a review it requires and does not have")
     elif decision == "CHANGES_REQUESTED":
         blockers.append("a review requesting changes")
-    if resolution_required and unresolved:
-        blockers.append(f"{unresolved} unresolved conversation(s)")
-    return blockers, ""
+    if not (resolution_required and unresolved):
+        return blockers, [], ""
+    blockers.append(f"{unresolved} unresolved conversation(s)")
+    named = conversations[:_NAMED_CONVERSATIONS]
+    if len(conversations) > len(named):
+        named.append(f"and {len(conversations) - len(named)} more")
+    return blockers, named, ""
 
 
 def assess_gap_pull_request(repo, pr, plan):
@@ -1376,7 +1416,7 @@ def assess_gap_pull_request(repo, pr, plan):
             and (rule.get("parameters") or {}).get("required_review_thread_resolution")
             for rule in effective
         )
-        blockers, why = _review_blockers(repo, pr.number, resolution_required)
+        blockers, conversations, why = _review_blockers(repo, pr.number, resolution_required)
         if blockers is None:
             error_lines(
                 f"GitHub reports pull request #{pr.number} blocked, and its review state could "
@@ -1385,9 +1425,14 @@ def assess_gap_pull_request(repo, pr, plan):
             )
             return None
         if blockers:
+            # Named, so resolving them is one click each rather than a hunt
+            # through the pull request; the next run merges once they are.
+            named = (
+                f" -- resolve them and rerun: {'; '.join(conversations)}" if conversations else ""
+            )
             return GapPullRequestState(
                 "held",
-                f"GitHub blocks it on {' and '.join(blockers)}, which this tool cannot settle",
+                f"GitHub blocks it on {' and '.join(blockers)}, which this tool cannot settle{named}",
                 head_sha,
             )
         types = {rule.get("type") for rule in effective}
