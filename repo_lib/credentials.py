@@ -32,6 +32,7 @@ why `repo setup` needs the value handed to it to complete a move.
 
 import base64
 import dataclasses
+import glob
 import json
 import re
 import urllib.parse
@@ -594,6 +595,194 @@ def _jobs(doc):
     if not isinstance(doc, dict) or not isinstance(doc.get("jobs"), dict):
         return {}
     return {name: job for name, job in doc["jobs"].items() if isinstance(job, dict)}
+
+
+# What stands in for a `${{ }}` in a check-run name pattern: GitHub
+# resolves it at run time, so the literal text around it is all a static
+# read has. A pattern is matched with fnmatch, so the literal parts are
+# glob-escaped.
+_EXPRESSION_RE = re.compile(r"\$\{\{.*?\}\}")
+
+
+def _name_pattern(name):
+    """`name` as an fnmatch pattern: every `${{ }}` a `*`, everything else
+    literal. `test ${{ matrix.os }}` becomes `test *`, which cannot match
+    `lanes` -- the common shape that would otherwise read as "cannot tell"
+    and hold a scaffold file back over a job that has nothing to do with
+    it."""
+    return "*".join(glob.escape(part) for part in _EXPRESSION_RE.split(name))
+
+
+def job_check_names(text):
+    """`(exact names, patterns)` for the check runs a workflow's jobs
+    publish, or None when the document itself cannot be read (PyYAML
+    rejects it, `jobs:` is not a mapping, a job key is not a string).
+
+    A job publishes under its `name:` when it has one and its own key
+    otherwise -- EXACTLY only for the plain shape: a mapping job, with no
+    `strategy:`, no job-level `uses:`, and nothing in the name that only
+    run time resolves. Everything else lands in `patterns` for the caller
+    to match the name it is asking about against, because every one of
+    them publishes something other than, or wider than, the bare name:
+
+    - an unnamed MATRIX job publishes `key (ubuntu, 3.11)` and never the
+      bare `key`, so its pattern is `key (*)`;
+    - a NAMED matrix job, or one whose `strategy:` this cannot read, is
+      `name*`: whether GitHub appends a leg's values to a name it was
+      given is not something a static read settles, and the two answers
+      differ by exactly that suffix;
+    - a job-level `uses:` publishes one check per job of the workflow it
+      calls, named `caller / called`, so its pattern is `name / *`;
+    - a `${{ }}` in a `name:` is the pattern that expression allows;
+    - a job that is not a mapping at all (`jobs: {lanes: null}`) is not
+      one GitHub can run, and not one to read a name off either: `key*`.
+
+    The default is the pattern, not the exact name (Codex, mikelward/
+    repo#69, four rounds of it): every round of review has found another
+    way that what GitHub publishes is not what the YAML appears to say,
+    so the exact answer is given only for the shape where there is
+    nothing left to be wrong about.
+
+    None and a pattern alike are "cannot tell", never "publishes nothing":
+    the caller asks whether a name is already taken before adding a second
+    workflow publishing it, and a guess in that direction lands the
+    duplicate gate this exists to prevent (Codex, mikelward/conf#307)."""
+    doc = _document(text)
+    if doc is _REJECTED:
+        return None
+    if doc is None:
+        return set(), []  # an empty document -- no jobs, nothing published
+    if not isinstance(doc, dict):
+        return None
+    jobs = doc.get("jobs")
+    if jobs is None:
+        return set(), []
+    if not isinstance(jobs, dict):
+        return None
+    names = set()
+    patterns = []
+    for key, job in jobs.items():
+        if not isinstance(key, str):
+            return None
+        if not isinstance(job, dict):
+            # `jobs: {lanes: null}` -- not a job GitHub can run, and not
+            # one this can read either.
+            patterns.append(glob.escape(key) + "*")
+            continue
+        name = job.get("name")
+        if name is not None and not isinstance(name, str):
+            return None
+        published = key if name is None else name
+        expression = name is not None and "${{" in name
+        matrix = "strategy" in job and (
+            not isinstance(job["strategy"], dict) or "matrix" in job["strategy"]
+        )
+        called = "uses" in job
+        if not expression and not matrix and not called:
+            names.add(published)
+            continue
+        pattern = _name_pattern(name) if expression else glob.escape(published)
+        if called:
+            # A job-level `uses:` publishes one check per job of the
+            # called workflow, named `caller / called` -- and never the
+            # caller's own name on its own.
+            patterns.append(pattern + ("*" if matrix else "") + " / *")
+        elif matrix and not expression and name is None and isinstance(job["strategy"], dict):
+            # `key (ubuntu, 3.11)`, never the bare key.
+            patterns.append(pattern + " (*)")
+        else:
+            # An expression name with nothing else going on is already
+            # exactly what that expression allows; a matrix adds the leg
+            # suffix on top of whichever name the job ends up with.
+            patterns.append(pattern + ("*" if matrix else ""))
+    return names, patterns
+
+
+# A workflow's `on:` key parses as the BOOLEAN True: PyYAML implements
+# YAML 1.1, where `on`/`off`/`yes`/`no` are booleans, and GitHub's own
+# schema spells the key unquoted. A quoted `"on":` stays a string, so both
+# are looked up.
+# The one trigger whose checks land where a merge needs them. A
+# `pull_request_target` run is against the BASE ref, and its check runs
+# attach to the base commit rather than the pull request's head, so a
+# check required on the head is never satisfied by one -- it is read here
+# as "cannot tell", never as a publisher (Codex, mikelward/repo#69).
+_PULL_REQUEST_EVENT = "pull_request"
+_BASE_COMMIT_EVENT = "pull_request_target"
+_PULL_REQUEST_EVENTS = (_PULL_REQUEST_EVENT, _BASE_COMMIT_EVENT)
+# Trigger filters that keep a workflow off SOME pull requests.
+_NARROWING_FILTERS = ("paths", "paths-ignore", "branches", "branches-ignore")
+# The activity types a `types:` filter has to keep for the workflow to run
+# on every head of every open pull request: the one that opens it, and the
+# one every later push to it fires. Without both, a check the workflow
+# publishes is one some open pull request never gets -- `types: [closed]`
+# is the extreme, running only once the pull request is already gone
+# (Codex, mikelward/repo#69).
+_OPEN_PULL_REQUEST_TYPES = ("opened", "synchronize")
+
+
+def publishes_on_pull_requests(text):
+    """Whether every pull request runs `text` -- True only for a
+    `pull_request` trigger with no filter that keeps it off some of them,
+    False when there is no pull-request trigger at all, and None when
+    there is one this cannot vouch for: a `paths` or `branches` filter, a
+    `types:` that drops `opened` or `synchronize`, a `pull_request_target`
+    (whose checks attach to the base commit, not the head a merge needs
+    them on), or a shape it cannot read.
+
+    The question is whether a check this workflow's jobs publish is one a
+    pull request can be REQUIRED to pass. A job named for a required check
+    in a push-only workflow publishes it on the default branch and never
+    on a pull request, so requiring it there blocks every merge (Codex,
+    mikelward/repo#69)."""
+    doc = _document(text)
+    if doc is _REJECTED or not isinstance(doc, dict):
+        return None
+    if True in doc:
+        triggers = doc[True]
+    elif "on" in doc:
+        triggers = doc["on"]
+    else:
+        return False  # no trigger at all -- nothing runs this
+    if isinstance(triggers, str):
+        triggers = [triggers]
+    if isinstance(triggers, list):
+        # A sequence of event names carries no filters to read.
+        if _PULL_REQUEST_EVENT in triggers:
+            return True
+        return None if _BASE_COMMIT_EVENT in triggers else False
+    if not isinstance(triggers, dict):
+        return None
+    verdict = False
+    for event in _PULL_REQUEST_EVENTS:
+        if event not in triggers:
+            continue
+        if event == _BASE_COMMIT_EVENT:
+            verdict = None
+            continue
+        filters = triggers[event]
+        if filters is None:
+            return True
+        if not isinstance(filters, dict):
+            verdict = None
+        elif any(name in filters for name in _NARROWING_FILTERS):
+            verdict = None
+        elif "types" in filters and not _covers_open_pull_requests(filters["types"]):
+            verdict = None
+        else:
+            return True
+    return verdict
+
+
+def _covers_open_pull_requests(types):
+    """Whether a `types:` filter keeps the activity types that run a
+    workflow on every head of every OPEN pull request -- `opened` and
+    `synchronize`. A `types:` narrows which activity starts a run, which
+    is not a narrowing of which pull requests the workflow serves only for
+    as long as it keeps those two."""
+    if not isinstance(types, list):
+        return False
+    return all(activity in types for activity in _OPEN_PULL_REQUEST_TYPES)
 
 
 def _caller_verdicts(text, workflow_prefix, resolved=None):
