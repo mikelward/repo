@@ -1030,6 +1030,20 @@ def run(args):
     else:
         gap("conversation resolution is not required")
 
+    # A Vercel project's standard includes Vercel's own status, bound to its
+    # App, whatever the named checks are -- the same (context, App) entries
+    # `repo setup` writes (rules.vercel_checks), so the audit looks for what
+    # setup would add or tighten.
+    try:
+        vercel = dict(rules.vercel_checks(repo))
+    except rules.RulesetError as e:
+        vercel = {}
+        gap(
+            f"could not tell whether Vercel deploys {repo}, so whether its check must be "
+            f"required is unverified:\n  {e.detail}"
+        )
+    checks = checks + [context for context in vercel if context not in checks]
+
     if any_rule("required_status_checks"):
         contexts = set()
         # Every context the branch enforces, with the App it is bound to,
@@ -1045,7 +1059,11 @@ def run(args):
                 if entry not in required_entries:
                     required_entries.append(entry)
         for check in checks:
-            if check in contexts:
+            if check in vercel and check in contexts and (check, vercel[check]) not in required_entries:
+                # Setup binds it to Vercel's App; required from anyone, a
+                # status by that name from any producer satisfies it.
+                gap(f"'{check}' is required, but not from Vercel's App ({vercel[check]})")
+            elif check in contexts:
                 ok(f"'{check}' is a required status check")
             else:
                 gap(f"'{check}' is NOT a required status check")
@@ -1070,6 +1088,13 @@ def run(args):
             cant_tell = set()
             for context, integration_id in required_entries:
                 if integration_id is None:
+                    continue
+                if vercel.get(context) == integration_id:
+                    # Vercel's own status on the head this run just read is
+                    # taken as coverage -- the same reading setup requires it
+                    # on, since the installations read is refused to a
+                    # gh-auth token. An unlink since that push is the accepted
+                    # window (TODO.md).
                     continue
                 if integration_id == rules.ACTIONS_APP_ID:
                     # GitHub Actions is not an installed App: it has no

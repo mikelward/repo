@@ -329,8 +329,11 @@ you're debugging. Converging a repository that was missing scaffold
 files takes a few runs, one rung each (see SPEC.md's ladder): the pull
 request opens, a later run merges it, a later run requires the checks it
 publishes once they have passed, and `codex` follows from the first pull
-request the sweep sees with its workflow on the default branch. `repo
-audit` is the read-only counterpart: it reports whether a branch's rules
+request the sweep sees with its workflow on the default branch. A
+repository Vercel deploys -- `vercel[bot]` has posted a status on its
+default branch's head -- also gets Vercel's own check required, bound to
+Vercel's App, with no flag to pass, and `repo audit` looks for it there
+too. `repo audit` is the read-only counterpart: it reports whether a branch's rules
 (required checks, conversation resolution, up-to-date merges, force-push
 and deletion protection, bypass actors, and -- when auditing the
 repository's real default branch -- whether every covering ruleset also

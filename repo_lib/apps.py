@@ -127,6 +127,15 @@ def installations_readable():
 # back to the API exactly as before.
 _known_slugs = {}
 
+# Vercel's GitHub App, whose commit statuses a Vercel project's ruleset
+# requires (rules.vercel_checks). Its slug is public and fixed, so the
+# pairing is built in rather than left to config: without it, matching the
+# `vercel[bot]` creator would need `user/installations`, which a gh-auth
+# token is refused (APP_TOKEN_HINT).
+VERCEL_APP_ID = 8329
+VERCEL_APP_SLUG = "vercel"
+_BUILTIN_SLUGS = {VERCEL_APP_ID: VERCEL_APP_SLUG}
+
 
 def register_known_slugs(mapping):
     """Replace the operator-supplied App id -> slug pairings. Keys coerce to
@@ -454,6 +463,12 @@ def app_slug_for_id(owner, app_id, use_known=True):
         # both _known_slugs and the owner-filtered API read, and is trusted even
         # under use_known=False (coverage prediction), unlike a config pairing.
         return _app_slug_via_jwt(numeric, _app_keys[numeric])
+    if use_known and numeric in _BUILTIN_SLUGS:
+        # A public, fixed pairing, ahead of any config assertion: the Vercel
+        # check is found by its `vercel[bot]` creator (rules.vercel_checks),
+        # and a config slug that disagreed would leave its binding waiting on
+        # a login that never posts.
+        return _BUILTIN_SLUGS[numeric]
     if use_known and numeric in _known_slugs:
         # The operator asserted this id's slug (config `app_logins`), so the
         # match needs no `user/installations` read -- and the assertion is

@@ -1057,6 +1057,25 @@
       already-`~DEFAULT_BRANCH` ruleset should do when the default branch
       is later renamed, where the literal entry is not redundant at all.
 
+- [x] **Accepted: a Vercel project unlinked between its last push and a
+      run** (maintainer, 2026-10-03; mikelward/repo#85). setup infers a
+      Vercel project from `vercel[bot]`'s status on the default branch's
+      head and requires that context from Vercel's App. The status stays on
+      the head after the project is unlinked or the App loses access, so a
+      run in that window adds a requirement no pull request can satisfy,
+      and setup never removes one. Verifying coverage independently is not
+      possible on the token setup runs on: it answers only to the App's own
+      key or to `user/installations`, which a gh-auth token is refused, and
+      Vercel's key is not one we hold. The window takes an unlink with no
+      push after it, and the remedy is relinking Vercel or removing the
+      requirement by hand (SPEC.md, *What still needs a person*).
+      Alternatives weighed: ask Vercel's API whether the project is still
+      linked (a Vercel token in the fleet config and one extra call per
+      repository; closes the window), or require it unbound (a status
+      anyone with write access can post clears a stuck pull request, and
+      fakes a green one). Reversible: either replaces the inference in
+      `rules.vercel_checks` without touching the ruleset write.
+
 ## repo cleanup
 
 - [ ] **`repo audit` cannot see an unmergeable branch.**
