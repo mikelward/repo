@@ -210,6 +210,7 @@ class FakeGh:
         # /statuses endpoint, every status ever posted, NEWEST FIRST as
         # GitHub lists them; a pair is a success.
         self.status_creators = {}
+        self.status_creators_read_fails = False
         self.open_prs = []
         self.closed_prs = []
         self.existing_ruleset_id = None
@@ -765,6 +766,8 @@ class FakeGh:
 
         m = _STATUSES_LIST_RE.match(endpoint)
         if m:
+            if self.status_creators_read_fails:
+                raise gh.GhError("gh: HTTP 500: Internal Server Error\n")
             # Models --jq '.[] | [.context, (.creator.login // ""), .state]'.
             return "".join(
                 json.dumps([entry[0], entry[1], entry[2] if len(entry) > 2 else "success"]) + "\n"
@@ -4988,6 +4991,134 @@ class UpdatePlanTest(unittest.TestCase):
         self.assertIn("force pushes are blocked", plan)
 
 
+class VercelCheckTest(unittest.TestCase):
+    """A Vercel project's ruleset requires Vercel's own status, bound to its
+    App -- read from the repository, never named by a flag (SPEC.md, *The
+    standard*)."""
+
+    _VERCEL = {"context": "Vercel", "integration_id": apps.VERCEL_APP_ID}
+
+    def _fake(self, contexts=("lanes", "codex", "zizmor")):
+        """A repository Vercel deploys -- its App's status on the default
+        branch's head -- under a ruleset already requiring `contexts`."""
+        fake = FakeGh()
+        head = fake.default_head_sha
+        fake.check_runs = {head: ["lanes", "codex", "zizmor"]}
+        fake.statuses = {head: ["Vercel"]}
+        fake.status_creators = {head: [("Vercel", "vercel[bot]")]}
+        fake.existing_ruleset_id = "1"
+        fake.all_ruleset_ids = ["1"]
+        fake.ruleset_objects["1"] = {
+            "id": 1,
+            "name": "main",
+            "enforcement": "active",
+            "target": "branch",
+            "conditions": {"ref_name": {"include": list(_HARDENED_SCOPE), "exclude": []}},
+            "rules": _rules_with(contexts),
+        }
+        return fake
+
+    def _required(self, fake):
+        rule = next(r for r in fake.puts[-1][1]["rules"] if r["type"] == "required_status_checks")
+        return rule["parameters"]["required_status_checks"]
+
+    def test_a_vercel_project_requires_vercel_from_its_app(self):
+        fake = self._fake()
+        code, out, err = _run(fake, ["--dry-run", "--no-bootstrap", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("would newly require: Vercel", out + err)
+
+        # Whatever --rule names: it shapes the fleet's checks, and this one
+        # is the repository's own.
+        code, out, err = _run(fake, ["--force", "--no-bootstrap", "--rule", "lanes", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(
+            self._required(fake),
+            [{"context": "lanes"}, self._VERCEL, {"context": "codex"}, {"context": "zizmor"}],
+        )
+        # Vercel's bot is matched by its public slug: a gh-auth token is
+        # refused the installations read that would otherwise name it.
+        self.assertFalse(any("user/installations" in " ".join(c) for c in fake.calls))
+
+    def test_a_vercel_requirement_already_there_is_left_as_it_is(self):
+        fake = self._fake()
+        checks = fake.ruleset_objects["1"]["rules"][0]["parameters"]["required_status_checks"]
+        checks.append(dict(self._VERCEL))
+        code, out, err = _run(fake, ["--force", "--no-bootstrap", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.puts, [])
+
+        # Named by --rule too: bound in place, not passed both bare and
+        # bound, which wrote the binding a second time on every run. The
+        # first run may reorder to --rule's order; the next writes nothing.
+        argv = ["--force", "--no-bootstrap", "--rule", "lanes", "--rule", "Vercel", REPO]
+        code, out, err = _run(fake, argv)
+        self.assertEqual(code, 0, err)
+        if fake.puts:
+            self.assertEqual([e["context"] for e in self._required(fake)].count("Vercel"), 1)
+            checks[:] = self._required(fake)
+            fake.puts.clear()
+        code, out, err = _run(fake, argv)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.puts, [])
+
+    def test_vercel_named_by_rule_is_required_once_from_its_app(self):
+        fake = self._fake()
+        code, out, err = _run(
+            fake, ["--force", "--no-bootstrap", "--rule", "Vercel", "--rule", "lanes", REPO]
+        )
+        self.assertEqual(code, 0, err)
+        self.assertEqual(
+            self._required(fake),
+            [self._VERCEL, {"context": "lanes"}, {"context": "codex"}, {"context": "zizmor"}],
+        )
+
+    def test_a_vercel_status_from_anyone_else_adds_nothing(self):
+        fake = self._fake()
+        fake.status_creators = {fake.default_head_sha: [("Vercel", "someone")]}
+        code, out, err = _run(fake, ["--force", "--no-bootstrap", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.puts, [])
+
+    def test_a_vercel_status_name_with_a_control_character_is_skipped_not_fatal(self):
+        # apply_ruleset refuses such a name as a usage error (exit 2); one
+        # Vercel posted must not stop a run nobody typed it into.
+        fake = self._fake()
+        fake.status_creators = {fake.default_head_sha: [("Vercel\nx", "vercel[bot]")]}
+        code, out, err = _run(fake, ["--force", "--no-bootstrap", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.puts, [])
+        self.assertIn("not requiring Vercel's status 'Vercel\\nx'", err)
+
+    def test_a_vercel_check_that_never_passed_waits_like_any_other(self):
+        fake = self._fake()
+        head = fake.default_head_sha
+        fake.statuses = {head: [("Vercel", "failure")]}
+        fake.status_creators = {head: [("Vercel", "vercel[bot]", "failure")]}
+        code, out, err = _run(fake, ["--force", "--no-bootstrap", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.puts, [])
+        self.assertIn(f"'Vercel' has not passed here as App {apps.VERCEL_APP_ID} yet", out + err)
+
+    def test_an_unreadable_status_list_holds_back_only_vercel(self):
+        # Invariant 1: the rest of the ruleset still lands. The run is not
+        # converged, though, so it says so in its exit status -- and the
+        # dry run previews the same.
+        fake = self._fake(contexts=("lanes", "codex"))
+        fake.status_creators_read_fails = True
+        code, out, err = _run(fake, ["--dry-run", "--no-bootstrap", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("could not tell whether Vercel deploys this repository", err)
+
+        code, out, err = _run(fake, ["--force", "--no-bootstrap", REPO])
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            self._required(fake),
+            [{"context": "lanes"}, {"context": "codex"}, {"context": "zizmor"}],
+        )
+        self.assertIn("failed on: ruleset-vercel", err)
+
+
 def _only_log(state):
     """The single log file a run wrote under `state`, as text."""
     directory = os.path.join(state, "repo")
@@ -6847,6 +6978,43 @@ class LanesCredentialStepTest(unittest.TestCase):
                 {"context": "codex"},
                 {"context": "zizmor"},
             ],
+        )
+
+    def test_an_unreadable_vercel_read_does_not_hold_back_the_binding(self):
+        # The Vercel read failing holds back that addition alone: the run
+        # still exits 1 for it, but the lanes binding it says nothing about
+        # is written.
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = self._publisher()
+            fake.env_secret_names = {"lanes": set(self.PAIR)}
+            fake.env_policies = {"lanes": ["main"]}
+            self._ruleset_requiring(
+                fake,
+                [{"context": "lanes"}, {"context": "codex"}, {"context": "zizmor"}],
+            )
+            fake.check_runs = {fake.default_head_sha: [("lanes", 12345), "codex", "zizmor"]}
+            fake.app_coverage = {12345: ("lanes-app", "all")}
+            fake.status_creators_read_fails = True
+            code, out, err = _run(
+                fake,
+                [
+                    "--force",
+                    "--credential", f"LANES_APP_ID={app_id}",
+                    "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                    REPO,
+                ],
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("failed on: ruleset-vercel", err)
+        self.assertNotIn("ruleset-binding", err)
+        checks_rule = next(
+            r for r in fake.puts[-1][1]["rules"] if r["type"] == "required_status_checks"
+        )
+        self.assertIn(
+            {"context": "lanes", "integration_id": 12345},
+            checks_rule["parameters"]["required_status_checks"],
         )
 
     def test_binding_supersedes_an_actions_bound_entry(self):

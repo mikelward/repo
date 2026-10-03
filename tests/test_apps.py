@@ -332,5 +332,21 @@ class AppSlugViaJwtTest(unittest.TestCase):
             self.assertEqual(apps.app_slug_for_id("owner", 777, use_known=False), "real")
 
 
+class BuiltinSlugTest(unittest.TestCase):
+    def tearDown(self):
+        apps.register_known_slugs({})
+
+    def test_vercel_resolves_with_no_installations_read(self):
+        with patch("repo_lib.gh.run", side_effect=AssertionError("no API read expected")):
+            self.assertEqual(apps.app_slug_for_id("owner", apps.VERCEL_APP_ID), "vercel")
+
+    def test_the_builtin_pairing_outranks_a_config_assertion(self):
+        # The Vercel check is found by its `vercel[bot]` creator; a config slug
+        # that disagreed would leave the binding waiting on a login that never
+        # posts.
+        apps.register_known_slugs({str(apps.VERCEL_APP_ID): "stale-slug"})
+        self.assertEqual(apps.app_slug_for_id("owner", apps.VERCEL_APP_ID), "vercel")
+
+
 if __name__ == "__main__":
     unittest.main()

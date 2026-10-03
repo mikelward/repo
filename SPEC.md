@@ -162,10 +162,19 @@ setup`, always on unless a flag opts the repository out:
   rebase the only merge method, conversation resolution required, linear
   history, no force pushes, and the required checks `lanes`, `codex` and
   `zizmor` with branches required up to date -- `lanes` bound to the lanes
-  App once that App publishes it. The standard is a floor: a check the
-  ruleset already requires beyond it stays required, since this tool only
-  ever adds a requirement, and removing one is a person's decision made
-  in the ruleset by hand. The one `integration_id` that is not a binding
+  App once that App publishes it. A Vercel project requires its
+  deployment too: every context Vercel's App (`vercel[bot]`) has posted on
+  the default branch's head -- `Vercel` -- bound to that App, whatever
+  `--rule` names. Read from the repository, never from a flag: only part
+  of the fleet deploys there, and a flag varied per repository is the
+  thing *The contract* forbids. Vercel posts on every push it sees, a
+  skipped build included (as a success), so a pull request can always
+  satisfy it; a head Vercel has not reported on yet is picked up by a
+  later run, and a read that cannot tell holds back only this addition --
+  the rest of the ruleset lands, and the run exits non-zero. The standard
+  is a floor: a check the ruleset already requires beyond it stays
+  required, since this tool only ever adds a requirement, and removing
+  one is a person's decision made in the ruleset by hand. The one `integration_id` that is not a binding
   is GitHub Actions': every workflow in the repository posts its check
   runs as that App, a pull request's own included, so requiring a check
   FROM it excludes nobody who could already produce it. GitHub's ruleset
@@ -390,6 +399,13 @@ do, and none of them is caused by a run:
   pairing (the operator naming the App's slug for its id), but coverage then
   waits for a token that can make the installations read.
 - A legacy-named ruleset whose merge methods conflict with rebase.
+- A Vercel project unlinked, or its App's access removed, after the last
+  push to the default branch and before a run -- the one entry here a run
+  can cause: Vercel's status still on that head is what says the
+  repository deploys there, so the run requires a check no pull request
+  can satisfy. Relink Vercel, or remove `Vercel` from the ruleset by hand.
+  Whether the App still covers the repository is not readable on a gh-auth
+  token, so the window is accepted rather than closed (`TODO.md`).
 - A branch that already requires a check whose publisher is missing from
   it (a state that predates the tool): every pull request there is stuck
   until someone who can bypass the rule lands the workflow.

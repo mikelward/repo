@@ -695,6 +695,60 @@ def deferral_reason(item):
     return f"'{context}' has never run here"
 
 
+def vercel_checks(repo):
+    """The checks a Vercel project's ruleset requires on top of the fleet's
+    (SPEC.md, *The standard*): every context Vercel's App has posted on the
+    default branch's head, bound to that App, as (context, integration_id)
+    entries -- empty for a repository Vercel does not deploy.
+
+    The head, not the history: a status there is Vercel's word on the
+    branch as it stands, where an older one could be a project long since
+    unlinked, whose requirement nothing would ever satisfy again. An unlink
+    AFTER the head's push is the one case this cannot see -- whether the App
+    still covers the repository is not readable on a gh-auth token -- and is
+    accepted (TODO.md). Vercel posts on every push it sees, so the head of
+    any Vercel project carries one; one it has not reached yet waits for a
+    later run. The same two reads the evidence scan makes, so the statuses
+    read is shared with it (see _cached_run). Raises RulesetError on a
+    failed read: "not a Vercel project" and "could not tell" are different
+    answers."""
+    try:
+        head = _cached_run(["api", f"repos/{repo}/commits?per_page=1", "--jq", ".[0].sha"]).strip()
+    except gh.GhError as e:
+        if _repo_is_empty(repo) is True:
+            return []  # nothing pushed, so nothing deployed
+        raise RulesetError(f"reading the head of the default branch:\n{e.stderr}")
+    if not head or head == "null":
+        return []
+    try:
+        out = _cached_run(
+            [
+                "api",
+                "--paginate",
+                f"repos/{repo}/commits/{head}/statuses",
+                "--jq",
+                '.[] | [.context, (.creator.login // ""), .state] | @json',
+            ]
+        )
+    except gh.GhError as e:
+        raise RulesetError(f"reading commit status creators for {head}:\n{e.stderr}")
+    login = f"{apps.VERCEL_APP_SLUG}[bot]"
+    contexts = []
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        context, creator, _state = json.loads(line)
+        if creator != login or context in contexts:
+            continue
+        if _CONTROL_CHAR_RE.search(context):
+            # apply_ruleset refuses such a name as a usage error, which would
+            # stop the whole run over a name nobody here typed.
+            warn(f"{repo}: not requiring Vercel's status {context!r}: its name has a control character")
+            continue
+        contexts.append(context)
+    return [(context, apps.VERCEL_APP_ID) for context in sorted(contexts)]
+
+
 def _lookup_ruleset_ids(repo, ruleset_name, include_parents=False):
     """Every ruleset id on `repo` named `ruleset_name`, oldest first.
 

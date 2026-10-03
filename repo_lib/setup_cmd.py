@@ -2125,6 +2125,33 @@ def _run(args, log=None):
                 for check in unpublished
             }
 
+    # A Vercel project requires its deployment too: whatever Vercel's App
+    # posts on the default branch, bound to that App (SPEC.md, *The
+    # standard*). Read from the repository, not named by a flag, and added
+    # to the main ruleset write only -- the binding write after it re-reads
+    # the ruleset and keeps what this one added. Not in `defer`'s reach:
+    # no scaffold file publishes it. A read that cannot tell holds back this
+    # addition alone; the rest of the ruleset still lands.
+    ruleset_checks = list(checks)
+    vercel_unreadable = False
+    if not args.no_rules:
+        _progress(args, f"{repo}: checking whether Vercel deploys it")
+        try:
+            vercel = dict(rules.vercel_checks(repo))
+        except rules.RulesetError as e:
+            error_lines(
+                f"{repo}: could not tell whether Vercel deploys this repository, so its "
+                "check is not added this run:",
+                e.detail,
+            )
+            vercel_unreadable = True
+        else:
+            # A name --rule already gives is bound in place, as _bind_checks
+            # binds `lanes`: the bare name and the bound entry side by side
+            # wrote the binding twice, on every run.
+            ruleset_checks = [(c, vercel[c]) if c in vercel else c for c in checks]
+            ruleset_checks += sorted(item for item in vercel.items() if item[0] not in checks)
+
     ruleset_lines = []
     ruleset_preview_failed = False
     ruleset_report = {}
@@ -2134,7 +2161,7 @@ def _run(args, log=None):
         with redirect_stdout(buf):
             code = rules.apply_ruleset(
                 repo,
-                checks,
+                ruleset_checks,
                 dry_run=True,
                 force=args.force,
                 report=ruleset_report,
@@ -2592,6 +2619,7 @@ def _run(args, log=None):
             or binding_uncovered
             or refuse_repoint
             or refuse_credential_repoint
+            or vercel_unreadable
             # A check deferred to a later run -- the App binding included --
             # is the expected state of a repository climbing the ladder,
             # not a failure: everything else lands, and a later run adds
@@ -3012,7 +3040,7 @@ def _run(args, log=None):
         if (
             rules.apply_ruleset(
                 repo,
-                checks,
+                ruleset_checks,
                 dry_run=False,
                 force=args.force,
                 expected_fingerprint=ruleset_report["fingerprint"],
@@ -3051,6 +3079,12 @@ def _run(args, log=None):
             != 0
         ):
             failed.append("ruleset")
+    if vercel_unreadable:
+        # The write went in without the Vercel check, and the read that
+        # would have added it is what failed, so the run is not converged.
+        # Its own name, not "ruleset": that one holds back the lanes binding
+        # below, which this read says nothing about.
+        failed.append("ruleset-vercel")
 
     # Capture the binding write's fingerprint now, against the ruleset as the
     # main step just left it, so the deferred write below -- which runs after

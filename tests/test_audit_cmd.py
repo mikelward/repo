@@ -8,7 +8,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from unittest.mock import patch
 
-from repo_lib import gh, rules
+from repo_lib import apps, gh, rules
 from repo_lib.cli import main
 
 REPO = "owner/repo"
@@ -142,6 +142,7 @@ class FakeGh:
         # sha -> [(context, creator_login), ...] for the plural /statuses
         # endpoint, which (unlike /status) carries each status's bot user.
         self.status_creators = {}
+        self.status_creators_fails = None  # gh stderr text, or None
         # Installations visible to the caller, for the id -> slug resolution an
         # App-bound status check verifies through. Each entry is (app_id,
         # app_slug) -- installed on this repo's owner, "all repositories" -- or
@@ -247,6 +248,8 @@ class FakeGh:
 
         m = _STATUSES_RE.match(endpoint)
         if m:
+            if self.status_creators_fails is not None:
+                raise gh.GhError(self.status_creators_fails)
             # Models --jq '.[] | [.context, (.creator.login // ""), .state]'.
             return "".join(
                 json.dumps([ctx, login, "success"]) + "\n"
@@ -589,6 +592,56 @@ class AuditCmdTest(unittest.TestCase):
         self.assertEqual(code, 0, err)
         for check in ("lanes", "codex", "zizmor"):
             self.assertIn(f"[ok] '{check}' is a required status check", out)
+        self.assertNotIn("Vercel", out)
+
+    def test_a_vercel_project_is_audited_for_vercel_too(self):
+        # What `repo setup` would add, whatever checks are named: a ruleset
+        # missing it is the gap setup closes.
+        fake = FakeGh()
+        fake.status_creators = {fake.default_head_sha: [("Vercel", "vercel[bot]")]}
+        code, out, err = _run(fake, [REPO, "lanes"])
+        self.assertEqual(code, 1, err)
+        self.assertIn("[GAP] 'Vercel' is NOT a required status check", out)
+
+        # Required from anyone: setup would tighten it to Vercel's App.
+        fake.statuses = {fake.default_head_sha: ["Vercel"]}
+        fake.effective_rules = self._with_checks("Vercel")
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 1, err)
+        self.assertIn("[GAP] 'Vercel' is required, but not from Vercel's App (8329)", out)
+
+        # As setup writes it: a clean pass. Coverage rests on the status this
+        # run just read, so a token refused user/installations -- as gh's own
+        # is -- never reaches that read for it.
+        fake.effective_rules = self._with_checks(("Vercel", apps.VERCEL_APP_ID))
+        fake.installations_fails = "gh: HTTP 403: not authorized to a GitHub App\n"
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("[ok] 'Vercel' is a required status check", out)
+        self.assertFalse(any("user/installations" in " ".join(c) for c in fake.calls))
+
+    def _with_checks(self, extra):
+        return [
+            r
+            if r["type"] != "required_status_checks"
+            else _status_checks_rule(["lanes", "codex", "zizmor", extra])
+            for r in DEFAULT_EFFECTIVE_RULES
+        ]
+
+    def test_a_vercel_status_from_anyone_else_is_not_looked_for(self):
+        fake = FakeGh()
+        fake.status_creators = {fake.default_head_sha: [("Vercel", "someone")]}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("'Vercel'", out)
+
+    def test_an_unreadable_status_list_is_a_gap_not_a_pass(self):
+        fake = FakeGh()
+        fake.status_creators_fails = "gh: HTTP 500: Internal Server Error\n"
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 1, err)
+        self.assertIn("[GAP] could not tell whether Vercel deploys", out)
+        self.assertIn("HTTP 500", out)
 
     def test_no_required_status_checks_rule_at_all_is_a_gap(self):
         fake = FakeGh()
