@@ -279,7 +279,8 @@ already-existing repository is still missing -- reusing `repo create
 --scaffold`'s own generated files, never overwriting one already there
 except codex-review's three workflow files, which every consumer pins
 byte for byte and which are brought up to the current template when they
-differ -- as one commit on a branch of its own, opened as a pull request against
+differ (the hub, `mikelward/codex-review`, gets two: it runs its checker
+directly rather than through a caller pinned to its released self) -- as one commit on a branch of its own, opened as a pull request against
 the default branch (or, for a repository whose branch has no commits yet
 and so has no base for a pull request to target, the same two-commit
 bootstrap `repo create --scaffold` uses, written directly). A pull

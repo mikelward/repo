@@ -1205,7 +1205,7 @@ class FakeGh:
                 # this fake, so the shas are the ones the step expects.
                 base = self._all_scaffold_paths() if self.bootstrap_existing_paths is None else self.bootstrap_existing_paths
                 entries = {p: (self._tree_sha(p), "100644") for p in base}
-                for p, content in scaffold.build_scaffold_files(self.default_branch).items():
+                for p, content in scaffold.build_scaffold_files(self.default_branch, REPO).items():
                     if p not in entries or (
                         p in scaffold.UPDATED_PATHS and p in self.bootstrap_outdated_paths
                     ):
@@ -1269,7 +1269,7 @@ class FakeGh:
         """The commit message the generator writes for this fake's gap:
         what a scaffold pull request's head has to carry to be merged."""
         present = self._all_scaffold_paths() if self.bootstrap_existing_paths is None else self.bootstrap_existing_paths
-        files = scaffold.build_scaffold_files(self.default_branch)
+        files = scaffold.build_scaffold_files(self.default_branch, REPO)
         missing = {p: c for p, c in files.items() if p not in present}
         outdated = {
             p: c
@@ -11617,6 +11617,33 @@ class BootstrapStepTest(unittest.TestCase):
         self.assertIn("closed pull request #11 -- this tool's own, and the scaffold is complete on 'main'", out + err)
         self.assertEqual(fake.created_pulls, [])
         self.assertEqual(fake.merged_pulls, [])
+
+    def test_the_hub_is_complete_without_the_caller(self):
+        # codex-review itself deliberately has no codex-review-check.yml
+        # (scaffold.HUB_OMITTED_TEMPLATE): its suite fails while one exists.
+        # So everything else on its branch is a complete scaffold, and a
+        # pull request an earlier run opened to add the caller is closed
+        # rather than merged.
+        hub = "mikelward/codex-review"
+        caller = ".github/workflows/codex-review-check.yml"
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = fake._all_scaffold_paths() - {caller}
+        fake.bootstrap_open_pulls = [
+            (50, "repo-setup/fleet-ci-scaffold-abc1234", True, f"https://github.com/{hub}/pull/50")
+        ]
+        code, out, err = _run(fake, ["--force", "--no-rules", hub])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.closed_pulls, [50])
+        self.assertIn("the scaffold is complete on 'main'", out + err)
+        self.assertEqual(fake.created_pulls, [])
+        self.assertEqual(fake.merged_pulls, [])
+
+        # Any other repository with that same branch is still missing it.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = fake._all_scaffold_paths() - {caller}
+        code, out, err = _run(fake, ["--dry-run", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"add {caller}", out)
 
     def test_a_second_scaffold_pull_request_from_an_overlapping_run_is_closed_first(self):
         # Two runs overlapping each found none open and opened their own.

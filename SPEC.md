@@ -152,7 +152,11 @@ setup`, always on unless a flag opts the repository out:
   template, `zizmor.yml` and its `.github/zizmor.yml` policy, a `ci.yml`
   running lanes' classify/gate pair with `.github/lanes.conf`, and
   `AGENTS.md` with a `CLAUDE.md` that imports it. `--no-bootstrap` opts
-  out.
+  out. The hub, `mikelward/codex-review` itself, takes two of the three:
+  it deliberately has no `codex-review-check.yml` caller, which would
+  name the checker at `@main` -- the released one, not the one a pull
+  request there is changing -- so its CI runs the checker directly and
+  its own suite fails while the caller is present.
 - **One branch ruleset named `main`**, targeting `~DEFAULT_BRANCH`,
   `refs/heads/main` and `refs/heads/master`: pull requests required,
   rebase the only merge method, conversation resolution required, linear

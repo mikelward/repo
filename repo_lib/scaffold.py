@@ -179,6 +179,21 @@ TEMPLATE_FILES = ("codex-review.yml", "codex-review-check.yml", "codex-review-li
 # other scaffold file may carry a project's own decisions and is only ever
 # added (SPEC.md, *What is updated, and what is only added*).
 UPDATED_PATHS = frozenset(f".github/workflows/{name}" for name in TEMPLATE_FILES)
+# The template the hub itself does not install. A caller in codex-review
+# would name the checker at `@main` -- the released one -- so a pull
+# request changing the checker or a template would be validated against
+# the previous release; its CI runs the checker directly instead, and its
+# own suite fails while the caller exists (that repository's AGENTS.md and
+# `is_hub`). Identified by name, as `is_hub` identifies it by path: no
+# consumer can be called mikelward/codex-review.
+HUB_OMITTED_TEMPLATE = "codex-review-check.yml"
+
+
+def _template_files_for(repo):
+    """TEMPLATE_FILES as `repo` installs them: all three, except on the hub."""
+    if repo.lower() == TEMPLATE_REPO.lower():
+        return tuple(name for name in TEMPLATE_FILES if name != HUB_OMITTED_TEMPLATE)
+    return TEMPLATE_FILES
 ZIZMOR_SOURCE_REPO = "mikelward/lanes"
 # The fleet's shared agent conventions, and where a scaffolded repository
 # gets its own copy from. One maintained file rather than a second copy
@@ -533,13 +548,14 @@ def _branches_line(text, default_branch):
     return "\n".join(lines)
 
 
-def build_scaffold_files(default_branch):
+def build_scaffold_files(default_branch, repo):
     """The scaffold's files as {path: content}, or None (with the failure
     already reported) if fetching either template source fails, or if
     zizmor.yml's push filter can't be safely re-pointed at
     `default_branch` (see _branches_line). Pure -- makes no write of its
     own, so a caller can build this before deciding anything is safe to
-    push."""
+    push. `repo` is the repository it is for -- required, so no caller can
+    leave it out: the hub gets one template fewer (HUB_OMITTED_TEMPLATE)."""
     files = {}
     # The three template files are pinned byte for byte against each other
     # as a SET (see this module's own docstring), so they're fetched at one
@@ -552,7 +568,7 @@ def build_scaffold_files(default_branch):
     template_sha = _resolve_commit_sha(TEMPLATE_REPO)
     if template_sha is None:
         return None
-    for name in TEMPLATE_FILES:
+    for name in _template_files_for(repo):
         # No _branches_line rewrite here: none of codex-review's three
         # templates has a branches:-filtered push trigger at all --
         # verified against the real templates, not assumed -- so passing
@@ -1825,7 +1841,7 @@ def plan_gaps(repo, default_branch):
     component of one) is occupied by something other than a plain file
     (see occupied_reason below) -- there is no safe way to add the
     scaffold there without silently replacing whatever that is."""
-    files = build_scaffold_files(default_branch)
+    files = build_scaffold_files(default_branch, repo)
     if files is None:
         return GapPlan(error=True)
 

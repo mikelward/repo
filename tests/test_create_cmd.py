@@ -401,6 +401,17 @@ class ScaffoldFlagTest(unittest.TestCase):
         self.assertIn(f"pushed the CI scaffold ({EXPECTED_SCAFFOLD_FILE_COUNT} files)", out)
         self.assertIn("repo setup mikelward/newthing --force", out)
 
+    def test_the_hub_is_scaffolded_without_the_caller(self):
+        # codex-review itself deliberately has no codex-review-check.yml
+        # (scaffold.HUB_OMITTED_TEMPLATE), however its scaffold is built.
+        fake = FakeGh(self_login="mikelward")
+        status, out, err = run_repo_create(fake, ["--public", "mikelward/codex-review"])
+        self.assertEqual(status, 0, err)
+        paths = {entry["path"] for entry in fake.tree_payload["tree"]}
+        self.assertEqual(len(paths), EXPECTED_SCAFFOLD_FILE_COUNT - 1)
+        self.assertNotIn(".github/workflows/codex-review-check.yml", paths)
+        self.assertIn(".github/workflows/codex-review.yml", paths)
+
     def test_scaffold_bootstraps_when_the_precheck_gets_the_real_409_shape(self):
         # This is the intended input for `repo create --scaffold`: a
         # repository this same run just created, which has zero git

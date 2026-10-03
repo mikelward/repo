@@ -121,7 +121,7 @@ def run(args):
         error("once that's resolved -- its bootstrap step scaffolds a still-empty branch too.")
         raise SystemExit(1)
 
-    files = scaffold.build_scaffold_files(default_branch)
+    files = scaffold.build_scaffold_files(default_branch, args.repo)
     if files is None:
         error(f"{args.repo} was created, but fetching the scaffold's template files failed")
         error("(see above); nothing was pushed. Run:")
