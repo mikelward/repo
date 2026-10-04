@@ -1041,13 +1041,11 @@
       inverse when the token is there and the literal ref is added. Two
       separable consequences (Codex review, mikelward/repo#45):
 
-      The **plan overstates**: `scope_added` carries that token, and
-      `_effective_scope_added` filters it against the ruleset's own
-      exclusions but not against what the include list already reaches,
-      so `newly effective on ~DEFAULT_BRANCH` can name a branch already
-      protected. Display only, and the fix is contained -- normalize the
-      ORIGINAL include list and drop from `covered` anything it already
-      covers.
+      The **plan overstated** -- fixed: `_effective_scope_added` now drops
+      any added ref the original include list already reaches, so `newly
+      effective on` names only branches the write newly protects. The
+      `scope: also targeting` line still lists the token, which is
+      accurate: it is what the write appends.
 
       The **write is redundant**: the appended token makes `target !=
       original`, so `needs_write` goes true and a PUT happens for a scope

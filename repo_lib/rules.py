@@ -1274,24 +1274,35 @@ def _excluded_hardened_refs(exclude, default_branch):
     return named, _has_glob(exclude)
 
 
-def _effective_scope_added(scope_added, exclude, default_branch):
+def _effective_scope_added(scope_added, include, exclude, default_branch):
     """(covered, unevaluated): which of the refs a widening adds the
-    ruleset will actually govern, and whether a glob exclusion makes that
+    ruleset will newly govern, and whether a glob exclusion makes that
     unanswerable.
 
     An exclusion outranks an include, so a widening that adds
     refs/heads/master to a ruleset already excluding it changes the
     include list and protects nothing. Claiming otherwise would put the
     plan at odds with _report_excluded_hardened, which says on the same
-    run that the branch stays open (Codex review, mikelward/repo#45)."""
+    run that the branch stays open (Codex review, mikelward/repo#45).
+
+    A ref the ruleset already reached is not new either. _widen_include
+    compares refs literally, so a ruleset including refs/heads/main on a
+    repository whose default branch is main still gets ~DEFAULT_BRANCH
+    appended, and the reverse. Both name the branch it already protected
+    (Codex review, mikelward/repo#45). `include` is the widened list, so
+    the original is whatever is left once the added refs are taken out."""
     exclude = list(exclude or [])
     if "~ALL" in exclude:
         return [], False
     excluded = set(_normalize_refs(exclude, default_branch))
+    added = set(scope_added)
+    already = set(
+        _normalize_refs([ref for ref in include or [] if ref not in added], default_branch)
+    )
     covered = [
         ref
         for ref in scope_added
-        if _normalize_refs([ref], default_branch)[0] not in excluded
+        if _normalize_refs([ref], default_branch)[0] not in excluded | already
     ]
     return covered, _has_glob(exclude)
 
@@ -2198,12 +2209,13 @@ def _describe_plan(
             # mikelward/repo#45).
             ref_name = ((target_body or {}).get("conditions") or {}).get("ref_name") or {}
             covered, unevaluated = _effective_scope_added(
-                scope_added, ref_name.get("exclude"), default_branch
+                scope_added, ref_name.get("include"), ref_name.get("exclude"), default_branch
             )
             if covered:
-                # Only the refs the exclusions leave alone: a ref added to
-                # the include list and excluded in the same ruleset gets
-                # nothing, and _report_excluded_hardened says so.
+                # Only the refs the exclusions leave alone and the ruleset
+                # did not already reach: a ref added to the include list
+                # and excluded in the same ruleset gets nothing, and
+                # _report_excluded_hardened says so.
                 lines.append(
                     "  newly effective on "
                     + ", ".join(covered)

@@ -4976,9 +4976,24 @@ class UpdatePlanTest(unittest.TestCase):
         plan = out + err
         self.assertIn("scope: also targeting", plan)
         self.assertIn("excludes refs/heads/master", plan)
-        # ~DEFAULT_BRANCH is still genuinely newly covered; master is not.
-        self.assertIn("newly effective on ~DEFAULT_BRANCH:", plan)
-        self.assertNotIn("newly effective on ~DEFAULT_BRANCH, refs/heads/master", plan)
+        # Master is excluded, and ~DEFAULT_BRANCH is main, which the
+        # ruleset already included -- so nothing is newly protected.
+        self.assertNotIn("newly effective on", plan)
+
+    def test_a_ref_the_ruleset_already_reached_is_not_claimed_as_new(self):
+        # _widen_include compares refs literally, so a ruleset naming the
+        # default branch one way gets it appended the other way. Either
+        # spelling names a branch the ruleset already protected (Codex
+        # review, mikelward/repo#45).
+        for include in (["refs/heads/main"], ["~DEFAULT_BRANCH"]):
+            with self.subTest(include=include):
+                fake = self._existing(("lanes",))
+                fake.ruleset_objects["1"]["conditions"]["ref_name"]["include"] = include
+                code, out, err = _run(fake, ["--dry-run", "--rule", "lanes", REPO])
+                plan = out + err
+                self.assertIn("scope: also targeting", plan)
+                # Only master is new.
+                self.assertIn("newly effective on refs/heads/master:", plan)
 
     def test_a_create_still_lists_every_rule(self):
         # On a create all of it is new, so the list *is* the change.
