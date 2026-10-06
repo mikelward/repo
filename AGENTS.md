@@ -1,7 +1,7 @@
 ---
 trigger: always_on
 alwaysApply: true
-last_modified: 2026-10-04
+last_modified: 2026-10-06
 ---
 
 # AGENTS.md
@@ -296,14 +296,15 @@ one that has stopped biting.
     push.
   - A PR reading `dirty` -- always -- or `behind` where the ruleset
     requires branches up to date, needs a rebase onto its base and a
-    lease-guarded force-push. Nothing reports a base advance, so only this
-    check catches it. Fetch both refs by explicit refspec, unshallow a
-    shallow clone, and rebase onto the fetched `origin/<base>` -- not
-    always `main`, never the local branch a fetch leaves behind. Confirm
-    before you rebase that your branch has every commit the remote head
-    has, and before you push that the head has not moved since the tip you
-    noted before fetching. If either fails, or you can't tell, stop and
-    ask.
+    lease-guarded force-push. Read `mergeable_state` at every scheduled
+    check, PR-event wake and drive step, not this check alone, and act at
+    once, unasked: nothing reports a base advance, so that read is the
+    only signal. Fetch both refs by explicit refspec, unshallow a shallow
+    clone, and rebase onto the fetched `origin/<base>` -- not always
+    `main`, never the local branch a fetch leaves behind. Confirm before
+    you rebase that your branch has every commit the remote head has, and
+    before you push that the head has not moved since the tip you noted
+    before fetching. If either fails, or you can't tell, stop and ask.
   - Name the PR, and say what to re-read rather than what you read. A SHA
     or a list of which PRs are open goes stale before it fires; one PR
     number does not, and the trigger has to be matchable to it.
