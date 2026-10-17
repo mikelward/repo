@@ -3040,5 +3040,185 @@ class SecretsAuditTest(unittest.TestCase):
         self.assertIn("could not list owner/repo's workflows on branch main:", err)
 
 
+class ClaudeTokenAuditTest(unittest.TestCase):
+    """The Claude review token, audited like the commit-back token but held
+    to the job's own `environment:` declaration, as the lanes pair is.
+    [FIX] findings keep the exit at 0, as in SecretsAuditTest."""
+
+    REVIEW = (
+        "on: pull_request_target\n"
+        "jobs:\n"
+        "  review:\n"
+        "    environment: claude-review\n"
+        "    steps:\n"
+        "      - uses: anthropics/claude-code-action@0123456789abcdef0123456789abcdef01234567\n"
+        "        with:\n"
+        "          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}\n"
+    )
+
+    def _fake(self, text=None):
+        fake = FakeGh()
+        fake.workflow_files = ["claude-review.yml"]
+        fake.workflow_texts = {"claude-review.yml": self.REVIEW if text is None else text}
+        return fake
+
+    def test_the_token_in_its_environment_is_ok(self):
+        fake = self._fake()
+        fake.environments = {"claude-review": ["CLAUDE_CODE_OAUTH_TOKEN"]}
+        fake.env_policies = {"claude-review": ["main"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "[ok] claude-review: the token lives in the 'claude-review' environment, which admits "
+            "only 'main'",
+            out,
+        )
+        self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN is a repository secret", out)
+
+    def test_a_repository_copy_is_a_fix_naming_the_move(self):
+        fake = self._fake()
+        fake.repo_secrets = ["CLAUDE_CODE_OAUTH_TOKEN"]
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "[FIX] CLAUDE_CODE_OAUTH_TOKEN is a repository secret, which reaches every job of every "
+            f"workflow -- `repo setup --credential CLAUDE_CODE_OAUTH_TOKEN=PATH {REPO}` moves it into "
+            "the 'claude-review' environment",
+            out,
+        )
+        # Not listed again among the secrets to review by hand.
+        self.assertNotIn("    CLAUDE_CODE_OAUTH_TOKEN\n", out)
+
+    def test_a_job_not_declaring_the_environment_is_a_fix(self):
+        fake = self._fake(self.REVIEW.replace("    environment: claude-review\n", ""))
+        fake.environments = {"claude-review": ["CLAUDE_CODE_OAUTH_TOKEN"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "[FIX] claude-review: claude-review reads CLAUDE_CODE_OAUTH_TOKEN in a job that does not "
+            "declare `environment: claude-review`",
+            out,
+        )
+        self.assertNotIn("[ok] claude-review:", out)
+
+    def test_a_repository_copy_behind_an_undeclared_job_names_what_the_move_waits_on(self):
+        # `repo setup` holds the move until the job declares the
+        # environment, so the command is not offered as a fix on its own.
+        fake = self._fake(self.REVIEW.replace("    environment: claude-review\n", ""))
+        fake.repo_secrets = ["CLAUDE_CODE_OAUTH_TOKEN"]
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "moves it into the 'claude-review' environment once every job reading it declares "
+            "`environment: claude-review`",
+            out,
+        )
+
+    def test_an_open_environment_is_a_fix_setup_closes(self):
+        fake = self._fake()
+        fake.environments = {"claude-review": ["CLAUDE_CODE_OAUTH_TOKEN"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "[FIX] claude-review: environment 'claude-review' can be reached from any branch -- a "
+            "same-repository branch's push-triggered workflow could declare it and read the token; "
+            f"`repo setup {REPO}` restricts it to 'main'",
+            out,
+        )
+        self.assertNotIn("[ok] claude-review:", out)
+
+    def test_a_policy_someone_set_is_a_fix_by_hand(self):
+        fake = self._fake()
+        fake.environments = {"claude-review": ["CLAUDE_CODE_OAUTH_TOKEN"]}
+        fake.env_policies = {"claude-review": ["release"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "[FIX] claude-review: environment 'claude-review' is restricted to 'release', not to "
+            "'main' alone -- restrict it to 'main' in the environment's settings",
+            out,
+        )
+
+    def test_a_reader_on_pull_request_is_a_fix(self):
+        fake = self._fake(self.REVIEW.replace("on: pull_request_target", "on: pull_request"))
+        fake.environments = {"claude-review": ["CLAUDE_CODE_OAUTH_TOKEN"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "[FIX] claude-review: claude-review reads CLAUDE_CODE_OAUTH_TOKEN on `pull_request`, "
+            "where a pull request's own copy of the workflow runs with it -- move it to "
+            "`pull_request_target`",
+            out,
+        )
+        # The open environment is not offered for restriction: that would
+        # refuse the reader's runs.
+        self.assertNotIn("restricts it to 'main'", out)
+        self.assertNotIn("[ok] claude-review:", out)
+
+    def test_a_reusable_reader_is_a_fix(self):
+        fake = self._fake(self.REVIEW.replace("on: pull_request_target", "on: workflow_call"))
+        fake.environments = {"claude-review": ["CLAUDE_CODE_OAUTH_TOKEN"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "[FIX] claude-review: claude-review reads CLAUDE_CODE_OAUTH_TOKEN in a reusable workflow "
+            "(`workflow_call`), whose callers' triggers this does not trace",
+            out,
+        )
+        self.assertNotIn("restricts it to 'main'", out)
+
+    def test_no_token_anywhere_is_a_fix(self):
+        code, out, err = _run(self._fake(), [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "[FIX] claude-review: environment 'claude-review' holds no CLAUDE_CODE_OAUTH_TOKEN -- the "
+            "Claude review fails on every pull request",
+            out,
+        )
+
+    def test_a_token_nothing_reads_is_stale_wherever_it_sits(self):
+        fake = self._fake("jobs: {}\n")
+        fake.repo_secrets = ["CLAUDE_CODE_OAUTH_TOKEN"]
+        fake.environments = {"claude-review": ["CLAUDE_CODE_OAUTH_TOKEN"]}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "[FIX] CLAUDE_CODE_OAUTH_TOKEN as a repository secret and in the 'claude-review' "
+            f"environment, but no workflow here reads it -- `repo setup {REPO}` deletes it",
+            out,
+        )
+        self.assertNotIn("moves it into the 'claude-review' environment", out)
+
+    def test_a_call_that_could_inherit_it_is_cannot_tell(self):
+        fake = self._fake(
+            "on: pull_request\njobs:\n  review:\n"
+            "    uses: example/shared/.github/workflows/review.yml@main\n"
+            "    secrets: inherit\n"
+        )
+        fake.repo_secrets = ["CLAUDE_CODE_OAUTH_TOKEN"]
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "[FIX] CLAUDE_CODE_OAUTH_TOKEN as a repository secret, and no workflow here reads it, but "
+            "claude-review calls a reusable workflow this cannot read, which may -- `repo setup` "
+            "deletes nothing of it",
+            out,
+        )
+        self.assertNotIn("deletes it", out)
+
+    def test_a_mention_outside_a_job_is_cannot_tell(self):
+        fake = self._fake("env:\n  T: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}\n" + self.REVIEW)
+        fake.repo_secrets = ["CLAUDE_CODE_OAUTH_TOKEN"]
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "[FIX] claude-review: claude-review names CLAUDE_CODE_OAUTH_TOKEN outside a job that can "
+            "declare the 'claude-review' environment",
+            out,
+        )
+        self.assertNotIn("moves it into the 'claude-review' environment", out)
+        self.assertNotIn("deletes it", out)
+
+
 if __name__ == "__main__":
     unittest.main()
