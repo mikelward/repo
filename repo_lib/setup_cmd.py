@@ -531,6 +531,14 @@ def _plan_credentials(repo, specs):
       what holds a move back; and the environment itself, when any branch
       can reach it, is restricted to the default branch after the write --
       a policy someone set by hand is reported, never rewritten;
+    - the Claude review token follows the lanes substitution -- a job
+      reading it that does not declare the `claude-review` environment
+      holds the move back -- and its environment is restricted to the
+      default branch the same way, unless a reader runs on a trigger not
+      known to run on the default branch's ref (`pull_request`, `push`,
+      `workflow_call`, ...), whose runs the restriction could refuse.
+      Neither a policy someone set nor that reader holds the move, since an
+      environment copy reaches fewer jobs than a repository copy;
     - "unused" is decided from the text, not from what the reader could
       parse: a credential is deleted as unused only when no workflow
       mentions its reader at all. A mention with no readable job-level
@@ -549,7 +557,12 @@ def _plan_credentials(repo, specs):
         default, texts = credentials.workflow_snapshot(repo, default_only=True)
         held = {
             env: credentials.environment_secrets(repo, environments, env)
-            for env in (*credentials.BATCH_HUBS, credentials.COMMIT_ARTIFACT_ENV, credentials.LANES_ENV)
+            for env in (
+                *credentials.BATCH_HUBS,
+                credentials.COMMIT_ARTIFACT_ENV,
+                credentials.CLAUDE_ENV,
+                credentials.LANES_ENV,
+            )
         }
     except credentials.ReadError as e:
         plan.failed = True
@@ -578,6 +591,31 @@ def _plan_credentials(repo, specs):
                 return f"{e.message.rstrip(':')} (the plan could not be re-validated)"
 
         return run
+
+    def still_trusted(recheck, env):
+        """`recheck`, and then `env`'s branch policy again. The policy is
+        the one input a run whose policy was already right never reads
+        twice: a restriction carries its own apply-time re-read, and
+        `move`'s destination read asks what the environment holds, not who
+        may enter it. So an administrator opening the environment while
+        the prompt sat let the apply write the credential in and delete the
+        repository copies, exiting 0 with it reachable from an untrusted
+        branch (Codex, mikelward/repo#36, and for the Claude token
+        mikelward/repo#96). Composed onto the move's own recheck rather
+        than folded into the workflow rechecks, which are asked on paths
+        that touch no environment; `recheck` runs first, so the default
+        branch this compares against is one it has already confirmed."""
+
+        def run():
+            reason = recheck()
+            if reason is not None:
+                return reason
+            wrong_now = credentials.branch_policy_verdict(
+                credentials.environment_branch_policy(repo, env), default
+            )
+            return None if wrong_now is None else f"environment '{env}' now {wrong_now}"
+
+        return guarded(run)
 
     def unused(label, names, listed, env_secrets, why, recheck):
         move = CredentialMove(label=label, writes=[], deletes=[], recheck=guarded(recheck))
@@ -813,6 +851,220 @@ def _plan_credentials(repo, specs):
         lambda held_after: token in held_after,
         lambda held_after: [token],
     )
+
+    # The Claude review token. An action step reads it, like the lanes pair
+    # below, so a consuming job that does not declare the environment is
+    # what holds the move back, and the environment is restricted to the
+    # default branch as that pair's is. Planned before the lanes pair,
+    # whose planner returns early on what it cannot read. Every name here
+    # is its own: the closures above read `token` late, so rebinding it
+    # turned the commit-back token's usability test into this one's, and
+    # the lanes block below rebinds `label` and `unread` the same way.
+    claude_token = credentials.CLAUDE_TOKEN
+    claude_env = credentials.CLAUDE_ENV
+    claude_listed, claude_secrets = held[claude_env]
+    claude_readers = credentials.claude_consumers(texts)
+    claude_unread_files = credentials.claude_unread(texts)
+    # A reusable workflow this cannot read, called so that it could receive
+    # the token -- `secrets: inherit` hands it every repository secret
+    # without naming one -- holds the unused delete, as for the lanes pair
+    # (Codex, mikelward/repo#96).
+    claude_calls = credentials.lanes_called_workflows(texts, repo)
+    if claude_unread_files:
+        plan.unfixed.append(
+            f"{claude_env}: {credentials.workflow_labels(claude_unread_files)} names {claude_token} "
+            f"outside a job that can declare the '{claude_env}' environment, or reads secrets by a "
+            f"name this cannot see -- whether it is used there cannot be told, so nothing is moved "
+            f"or deleted; read it by name in a job that declares the environment, or move it by hand"
+        )
+    elif not claude_readers and claude_calls and (
+        claude_token in repo_secrets or claude_token in claude_secrets
+    ):
+        plan.unfixed.append(
+            f"{claude_env}: no workflow here reads {claude_token}, but "
+            f"{credentials.workflow_labels(claude_calls)} calls a reusable workflow this cannot "
+            f"read, which may -- so nothing is deleted; delete it by hand if nothing uses it"
+        )
+    else:
+
+        def claude_now():
+            """(reason, readers, texts) as the workflows read now, for a
+            recheck -- the same default-branch confirmation `settle`'s `now`
+            makes."""
+            texts_now = reread()
+            default_now = credentials.default_branch(repo)
+            if default_now != default:
+                return f"the default branch is now '{default_now}', not '{default}'", {}, texts_now
+            if credentials.claude_unread(texts_now):
+                return (
+                    f"a workflow now names {claude_token} outside a job that can declare the "
+                    f"environment, or reads secrets by a name this cannot see",
+                    {},
+                    texts_now,
+                )
+            return None, credentials.claude_consumers(texts_now), texts_now
+
+        if not claude_readers:
+
+            def claude_still_unused():
+                reason, consumers_now, texts_now = claude_now()
+                if reason is None and consumers_now:
+                    reason = (
+                        f"{credentials.workflow_labels(sorted(consumers_now))} "
+                        "appeared since the plan was built"
+                    )
+                if reason is None and credentials.lanes_called_workflows(texts_now, repo):
+                    reason = "a workflow now calls a reusable workflow this cannot read"
+                return reason
+
+            unused(
+                claude_env,
+                (claude_token,),
+                claude_listed,
+                claude_secrets,
+                f"no workflow here reads {claude_token}, so nothing uses it",
+                claude_still_unused,
+            )
+        else:
+
+            def claude_still_declares():
+                reason, consumers_now, texts_now = claude_now()
+                if reason is not None:
+                    return reason
+                if set(consumers_now) != set(claude_readers):
+                    return (
+                        f"the workflows reading {claude_token} changed since the plan was built "
+                        f"({credentials.workflow_labels(sorted(consumers_now)) or 'none'} now)"
+                    )
+                missing = sorted(name for name, declares in consumers_now.items() if not declares)
+                if missing:
+                    return (
+                        f"{credentials.workflow_labels(missing)} no longer declares "
+                        f"`environment: {claude_env}`"
+                    )
+                # The restriction this move may carry rests on the triggers
+                # too: a reader moved to `pull_request` while the prompt sat
+                # would be refused by it (Codex, mikelward/repo#96).
+                unrestricted_now = credentials.claude_unrestricted_readers(texts_now)
+                if unrestricted_now != claude_unrestricted:
+                    return (
+                        f"the workflows reading {claude_token} on a trigger that can run off the "
+                        f"default branch changed since the plan was built "
+                        f"({credentials.workflow_labels(sorted(unrestricted_now)) or 'none'} now)"
+                    )
+                return None
+
+            claude_unrestricted = credentials.claude_unrestricted_readers(texts)
+            failing = sorted(name for name, declares in claude_readers.items() if not declares)
+            claude_moves_before = len(plan.moves)
+            claude_unfixed_before = len(plan.unfixed)
+            move(
+                claude_env,
+                (claude_token,),
+                claude_listed,
+                claude_secrets,
+                claude_listed or claude_env,
+                credentials.workflow_labels(failing or sorted(claude_readers)),
+                not failing,
+                lambda held_after: claude_token in held_after,
+                lambda held_after: [claude_token],
+                claude_still_declares,
+                how=(
+                    f"{credentials.workflow_labels(failing)} reads {claude_token} in a job that "
+                    f"does not declare `environment: {claude_env}`"
+                ),
+                hint="declare it on the job first",
+            )
+            # The environment admits the default branch alone, as `lanes`
+            # does (see repo_lib.credentials). Restricted before this run's
+            # writes when it is open or new -- CredentialMove.restrict --
+            # and a policy someone set is reported, never rewritten. Neither
+            # holds the move: an environment copy reaches only the jobs that
+            # declare it, a repository copy every job, so the move narrows
+            # the token's reach whatever the policy says.
+            claude_moves = plan.moves[claude_moves_before:]
+            # A move that refused settles the environment with it, as for lanes.
+            moved = len(plan.unfixed) == claude_unfixed_before
+            if moved and claude_unrestricted:
+                for name, trigger in sorted(claude_unrestricted.items()):
+                    plan.unfixed.append(
+                        f"{claude_env}: {credentials.workflow_label(name)} reads {claude_token} "
+                        + credentials.claude_trigger_finding(trigger)
+                        + f"; the '{claude_listed or claude_env}' environment is not restricted "
+                        f"until then, since a restriction to '{default}' could refuse its runs"
+                    )
+            elif moved and (claude_listed is not None or any(m.writes for m in claude_moves)):
+                claude_where = claude_listed or claude_env
+                try:
+                    claude_policy = (
+                        "open"
+                        if claude_listed is None
+                        else credentials.environment_branch_policy(repo, claude_listed)
+                    )
+                except credentials.ReadError as e:
+                    plan.unfixed.append(
+                        f"{claude_env}: {e.message.rstrip(':')}, so whether it admits only "
+                        f"'{default}' cannot be told"
+                    )
+                else:
+                    claude_wrong = credentials.branch_policy_verdict(claude_policy, default)
+                    # A policy this run vouches for -- one it found right or
+                    # restricts itself -- is confirmed again at apply time,
+                    # as for the lanes pair: an environment opened while
+                    # the prompt sat would otherwise take the token and
+                    # lose the repository copy, with the run reporting it
+                    # restricted (Codex, mikelward/repo#96). A policy
+                    # someone set is reported instead, and moves anyway.
+                    if claude_wrong is None:
+                        plan.lines.append(
+                            f"{claude_env}: environment '{claude_where}' admits only '{default}'"
+                        )
+                        for step in claude_moves:
+                            step.recheck = still_trusted(step.recheck, claude_where)
+                            step.shut = (claude_where, default)
+                    elif credentials.restrictable(claude_policy):
+                        plan.lines.append(
+                            f"{claude_env}: restrict environment '{claude_where}' to branch "
+                            f"'{default}' -- it {claude_wrong}, so a same-repository branch's "
+                            f"push-triggered workflow could declare it and read the token"
+                        )
+                        for step in claude_moves:
+                            step.shut = (claude_where, default)
+                        if claude_moves:
+                            claude_moves[-1].restrict = (claude_where, default)
+                        else:
+
+                            def claude_still_holds():
+                                # Nothing written or deleted here, so `move`'s
+                                # destination re-read never runs: restricting an
+                                # environment emptied while the prompt sat would
+                                # report the repository in shape (Codex,
+                                # mikelward/repo#96), as for the lanes pair.
+                                reason = claude_still_declares()
+                                if reason is not None:
+                                    return reason
+                                _listed, held_now = credentials.environment_secrets(
+                                    repo, credentials.environments(repo), claude_where
+                                )
+                                if claude_token not in held_now:
+                                    return f"the '{claude_where}' environment no longer holds {claude_token}"
+                                return None
+
+                            plan.moves.append(
+                                CredentialMove(
+                                    label=claude_env,
+                                    writes=[],
+                                    deletes=[],
+                                    recheck=guarded(claude_still_holds),
+                                    restrict=(claude_where, default),
+                                )
+                            )
+                    else:
+                        plan.unfixed.append(
+                            f"{claude_env}: environment '{claude_where}' {claude_wrong} -- restrict "
+                            f"it to '{default}' in the environment's settings (`repo setup` "
+                            f"rewrites no policy someone set)"
+                        )
 
     # The lanes App pair. An action step, not a called workflow: the
     # secret reaches it through the job's `environment:` declaration, so
@@ -1155,35 +1407,10 @@ def _plan_credentials(repo, specs):
             return plan
     wrong = credentials.branch_policy_verdict(policy, default)
 
-    def still_trusted(recheck):
-        """`recheck`, and then the environment's branch policy again. The
-        policy is the one input a run whose policy was already right never
-        reads twice: a restriction carries its own apply-time re-read, and
-        `move`'s destination read asks what the environment holds, not who
-        may enter it. So an administrator opening the environment while
-        the prompt sat let the apply write the pair in and delete the
-        repository copies, exiting 0 with the credential reachable from an
-        untrusted branch (Codex, mikelward/repo#36). Composed onto the
-        move's own recheck rather than folded into `lanes_changed`, which
-        answers for the workflows and is asked on paths that touch no
-        environment; `recheck` runs first, so the default branch this
-        compares against is one it has already confirmed."""
-
-        def run():
-            reason = recheck()
-            if reason is not None:
-                return reason
-            wrong_now = credentials.branch_policy_verdict(
-                credentials.environment_branch_policy(repo, env), default
-            )
-            return None if wrong_now is None else f"environment '{env}' now {wrong_now}"
-
-        return guarded(run)
-
     if wrong is None:
         plan.lines.append(f"{label}: environment '{env}' admits only the trusted base branch")
         for step in plan.moves[moves_before:]:
-            step.recheck = still_trusted(step.recheck)
+            step.recheck = still_trusted(step.recheck, env)
             step.shut = (env, default)
     elif credentials.restrictable(policy):
         plan.lines.append(

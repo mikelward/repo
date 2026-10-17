@@ -26,6 +26,21 @@ trusted publishing exists to close. The environment must also admit only
 the trusted base branch, or that same run reaches it by declaring the
 environment itself.
 
+The Claude review token, `CLAUDE_CODE_OAUTH_TOKEN`, is read by an action
+step too (anthropics/claude-code-action), so it reaches a job the same way:
+through the job's own `claude-review` environment declaration. A copy at
+repository level reaches every job of every workflow instead -- the
+batches' untrusted update job included, through `secrets: inherit`. And as
+for lanes, the environment admits the default branch alone: the review runs
+on `pull_request_target`, whose runs carry the base branch's ref and the base
+branch's copy of the workflow, so a pull request cannot rewrite the job that
+holds the token. A reader on `pull_request` is the exception the restriction
+would break -- GitHub matches the policy against `refs/pull/<n>/merge` there
+-- and is reported instead: on that trigger the pull request's own copy of
+the workflow runs with the token. Any trigger not known to run on the
+default branch's ref -- `push`, `workflow_dispatch`, `workflow_call` -- holds
+the restriction too: it waits on positive evidence.
+
 Names only, throughout: GitHub never returns a secret's value, which is
 why `repo setup` needs the value handed to it to complete a move.
 """
@@ -58,6 +73,9 @@ LANES_CHECK = "lanes"
 # action, not a reusable workflow: a step's `uses:` carries no secrets,
 # so the environment declaration on the job is what reaches it a credential.
 LANES_ACTION = "mikelward/lanes"
+
+CLAUDE_TOKEN = "CLAUDE_CODE_OAUTH_TOKEN"
+CLAUDE_ENV = "claude-review"
 
 
 def batch_credentials(hub):
@@ -177,6 +195,7 @@ FLEET_CREDENTIALS = tuple(name for hub in BATCH_HUBS for name in batch_credentia
     COMMIT_ARTIFACT_TOKEN,
     LANES_APP_ID,
     LANES_APP_PRIVATE_KEY,
+    CLAUDE_TOKEN,
 )
 
 
@@ -191,6 +210,8 @@ def home_environment(name):
         return COMMIT_ARTIFACT_ENV
     if name in (LANES_APP_ID, LANES_APP_PRIVATE_KEY):
         return LANES_ENV
+    if name == CLAUDE_TOKEN:
+        return CLAUDE_ENV
     return None
 
 
@@ -647,6 +668,239 @@ def mentions(text, workflow_prefix):
     mikelward/repo#13). A comment does not count: a comment calls
     nothing."""
     return _mention_count(text, workflow_prefix) > 0
+
+
+# A reference to the Claude review token: `secrets.CLAUDE_CODE_OAUTH_TOKEN`
+# or `secrets['CLAUDE_CODE_OAUTH_TOKEN']`, in any case, since GitHub
+# resolves secret names that way, and only inside a `${{ }}` expression,
+# the one place it resolves them (`if:` may not name a secret at all).
+# Neither the bare name -- the action's own input is
+# `claude_code_oauth_token`, and a job feeding it another secret reads
+# nothing of this one -- nor the reference written as prose is a read
+# (Codex, mikelward/repo#96, three times).
+_CLAUDE_REFERENCE = re.compile(
+    rf"secrets\s*(?:\.\s*{CLAUDE_TOKEN}\b|\[\s*['\"]{CLAUDE_TOKEN}['\"]\s*\])",
+    re.IGNORECASE,
+)
+
+
+def _expressions(string):
+    """The bodies of the `${{ }}` expressions in `string`. A `}}` inside a
+    single-quoted literal does not end one -- `format('{{0}}', ...)` is
+    valid, and `''` escapes a quote -- and an expression never closed runs
+    to the end of the string, so a reference in it still counts: missing
+    one would delete a credential a workflow reads."""
+    bodies = []
+    start = string.find("${{")
+    while start >= 0:
+        end, quoted = start + 3, False
+        while end < len(string):
+            if string[end] == "'":
+                quoted = not quoted
+            elif not quoted and string.startswith("}}", end):
+                break
+            end += 1
+        bodies.append(string[start + 3 : end])
+        start = string.find("${{", end + 2)
+    return bodies
+
+
+def _references_claude_token(string):
+    """Whether `string` holds an expression reading the Claude review token."""
+    return any(_CLAUDE_REFERENCE.search(body) for body in _expressions(string))
+
+
+# What may follow `secrets` for the name it reads to be visible: a property
+# or a quoted index.
+_SECRET_NAME = re.compile(r"""\s*(?:\.\s*[A-Za-z_][A-Za-z0-9_-]*|\[\s*(?:'(?:[^']|'')*'|"[^"]*")\s*\])""")
+
+
+def _reads_secrets_opaquely(string):
+    """Whether an expression in `string` reads the `secrets` context by a
+    name this cannot see: an index computed at runtime
+    (`secrets[format('CLAUDE_{0}', 'CODE_OAUTH_TOKEN')]`), the whole
+    context (`toJSON(secrets)`), or a filter (`secrets.*`). Any of them can
+    read the Claude review token without spelling it, and reading that as
+    "unused" deleted a token in use (Codex, mikelward/repo#96), so it is
+    "cannot tell". Every such read counts, not just ones that could be
+    shown to build the name: telling which do is the next case waiting."""
+    for body in _expressions(string):
+        lower, quoted, i = body.lower(), False, 0
+        while i < len(body):
+            if body[i] == "'":
+                quoted = not quoted
+            elif (
+                not quoted
+                and lower.startswith("secrets", i)
+                and (i == 0 or not (body[i - 1].isalnum() or body[i - 1] in "_-."))
+                and not (i + 7 < len(body) and (body[i + 7].isalnum() or body[i + 7] in "_-"))
+            ):
+                if not _SECRET_NAME.match(body, i + 7):
+                    return True
+                i += 7
+                continue
+            i += 1
+    return False
+
+
+def _claude_jobs(text):
+    """(one True/False per job in `text` naming the Claude review token --
+    whether that job declares the `claude-review` environment -- and
+    whether the token is also named somewhere no job's declaration can
+    carry it to).
+
+    "Named" is an expression referencing the token (`_CLAUDE_REFERENCE`)
+    anywhere in a job's strings, a `run:` script's text included. The
+    somewhere-else is a workflow-level `env:` (or any other key outside
+    `jobs:`), a job calling a reusable workflow -- a caller cannot declare
+    an environment, so a token it passes by name would arrive empty -- a
+    job that is not a mapping, and a document PyYAML rejects, where the
+    bare name anywhere in the text counts. So is a `secrets` read by a
+    name this cannot see, anywhere (`_reads_secrets_opaquely`). Each is
+    "cannot tell", which moves and deletes nothing."""
+    needle = CLAUDE_TOKEN.lower()
+
+    def named(node):
+        return any(_references_claude_token(string) for string in _strings(node))
+
+    def opaque(node):
+        return any(_reads_secrets_opaquely(string) for string in _strings(node))
+
+    def touched(node):
+        return named(node) or opaque(node)
+
+    doc = _document(text)
+    if doc is _REJECTED:
+        return [], _occurrences(text.lower(), needle, False) > 0
+    if not isinstance(doc, dict):
+        return [], touched(doc)
+    unread = any(touched(key) or touched(value) for key, value in doc.items() if key != "jobs")
+    jobs = doc.get("jobs")
+    if not isinstance(jobs, dict):
+        return [], unread or touched(jobs)
+    verdicts = []
+    for name, job in jobs.items():
+        if opaque(name) or opaque(job):
+            unread = True
+        if not (named(name) or named(job)):
+            continue
+        if not isinstance(job, dict) or "uses" in job:
+            unread = True
+            continue
+        verdicts.append(_declares_environment(job, CLAUDE_ENV))
+    return verdicts, unread
+
+
+def claude_consumers(texts):
+    """Every workflow in `texts` (name -> text) with a job naming the Claude
+    review token, mapped to whether every such job declares the
+    `claude-review` environment -- the only route by which the token
+    reaches a step once it lives there."""
+    found = {}
+    for name, text in texts.items():
+        verdicts, _unread = _claude_jobs(text)
+        if verdicts:
+            found[name] = all(verdicts)
+    return found
+
+
+def claude_unread(texts):
+    """The workflows naming the Claude review token somewhere a job's
+    `environment:` cannot carry it to -- see `_claude_jobs`."""
+    return sorted(name for name, text in texts.items() if _claude_jobs(text)[1])
+
+
+def _triggers(doc):
+    """The event names a parsed workflow's `on:` lists. PyYAML reads a bare
+    `on` key as the boolean True (YAML 1.1), so both spellings are asked."""
+    events = doc.get("on", doc.get(True)) if isinstance(doc, dict) else None
+    if isinstance(events, str):
+        return {events}
+    if isinstance(events, (list, dict)):
+        return {event for event in events if isinstance(event, str)}
+    return set()
+
+
+# The events whose runs carry the default branch's ref, per GitHub's
+# "Events that trigger workflows" (GITHUB_REF: "Default branch"), plus
+# `pull_request_target`, whose run carries the base branch's, which a job
+# can hold to the default branch -- one into another base is simply
+# refused. Positive evidence: an event missing from here blocks the
+# restriction, so a trigger nobody listed is a finding rather than a
+# broken reader.
+DEFAULT_REF_EVENTS = frozenset(
+    {
+        "branch_protection_rule",
+        "check_run",
+        "check_suite",
+        "delete",
+        "discussion",
+        "discussion_comment",
+        "fork",
+        "gollum",
+        "image_version",
+        "issue_comment",
+        "issues",
+        "label",
+        "milestone",
+        "page_build",
+        "public",
+        "pull_request_target",
+        "repository_dispatch",
+        "schedule",
+        "status",
+        "watch",
+        "workflow_run",
+    }
+)
+
+
+def claude_unrestricted_readers(texts):
+    """The workflows reading the Claude review token that a restriction of
+    its environment to the default branch could break, each with a trigger
+    that says so: one outside `DEFAULT_REF_EVENTS` -- `pull_request`, whose
+    run carries `refs/pull/<n>/merge`; `push` or `workflow_dispatch`, which
+    run on any branch; `workflow_call`, which runs on its caller's ref --
+    or None when the workflow's `on:` names no event this can read. A
+    restriction is placed only when there are none of these (Codex,
+    mikelward/repo#96, three times)."""
+    found = {}
+    for name in claude_consumers(texts):
+        triggers = _triggers(_document(texts[name]))
+        if not triggers:
+            found[name] = None
+            continue
+        outside = sorted(triggers - DEFAULT_REF_EVENTS)
+        if outside:
+            found[name] = "pull_request" if "pull_request" in outside else outside[0]
+    return found
+
+
+def claude_trigger_finding(trigger):
+    """Why a reader on `trigger` (see `claude_unrestricted_readers`) holds
+    the restriction, in prose that follows "<workflow> reads <token> ", so
+    `repo audit` and `repo setup` say the same thing."""
+    if trigger == "pull_request":
+        return (
+            "on `pull_request`, where a pull request's own copy of the workflow runs with it "
+            "-- move it to `pull_request_target`"
+        )
+    if trigger is None:
+        return (
+            "in a workflow whose `on:` this cannot read -- trigger it on "
+            "`pull_request_target` or another event that runs on the default branch"
+        )
+    if trigger == "workflow_call":
+        return (
+            "in a reusable workflow (`workflow_call`), whose callers' triggers this does not "
+            "trace -- read it only from workflows triggered on `pull_request_target` or another "
+            "event that runs on the default branch"
+        )
+    return (
+        f"on `{trigger}`, which can run on a ref other than the default branch's -- read it "
+        f"only from workflows triggered on `pull_request_target` or another event that runs "
+        f"on the default branch"
+    )
 
 
 def _is_lanes(reference):

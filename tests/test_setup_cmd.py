@@ -13029,5 +13029,356 @@ class LogOpenFailureTest(unittest.TestCase):
         self.assertNotIn("error:", msg)
 
 
+class ClaudeTokenStepTest(unittest.TestCase):
+    """The Claude review token moves like the commit-back token, held back
+    by a consuming job without the `claude-review` environment the way a
+    lanes publisher without `lanes` is -- and the environment is never
+    restricted, since the review runs on pull_request refs."""
+
+    REVIEW = (
+        "on: pull_request_target\n"
+        "jobs:\n"
+        "  review:\n"
+        "    environment: claude-review\n"
+        "    steps:\n"
+        "      - uses: anthropics/claude-code-action@0123456789abcdef0123456789abcdef01234567\n"
+        "        with:\n"
+        "          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}\n"
+    )
+
+    def _fake(self, texts):
+        fake = FakeGh()
+        fake.workflow_files = list(texts)
+        fake.workflow_texts = dict(texts)
+        return fake
+
+    def test_a_supplied_token_moves_into_the_environment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _secret_file(tmp, "token.txt", b"oauth-example")
+            fake = self._fake({"claude-review.yml": self.REVIEW})
+            fake.secret_names = {"CLAUDE_CODE_OAUTH_TOKEN"}
+            code, out, err = _run(
+                fake,
+                ["--force", "-v", "--no-rules", "--credential", f"CLAUDE_CODE_OAUTH_TOKEN={path}", REPO],
+            )
+        self.assertEqual(code, 0, err)
+        self.assertIn("claude-review: set CLAUDE_CODE_OAUTH_TOKEN in environment 'claude-review' (new)", err)
+        self.assertEqual(
+            fake.written_secrets,
+            [("CLAUDE_CODE_OAUTH_TOKEN", REPO, "claude-review", b"oauth-example")],
+        )
+        self.assertEqual(fake.deleted_secrets, [("CLAUDE_CODE_OAUTH_TOKEN", None)])
+        # The environment this run created is restricted to the default
+        # branch, which a pull_request_target run carries.
+        self.assertIn(
+            "claude-review: restrict environment 'claude-review' to branch 'main' -- it can be "
+            "reached from any branch",
+            err,
+        )
+        self.assertEqual(fake.env_policies["claude-review"], ["main"])
+
+    def test_the_commit_back_token_still_moves_beside_it(self):
+        # Both in one run: the Claude block once rebound a name the
+        # commit-back token's usability test read late, and that move then
+        # judged the environment it had just written to empty.
+        sync = (
+            "jobs:\n  sync:\n"
+            "    uses: mikelward/ci-commit-artifact/.github/workflows/commit-artifact.yml@main\n"
+            "    secrets: inherit\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = _secret_file(tmp, "artifact.txt", b"github_pat_example")
+            claude = _secret_file(tmp, "claude.txt", b"oauth-example")
+            fake = self._fake({"ci.yml": sync, "claude-review.yml": self.REVIEW})
+            fake.secret_names = {"CI_COMMIT_ARTIFACT_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"}
+            code, out, err = _run(
+                fake,
+                [
+                    "--force", "--no-rules",
+                    "--credential", f"CI_COMMIT_ARTIFACT_TOKEN={artifact}",
+                    "--credential", f"CLAUDE_CODE_OAUTH_TOKEN={claude}",
+                    REPO,
+                ],
+            )
+        self.assertEqual(code, 0, err)
+        self.assertCountEqual(
+            fake.written_secrets,
+            [
+                ("CI_COMMIT_ARTIFACT_TOKEN", REPO, "ci-commit-artifact", b"github_pat_example"),
+                ("CLAUDE_CODE_OAUTH_TOKEN", REPO, "claude-review", b"oauth-example"),
+            ],
+        )
+        self.assertCountEqual(
+            fake.deleted_secrets, [("CI_COMMIT_ARTIFACT_TOKEN", None), ("CLAUDE_CODE_OAUTH_TOKEN", None)]
+        )
+
+    def test_a_job_without_the_environment_holds_the_move(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _secret_file(tmp, "token.txt")
+            fake = self._fake(
+                {"claude-review.yml": self.REVIEW.replace("    environment: claude-review\n", "")}
+            )
+            fake.secret_names = {"CLAUDE_CODE_OAUTH_TOKEN"}
+            code, out, err = _run(
+                fake, ["--force", "--no-rules", "--credential", f"CLAUDE_CODE_OAUTH_TOKEN={path}", REPO]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "not fixed: claude-review: claude-review reads CLAUDE_CODE_OAUTH_TOKEN in a job that does "
+            "not declare `environment: claude-review`, so a credential in the 'claude-review' "
+            "environment would never reach it -- declare it on the job first",
+            err,
+        )
+        self.assertEqual(fake.written_secrets, [])
+        self.assertEqual(fake.deleted_secrets, [])
+
+    def test_a_policy_someone_set_fails_the_run_but_holds_nothing(self):
+        # Reported, never rewritten -- and the move still goes ahead: the
+        # environment copy reaches only the jobs declaring it, which the
+        # repository copy it replaces reached and more.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _secret_file(tmp, "token.txt", b"oauth-example")
+            fake = self._fake({"claude-review.yml": self.REVIEW})
+            fake.secret_names = {"CLAUDE_CODE_OAUTH_TOKEN"}
+            fake.env_secret_names = {"claude-review": set()}
+            fake.env_policies = {"claude-review": ["release"]}
+            code, out, err = _run(
+                fake, ["--force", "--no-rules", "--credential", f"CLAUDE_CODE_OAUTH_TOKEN={path}", REPO]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "not fixed: claude-review: environment 'claude-review' is restricted to 'release', not "
+            "to 'main' alone -- restrict it to 'main' in the environment's settings",
+            err,
+        )
+        self.assertEqual(
+            fake.written_secrets, [("CLAUDE_CODE_OAUTH_TOKEN", REPO, "claude-review", b"oauth-example")]
+        )
+        self.assertEqual(fake.deleted_secrets, [("CLAUDE_CODE_OAUTH_TOKEN", None)])
+        self.assertEqual(fake.env_policies["claude-review"], ["release"])
+
+    def test_an_open_environment_is_restricted_to_the_default_branch(self):
+        # An environment that already holds the token and nothing else to
+        # do: the restriction is a move of its own.
+        fake = self._fake({"claude-review.yml": self.REVIEW})
+        fake.env_secret_names = {"claude-review": {"CLAUDE_CODE_OAUTH_TOKEN"}}
+        code, out, err = _run(fake, ["--force", "-v", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("claude-review: restrict environment 'claude-review' to branch 'main'", err)
+        self.assertEqual(fake.env_policies["claude-review"], ["main"])
+        self.assertEqual(fake.written_secrets, [])
+        self.assertEqual(fake.deleted_secrets, [])
+
+    def test_a_reader_moved_to_pull_request_while_the_plan_waited_holds_the_restriction(self):
+        fake = self._fake({"claude-review.yml": self.REVIEW})
+        fake.env_secret_names = {"claude-review": {"CLAUDE_CODE_OAUTH_TOKEN"}}
+        fake.workflow_texts_after_recheck = {
+            "claude-review.yml": self.REVIEW.replace("on: pull_request_target", "on: pull_request")
+        }
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "the workflows reading CLAUDE_CODE_OAUTH_TOKEN on a trigger that can run off the default "
+            "branch changed since the plan was built (claude-review now)",
+            err,
+        )
+        self.assertIsNone(fake.env_policies.get("claude-review"))
+
+    def test_a_restriction_waits_on_the_token_still_being_there(self):
+        # The standalone restriction writes and deletes nothing, so it re-reads
+        # the environment itself: one emptied while the plan waited is not
+        # restricted and reported as in shape.
+        fake = self._fake({"claude-review.yml": self.REVIEW})
+        fake.env_secret_names = {"claude-review": {"CLAUDE_CODE_OAUTH_TOKEN"}}
+        fake.env_secret_names_after_recheck = {"claude-review": set()}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("the 'claude-review' environment no longer holds CLAUDE_CODE_OAUTH_TOKEN", err)
+        self.assertIsNone(fake.env_policies.get("claude-review"))
+
+    def test_a_reader_on_push_holds_the_restriction(self):
+        fake = self._fake(
+            {"claude-review.yml": self.REVIEW.replace("on: pull_request_target", "on: [pull_request_target, push]")}
+        )
+        fake.env_secret_names = {"claude-review": {"CLAUDE_CODE_OAUTH_TOKEN"}}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "not fixed: claude-review: claude-review reads CLAUDE_CODE_OAUTH_TOKEN on `push`, which can "
+            "run on a ref other than the default branch's",
+            err,
+        )
+        self.assertIsNone(fake.env_policies.get("claude-review"))
+
+    def test_a_reusable_reader_holds_the_restriction(self):
+        fake = self._fake(
+            {"claude-review.yml": self.REVIEW.replace("on: pull_request_target", "on: workflow_call")}
+        )
+        fake.env_secret_names = {"claude-review": {"CLAUDE_CODE_OAUTH_TOKEN"}}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "not fixed: claude-review: claude-review reads CLAUDE_CODE_OAUTH_TOKEN in a reusable "
+            "workflow (`workflow_call`), whose callers' triggers this does not trace",
+            err,
+        )
+        self.assertIsNone(fake.env_policies.get("claude-review"))
+
+    def test_a_reader_on_pull_request_holds_the_restriction_not_the_move(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _secret_file(tmp, "token.txt", b"oauth-example")
+            fake = self._fake(
+                {"claude-review.yml": self.REVIEW.replace("on: pull_request_target", "on: pull_request")}
+            )
+            fake.secret_names = {"CLAUDE_CODE_OAUTH_TOKEN"}
+            code, out, err = _run(
+                fake, ["--force", "--no-rules", "--credential", f"CLAUDE_CODE_OAUTH_TOKEN={path}", REPO]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "not fixed: claude-review: claude-review reads CLAUDE_CODE_OAUTH_TOKEN on `pull_request`, "
+            "where a pull request's own copy of the workflow runs with it -- move it to "
+            "`pull_request_target`",
+            err,
+        )
+        self.assertEqual(
+            fake.written_secrets, [("CLAUDE_CODE_OAUTH_TOKEN", REPO, "claude-review", b"oauth-example")]
+        )
+        self.assertIsNone(fake.env_policies.get("claude-review"))
+
+    def test_a_call_that_could_inherit_it_holds_the_unused_delete(self):
+        # `secrets: inherit` hands a reusable workflow this cannot read every
+        # repository secret without naming one, so "no workflow names it" is
+        # not "nothing uses it".
+        fake = self._fake(
+            {
+                "review.yml": (
+                    "on: pull_request\njobs:\n  review:\n"
+                    "    uses: example/shared/.github/workflows/review.yml@main\n"
+                    "    secrets: inherit\n"
+                )
+            }
+        )
+        fake.secret_names = {"CLAUDE_CODE_OAUTH_TOKEN"}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "not fixed: claude-review: no workflow here reads CLAUDE_CODE_OAUTH_TOKEN, but review "
+            "calls a reusable workflow this cannot read, which may -- so nothing is deleted",
+            err,
+        )
+        self.assertEqual(fake.deleted_secrets, [])
+
+    def test_a_token_nothing_reads_is_deleted_and_a_supplied_one_not_set(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _secret_file(tmp, "token.txt")
+            fake = self._fake({"ci.yml": "jobs:\n  build:\n    steps: []\n"})
+            fake.secret_names = {"CLAUDE_CODE_OAUTH_TOKEN"}
+            code, out, err = _run(
+                fake, ["--force", "--no-rules", "--credential", f"CLAUDE_CODE_OAUTH_TOKEN={path}", REPO]
+            )
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.deleted_secrets, [("CLAUDE_CODE_OAUTH_TOKEN", None)])
+        self.assertEqual(fake.written_secrets, [])
+        self.assertIn(
+            "claude-review: CLAUDE_CODE_OAUTH_TOKEN not set -- no workflow here reads "
+            "CLAUDE_CODE_OAUTH_TOKEN, so nothing uses it",
+            err,
+        )
+
+    def test_a_mention_outside_a_job_moves_and_deletes_nothing(self):
+        fake = self._fake(
+            {"claude-review.yml": "env:\n  T: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}\n" + self.REVIEW}
+        )
+        fake.secret_names = {"CLAUDE_CODE_OAUTH_TOKEN"}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "not fixed: claude-review: claude-review names CLAUDE_CODE_OAUTH_TOKEN outside a job that "
+            "can declare the 'claude-review' environment, or reads secrets by a name this cannot see "
+            "-- whether it is used there cannot be told",
+            err,
+        )
+        self.assertEqual(fake.deleted_secrets, [])
+
+    def test_a_reader_appearing_while_the_plan_waited_keeps_a_stale_copy(self):
+        fake = self._fake({"ci.yml": "jobs:\n  build:\n    steps: []\n"})
+        fake.workflow_texts_after_recheck = {"ci.yml": self.REVIEW}
+        fake.secret_names = {"CLAUDE_CODE_OAUTH_TOKEN"}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("CLAUDE_CODE_OAUTH_TOKEN kept: ci appeared since the plan was built", err)
+        self.assertEqual(fake.deleted_secrets, [])
+
+    def test_a_secret_read_by_a_computed_name_keeps_the_token(self):
+        # `secrets[format(...)]` reads the token without spelling it; read
+        # as "unused", a forced run deleted it from under the review (Codex,
+        # mikelward/repo#96).
+        reader = self.REVIEW.replace(
+            "secrets.CLAUDE_CODE_OAUTH_TOKEN", "secrets[format('CLAUDE_{0}', 'CODE_OAUTH_TOKEN')]"
+        )
+        fake = self._fake({"claude-review.yml": reader})
+        fake.secret_names = {"CLAUDE_CODE_OAUTH_TOKEN"}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "not fixed: claude-review: claude-review names CLAUDE_CODE_OAUTH_TOKEN outside a job that "
+            "can declare the 'claude-review' environment, or reads secrets by a name this cannot see",
+            err,
+        )
+        self.assertEqual(fake.deleted_secrets, [])
+        self.assertEqual(fake.written_secrets, [])
+
+    def test_a_policy_opened_while_the_plan_waited_holds_the_move(self):
+        # The policy was right when the plan was shown, so nothing queued a
+        # restriction and nothing else re-read it: the move's own recheck
+        # asks what the environment holds, not who may enter it (Codex,
+        # mikelward/repo#96), as for the lanes pair.
+        fake = self._fake({"claude-review.yml": self.REVIEW})
+        fake.secret_names = {"CLAUDE_CODE_OAUTH_TOKEN"}
+        fake.env_secret_names = {"claude-review": {"CLAUDE_CODE_OAUTH_TOKEN"}}
+        fake.env_policies = {"claude-review": ["main"]}
+        # Opened between the plan's read and the apply's.
+        fake.env_policies_after_read = {"claude-review": (2, None)}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("environment 'claude-review' now can be reached from any branch", err)
+        self.assertEqual(fake.deleted_secrets, [])
+        self.assertEqual(fake.env_puts, [])
+
+    def test_a_policy_opened_during_the_write_takes_it_back_out(self):
+        # The window left after the recheck: the token goes in, then the
+        # policy is read once more before the repository copy is deleted.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _secret_file(tmp, "token.txt", b"oauth-example")
+            fake = self._fake({"claude-review.yml": self.REVIEW})
+            fake.secret_names = {"CLAUDE_CODE_OAUTH_TOKEN"}
+            fake.env_secret_names = {"claude-review": set()}
+            fake.env_policies = {"claude-review": ["main"]}
+            fake.env_reopened_during_writes = {"claude-review"}
+            code, out, err = _run(
+                fake, ["--force", "--no-rules", "--credential", f"CLAUDE_CODE_OAUTH_TOKEN={path}", REPO]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("undid the write of 'CLAUDE_CODE_OAUTH_TOKEN' (environment 'claude-review')", out)
+        self.assertIn(
+            "CLAUDE_CODE_OAUTH_TOKEN kept: environment 'claude-review' can be reached from any branch "
+            "after the credential was written",
+            err,
+        )
+        self.assertEqual(fake.deleted_secrets, [("CLAUDE_CODE_OAUTH_TOKEN", "claude-review")])
+        self.assertEqual(fake.env_secret_names["claude-review"], set())
+
+    def test_a_policy_still_restricted_at_apply_time_lets_the_move_run(self):
+        # The re-read is a gate, not a refusal.
+        fake = self._fake({"claude-review.yml": self.REVIEW})
+        fake.secret_names = {"CLAUDE_CODE_OAUTH_TOKEN"}
+        fake.env_secret_names = {"claude-review": {"CLAUDE_CODE_OAUTH_TOKEN"}}
+        fake.env_policies = {"claude-review": ["main"]}
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.deleted_secrets, [("CLAUDE_CODE_OAUTH_TOKEN", None)])
+
+
 if __name__ == "__main__":
     unittest.main()
