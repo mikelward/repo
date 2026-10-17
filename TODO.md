@@ -628,6 +628,25 @@
       `CLAUDE.md` gets made, and what happens where one already exists as
       a symlink.
 
+- [ ] **Scaffold a `GEMINI.md` too.** Gemini / Antigravity reads
+      `GEMINI.md`, and the scaffold writes only `CLAUDE.md` (`@AGENTS.md`,
+      `_CLAUDE_MD` in `repo_lib/scaffold.py`), so a freshly created
+      repository gives that client no conventions -- the gap the item
+      above closed for Claude. Flagged as the follow-up in
+      mikelward/conf#422; this repository's own `GEMINI.md` is a symlink
+      to `AGENTS.md`. Settle first whether Antigravity honors an
+      `@AGENTS.md` import line the way Claude Code does, or needs the
+      symlink.
+
+- [ ] **Fail CI when `AGENTS.md` reaches 24,000 bytes.** Antigravity caps
+      rule files at 24 KB and silently truncates the tail, so a rule
+      appended past the cap is lost with nothing to say so. Add
+      `test "$(wc -c < AGENTS.md)" -lt 24000` on a path CI runs for an
+      `AGENTS.md`-only change -- the `classify` job, since the docs lane
+      skips `test` -- as mikelward/stopdash#932 planned for stopdash.
+      Whether the scaffolded `ci.yml` should carry the same check for
+      every repository is the other half of the question.
+
 - [x] **The bootstrap failure names `--no-bootstrap`.** GitHub's own
       rejection, relayed verbatim, says nothing about what to do next, so
       the failure names the way past it. The cause that prompted this --
