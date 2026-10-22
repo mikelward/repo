@@ -1,7 +1,7 @@
 ---
 trigger: always_on
 alwaysApply: true
-last_modified: 2026-10-17
+last_modified: 2026-10-22
 ---
 
 # AGENTS.md
@@ -303,9 +303,11 @@ trim rather than append, and delete rules that have stopped biting.
   oldest first); they block the merge until fixed, rebutted or deferred, and an
   acknowledgment is not an answer. A pending `codex` status with nothing left to address
   -- a clean review without a reaction, an unanswered rebuttal, or no answer to a push --
-  gets one `@codex review` poke five minutes on; escalate five minutes after it rather
-  than poking twice. The `codex` commit status (`get_status`, separate from check runs)
-  is the authoritative gate.
+  gets an `@codex review` poke five minutes on, as does a review stuck at running (eyes)
+  ten minutes on; a poke that hangs the same way gets a second an hour later, and only a
+  second that hangs too is escalated, never the first (maintainer, 2026-10-22). The
+  `codex` commit status (`get_status`, separate from check runs) is the authoritative
+  gate.
 - **Once Codex +1s a PR's head, make no unnecessary change without asking** (maintainer,
   2026-10-13): a to-do, tidy-up or extra fix re-runs CI and Codex for nothing, so it waits
   for a yes or a follow-up PR. A rebase for `dirty` (or `behind` where the ruleset
