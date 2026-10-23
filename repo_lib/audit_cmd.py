@@ -896,6 +896,111 @@ def audit_secrets(repo, ok, fix):
                     f"in the environment's settings (`repo setup` rewrites no policy someone set)"
                 )
 
+    # The Claude review token, audited the way the commit-back token is --
+    # with the lanes pair's substitution above: an action step reads it, so
+    # it reaches a job through that job's own `environment:` declaration,
+    # not `secrets: inherit`, and that declaration is what each consuming
+    # job is held to. The environment is held to the default branch, as
+    # `lanes` is (repo_lib.credentials).
+    token = credentials.CLAUDE_TOKEN
+    label = credentials.CLAUDE_ENV
+    consumers = credentials.claude_consumers(texts)
+    unread = credentials.claude_unread(texts)
+    environment, env_secrets = environment_secrets(label)
+    if unread:
+        fix(
+            f"{label}: {credentials.workflow_labels(unread)} names {token} outside a job that can "
+            f"declare the '{label}' environment -- a workflow-level `env:`, a reusable workflow's "
+            f"caller, or a shape this cannot read -- or reads secrets by a name this cannot see "
+            f"(`secrets[format(...)]`, `toJSON(secrets)`), so whether it is used there cannot be "
+            f"told; read it by name in a job that declares the environment (`repo setup` moves "
+            f"or deletes nothing of it until then)"
+        )
+    elif not consumers:
+        where = []
+        if token in repo_secrets:
+            where.append("as a repository secret")
+        if token in env_secrets:
+            where.append(f"in the '{environment}' environment")
+        # Read as `repo setup` reads it: a reusable workflow this cannot
+        # read, called so that it could receive the token, holds the delete.
+        called = credentials.lanes_called_workflows(texts, repo) if where else []
+        if called:
+            fix(
+                f"{token} {' and '.join(where)}, and no workflow here reads it, but "
+                f"{credentials.workflow_labels(called)} calls a reusable workflow this cannot read, "
+                f"which may -- `repo setup` deletes nothing of it; delete it by hand if nothing "
+                f"uses it"
+            )
+        elif where:
+            fix(
+                f"{token} {' and '.join(where)}, but no workflow here reads it -- "
+                f"`repo setup {repo}` deletes it"
+            )
+    else:
+        declares = True
+        for name, verdict in sorted(consumers.items()):
+            if not verdict:
+                declares = False
+                fix(
+                    f"{label}: {credentials.workflow_label(name)} reads {token} in a job that does "
+                    f"not declare `environment: {label}`, so a token in that environment never "
+                    f"reaches it -- declare it on the job"
+                )
+        # The environment is held to the default branch, as `lanes` is,
+        # except while a reader runs on a trigger not known to run on the
+        # default branch's ref: the restriction could refuse those runs, and
+        # that trigger is the finding.
+        unrestricted = credentials.claude_unrestricted_readers(texts)
+        for name, trigger in sorted(unrestricted.items()):
+            fix(
+                f"{label}: {credentials.workflow_label(name)} reads {token} "
+                + credentials.claude_trigger_finding(trigger)
+                + f" (`repo setup` restricts the '{label}' environment only then)"
+            )
+        wrong = None
+        if environment is not None and not unrestricted:
+            try:
+                policy = credentials.environment_branch_policy(repo, environment)
+            except credentials.ReadError as e:
+                error_lines(e.message, e.detail)
+                raise SystemExit(1)
+            wrong = credentials.branch_policy_verdict(policy, default)
+            if wrong is not None and credentials.restrictable(policy):
+                fix(
+                    f"{label}: environment '{environment}' {wrong} -- a same-repository branch's "
+                    f"push-triggered workflow could declare it and read the token; "
+                    f"`repo setup {repo}` restricts it to '{default}'"
+                )
+            elif wrong is not None:
+                fix(
+                    f"{label}: environment '{environment}' {wrong} -- restrict it to '{default}' "
+                    f"in the environment's settings (`repo setup` rewrites no policy someone set)"
+                )
+        until = (
+            ""
+            if declares
+            else f" once every job reading it declares `environment: {label}`"
+        )
+        if token in repo_secrets:
+            # Reported even when the environment already holds a copy: the
+            # repository one is what reaches every job of every workflow.
+            fix(
+                f"{token} is a repository secret, which reaches every job of every workflow -- "
+                f"{move_command([token])} moves it into the '{label}' environment{until}"
+            )
+        if token in env_secrets:
+            if token not in repo_secrets and declares and wrong is None and not unrestricted:
+                ok(
+                    f"{label}: the token lives in the '{label}' environment, which admits only "
+                    f"'{default}'"
+                )
+        elif token not in repo_secrets:
+            fix(
+                f"{label}: environment '{label}' holds no {token} -- the Claude review fails on "
+                f"every pull request; {move_command([token])} sets one{until}"
+            )
+
     other = sorted(name for name in repo_secrets if name not in credentials.FLEET_CREDENTIALS)
     if other:
         print(
