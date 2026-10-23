@@ -1,7 +1,7 @@
 ---
 trigger: always_on
 alwaysApply: true
-last_modified: 2026-10-22
+last_modified: 2026-10-23
 ---
 
 # AGENTS.md
@@ -128,6 +128,11 @@ trim rather than append, and delete rules that have stopped biting.
   autosquash, squash, reorder, split) so review responses fold into their commit -- no
   `wip` / `address review` churn in `main`. `--force-with-lease` after a rebase, never a
   bare `--force`.
+- **Title commits like a changelog line** (maintainer, 2026-10-23): after any prefix, an
+  imperative verb, then the change as someone running `repo` sees it, plain English,
+  sentence case, ≤ ~70 chars, e.g. `Fix …` for what was broken, `Improve …` for what got
+  better, `Add …` for what's new; an optional parenthetical says how. Never the scenario
+  or the mechanism (that's the body). PR titles match.
 - **Merge cue (`merged` / `I merged` / `landed` / merge webhook) runs hygiene first:**
   fetch main if the sandbox can
   (`git fetch origin +refs/heads/main:refs/remotes/origin/main`; a bare fetch leaves a
