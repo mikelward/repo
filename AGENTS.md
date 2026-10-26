@@ -1,7 +1,7 @@
 ---
 trigger: always_on
 alwaysApply: true
-last_modified: 2026-10-23
+last_modified: 2026-10-26
 ---
 
 # AGENTS.md
@@ -157,10 +157,12 @@ trim rather than append, and delete rules that have stopped biting.
 
 ## Talking to the user
 
-- **Answer a mid-turn message first** -- the "sent while you were working" interjection
-  is addressed in your very next output, before any further tool call, even if it's one
+- **Answer a mid-turn message first** -- the "sent while you were working" interjection is
+  addressed in your very next output, before any further tool call, even if it's one
   sentence. A merge cue is the exception: its hygiene runs first, and announcing the
-  switch is that answer.
+  switch is that answer. **Claude Code only** (maintainer, 2026-10-25): its app reliably
+  shows just a turn's last message, so reply only there, answering a mid-turn message at a
+  stopping point soon.
 - **Message only when the user needs to see it** (maintainer, 2026-10-15): each one
   notifies their phone. Work in silence; speak up for a question or blocker, something to
   merge or act on, a merge, an autopilot decision (to review when seen, never waited on),
