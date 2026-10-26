@@ -56,9 +56,11 @@ project knowledge, and only ever does the former:
 - `AGENTS.md` is the fleet's shared agent conventions, fetched from
   `mikelward/conf`'s `agents/AGENTS.md` -- the one maintained copy, rather
   than a second one here kept in step by hand, which is the arrangement
-  this whole repository exists to replace. A generated header goes on top
-  carrying the two things no template can know (what the project is, and
-  what a contributor runs) as explicit TODOs. It carries the shared rules
+  this whole repository exists to replace. Wrapped, in the order every
+  repository's copy uses, around the two things no template can know as
+  explicit TODOs: what the project is (a description under the title,
+  below the shared front matter) and what a contributor runs (a Project
+  section after the shared rules). It carries the shared rules
   rather than deferring to a user-level file, because a freshly created
   repository is otherwise the one place in this fleet an agent works with
   no conventions loaded at all -- and a remote session does not
@@ -292,47 +294,47 @@ def _ref_missing_commits(ref_raw):
     return "HTTP 404" in ref_raw or ("HTTP 409" in ref_raw and "Git Repository is empty" in ref_raw)
 
 
-# Prepended to the fetched conventions. Everything a scaffolded repository
-# has to say for itself is a TODO here, because none of it is derivable:
-# what the project is, and what a contributor actually runs. The shared
-# conventions follow, so a repository nobody has written a word about yet
-# still gives an agent the rules the rest of the fleet works under.
-_AGENTS_HEADER = """\
-# AGENTS.md
-
-Conventions for AI agents working in this repository.
-
-`CLAUDE.md` imports this file, so every agent reads the same conventions.
-Edit `AGENTS.md`.
-
-## What this repository is
-
+# Wrapped around the fetched conventions, in the order every repository's
+# AGENTS.md uses: the shared front matter, this repository's title and
+# description, the shared conventions, then its own Project section.
+# Everything a scaffolded repository has to say for itself is a TODO,
+# because none of it is derivable: what the project is, and what a
+# contributor actually runs. The shared conventions sit between them, so a
+# repository nobody has written a word about yet still gives an agent the
+# rules the rest of the fleet works under.
+_AGENTS_DESCRIPTION = """\
 TODO: one paragraph -- what it does, what it is built with, and what a
 reader has to know before changing anything. Name the normative documents
 (`SPEC.md`, `TODO.md`, `README.md`) if there are any.
-
-## Building and testing
-
-TODO: the commands a contributor actually runs, and which one of them to
-run before every commit. `.github/workflows/ci.yml` ships with a
-placeholder job standing in for this project's real ones -- replacing it
-and describing it here are the same task.
-
-## Everything below
-
-The rest of this file was copied from this account's shared conventions
-(`mikelward/conf`, `agents/AGENTS.md`) when the repository was scaffolded,
-so it says what the rest of the fleet already does. It is this
-repository's copy now: edit it where this project genuinely differs,
-rather than treating it as something that syncs.
-
-Keep the whole file as short as it can be and still work. Every session
-loads it whole, so each rule costs context on every turn: add one the
-first time something bites, say it once in the fewest words that carry the
-*why*, rewrite or trim an existing rule rather than appending beside it,
-and delete one that has stopped biting.
-
 """
+
+_AGENTS_PROJECT = """\
+## Project
+
+- **Checks**. TODO: the commands to run before every commit.
+  `.github/workflows/ci.yml` ships with a placeholder job standing in for
+  this project's real ones: replacing it and describing it here are the
+  same task.
+"""
+
+
+def _agents_md(repo, conventions):
+    """The scaffolded AGENTS.md: `conventions`' front matter (when it has
+    one) first, since tools only read it at the top of the file, then the
+    title and the TODO description, the conventions themselves, and the
+    TODO Project section."""
+    front, body = "", conventions
+    if conventions.startswith("---\n"):
+        close = conventions.find("\n---\n", 3)
+        if close != -1:
+            front = conventions[: close + 5] + "\n"
+            body = conventions[close + 5 :]
+    name = repo.split("/")[-1]
+    return (
+        f"{front}# {name}\n\n{_AGENTS_DESCRIPTION}\n"
+        f"{body.strip()}\n\n{_AGENTS_PROJECT}"
+    )
+
 
 # Claude Code reads CLAUDE.md, not AGENTS.md, so a scaffolded repository
 # needs both. An import rather than a symlink: it is what mikelward/conf's
@@ -592,7 +594,7 @@ def build_scaffold_files(default_branch, repo):
     conventions = _fetch_file(CONVENTIONS_REPO, CONVENTIONS_PATH)
     if conventions is None:
         return None
-    files["AGENTS.md"] = _AGENTS_HEADER + conventions
+    files["AGENTS.md"] = _agents_md(repo, conventions)
     files["CLAUDE.md"] = _CLAUDE_MD
 
     files[".github/zizmor.yml"] = _ZIZMOR_POLICY
