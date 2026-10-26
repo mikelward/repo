@@ -371,8 +371,20 @@ branch while no branch-protection rule exists, and a ruleset is not one: the
 App publishes the status the ruleset requires, so an environment any branch
 can reach hands a same-repo pull request's push-triggered run the same reach
 -- an open one is a `[FIX]` that `repo setup` closes, a policy someone set
-to something else is a `[FIX]` to close by hand. A repository that does not allow auto-merge is a `[FIX]` too: the weekly
-batches arm it on their pull requests. So is one that does not delete a merged
+to something else is a `[FIX]` to close by hand. The Claude review token
+(`CLAUDE_CODE_OAUTH_TOKEN`, read by an anthropics/claude-code-action step) is
+audited the same way -- a job naming it without declaring
+`environment: claude-review` is the `[FIX]`, and so is the token named
+anywhere such a declaration cannot carry it (a workflow-level `env:`, a
+reusable workflow's caller), and the `claude-review` environment is held to
+the default branch too, since the review runs on `pull_request_target`,
+whose runs carry the base branch's ref. A reader on `pull_request` is a
+`[FIX]` of its own -- there a pull request's own copy of the workflow runs
+with the token, and the restriction would refuse those runs -- and so is one
+on any other trigger not known to run on the default branch's ref (`push`,
+`workflow_dispatch`, a reusable workflow's `workflow_call`). A repository
+that does not allow auto-merge is a `[FIX]` too: the weekly batches arm it
+on their pull requests. So is one that does not delete a merged
 pull request's head branch automatically -- without it nothing sweeps the
 branches a merge leaves behind (see `repo cleanup` below). So is one that lets
 anyone open a pull request: set to collaborators only, a stranger's branch
@@ -419,7 +431,14 @@ credential nothing uses.) A publishing job that does not declare the
 environment holds the move back; once the pair is settled, an open `lanes`
 environment is restricted to the default branch (re-sending its wait timer and
 reviewers, which the API would otherwise reset), and a policy someone set to
-anything else is reported, never rewritten.
+anything else is reported, never rewritten. The Claude review token moves the
+same way, held back by a job naming it without `environment: claude-review`,
+and is placed only where a workflow on the default branch reads it. Its
+environment is restricted to the default branch like `lanes` -- except
+while a reader runs on a trigger that can carry another ref, which is
+reported instead -- but neither that nor a policy someone set holds the
+move: an environment copy reaches only the jobs declaring it, a repository
+copy every job.
 
 Once the default branch actually publishes the `lanes` status as the App --
 an `init`/`gate`/`attest` step holding the pair -- and the run is handed
@@ -461,7 +480,7 @@ When the App's key is supplied that coverage is read *as the App* (the
 repo-scoped installation endpoint over an App JWT), so the precondition holds
 on a gh-auth token; otherwise it reads `user/installations`.
 Across a fleet:
-`repo list | xargs -n1 repo setup --force --credential NPM_UPDATE_PAT=pat.txt --credential GRADLE_UPDATE_PAT=pat.txt --credential RUST_UPDATE_PAT=pat.txt --credential CI_COMMIT_ARTIFACT_TOKEN=token.txt --credential LANES_APP_ID=app-id.txt --credential LANES_APP_PRIVATE_KEY=app.pem`.
+`repo list | xargs -n1 repo setup --force --credential NPM_UPDATE_PAT=pat.txt --credential GRADLE_UPDATE_PAT=pat.txt --credential RUST_UPDATE_PAT=pat.txt --credential CI_COMMIT_ARTIFACT_TOKEN=token.txt --credential LANES_APP_ID=app-id.txt --credential LANES_APP_PRIVATE_KEY=app.pem --credential CLAUDE_CODE_OAUTH_TOKEN=claude.txt`.
 `repo cleanup` deletes the branches a repository has finished with. It exists
 because this fleet used to leave GitHub's "automatically delete head branches"
 off with nothing else sweeping up -- mikelward/simmo reached 192 branches, 184

@@ -1425,5 +1425,189 @@ class BranchPolicyTest(unittest.TestCase):
         self.assertEqual(writes, [])
 
 
+REVIEW = """on: pull_request_target
+jobs:
+  review:
+    environment: claude-review
+    runs-on: ubuntu-latest
+    steps:
+      - uses: anthropics/claude-code-action@0123456789abcdef0123456789abcdef01234567
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+"""
+
+
+class ClaudeReaderTest(unittest.TestCase):
+    """Which workflows read the Claude review token, and whether each job
+    reading it declares the environment it moves into. A false "unused"
+    deletes the token from under the review, and a false "declares" moves
+    it where the job cannot see it, so what cannot be read is "cannot
+    tell"."""
+
+    def test_a_job_declaring_the_environment(self):
+        self.assertEqual(credentials.claude_consumers({"review.yml": REVIEW}), {"review.yml": True})
+        self.assertEqual(credentials.claude_unread({"review.yml": REVIEW}), [])
+
+    def test_the_mapping_form_of_the_declaration(self):
+        text = REVIEW.replace("environment: claude-review", "environment:\n      name: Claude-Review")
+        self.assertEqual(credentials.claude_consumers({"review.yml": text}), {"review.yml": True})
+
+    def test_a_job_without_the_declaration(self):
+        text = REVIEW.replace("    environment: claude-review\n", "")
+        self.assertEqual(credentials.claude_consumers({"review.yml": text}), {"review.yml": False})
+
+    def test_one_job_without_it_is_the_file_without_it(self):
+        text = REVIEW + (
+            "  again:\n    runs-on: ubuntu-latest\n    env:\n"
+            "      TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}\n    steps: []\n"
+        )
+        self.assertEqual(credentials.claude_consumers({"review.yml": text}), {"review.yml": False})
+
+    def test_a_workflow_not_naming_it_is_no_consumer(self):
+        text = "# CLAUDE_CODE_OAUTH_TOKEN lives in the environment\njobs:\n  build:\n    steps: []\n"
+        self.assertEqual(credentials.claude_consumers({"ci.yml": text}), {})
+        self.assertEqual(credentials.claude_unread({"ci.yml": text}), [])
+
+    def test_the_action_input_alone_is_no_reader(self):
+        # `claude_code_oauth_token` is the action's input, not this secret:
+        # a job feeding it another secret leaves this one unused.
+        text = REVIEW.replace("secrets.CLAUDE_CODE_OAUTH_TOKEN", "secrets.OTHER_TOKEN")
+        self.assertEqual(credentials.claude_consumers({"review.yml": text}), {})
+        self.assertEqual(credentials.claude_unread({"review.yml": text}), [])
+        text = REVIEW.replace("secrets.CLAUDE_CODE_OAUTH_TOKEN", "secrets.CLAUDE_CODE_OAUTH_TOKEN_2")
+        self.assertEqual(credentials.claude_consumers({"review.yml": text}), {})
+
+    def test_a_reference_outside_an_expression_is_no_reader(self):
+        # GitHub resolves `secrets` only inside `${{ }}`: prose naming it
+        # reads nothing.
+        job = (
+            "on: pull_request_target\njobs:\n  review:\n    environment: claude-review\n"
+            "    runs-on: ubuntu-latest\n    steps:\n{steps}"
+        )
+        prose = job.format(
+            steps="      - name: Document secrets.CLAUDE_CODE_OAUTH_TOKEN\n"
+            "        run: echo 'secrets.CLAUDE_CODE_OAUTH_TOKEN'\n"
+        )
+        self.assertEqual(credentials.claude_consumers({"review.yml": prose}), {})
+        self.assertEqual(credentials.claude_unread({"review.yml": prose}), [])
+        # Inside a script's expression, even spread over lines, it is one.
+        for script in (
+            "      - run: echo \"${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}\" | wc -c\n",
+            "      - run: |\n          echo \"${{\n            secrets.CLAUDE_CODE_OAUTH_TOKEN\n          }}\" | wc -c\n",
+        ):
+            text = job.format(steps=script)
+            self.assertEqual(credentials.claude_consumers({"review.yml": text}), {"review.yml": True}, script)
+
+    def test_braces_inside_an_expression_string_do_not_end_it(self):
+        # `format` takes doubled braces in its quoted template, and `''`
+        # escapes a quote; a `}}` there must not hide the reference after
+        # it, or the token reads as unused and is deleted.
+        for expression in (
+            "${{ format('{{Hello {0}!}}', secrets.CLAUDE_CODE_OAUTH_TOKEN) }}",
+            "${{ format('it''s }}', secrets.CLAUDE_CODE_OAUTH_TOKEN) }}",
+            "${{ secrets.CLAUDE_CODE_OAUTH_TOKEN",
+        ):
+            text = REVIEW.replace("${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}", f'"{expression}"')
+            self.assertEqual(credentials.claude_consumers({"review.yml": text}), {"review.yml": True}, expression)
+        # Prose after a closed expression is still prose.
+        text = REVIEW.replace(
+            "${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}", "\"${{ secrets.OTHER }} secrets.CLAUDE_CODE_OAUTH_TOKEN\""
+        )
+        self.assertEqual(credentials.claude_consumers({"review.yml": text}), {})
+
+    def test_every_spelling_of_a_reference_reads_it(self):
+        for reference in (
+            "secrets.claude_code_oauth_token",
+            "secrets['CLAUDE_CODE_OAUTH_TOKEN']",
+            'secrets[ "claude_code_oauth_token" ]',
+        ):
+            text = REVIEW.replace("secrets.CLAUDE_CODE_OAUTH_TOKEN", reference)
+            self.assertEqual(credentials.claude_consumers({"review.yml": text}), {"review.yml": True}, reference)
+
+    def test_a_workflow_level_env_is_unread(self):
+        text = "env:\n  TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}\n" + REVIEW
+        self.assertEqual(credentials.claude_unread({"review.yml": text}), ["review.yml"])
+
+    def test_a_reusable_workflow_caller_passing_it_is_unread(self):
+        # A caller job cannot declare an environment, so the token it
+        # passes by name would arrive empty once moved.
+        text = (
+            "jobs:\n  review:\n    uses: ./.github/workflows/review.yml\n    secrets:\n"
+            "      token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}\n"
+        )
+        self.assertEqual(credentials.claude_consumers({"ci.yml": text}), {})
+        self.assertEqual(credentials.claude_unread({"ci.yml": text}), ["ci.yml"])
+
+    def test_a_rejected_document_naming_it_is_unread(self):
+        text = "jobs: {review: {env: {T: '${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}'}\n"
+        self.assertEqual(credentials.claude_consumers({"review.yml": text}), {})
+        self.assertEqual(credentials.claude_unread({"review.yml": text}), ["review.yml"])
+
+    def test_a_secret_read_by_a_name_this_cannot_see_is_unread(self):
+        # Each can read the token without spelling it, so none is "unused"
+        # (Codex, mikelward/repo#96).
+        for expression in (
+            "${{ secrets[format('CLAUDE_{0}', 'CODE_OAUTH_TOKEN')] }}",
+            "${{ secrets[env.NAME] }}",
+            "${{ toJSON(secrets) }}",
+            "${{ toJSON(SECRETS.*) }}",
+            "${{ secrets }}",
+        ):
+            text = REVIEW.replace("${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}", f'"{expression}"')
+            self.assertEqual(credentials.claude_consumers({"review.yml": text}), {}, expression)
+            self.assertEqual(credentials.claude_unread({"review.yml": text}), ["review.yml"], expression)
+        # In a job that does not read the token, it still holds the file.
+        text = REVIEW + "  dump:\n    runs-on: ubuntu-latest\n    env:\n      ALL: ${{ toJSON(secrets) }}\n"
+        self.assertEqual(credentials.claude_unread({"review.yml": text}), ["review.yml"])
+
+    def test_a_secret_read_by_a_name_this_can_see_is_not_unread(self):
+        for expression in (
+            "${{ secrets.OTHER_TOKEN }}",
+            "${{ secrets['OTHER_TOKEN'] }}",
+            "${{ steps.secrets.outputs.token }}",
+            "${{ inputs.use-secrets }}",
+            "${{ env.SECRETS_DIR }}",
+            "${{ contains(github.event.head_commit.message, 'toJSON(secrets)') }}",
+        ):
+            text = REVIEW.replace("${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}", f'"{expression}"')
+            self.assertEqual(credentials.claude_unread({"review.yml": text}), [], expression)
+        # Prose outside an expression reads nothing.
+        text = REVIEW.replace("${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}", '"toJSON(secrets)"')
+        self.assertEqual(credentials.claude_unread({"review.yml": text}), [])
+
+    def test_a_reader_on_pull_request_or_workflow_call_is_named(self):
+        # Every spelling of `on:` that lists the event; pull_request_target,
+        # which runs the base branch's copy, is neither.
+        readers = credentials.claude_unrestricted_readers
+        self.assertEqual(readers({"review.yml": REVIEW}), {})
+        for trigger in ("on: pull_request", "on: [push, pull_request]", "on:\n  pull_request:\n    types: [opened]"):
+            text = REVIEW.replace("on: pull_request_target", trigger)
+            self.assertEqual(readers({"review.yml": text}), {"review.yml": "pull_request"}, trigger)
+        # A reusable reader runs on its caller's ref, which is not traced.
+        text = REVIEW.replace("on: pull_request_target", "on: workflow_call")
+        self.assertEqual(readers({"review.yml": text}), {"review.yml": "workflow_call"})
+        # Positive evidence only: push runs on any branch, so it blocks too,
+        # beside events that do run on the default branch.
+        text = REVIEW.replace("on: pull_request_target", "on: [pull_request_target, push, schedule]")
+        self.assertEqual(readers({"review.yml": text}), {"review.yml": "push"})
+        text = REVIEW.replace("on: pull_request_target", "on: [pull_request_target, schedule]")
+        self.assertEqual(readers({"review.yml": text}), {})
+        # repository_dispatch runs on the default branch; workflow_dispatch
+        # runs on whichever branch it was dispatched to.
+        text = REVIEW.replace("on: pull_request_target", "on: [repository_dispatch, check_suite]")
+        self.assertEqual(readers({"review.yml": text}), {})
+        text = REVIEW.replace("on: pull_request_target", "on: [repository_dispatch, workflow_dispatch]")
+        self.assertEqual(readers({"review.yml": text}), {"review.yml": "workflow_dispatch"})
+        # No readable `on:` at all is no evidence either.
+        text = REVIEW.replace("on: pull_request_target\n", "")
+        self.assertEqual(readers({"review.yml": text}), {"review.yml": None})
+        # A workflow on pull_request that does not read the token is not one.
+        self.assertEqual(readers({"ci.yml": "on: pull_request\njobs:\n  b:\n    steps: []\n"}), {})
+
+    def test_it_is_a_fleet_credential_homed_in_its_environment(self):
+        self.assertIn("CLAUDE_CODE_OAUTH_TOKEN", credentials.FLEET_CREDENTIALS)
+        self.assertEqual(credentials.home_environment("claude_code_oauth_token"), "claude-review")
+
+
 if __name__ == "__main__":
     unittest.main()

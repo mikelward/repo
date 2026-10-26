@@ -211,7 +211,14 @@ setup`, always on unless a flag opts the repository out:
   deleted (recorded first). `--no-rules` opts out; `--rule` names a
   different check set to add.
 - **Fleet credentials in their environments**, each restricted to the
-  default branch, with no repository-level copy left behind.
+  default branch, with no repository-level copy left behind. The Claude
+  review token's `claude-review` environment is restricted only on positive
+  evidence that it can be -- every workflow reading the token runs only on
+  events whose runs carry the default branch's ref (`pull_request_target`,
+  `schedule`, ...), since the restriction refuses any other ref: a
+  `pull_request` run's `refs/pull/<n>/merge`, a `push` to another branch, a
+  reusable workflow's caller's -- and its token is planned apart from the
+  lanes pair, so a hold on one never stops the other.
 - **Auto-merge** and **delete branch on merge** enabled.
 - **Opening a pull request restricted to collaborators.** `all` lets
   anyone with a fork open one, and its head is then a ref the fleet's
@@ -409,6 +416,23 @@ do, and none of them is caused by a run:
 - A branch that already requires a check whose publisher is missing from
   it (a state that predates the tool): every pull request there is stuck
   until someone who can bypass the rule lands the workflow.
+- The Claude review token (`CLAUDE_CODE_OAUTH_TOKEN`) in a workflow shape
+  the move cannot serve. Each holds only that token's step, and each needs
+  the workflow changed, never the invocation:
+  - named where no job's `environment: claude-review` can carry it (a
+    workflow-level `env:`, a reusable workflow's caller): nothing is moved
+    or deleted, since whether it is used there cannot be told;
+  - read by a job that does not declare `environment: claude-review`: the
+    move is held, since the token would not reach that job;
+  - read on a trigger that can carry another ref (`pull_request`, `push`,
+    `workflow_call`, ...): the move goes ahead, but the restriction to the
+    default branch waits until the reader runs only on default-ref events,
+    since it could refuse those runs;
+  - a `claude-review` branch policy someone set to anything but the default
+    branch: reported, never rewritten -- restrict it by hand;
+  - a copy nothing here reads while a reusable workflow this cannot read
+    could receive it: kept, not deleted as unused -- delete it by hand if
+    nothing uses it.
 - A `lanes` check bound to a different App than the supplied
   `LANES_APP_ID`: the run refuses to switch the credential and to re-point
   the binding, so the switch never leads the requirement. Re-point by hand;
