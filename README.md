@@ -231,9 +231,9 @@ exceptions policy and `.github/lanes.conf` docs/code split those imply, and a
 `ci.yml` wiring `mikelward/lanes`'s classify+gate job pair with a trivial
 placeholder standing in for the project's real jobs, carrying the comment
 that says how to replace it. It also writes `AGENTS.md` -- this account's
-shared agent conventions, fetched from `mikelward/conf`, under a generated
-header whose two sections (what the project is, what a contributor runs)
-are left as TODOs -- and a `CLAUDE.md` that imports it, so a brand-new
+shared agent conventions, fetched from `mikelward/conf`, between a TODO
+description of the project (under its title) and a TODO Project section
+saying what a contributor runs -- and a `CLAUDE.md` that imports it, so a brand-new
 repository is not the one place an agent works with no conventions at
 all. `lanes` and `zizmor` report from the scaffold's own CI run; `codex`
 needs a pull request whose BASE branch already carries its workflow,

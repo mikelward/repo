@@ -9765,6 +9765,35 @@ class BootstrapStepTest(unittest.TestCase):
         self.assertIn("TODO: one paragraph", agents)
         self.assertIn("Fake shared conventions", agents)
         self.assertEqual(blobs["CLAUDE.md"], "@AGENTS.md\n")
+        # The order every repository's AGENTS.md uses: its title and
+        # description, the shared conventions, then its own section.
+        self.assertTrue(agents.startswith("# repo\n\nTODO: one paragraph"), agents)
+        self.assertLess(agents.index("TODO: one paragraph"), agents.index("Fake shared conventions"))
+        self.assertLess(agents.index("Fake shared conventions"), agents.index("## Project"))
+
+    def test_the_scaffolded_conventions_keep_the_shared_front_matter_on_top(self):
+        # Tools read front matter only at the very top of the file, so the
+        # title and description go after it, not before.
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set()
+        fake.conventions_content = (
+            "---\ntrigger: always_on\n---\n\n## Fleet conventions\n\n- Fake shared conventions.\n"
+        )
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        tree_posts = [body for _args, body in fake.posts if "base_tree" in body]
+        blob_posts = [body for _args, body in fake.posts if "encoding" in body]
+        blobs = {entry["path"]: body["content"] for entry, body in zip(tree_posts[0]["tree"], blob_posts)}
+        self.assertEqual(
+            [e["path"] for e in tree_posts[0]["tree"]], sorted(blobs), "blob order assumption"
+        )
+        self.assertTrue(
+            blobs["AGENTS.md"].startswith(
+                "---\ntrigger: always_on\n---\n\n# repo\n\nTODO: one paragraph"
+            ),
+            blobs["AGENTS.md"],
+        )
+        self.assertEqual(blobs["AGENTS.md"].count("---\n"), 2)
 
     def test_an_unreadable_conventions_source_fails_the_scaffold(self):
         # Fail-closed like every other template source: a scaffold missing
