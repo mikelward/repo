@@ -340,6 +340,117 @@ def audit_auto_merge(repo, ok, fix):
         )
 
 
+# The scaffold workflows `repo setup` renders the default branch's name into
+# (scaffold._CI_YML, and zizmor.yml through scaffold._branches_line).
+SCAFFOLD_PUSH_FILTERED_WORKFLOWS = ("ci.yml", "zizmor.yml")
+
+# Characters that make a GitHub branch filter a pattern rather than a name.
+_FILTER_PATTERN_CHARS = frozenset("*?+[]!")
+
+
+def _push_coverage(document):
+    """Which pushes a parsed workflow runs on, as ("none",) for no push
+    trigger at all, ("all",) for a push trigger with no branch or tag
+    filter, ("branches", [names]) for a filter of literal branch names and
+    nothing else, or ("unevaluated", why) for anything else.
+
+    Deliberately not an evaluator of GitHub's filter language. Its globs
+    are not fnmatch's -- `*` stops at `/`, and `?` and `+` mean other
+    things -- and `branches-ignore`, `tags` and `!` entries each change
+    what a missing key means; three review findings on the first version
+    were each one of those read as coverage (Codex, mikelward/repo#103).
+    What this exists to catch is the literal name `repo setup` writes, so
+    that shape is judged and every other one is said to be unjudged.
+
+    PyYAML reads an unquoted `on:` key as YAML 1.1's boolean true, so both
+    spellings are looked up."""
+    if not isinstance(document, dict):
+        return ("unevaluated", "its triggers are not a shape this can read")
+    triggers = document.get("on", document.get(True))
+    if isinstance(triggers, str):
+        triggers = [triggers]
+    if isinstance(triggers, list):
+        return ("all",) if "push" in triggers else ("none",)
+    if not isinstance(triggers, dict):
+        return ("unevaluated", "its triggers are not a shape this can read")
+    if "push" not in triggers:
+        return ("none",)
+    push = triggers["push"]
+    if push is None:
+        return ("all",)
+    if not isinstance(push, dict):
+        return ("unevaluated", "its push trigger is not a shape this can read")
+    ref_keys = {"branches", "branches-ignore", "tags", "tags-ignore"} & set(push)
+    if not ref_keys:
+        return ("all",)
+    if ref_keys != {"branches"}:
+        return ("unevaluated", f"its push trigger filters with {', '.join(sorted(ref_keys))}")
+    branches = push["branches"]
+    if isinstance(branches, str):
+        branches = [branches]
+    if not isinstance(branches, list) or not all(isinstance(b, str) for b in branches):
+        return ("unevaluated", "its push branch filter is not a shape this can read")
+    if any(_FILTER_PATTERN_CHARS & set(b) for b in branches):
+        return ("unevaluated", f"its push branch filter {branches!r} uses patterns")
+    return ("branches", branches)
+
+
+def audit_push_filters(repo, default, ok, gap, note):
+    """Whether the scaffold workflows still run on pushes to the default
+    branch.
+
+    `repo setup` renders the default branch's name into their push
+    filters when it adds them, and never touches them again -- the
+    scaffold only adds a path that is absent. So renaming or switching the
+    default branch leaves the filter naming the old one, and the workflow
+    runs on no merge: CI and the zizmor scan silently stop covering what
+    lands, with every pull request still green. Found on mikelward/mmail,
+    whose scaffold was generated while a feature branch was the default.
+
+    Only the literal-name shape is judged (see _push_coverage). Any other
+    filter is a [CHECK]: something to look at, not a verdict this guessed."""
+    try:
+        entries = credentials.workflow_entries(repo, default)
+    except credentials.ReadError as e:
+        # Can't-tell is a gap here, as for an unverifiable App binding: the
+        # audit has verified nothing about these filters, and a note would
+        # let it pass (mikelward/repo#75).
+        gap(f"could not tell whether the scaffold workflows run on pushes to '{default}' -- "
+            f"{e.message} {e.detail.strip()}")
+        return
+    for name in SCAFFOLD_PUSH_FILTERED_WORKFLOWS:
+        if name not in entries:
+            continue
+        path = f".github/workflows/{name}"
+        try:
+            text = credentials.workflow_text(repo, name, default)
+        except credentials.ReadError as e:
+            gap(f"could not tell whether {path} runs on pushes to '{default}' -- "
+                f"{e.message} {e.detail.strip()}")
+            continue
+        document = credentials._document(text)
+        coverage = (
+            ("unevaluated", "it is not YAML this can parse")
+            if document is credentials._REJECTED
+            else _push_coverage(document)
+        )
+        kind = coverage[0]
+        if kind == "all":
+            ok(f"{path} runs on pushes to every branch, '{default}' included")
+        elif kind == "branches" and default in coverage[1]:
+            ok(f"{path} runs on pushes to '{default}'")
+        elif kind == "branches":
+            gap(
+                f"{path}'s push filter names {coverage[1]!r}, not the default branch "
+                f"'{default}' -- it runs on no merge; `repo setup` adds this file but never "
+                "rewrites it, so retarget the filter by hand"
+            )
+        elif kind == "none":
+            gap(f"{path} has no push trigger, so it runs on no merge to '{default}'")
+        else:
+            note(f"whether {path} runs on pushes to '{default}' is not evaluated: {coverage[1]}")
+
+
 def audit_delete_branch_on_merge(repo, ok, fix):
     """Whether the repository deletes a pull request's head branch once it
     merges. Off, nothing sweeps the branches a merged pull request leaves
@@ -1462,6 +1573,7 @@ def run(args):
 
     audit_duplicate_rulesets(repo, ok, note)
     audit_legacy_rulesets(repo, ok, fix)
+    audit_push_filters(repo, default, ok, gap, note)
     audit_auto_merge(repo, ok, fix)
     audit_delete_branch_on_merge(repo, ok, fix)
     audit_pull_request_creation_policy(repo, ok, fix, gap)

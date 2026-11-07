@@ -2006,6 +2006,97 @@ class PullRequestCreationPolicyAuditTest(unittest.TestCase):
         self.assertNotIn("may open a pull request", out)
 
 
+class PushFilterAuditTest(unittest.TestCase):
+    """`repo setup` renders the default branch's name into the scaffold
+    workflows' push filters and never rewrites them, so a default branch
+    that changes afterward leaves CI and the zizmor scan running on no
+    merge at all, with every pull request still green (found on
+    mikelward/mmail)."""
+
+    CI = "name: ci\non:\n  push:\n    branches: [{}]\n  pull_request:\njobs: {{}}\n"
+
+    def _with(self, **texts):
+        fake = FakeGh()
+        fake.workflow_files = list(texts)
+        fake.workflow_texts = dict(texts)
+        return fake
+
+    def test_a_filter_naming_the_default_branch_is_ok(self):
+        fake = self._with(**{"ci.yml": self.CI.format("main"), "zizmor.yml": self.CI.format('"main"')})
+        code, out, err = _run(fake, [REPO])
+        self.assertIn("[ok] .github/workflows/ci.yml runs on pushes to 'main'", out)
+        self.assertIn("[ok] .github/workflows/zizmor.yml runs on pushes to 'main'", out)
+        self.assertNotIn("push filter names", out)
+
+    def test_a_filter_naming_another_branch_is_a_gap(self):
+        # The real case: generated while a feature branch was the default.
+        fake = self._with(**{"ci.yml": self.CI.format('"claude/old-default"')})
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 1, err)
+        self.assertIn(
+            "[GAP] .github/workflows/ci.yml's push filter names ['claude/old-default'], not the "
+            "default branch 'main' -- it runs on no merge",
+            out,
+        )
+
+    def test_an_unfiltered_push_trigger_is_ok(self):
+        for on in ("on: [push, pull_request]", "on: push", "on:\n  push:\n  pull_request:"):
+            fake = self._with(**{"ci.yml": f"{on}\njobs: {{}}\n"})
+            code, out, err = _run(fake, [REPO])
+            self.assertIn("[ok] .github/workflows/ci.yml runs on pushes to every branch", out, on)
+
+    def test_no_push_trigger_is_a_gap_not_an_unfiltered_one(self):
+        # A pull_request-only workflow never runs on a merge; reading the
+        # missing filter as "every branch" was a false all-clear (Codex,
+        # mikelward/repo#103).
+        for on in ("on: pull_request", "on: [pull_request]", "on:\n  pull_request:"):
+            fake = self._with(**{"ci.yml": f"{on}\njobs: {{}}\n"})
+            code, out, err = _run(fake, [REPO])
+            self.assertEqual(code, 1, on)
+            self.assertIn(
+                "[GAP] .github/workflows/ci.yml has no push trigger, so it runs on no merge", out, on
+            )
+
+    def test_other_ref_filters_are_not_evaluated(self):
+        # branches-ignore, and a tags-only filter -- which GitHub reads as
+        # "no branch pushes" -- each change what a missing `branches:`
+        # means; neither may read as coverage (Codex, mikelward/repo#103).
+        for push in ("branches-ignore: [main]", "tags: ['v*']", "branches: [main]\n    tags: ['v*']"):
+            fake = self._with(**{"ci.yml": f"on:\n  push:\n    {push}\njobs: {{}}\n"})
+            code, out, err = _run(fake, [REPO])
+            self.assertIn("[CHECK] whether .github/workflows/ci.yml runs on pushes to 'main'", out, push)
+            self.assertNotIn("[ok] .github/workflows/ci.yml runs on pushes", out, push)
+
+    def test_a_pattern_is_not_evaluated(self):
+        # GitHub's `*` stops at `/` and its `?` and `+` are not fnmatch's,
+        # so `release/*` would have "covered" release/team/main (Codex,
+        # mikelward/repo#103). Only the literal name repo setup writes is
+        # judged; `**` and `!` exclusions are reported, not guessed.
+        for branches in ('"**"', '"release/*"', '"main", "!main"'):
+            fake = self._with(**{"ci.yml": self.CI.format(branches)})
+            code, out, err = _run(fake, [REPO])
+            self.assertIn("uses patterns", out, branches)
+            self.assertNotIn("[ok] .github/workflows/ci.yml runs on pushes", out, branches)
+
+    def test_an_unreadable_file_is_a_gap_not_a_pass(self):
+        # Can't-tell fails the audit, as an unverifiable App binding does:
+        # a note would let a stale filter through unseen.
+        fake = self._with(**{"ci.yml": self.CI.format("main")})
+        fake.workflow_text_fails = {"ci.yml"}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 1, err)
+        self.assertIn(
+            "[GAP] could not tell whether .github/workflows/ci.yml runs on pushes to 'main'", out
+        )
+
+    def test_a_workflow_outside_the_scaffold_is_not_checked(self):
+        # A repository's own workflow may filter to a release branch on
+        # purpose; only the two files `repo setup` renders are its business.
+        fake = self._with(**{"release.yml": self.CI.format('"release"')})
+        code, out, err = _run(fake, [REPO])
+        self.assertNotIn("release.yml", out)
+
+
 class LanesCredentialAuditTest(unittest.TestCase):
     """The lanes App pair, audited like the other fleet credentials, plus
     the environment it lives in: the App publishes the required status, so
