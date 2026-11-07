@@ -96,7 +96,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
 from typing import Optional
 
-from repo_lib import apps, common, config, credentials, gh, rules, scaffold, secrets_cmd
+from repo_lib import apps, common, config, credentials, gh, rules, scaffold, secrets_cmd, tag_rules
 from repo_lib.common import error, error_lines, info, warn
 
 # The lookaheads reject `.` and `..` components: made of allowed
@@ -166,7 +166,9 @@ def add_arguments(parser):
         action="store_true",
         help="ignore the config file's apps for this run (skips the App step)",
     )
-    parser.add_argument("--no-rules", action="store_true", help="skip the ruleset step")
+    parser.add_argument(
+        "--no-rules", action="store_true", help="skip the ruleset steps (the branch's and release tags')"
+    )
     parser.add_argument(
         "--no-bootstrap",
         action="store_true",
@@ -1916,6 +1918,13 @@ def _run(args, log=None):
     delete_branch_state, delete_branch_lines = _plan_delete_branch_on_merge(repo)
     _progress(args, f"{repo}: checking who may open a pull request")
     pr_policy_state, pr_policy_lines = _plan_pull_request_creation_policy(repo)
+    # Like the three settings above, nothing waits on it and it gates
+    # nothing, so it lands on the first run. A ruleset, so --no-rules skips
+    # it with the branch's.
+    tag_plan = None
+    if not args.no_rules:
+        _progress(args, f"{repo}: checking the release tag ruleset")
+        tag_plan = tag_rules.plan(repo)
 
     # Always on, like credentials and auto-merge: there is nothing to
     # request here either, only one right state (the fleet's scaffold
@@ -2583,6 +2592,9 @@ def _run(args, log=None):
         if full or pr_policy_state != "restricted":
             lines.append("  pull request creation:")
             lines += [f"    {line}" for line in pr_policy_lines]
+        if tag_plan is not None and (full or tag_plan.state != "protected"):
+            lines.append("  release tags:")
+            lines += [f"    {line}" for line in tag_plan.lines]
         wedged = wedged_branch_warning() if not args.no_bootstrap else None
         if not args.no_bootstrap and (full or not bootstrap_idle or wedged):
             lines.append("  bootstrap (fleet CI scaffold):")
@@ -2610,6 +2622,7 @@ def _run(args, log=None):
             or auto_merge_state == "error"
             or delete_branch_state == "error"
             or pr_policy_state == "error"
+            or (tag_plan is not None and tag_plan.state == "error")
             or (bootstrap_plan is not None and bootstrap_plan.error)
             or (bootstrap_plan is not None and bootstrap_plan.missing_workflow_scope)
             or empty_branch_would_strand_ruleset
@@ -2695,6 +2708,7 @@ def _run(args, log=None):
         or auto_merge_state == "enable"
         or delete_branch_state == "enable"
         or pr_policy_state == "restrict"
+        or (tag_plan is not None and tag_plan.state in ("create", "update"))
         or (
             bootstrap_plan is not None
             and not bootstrap_plan.error
@@ -3679,6 +3693,21 @@ def _run(args, log=None):
             for line in pr_policy_lines:
                 error(line)
         failed.append("pull-request-creation")
+
+    if tag_plan is not None and tag_plan.state in ("create", "update"):
+        tag_done, tag_lines = tag_rules.apply(repo, tag_plan)
+        for line in tag_lines:
+            if tag_done:
+                print(f"{repo}: {line}")
+            else:
+                error(line)
+        if not tag_done:
+            failed.append("release-tags")
+    elif tag_plan is not None and tag_plan.state == "error":
+        if not show_plan:
+            for line in tag_plan.lines:
+                error(line)
+        failed.append("release-tags")
 
     # Said last, from what the run actually left behind rather than from
     # what it planned. Six rounds went on deciding it earlier and each was

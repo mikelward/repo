@@ -99,7 +99,7 @@ import json
 import re
 import urllib.parse
 
-from repo_lib import apps, credentials, gh, rules
+from repo_lib import apps, credentials, gh, rules, tag_rules
 from repo_lib.common import error, error_lines
 
 # Same shape as setup_cmd.py's/secrets_cmd.py's own OWNER_REPO_RE -- kept
@@ -518,6 +518,29 @@ def audit_pull_request_creation_policy(repo, ok, fix, gap):
             f"could not tell who may open a pull request on {repo} -- GitHub reported "
             f"'{value}', which this tool does not recognize; check the setting by hand"
         )
+
+
+def audit_release_tags(repo, ok, fix, gap):
+    """Whether a pushed `v*` tag stays where it was pushed. The question
+    is tag_rules.plan's, asked rather than restated: one definition of
+    "protected" for the audit and the setup step that converges on it.
+
+    Missing or short of the standard, it is a [FIX], since `repo setup`
+    closes it. Anything that plan refuses to touch -- a ruleset under the
+    name that is turned off, aimed at branches, or excludes every `v*`
+    tag -- is a [GAP]: no setup run resolves a person's decision, so it
+    fails the audit. So does a read that did not complete, which says
+    nothing either way about the tags."""
+    plan = tag_rules.plan(repo)
+    if plan.state == "protected":
+        ok(tag_rules.PROTECTED_LINE)
+    elif plan.state in ("create", "update"):
+        fix(
+            f"a v* tag on {repo} can be moved or deleted, so a pin on a release could build "
+            f"different code later; `repo setup {repo}` will {plan.lines[0]}"
+        )
+    else:
+        gap(" ".join(line.strip() for line in plan.lines))
 
 
 def _setup_stops(blocked):
@@ -1577,6 +1600,7 @@ def run(args):
     audit_auto_merge(repo, ok, fix)
     audit_delete_branch_on_merge(repo, ok, fix)
     audit_pull_request_creation_policy(repo, ok, fix, gap)
+    audit_release_tags(repo, ok, fix, gap)
     audit_secrets(repo, ok, fix)
 
     if gap_found[0]:

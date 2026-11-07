@@ -11,7 +11,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from unittest.mock import patch
 
-from repo_lib import apps, gh, rules, scaffold, setup_cmd
+from repo_lib import apps, gh, rules, scaffold, setup_cmd, tag_rules
 from repo_lib.cli import main
 
 REPO = "owner/repo"
@@ -112,6 +112,23 @@ _SCAFFOLD_PATHS = (
 )
 
 _OWNERSHIP_JQ = ".enforcement, .target"
+
+
+def _tag_ruleset(**changes):
+    """A release tag ruleset as GitHub returns one, already at the
+    standard unless `changes` say otherwise."""
+    ruleset = {
+        "id": 801,
+        "name": tag_rules.TAG_RULESET_NAME,
+        "target": "tag",
+        "source_type": "Repository",
+        "enforcement": "active",
+        "conditions": {"ref_name": {"include": ["refs/tags/v*"], "exclude": []}},
+        "rules": [{"type": "update"}, {"type": "deletion"}],
+        "bypass_actors": [],
+    }
+    ruleset.update(changes)
+    return ruleset
 
 
 def _check_run(entry):
@@ -289,6 +306,18 @@ class FakeGh:
         self._sibling_reads = 0
         self.puts = []
         self.posts = []
+        # The release tag ruleset (repo_lib.tag_rules), kept apart from the
+        # branch ruleset above: id -> ruleset. Present and correct by
+        # default, so a test about anything else sees it converged.
+        self.tag_rulesets = {"801": _tag_ruleset()}
+        # Replaces tag_rulesets from the second by-name lookup on: someone
+        # changing it between the plan and the write.
+        self.tag_rulesets_later = None
+        self._tag_lookups = 0
+        self.tag_ruleset_lookup_fails = False
+        self.tag_ruleset_read_fails = False
+        self.tag_ruleset_write_fails = False
+        self.tag_ruleset_writes = []  # (method, endpoint, body)
         self.fail_default_branch = False
         self.fail_allow_rebase = False
 
@@ -667,6 +696,20 @@ class FakeGh:
         endpoint, method, jq = _parse_api_args(args[1:])
         if "/compare/" in endpoint and jq == ".status":
             return self.merge_landed + "\n"
+
+        if _RULESETS_LOOKUP_RE.match(endpoint) and json.dumps(tag_rules.TAG_RULESET_NAME) in (jq or ""):
+            if self.tag_ruleset_lookup_fails:
+                raise gh.GhError("gh: HTTP 500: Internal Server Error\n")
+            self._tag_lookups += 1
+            if self._tag_lookups >= 2 and self.tag_rulesets_later is not None:
+                self.tag_rulesets = self.tag_rulesets_later
+                self.tag_rulesets_later = None
+            return "".join(f"{rid}\n" for rid in self.tag_rulesets)
+        m = _RULESET_ONE_RE.match(endpoint)
+        if m and m.group(2) in self.tag_rulesets and method is None:
+            if self.tag_ruleset_read_fails:
+                raise gh.GhError("gh: HTTP 500: Internal Server Error\n")
+            return json.dumps(self.tag_rulesets[m.group(2)])
 
         m = _DEFAULT_BRANCH_RE.match(endpoint)
         if m and jq == ".default_branch":
@@ -1409,6 +1452,16 @@ class FakeGh:
         assert args[0] == "api", args
         endpoint, method, _jq = _parse_api_args(args[1:])
         body = json.loads(input_bytes.decode())
+        m = _RULESET_ONE_RE.match(endpoint)
+        if (method == "POST" and endpoint == f"repos/{REPO}/rulesets" and body.get("target") == "tag") or (
+            method == "PUT" and m and m.group(2) in self.tag_rulesets
+        ):
+            if self.tag_ruleset_write_fails:
+                raise gh.GhError("gh: HTTP 422: Validation Failed\n")
+            self.tag_ruleset_writes.append((method, endpoint, body))
+            rid = m.group(2) if m else "802"
+            self.tag_rulesets[rid] = {**body, "id": int(rid)}
+            return json.dumps({**body, "id": int(rid)}).encode()
         if method == "PUT":
             m = _SCAFFOLD_PULL_MERGE_RE.match(endpoint)
             if m:
@@ -9614,6 +9667,223 @@ class PullRequestCreationPolicyStepTest(unittest.TestCase):
         )
         self.assertIn("failed on: pull-request-creation", err)
         self.assertEqual(fake.patches, [])
+
+
+class ReleaseTagRulesetStepTest(unittest.TestCase):
+    """A pushed `v*` tag stays where it was pushed: one tag ruleset, named
+    tag_rules.TAG_RULESET_NAME, restricting updates and deletions. Like the
+    settings above it gates nothing and waits on nothing, so it lands on the
+    first run; as a ruleset, --no-rules skips it."""
+
+    CREATED = {
+        "name": "release tags",
+        "target": "tag",
+        "enforcement": "active",
+        "conditions": {"ref_name": {"include": ["refs/tags/v*"], "exclude": []}},
+        "rules": [{"type": "update"}, {"type": "deletion"}],
+        "bypass_actors": [],
+    }
+
+    def _fake(self, **tag_ruleset):
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        fake.tag_rulesets = {"801": _tag_ruleset(**tag_ruleset)} if tag_ruleset else {}
+        return fake
+
+    def test_a_protected_repository_needs_nothing(self):
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        code, out, err = _run(fake, ["--force", REPO])
+        self.assertEqual(fake.tag_ruleset_writes, [])
+        self.assertNotIn("release tags", out + err)
+        code, out, err = _run(fake, ["--dry-run", "-v", REPO])
+        self.assertIn(
+            "  release tags:\n    already: no one may move or delete a tag matching v* "
+            "(ruleset 'release tags')\n",
+            out,
+        )
+
+    def test_a_missing_ruleset_is_created_after_confirmation(self):
+        fake = self._fake()
+        code, out, err = _run(fake, ["--no-bootstrap", REPO])
+        self.assertEqual(code, 1)
+        # Shown as part of the plan the run asks about, and not written
+        # without an answer.
+        self.assertIn("  release tags:\n    create ruleset 'release tags'", err)
+        self.assertIn("stdin is not a terminal", err)
+        self.assertEqual(fake.tag_ruleset_writes, [])
+        code, out, err = _run(fake, ["--force", "--no-bootstrap", REPO])
+        self.assertEqual(
+            fake.tag_ruleset_writes, [("POST", f"repos/{REPO}/rulesets", self.CREATED)]
+        )
+        self.assertIn(
+            f"{REPO}: created ruleset 'release tags': no one may move or delete a tag matching v*",
+            out,
+        )
+        self.assertNotIn("failed on: release-tags", err)
+
+    def test_a_dry_run_reports_without_writing(self):
+        fake = self._fake()
+        code, out, err = _run(fake, ["--dry-run", REPO])
+        self.assertIn(
+            "  release tags:\n    create ruleset 'release tags': no one may move or delete a "
+            "tag matching v*\n",
+            out,
+        )
+        self.assertEqual(fake.tag_ruleset_writes, [])
+
+    def test_an_existing_ruleset_gains_only_what_it_lacks(self):
+        # The standard is a floor: a rule a person added, an include of
+        # their own and the bypass list all stay as they were.
+        bypass = [{"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}]
+        fake = self._fake(
+            conditions={"ref_name": {"include": ["refs/tags/release-*"], "exclude": []}},
+            rules=[{"type": "update"}, {"type": "required_signatures"}],
+            bypass_actors=bypass,
+        )
+        code, out, err = _run(fake, ["--force", "--no-bootstrap", REPO])
+        self.assertEqual(len(fake.tag_ruleset_writes), 1)
+        method, endpoint, body = fake.tag_ruleset_writes[0]
+        self.assertEqual((method, endpoint), ("PUT", f"repos/{REPO}/rulesets/801"))
+        self.assertEqual(
+            body["conditions"]["ref_name"],
+            {"include": ["refs/tags/release-*", "refs/tags/v*"], "exclude": []},
+        )
+        self.assertEqual(
+            body["rules"],
+            [{"type": "update"}, {"type": "required_signatures"}, {"type": "deletion"}],
+        )
+        self.assertEqual(body["bypass_actors"], bypass)
+        self.assertIn(
+            f"{REPO}: updated ruleset 'release tags' (id 801): cover refs/tags/v*, "
+            "stop a tag being deleted",
+            out,
+        )
+
+    def _assert_held(self, fake, message):
+        # Refused, nothing written to it, counted failed -- and every other
+        # step still makes its progress.
+        fake.pull_request_creation_policy = "all"
+        code, out, err = _run(fake, ["--force", "--no-bootstrap", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(message, err)
+        self.assertIn("release-tags", err)
+        self.assertEqual(fake.tag_ruleset_writes, [])
+        self.assertEqual(
+            [body for _args, body in fake.patches],
+            [{"pull_request_creation_policy": "collaborators_only"}],
+        )
+
+    def test_a_ruleset_of_that_name_on_branches_is_left_for_a_person(self):
+        self._assert_held(
+            self._fake(target="branch"),
+            f"ruleset 'release tags' (id 801) on {REPO} targets 'branch', not tags",
+        )
+
+    def test_a_disabled_ruleset_is_left_for_a_person(self):
+        self._assert_held(
+            self._fake(enforcement="disabled"),
+            f"ruleset 'release tags' (id 801) on {REPO} is 'disabled', not 'active'",
+        )
+
+    def test_an_exclude_of_every_v_tag_is_left_for_a_person(self):
+        self._assert_held(
+            self._fake(conditions={"ref_name": {"include": ["refs/tags/v*"], "exclude": ["refs/tags/v*"]}}),
+            "excludes refs/tags/v*, which takes every v* tag back out of it",
+        )
+
+    def test_a_broader_exclude_of_every_v_tag_is_left_for_a_person(self):
+        # GitHub matches an exclude as a pattern: refs/tags/* takes every
+        # v* tag out as surely as refs/tags/v* does (Codex, mikelward/repo#105).
+        self._assert_held(
+            self._fake(conditions={"ref_name": {"include": ["refs/tags/v*"], "exclude": ["refs/tags/*"]}}),
+            "excludes refs/tags/*, which takes every v* tag back out of it",
+        )
+
+    def test_a_narrower_exclude_stays_a_persons_decision(self):
+        fake = self._fake(conditions={"ref_name": {"include": ["refs/tags/v*"], "exclude": ["refs/tags/v0.0.*"]}})
+        code, out, err = _run(fake, ["--force", "--no-bootstrap", REPO])
+        self.assertNotIn("release-tags", err)
+        self.assertEqual(fake.tag_ruleset_writes, [])
+
+    def test_an_exclude_matching_only_the_patterns_spelling_is_narrow(self):
+        # refs/tags/v? matches the text "refs/tags/v*" -- its ? takes the
+        # * -- but excludes only one-character tags, never v1.2.3. So the
+        # ruleset is still the tool's to complete (Codex, mikelward/repo#105).
+        fake = self._fake(
+            conditions={"ref_name": {"include": ["refs/tags/v*"], "exclude": ["refs/tags/v?"]}},
+            rules=[{"type": "update"}],
+        )
+        code, out, err = _run(fake, ["--force", "--no-bootstrap", REPO])
+        self.assertNotIn("takes every v* tag back out", err)
+        self.assertEqual([w[0] for w in fake.tag_ruleset_writes], ["PUT"])
+        self.assertEqual(
+            fake.tag_ruleset_writes[0][2]["conditions"]["ref_name"]["exclude"], ["refs/tags/v?"]
+        )
+
+    def test_a_rule_removed_since_the_plan_is_not_put_back(self):
+        # The write the plan meant and the one a fresh plan means can be
+        # the same while the ruleset itself is not: someone removing the
+        # one rule it had leaves a fresh plan asking for both, exactly as
+        # before. What was read is compared, not what would be written
+        # (Codex, mikelward/repo#105).
+        fake = self._fake(rules=[{"type": "update"}])
+        fake.tag_rulesets_later = {"801": _tag_ruleset(rules=[])}
+        code, out, err = _run(fake, ["--force", "--no-bootstrap", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(f"ruleset 'release tags' on {REPO} changed since this run read it", err)
+        self.assertEqual(fake.tag_ruleset_writes, [])
+
+    def test_a_failed_lookup_fails_this_step_alone(self):
+        # A lookup that could not complete is never "there is none": a
+        # second ruleset under the name would be the result.
+        fake = self._fake()
+        fake.tag_ruleset_lookup_fails = True
+        self._assert_held(
+            fake,
+            f"could not list {REPO}'s rulesets, so cannot tell whether 'release tags' already exists",
+        )
+
+    def test_a_failed_write_fails_the_step(self):
+        fake = self._fake()
+        fake.tag_ruleset_write_fails = True
+        code, out, err = _run(fake, ["--force", "--no-bootstrap", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(f"could not create ruleset 'release tags' on {REPO}:", err)
+        self.assertIn("failed on:", err)
+        self.assertIn("release-tags", err)
+
+    def test_a_ruleset_changed_since_the_plan_is_not_overwritten(self):
+        # Someone adds a ruleset of their own between the plan and the
+        # write: the run leaves it as they left it, and the next run plans
+        # from it.
+        fake = self._fake()
+        fake.tag_rulesets_later = {"801": _tag_ruleset(rules=[{"type": "update"}])}
+        code, out, err = _run(fake, ["--force", "--no-bootstrap", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            f"ruleset 'release tags' on {REPO} changed since this run read it, so nothing was "
+            "written",
+            err,
+        )
+        self.assertEqual(fake.tag_ruleset_writes, [])
+
+    def test_two_rulesets_of_the_name_write_only_the_first(self):
+        fake = self._fake(rules=[{"type": "update"}])
+        fake.tag_rulesets["802"] = _tag_ruleset(id=802)
+        code, out, err = _run(fake, ["--force", "-v", "--no-bootstrap", REPO])
+        self.assertEqual([w[1] for w in fake.tag_ruleset_writes], [f"repos/{REPO}/rulesets/801"])
+        self.assertIn(
+            "1 more ruleset named 'release tags' (id 802) left as it is; this run reads and writes id 801",
+            err,
+        )
+
+    def test_no_rules_skips_it(self):
+        fake = self._fake()
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake._tag_lookups, 0)
+        self.assertEqual(fake.tag_ruleset_writes, [])
 
 
 class BootstrapStepTest(unittest.TestCase):

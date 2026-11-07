@@ -384,15 +384,22 @@ interaction limit the setting does not expire. A value that is neither `all`
 nor `collaborators_only` is a `[GAP]` rather than a pass -- an absent or
 unfamiliar one reads exactly like a repository that is already restricted, and
 no `repo setup` run resolves a value nobody understands, so unlike the `[FIX]`
-findings it fails the audit.
+findings it fails the audit. A repository whose `v*` tags can be moved or
+deleted is a `[FIX]`: a pin on a release would build different code. A ruleset
+named `release tags` that is turned off, aimed at branches, or excludes every
+`v*` tag is a `[GAP]`, since that is a person's decision.
 `[FIX]` findings do
 not fail the audit yet (see `TODO.md`): the layout is being rolled out through
 `repo setup`.
 
 `repo setup` makes the move, enables auto-merge and delete-branch-on-merge
 on the repository where either is off, and restricts opening a pull request to
-collaborators where anyone may. That last step fails rather than writes when
-GitHub reports a policy it does not recognize. Its fleet-credentials step is always on: for
+collaborators where anyone may. That step fails rather than writes when
+GitHub reports a policy it does not recognize. It also keeps a tag ruleset,
+`release tags`, that stops anyone moving or deleting a tag matching `v*`
+(creating one stays open, as every release job does); an existing one keeps
+what it has and gains only what it lacks, and `--no-rules` skips it with the
+branch ruleset. Its fleet-credentials step is always on: for
 each batch the repository runs (by whichever workflows call it from a job,
 whatever they are named, on the default branch) and for the
 commit-back workflow (by a job calling it), a value passed as

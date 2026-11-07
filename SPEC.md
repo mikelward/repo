@@ -210,6 +210,18 @@ setup`, always on unless a flag opts the repository out:
   its old name. A legacy-named duplicate is adopted or
   deleted (recorded first). `--no-rules` opts out; `--rule` names a
   different check set to add.
+- **One tag ruleset named `release tags`**, targeting `refs/tags/v*`:
+  no one may move or delete a `v*` tag. A release is named by its tag,
+  and whatever pins one trusts it to name the same commit for good.
+  Creating a tag stays open, since every release job creates its own, and
+  none in the fleet moves or deletes one. It requires no check and gates
+  no merge, so it has no place in the ladder below and lands on the first
+  run. Like the branch ruleset it is a floor: an existing one gains the
+  pattern or rules it lacks and keeps everything else, its bypass list
+  included. One turned off, aimed at branches, or excluding every `v*` tag
+  is a person's decision, held and reported, and every other step still
+  runs. A ruleset that changed between the plan and the write is left as
+  it is, for the next run. `--no-rules` opts out, with the branch ruleset.
 - **Fleet credentials in their environments**, each restricted to the
   default branch, with no repository-level copy left behind.
 - **Auto-merge** and **delete branch on merge** enabled.
@@ -399,6 +411,8 @@ do, and none of them is caused by a run:
   pairing (the operator naming the App's slug for its id), but coverage then
   waits for a token that can make the installations read.
 - A legacy-named ruleset whose merge methods conflict with rebase.
+- A `release tags` ruleset that is turned off, aimed at branches, or
+  excludes every `v*` tag: turn it on, rename it, or remove the exclude.
 - A Vercel project unlinked, or its App's access removed, after the last
   push to the default branch and before a run -- the one entry here a run
   can cause: Vercel's status still on that head is what says the
