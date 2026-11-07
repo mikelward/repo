@@ -340,7 +340,10 @@ repository's real default branch -- whether every covering ruleset also
 targets `refs/heads/main` and `refs/heads/master`, whether a ruleset under
 a name this tool used before `main` is still there, and whether more than
 one ruleset carries the name `main` at all) already hold, without writing
-anything. It also audits where secrets live. The fleet's shared credentials -- the
+anything. It also checks that the scaffold's `ci.yml` and `zizmor.yml` still
+run on pushes to the default branch: `repo setup` writes the branch's name
+into their push filters and never rewrites them, so a default branch that
+changes afterward leaves both running on no merge at all. It also audits where secrets live. The fleet's shared credentials -- the
 weekly dependency batches' `<HUB>_PAT` (or `<HUB>_APP_ID` +
 `<HUB>_APP_PRIVATE_KEY` pair, for mikelward/npm-update, gradle-update and
 rust-update) and mikelward/ci-commit-artifact's `CI_COMMIT_ARTIFACT_TOKEN`
