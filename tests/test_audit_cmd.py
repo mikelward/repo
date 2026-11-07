@@ -8,7 +8,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from unittest.mock import patch
 
-from repo_lib import apps, gh, rules
+from repo_lib import apps, gh, rules, tag_rules
 from repo_lib.cli import main
 
 REPO = "owner/repo"
@@ -118,6 +118,21 @@ class FakeGh:
         self.effective_rules_pages = None
         self.ruleset_ids = []
         self.ruleset_objects = {}  # id -> ruleset dict
+        # The release tag ruleset (repo_lib.tag_rules), kept apart from the
+        # branch rulesets above so a test that sets those wholesale still
+        # sees it: id -> ruleset, at the standard by default.
+        self.tag_rulesets = {
+            "801": {
+                "id": 801,
+                "name": tag_rules.TAG_RULESET_NAME,
+                "target": "tag",
+                "enforcement": "active",
+                "conditions": {"ref_name": {"include": ["refs/tags/v*"], "exclude": []}},
+                "rules": [{"type": "update"}, {"type": "deletion"}],
+                "bypass_actors": [],
+            }
+        }
+        self.tag_rulesets_lookup_fails = None  # gh stderr text, or None
         self.ruleset_read_fails = set()  # ids whose read fails
         self.rulesets_list_fails = None  # gh stderr text, or None
         self.rulesets_lookup_fails = None  # the by-name lookup's own failure
@@ -310,6 +325,14 @@ class FakeGh:
             page_m = re.search(r"[&?]page=(\d+)", endpoint)
             page = int(page_m.group(1)) if page_m else 1
             return "".join(sha + "\n" for sha in shas[(page - 1) * 100 : page * 100])
+
+        if _RULESETS_LOOKUP_RE.match(endpoint) and json.dumps(tag_rules.TAG_RULESET_NAME) in (jq or ""):
+            if self.tag_rulesets_lookup_fails is not None:
+                raise gh.GhError(self.tag_rulesets_lookup_fails)
+            return "".join(f"{rid}\n" for rid in self.tag_rulesets)
+        m = _RULESET_ONE_RE.match(endpoint)
+        if m and m.group(2) in self.tag_rulesets:
+            return json.dumps(self.tag_rulesets[m.group(2)])
 
         if _RULESETS_LOOKUP_RE.match(endpoint) or (
             _RULESETS_ALL_RE.match(endpoint) and jq and "select(.name ==" in jq
@@ -2004,6 +2027,55 @@ class PullRequestCreationPolicyAuditTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn(f"could not read who may open a pull request on {REPO}:", err)
         self.assertNotIn("may open a pull request", out)
+
+
+class ReleaseTagAuditTest(unittest.TestCase):
+    def test_protected_tags_are_ok(self):
+        code, out, err = _run(FakeGh(), [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "[ok] no one may move or delete a tag matching v* (ruleset 'release tags')", out
+        )
+
+    def test_no_ruleset_is_a_fix_naming_setup(self):
+        fake = FakeGh()
+        fake.tag_rulesets = {}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            f"[FIX] a v* tag on {REPO} can be moved or deleted, so a pin on a release could "
+            f"build different code later; `repo setup {REPO}` will create ruleset 'release "
+            "tags': no one may move or delete a tag matching v*",
+            out,
+        )
+
+    def test_a_ruleset_short_of_the_standard_is_a_fix(self):
+        fake = FakeGh()
+        fake.tag_rulesets["801"]["rules"] = [{"type": "update"}]
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("will update ruleset 'release tags' (id 801): stop a tag being deleted", out)
+
+    def test_a_disabled_ruleset_fails_the_audit(self):
+        # A person turned it off; no setup run overrides that, so it is a
+        # [GAP], not a [FIX].
+        fake = FakeGh()
+        fake.tag_rulesets["801"]["enforcement"] = "disabled"
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(f"[GAP] ruleset 'release tags' (id 801) on {REPO} is 'disabled'", out)
+        self.assertNotIn("no one may move or delete a tag", out)
+
+    def test_a_failed_lookup_fails_the_audit(self):
+        fake = FakeGh()
+        fake.tag_rulesets_lookup_fails = "gh: HTTP 500: boom\n"
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            f"[GAP] could not list {REPO}'s rulesets, so cannot tell whether 'release tags' "
+            "already exists: gh: HTTP 500: boom",
+            out,
+        )
 
 
 class PushFilterAuditTest(unittest.TestCase):
