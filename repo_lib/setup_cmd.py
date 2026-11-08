@@ -162,6 +162,14 @@ def add_arguments(parser):
         "--no-config", action="store_true", help="ignore the fleet config file"
     )
     parser.add_argument(
+        "--rotate",
+        action="store_true",
+        help=(
+            "rewrite every supplied credential, even one already in its environment "
+            "(without it, a credential already there is left as it is)"
+        ),
+    )
+    parser.add_argument(
         "--no-app",
         action="store_true",
         help="ignore the config file's apps for this run (skips the App step)",
@@ -500,7 +508,7 @@ class CredentialsPlan:
     lanes_binding: Optional[int] = None
 
 
-def _plan_credentials(repo, specs):
+def _plan_credentials(repo, specs, rotate=False):
     """Where each fleet credential is on `repo`, against where it belongs
     (repo_lib.credentials has the reasoning), and what closes the gap:
 
@@ -599,11 +607,20 @@ def _plan_credentials(repo, specs):
 
     def move(
         label, names, listed, env_secrets, env, caller_desc, inherits, usable, suggest, recheck,
-        how=None, hint="convert the caller to `secrets: inherit` first",
+        how=None, hint="convert the caller to `secrets: inherit` first", keep=True,
     ):
         at_repo = [name for name in names if name in repo_secrets]
         in_env = [name for name in names if name in env_secrets]
-        supplied = [name for name in names if name in given]
+        # A supplied value whose credential the environment already holds
+        # is left there unless this run rotates: GitHub never returns a
+        # secret's value, so rewriting it on every run would make every
+        # run a change -- a prompt, a log and a line per credential on a
+        # repository already in shape (SPEC.md). It still counts as held,
+        # since the environment has it either way.
+        kept = [
+            name for name in names if name in given and name in in_env and keep and not rotate
+        ]
+        supplied = [name for name in names if name in given and name not in kept]
         held_after = set(in_env) | set(supplied)
         # A caller that names its secrets is a problem whenever there is
         # something the environment holds or would hold: a value to set, a
@@ -670,7 +687,11 @@ def _plan_credentials(repo, specs):
                     f"{label}: delete repository secret {name} -- the '{env}' environment holds "
                     f"the credential{' once set' if supplied else ''}"
                 )
-            if not supplied and not at_repo:
+            for name in kept:
+                plan.lines.append(
+                    f"{label}: {name} already in environment '{env}'; kept (--rotate rewrites it)"
+                )
+            if not supplied and not at_repo and not kept:
                 plan.lines.append(f"{label}: the credential lives in the '{env}' environment")
         else:
             flags = " ".join(f"--credential {name}=PATH" for name in suggest(held_after))
@@ -1118,6 +1139,14 @@ def _plan_credentials(repo, specs):
             f"from a job that does not declare `environment: {label}`"
         ),
         hint="declare the environment on every job that takes `app-id` first",
+        # The supplied id is also what `lanes` gets bound to, so a pair the
+        # environment holds is kept only when the binding already names
+        # that App: the binding then already agrees with whatever pair is
+        # there. Anywhere else, keeping it could leave the environment
+        # authenticating as one App while the ruleset requires another --
+        # every merge blocked (Codex, mikelward/repo#107) -- so the pair is
+        # written as before and the binding follows it.
+        keep=_lanes_bound_to(repo, given.get(app_id)),
     )
     if len(plan.unfixed) > unfixed_before:
         # The move refused -- a publisher without the environment, or no
@@ -1325,6 +1354,32 @@ def _plan_credentials(repo, specs):
             plan.lanes_binding = int(supplied_id)
 
     return plan
+
+
+def _lanes_bound_to(repo, spec):
+    """Whether the default branch's effective rules already require `lanes`
+    from the App whose id `spec` (a supplied LANES_APP_ID) holds. False when
+    nothing was supplied, the id is not a number, or the rules cannot be
+    read: each of those falls back to writing the pair, which is what every
+    run did before a kept credential existed."""
+    if spec is None or not spec.value:
+        return False
+    text = spec.value.decode(errors="replace").strip()
+    if not text.isdigit():
+        return False
+    try:
+        for rule in rules.effective_rules(repo, credentials.default_branch(repo)):
+            if rule.get("type") != "required_status_checks":
+                continue
+            for entry in (rule.get("parameters") or {}).get("required_status_checks") or []:
+                if (
+                    entry.get("context") == credentials.LANES_CHECK
+                    and str(entry.get("integration_id")) == text
+                ):
+                    return True
+    except (rules.RulesetError, credentials.ReadError):
+        return False
+    return False
 
 
 def _bind_checks(checks, lanes_binding):
@@ -1897,7 +1952,7 @@ def _run(args, log=None):
     # closes a gap it found; a repository already in shape costs the reads
     # and nothing more.
     _progress(args, f"{repo}: checking fleet credentials")
-    credentials_plan = _plan_credentials(repo, credential_specs)
+    credentials_plan = _plan_credentials(repo, credential_specs, rotate=args.rotate)
     # The main ruleset step requires `checks` with `lanes` UNBOUND (an existing
     # App binding is preserved, never stripped). When the credential step found
     # the default branch publishes `lanes` as the App and was handed the id, a
@@ -2588,10 +2643,21 @@ def _run(args, log=None):
                 # --no-rules, where refuse_credential_repoint is the only signal
                 # -- here), so say so rather than leaving the section promising a
                 # write that is held.
-                lines.append(
-                    f"    HELD: the `{credentials.LANES_CHECK}` credential switch above is not made "
-                    f"this run -- setup does not re-point an existing binding to a different App"
-                )
+                if lanes_move_planned:
+                    lines.append(
+                        f"    HELD: the `{credentials.LANES_CHECK}` credential switch above is not "
+                        f"made this run -- setup does not re-point an existing binding to a "
+                        f"different App"
+                    )
+                else:
+                    # Nothing is being written: the environment's pair was
+                    # kept, so there is no switch to hold -- only a supplied
+                    # id that disagrees with the binding.
+                    lines.append(
+                        f"    HELD: the supplied {credentials.LANES_APP_ID} names a different App "
+                        f"than `{credentials.LANES_CHECK}` is bound to; nothing is switched -- "
+                        f"setup does not re-point an existing binding to a different App"
+                    )
             if not credentials_plan.lines and not credentials_plan.unfixed:
                 lines.append("    nothing to do")
         if full or auto_merge_state != "allowed":

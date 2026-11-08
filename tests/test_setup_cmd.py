@@ -8358,6 +8358,67 @@ class LanesCredentialStepTest(unittest.TestCase):
         self.assertNotIn("does not re-point", out + err)
         self.assertNotIn("not switched", err)
 
+    def _bound_to(self, app):
+        return [
+            {
+                "type": "required_status_checks",
+                "parameters": {
+                    "required_status_checks": [
+                        {"context": "lanes", "integration_id": app},
+                        {"context": "codex"},
+                        {"context": "zizmor"},
+                    ]
+                },
+            }
+        ]
+
+    def _supply_pair(self, fake, extra=()):
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            return _run(
+                fake,
+                [
+                    "--force", "--no-rules", *extra,
+                    "--credential", f"LANES_APP_ID={app_id}",
+                    "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                    REPO,
+                ],
+            )
+
+    def test_a_pair_already_bound_to_the_supplied_app_is_kept(self):
+        # `lanes` already requires the supplied App, so the binding agrees
+        # with whatever pair the environment holds: keeping it is safe, and
+        # an in-shape repository writes nothing.
+        fake = self._publisher()
+        fake.secret_names = set()
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        fake.env_policies = {"lanes": ["main"]}
+        fake.effective_rules = self._bound_to(12345)
+        code, out, err = self._supply_pair(fake)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.written_secrets, [])
+        code, out, err = self._supply_pair(fake, ["--rotate"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(
+            sorted(w[0] for w in fake.written_secrets), ["LANES_APP_ID", "LANES_APP_PRIVATE_KEY"]
+        )
+
+    def test_a_pair_not_yet_bound_is_written_so_the_binding_matches_it(self):
+        # Unbound, the supplied id is what `lanes` gets bound to; keeping
+        # the environment's pair could leave it authenticating as another
+        # App than the one required, blocking every merge (Codex,
+        # mikelward/repo#107). So the pair is written, --rotate or not.
+        fake = self._publisher()
+        fake.secret_names = set()
+        fake.env_secret_names = {"lanes": set(self.PAIR)}
+        fake.env_policies = {"lanes": ["main"]}
+        code, out, err = self._supply_pair(fake)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(
+            sorted(w[0] for w in fake.written_secrets), ["LANES_APP_ID", "LANES_APP_PRIVATE_KEY"]
+        )
+
     def test_a_re_point_to_a_different_app_is_refused(self):
         # setup does not re-point: `lanes` is already bound to App 55 and this
         # run supplies App 12345, so the run REFUSES -- it does not switch the
@@ -8948,6 +9009,66 @@ class CredentialsStepTest(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertIn("gradle-update: the credential lives in the 'gradle-update' environment", out)
         self.assertNotIn("NOT FIXED", out)
+
+    def test_a_supplied_credential_already_in_place_is_kept(self):
+        # GitHub never returns a secret's value, so a supplied credential the
+        # environment already holds is left there: rewriting it on every run
+        # made every run a change -- a prompt, a log and a line -- on a
+        # repository already in shape (SPEC.md). A run with nothing else to
+        # do needs no confirmation and says nothing.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _secret_file(tmp, "pat.txt", b"ghp_example")
+            fake = self._consumer()
+            fake.env_secret_names = {"gradle-update": {"GRADLE_UPDATE_PAT"}}
+            fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+            code, out, err = _run(
+                fake, ["--no-rules", "--credential", f"GRADLE_UPDATE_PAT={path}", REPO]
+            )
+            self.assertEqual(code, 0, err)
+            self.assertEqual(fake.written_secrets, [])
+            self.assertEqual(fake.deleted_secrets, [])
+            self.assertEqual(out + err, "")
+            code, out, err = _run(
+                fake, ["--dry-run", "-v", "--credential", f"GRADLE_UPDATE_PAT={path}", REPO]
+            )
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "gradle-update: GRADLE_UPDATE_PAT already in environment 'gradle-update'; kept "
+            "(--rotate rewrites it)",
+            out,
+        )
+
+    def test_rotate_rewrites_a_supplied_credential_already_in_place(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _secret_file(tmp, "pat.txt", b"ghp_rotated")
+            fake = self._consumer()
+            fake.env_secret_names = {"gradle-update": {"GRADLE_UPDATE_PAT"}}
+            fake.check_runs = {fake.default_head_sha: ["lanes", "codex", "zizmor"]}
+            code, out, err = _run(
+                fake, ["--force", "-v", "--rotate", "--credential", f"GRADLE_UPDATE_PAT={path}", REPO]
+            )
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "gradle-update: set GRADLE_UPDATE_PAT in environment 'gradle-update' "
+            "(OVERWRITES an existing value)",
+            err,
+        )
+        self.assertEqual(
+            fake.written_secrets, [("GRADLE_UPDATE_PAT", REPO, "gradle-update", b"ghp_rotated")]
+        )
+
+    def test_a_kept_credential_still_justifies_deleting_the_repository_copy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _secret_file(tmp, "pat.txt", b"ghp_example")
+            fake = self._consumer()
+            fake.secret_names = {"GRADLE_UPDATE_PAT"}
+            fake.env_secret_names = {"gradle-update": {"GRADLE_UPDATE_PAT"}}
+            code, out, err = _run(
+                fake, ["--force", "--no-rules", "--credential", f"GRADLE_UPDATE_PAT={path}", REPO]
+            )
+        self.assertEqual(code, 0, err)
+        self.assertEqual(fake.written_secrets, [])
+        self.assertEqual(fake.deleted_secrets, [("GRADLE_UPDATE_PAT", None)])
 
     def test_without_a_value_the_move_is_reported_as_not_fixed(self):
         fake = self._consumer()
