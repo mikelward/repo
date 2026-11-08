@@ -327,6 +327,8 @@ class FakeGh:
         # so one switch for "this repo cannot be read at all".
         self.repo_missing = False
         self.repo_id = "999"
+        # repos/{repo} --jq .archived: the guard setup reads before anything else.
+        self.archived = "false"
 
         # -- secrets step state --
         self.secret_names = set()  # repo-level secret names, at preview time
@@ -736,6 +738,10 @@ class FakeGh:
             ):
                 branch = self.default_branch_after_bootstrap_plan
             return branch + "\n"
+        if m and jq == ".archived":
+            if self.repo_missing:
+                raise gh.GhError("gh: HTTP 404: Not Found\n")
+            return self.archived + "\n"
         if m and jq == ".allow_auto_merge":
             if self.fail_allow_auto_merge or self.repo_missing:
                 raise gh.GhError("gh: HTTP 404: Not Found\n")
@@ -9426,6 +9432,38 @@ class CredentialsStepTest(unittest.TestCase):
         code, out, err = _run(fake, ["--force", "--no-rules", "--credential", "RANDOM_TOKEN=x", REPO])
         self.assertIn("CI_COMMIT_ARTIFACT_TOKEN (environment 'ci-commit-artifact')", err)
         self.assertIn("--secret NAME[@ENV]=PATH sets it where you say", err)
+
+
+class ArchivedRepositoryTest(unittest.TestCase):
+    """An archived repository refuses every write, so setup stops before
+    planning anything for it (SPEC.md)."""
+
+    def test_an_archived_repository_is_skipped_untouched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _secret_file(tmp, "value.txt")
+            fake = FakeGh()
+            fake.archived = "true"
+            fake.allow_auto_merge = "false"
+            fake.workflow_files = []
+            code, out, err = _run(fake, ["--force", "--secret", f"TOKEN@lanes={path}", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"{REPO}: archived, so nothing to set up", out + err)
+        self.assertEqual(fake.patches, [])
+        self.assertEqual(fake.posts, [])
+        self.assertEqual(fake.puts, [])
+        self.assertEqual(fake.written_secrets, [])
+        # Past the archived flag, nothing about the repository is read.
+        reads = [c for c in fake.calls if c[:1] == ["api"] and REPO in " ".join(c)]
+        self.assertEqual(reads, [["api", f"repos/{REPO}", "--jq", ".archived"]])
+
+    def test_an_unarchived_repository_is_set_up_as_before(self):
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        fake.allow_auto_merge = "false"
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("archived", out + err)
+        self.assertEqual(len(fake.patches), 1)
 
 
 class AutoMergeStepTest(unittest.TestCase):
