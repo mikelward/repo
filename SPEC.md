@@ -30,6 +30,14 @@ flags. If converging the fleet needs anyone to vary the invocation, or to
 run it once with one set of flags and again with another, the tool is
 broken, not the workflow.
 
+An archived repository is outside the fleet: GitHub refuses every write
+to it, and nothing on it converges. `repo list` already leaves archived
+repositories out, and `repo setup` itself checks before anything else: an
+archived repository gets one line saying so and exits 0, with nothing read
+past that flag, nothing written and no credential command run. A repository
+that cannot be read at all is not skipped this way -- each step reports
+its own failure, as before.
+
 The convergence invocation is `--force` plus the fleet's `--credential`
 set (and `--rule`/`--app` where the fleet wants them). Those are safe to
 pass to every repository: a `--credential` for a reusable workflow this

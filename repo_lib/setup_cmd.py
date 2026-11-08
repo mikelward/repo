@@ -1836,6 +1836,17 @@ def _run(args, log=None):
     if args.app:
         apps.require_installations_readable(args.app)
 
+    # An archived repository refuses every write, so a run against it can
+    # only plan changes it cannot make -- and open a scaffold pull request
+    # nobody can merge. Checked before anything else touches the
+    # repository, a `command:` credential included (it may be slow or
+    # paid). A failed read is not a verdict either way: the steps below
+    # read the same repository and each reports its own failure.
+    ok, archived = gh.try_run(["api", f"repos/{args.repo}", "--jq", ".archived"])
+    if ok and archived.strip() == "true":
+        info(f"{args.repo}: archived, so nothing to set up")
+        return 0
+
     # A config `{ command: [...] }` credential resolves its value by running the
     # command -- only NOW, once the invocation is validated and gh is
     # authenticated, so a possibly paid, slow, or interactive fetch is never spent
