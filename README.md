@@ -19,7 +19,10 @@ at the standard, fully set up and with every protection in place, with
 nothing waiting on a person that a later run could settle and nothing left
 in a state a later run cannot fix. The command is never tailored per
 repository; a `--credential` for a reusable workflow this repository does
-not call is reported unused rather than written. (`--secret` is not a
+not call is reported unused rather than written, and one its environment
+already holds is left as it is -- so a repository already in shape prints
+nothing and asks nothing. After changing a credential's value, run the
+loop once with `--rotate` to rewrite it everywhere. (`--secret` is not a
 convergence flag -- it writes its value to every repository it is given --
 and the lanes App pair is placed ahead of its workflow by design. Re-pointing
 an existing lanes binding to a different App is the one hold a rerun does not
@@ -202,7 +205,7 @@ repo list [--owner OWNER] [--include-forks] [--include-archived]
 repo create (--private|--public) [--no-scaffold] OWNER/REPO
 repo secrets --name NAME [--env ENV] --file PATH [--force] OWNER/REPO...
 repo setup [--dry-run] [--force|--no-force] [-v|--verbose] [--no-rules]
-           [--no-bootstrap] [--config FILE] [--no-config] [--no-app]
+           [--no-bootstrap] [--config FILE] [--no-config] [--no-app] [--rotate]
            [--log FILE] [--no-log] [--rule CHECK]...
            [--secret NAME[@ENV]=PATH]... [--credential NAME=PATH]...
            [--app SLUG]... OWNER/REPO

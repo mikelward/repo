@@ -17,11 +17,18 @@ every repository --
 held, and the run exits 0. After a few passes every repository is at the
 fleet standard: fully set up, with every protection in place.
 
-The stopping condition is "no gaps left", not "wrote nothing". A supplied
-`--credential` is rewritten on every pass: GitHub never reveals a secret's
-value, so whether the one already there matches is unanswerable and the
-write is always attempted. A loop that waited for a run to make no writes
-at all would never stop.
+The stopping condition is "no gaps left", and a repository with none
+writes nothing and says nothing. A supplied `--credential` is written
+only where its environment lacks it: GitHub never reveals a secret's
+value, so whether the one already there matches is unanswerable, and
+rewriting it on every pass made every run a change -- a prompt, a log and
+a line per credential -- on a repository already in shape. A credential
+whose value has changed is therefore rotated deliberately, by one fleet
+pass with `--rotate`, which rewrites every supplied credential wherever it
+is used. Until then the environment keeps the old value. The lanes App
+pair is the exception: its id is also what `lanes` is bound to, so the pair
+is kept only once `lanes` already requires that App, and is otherwise
+written so the binding and the pair can never name different Apps.
 
 That is the whole product. An operator never tailors the command to a
 repository -- never `--no-rules` for this one and a shorter `--credential`
@@ -375,6 +382,10 @@ repository in it: passed identically everywhere, and a `--credential` no
 workflow there calls is reported unused rather than written. A flag that
 has to be varied per repository, or left off for some, contradicts the
 contract above.
+
+`--rotate` is passed for one pass when a credential's value changes, and
+identically everywhere; it is not part of the steady loop, which would
+then rewrite every credential on every run again.
 
 `--secret` is the exception and is not a convergence flag: it writes to
 every repository it is given, unconditionally (GitHub never returns a
