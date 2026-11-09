@@ -263,7 +263,10 @@ one run each, and every rung is a state the repository can sit in safely:
    before anything else; the ruleset is not written past that push
    failing, or past a run that could not plan the scaffold and so cannot
    say whether the branch is empty: pull-request protection on a branch
-   nothing can push to is the one wedge no rerun undoes.
+   nothing can push to is the one wedge no rerun undoes. The fleet
+   credentials are then read again, so they are placed against the
+   workflows that push added rather than held as changed since the plan;
+   a move the fresh read would make differently is still held.
 1. The scaffold's missing (or outdated) files go in as a pull request.
    The ruleset is written in the same run with everything that is safe
    now: pull-request protection, linear history, force-push protection,

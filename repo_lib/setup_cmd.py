@@ -93,7 +93,7 @@ import re
 import subprocess
 import sys
 from contextlib import redirect_stderr, redirect_stdout
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional
 
 from repo_lib import apps, common, config, credentials, gh, rules, scaffold, secrets_cmd, tag_rules
@@ -506,6 +506,47 @@ class CredentialsPlan:
     # LANES_APP_ID credential value), so the ruleset step can require the check
     # from that App rather than any producer of the name.
     lanes_binding: Optional[int] = None
+
+
+def _move_signature(move):
+    """What a CredentialMove changes, without the recheck that guards it."""
+    return (
+        move.label,
+        [(name, env, value) for name, env, value, _exists in move.writes],
+        list(move.deletes),
+        move.restrict,
+        move.shut,
+    )
+
+
+def _replan_credentials_after_scaffold(repo, confirmed, specs, rotate):
+    """`confirmed` with its rechecks re-anchored to the default branch as
+    this run's own scaffold left it.
+
+    Only a move the fresh plan makes identically is replaced: that is the
+    move the operator agreed to, now guarded against what the branch holds
+    after the push rather than before it. A move that would differ keeps
+    its old recheck, which then reports the change and holds the move --
+    nothing runs that was not shown. A failed read or a different `lanes`
+    binding keeps the whole confirmed plan for the same reason. New
+    findings are added, so a clean exit still means a clean repository."""
+    fresh = _plan_credentials(repo, specs, rotate=rotate)
+    if fresh.failed:
+        warn(f"{repo}: could not re-read the fleet credentials after adding the scaffold, so "
+             "the plan read before it stands:")
+        for line in fresh.lines:
+            warn(f"  {line}")
+        return confirmed
+    if fresh.lanes_binding != confirmed.lanes_binding:
+        return confirmed
+    by_label = {move.label: move for move in fresh.moves}
+    moves = []
+    for move in confirmed.moves:
+        again = by_label.get(move.label)
+        same = again is not None and _move_signature(again) == _move_signature(move)
+        moves.append(again if same else move)
+    unfixed = confirmed.unfixed + [r for r in fresh.unfixed if r not in confirmed.unfixed]
+    return replace(confirmed, moves=moves, unfixed=unfixed)
 
 
 def _plan_credentials(repo, specs, rotate=False):
@@ -3013,6 +3054,21 @@ def _run(args, log=None):
                     bootstrap_completed_sha = outcome.branch_sha
                     if bootstrap_plan.changes:
                         print(f"{repo}: added {len(bootstrap_plan.changes)} fleet CI scaffold file(s)")
+
+    # This run's own scaffold just moved the default branch (a bootstrap
+    # push, or a merged scaffold pull request), so the workflows the
+    # credential plan read are no longer the branch's: ci.yml's `gate` step
+    # alone made every lanes recheck report "changed since the plan was
+    # built" and hold the move, so a fresh repository took two runs.
+    if (
+        bootstrap_completed_sha is not None
+        and bootstrap_plan is not None
+        and bootstrap_completed_sha != bootstrap_plan.base_commit_sha
+        and credentials_plan.moves
+    ):
+        credentials_plan = _replan_credentials_after_scaffold(
+            repo, credentials_plan, credential_specs, args.rotate
+        )
 
     # The one whole-step skip left: pull-request protection on a branch
     # with no commits that nothing this run will push one to. Every other
