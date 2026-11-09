@@ -348,8 +348,8 @@ run on pushes to the default branch: `repo setup` writes the branch's name
 into their push filters and never rewrites them, so a default branch that
 changes afterward leaves both running on no merge at all. It also audits where secrets live. The fleet's shared credentials -- the
 weekly dependency batches' `<HUB>_PAT` (or `<HUB>_APP_ID` +
-`<HUB>_APP_PRIVATE_KEY` pair, for mikelward/npm-update, gradle-update and
-rust-update) and mikelward/ci-commit-artifact's `CI_COMMIT_ARTIFACT_TOKEN`
+`<HUB>_APP_PRIVATE_KEY` pair, for mikelward/npm-update, gradle-update,
+rust-update and dwl-update, which merges upstream dwl into its fork) and mikelward/ci-commit-artifact's `CI_COMMIT_ARTIFACT_TOKEN`
 -- each belong in an environment named after the reusable workflow that
 reads them, because a secret passed to a reusable workflow, or inherited
 by one, reaches every job in it, a batch's untrusted update job included.
@@ -474,7 +474,7 @@ When the App's key is supplied that coverage is read *as the App* (the
 repo-scoped installation endpoint over an App JWT), so the precondition holds
 on a gh-auth token; otherwise it reads `user/installations`.
 Across a fleet:
-`repo list | xargs -n1 repo setup --force --credential NPM_UPDATE_PAT=pat.txt --credential GRADLE_UPDATE_PAT=pat.txt --credential RUST_UPDATE_PAT=pat.txt --credential CI_COMMIT_ARTIFACT_TOKEN=token.txt --credential LANES_APP_ID=app-id.txt --credential LANES_APP_PRIVATE_KEY=app.pem`.
+`repo list | xargs -n1 repo setup --force --credential NPM_UPDATE_PAT=pat.txt --credential GRADLE_UPDATE_PAT=pat.txt --credential RUST_UPDATE_PAT=pat.txt --credential DWL_UPDATE_PAT=pat.txt --credential CI_COMMIT_ARTIFACT_TOKEN=token.txt --credential LANES_APP_ID=app-id.txt --credential LANES_APP_PRIVATE_KEY=app.pem`.
 `repo cleanup` deletes the branches a repository has finished with. It exists
 because this fleet used to leave GitHub's "automatically delete head branches"
 off with nothing else sweeping up -- mikelward/simmo reached 192 branches, 184

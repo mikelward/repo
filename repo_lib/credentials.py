@@ -3,8 +3,9 @@ actually are. Shared by `repo audit` (which reports) and `repo setup`
 (which fixes), so the two cannot disagree about what "in the right place"
 means.
 
-The weekly dependency batches -- mikelward/npm-update, gradle-update and
-rust-update -- and the screenshot commit-back workflow,
+The weekly batches -- mikelward/npm-update, gradle-update and rust-update
+for dependencies, and dwl-update for merging upstream dwl into its fork --
+and the screenshot commit-back workflow,
 mikelward/ci-commit-artifact, are reusable workflows. A secret passed to
 one by name reaches the runner of every job in it: for a batch, the
 untrusted update job that runs whatever the batch resolved, with sudo. So
@@ -40,7 +41,7 @@ import yaml
 
 from repo_lib import gh
 
-BATCH_HUBS = ("npm-update", "gradle-update", "rust-update")
+BATCH_HUBS = ("npm-update", "gradle-update", "rust-update", "dwl-update")
 
 COMMIT_ARTIFACT_TOKEN = "CI_COMMIT_ARTIFACT_TOKEN"
 COMMIT_ARTIFACT_ENV = "ci-commit-artifact"

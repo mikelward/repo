@@ -609,6 +609,7 @@ class CallersTest(unittest.TestCase):
     def test_home_environment(self):
         self.assertEqual(credentials.home_environment("npm_update_pat"), "npm-update")
         self.assertEqual(credentials.home_environment("RUST_UPDATE_APP_PRIVATE_KEY"), "rust-update")
+        self.assertEqual(credentials.home_environment("DWL_UPDATE_PAT"), "dwl-update")
         self.assertEqual(credentials.home_environment("CI_COMMIT_ARTIFACT_TOKEN"), "ci-commit-artifact")
         self.assertIsNone(credentials.home_environment("RELEASE_KEYSTORE_BASE64"))
 

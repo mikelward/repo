@@ -8814,6 +8814,20 @@ class CredentialsStepTest(unittest.TestCase):
         self.assertLess(write, delete)
         self.assertIn(f"{REPO}: deleted 'GRADLE_UPDATE_PAT'", out)
 
+    def test_a_dwl_update_caller_gets_its_credential_in_the_dwl_update_environment(self):
+        # mikelward/dwl-update, the weekly merge of upstream dwl into its
+        # fork, is a batch like the dependency ones: a caller's
+        # DWL_UPDATE_PAT lands in the 'dwl-update' environment.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _secret_file(tmp, "pat.txt", b"ghp_example")
+            fake = self._consumer(self.INHERITING.replace("gradle-update", "dwl-update"), hub="dwl-update")
+            code, out, err = _run(
+                fake, ["--force", "-v", "--no-rules", "--credential", f"DWL_UPDATE_PAT={path}", REPO]
+            )
+        self.assertEqual(code, 0, err)
+        self.assertIn("dwl-update: set DWL_UPDATE_PAT in environment 'dwl-update' (new)", err)
+        self.assertEqual(fake.written_secrets, [("DWL_UPDATE_PAT", REPO, "dwl-update", b"ghp_example")])
+
     def test_a_repository_copy_is_deleted_once_the_environment_already_holds_one(self):
         fake = self._consumer()
         fake.secret_names = {"GRADLE_UPDATE_PAT"}
