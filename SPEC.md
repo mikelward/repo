@@ -279,10 +279,11 @@ one run each, and every rung is a state the repository can sit in safely:
    so an edit since the read is refused rather than merged. A head that is
    not that commit is replaced with a fresh pull request.
 3. A later run sees the scaffold on the default branch and the checks it
-   publishes passed, and requires them. `lanes` and `zizmor` pass on the
-   scaffold pull request itself; `codex` reports from the first pull
-   request the sweep sees once its workflow is on the default branch --
-   the next scaffold update, a dependency batch, anything.
+   publishes passed, and requires them. `zizmor` passes on the scaffold
+   pull request itself; `lanes` and `codex` run under
+   `pull_request_target`, so they report from the first pull request
+   opened once their workflow is on the default branch -- the next
+   scaffold update, a dependency batch, anything.
 4. The lanes App binding follows the same rule: the check is bound to the
    App only once the App has published it here, and the credential is in
    place, in a run after the one that placed the credential.

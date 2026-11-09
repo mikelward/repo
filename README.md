@@ -231,18 +231,22 @@ files (fetched live from `mikelward/codex-review`,
 always current rather than a vendored copy going stale), `zizmor.yml`
 (from `mikelward/lanes`, its self-identified pilot), the `.github/zizmor.yml`
 exceptions policy and `.github/lanes.conf` docs/code split those imply, and a
-`ci.yml` wiring `mikelward/lanes`'s classify+gate job pair with a trivial
-placeholder standing in for the project's real jobs, carrying the comment
-that says how to replace it. It also writes `AGENTS.md` -- this account's
+`ci.yml` wiring `mikelward/lanes`'s trusted-publishing jobs (`init`,
+`classify` and the `gate` publisher, under `pull_request_target`, posting
+the `lanes` status as the lanes App from the `lanes` environment) with a
+trivial placeholder standing in for the project's real jobs, carrying the
+comment that says how to replace it. It also writes `AGENTS.md` -- this account's
 shared agent conventions, fetched from `mikelward/conf`, between a TODO
 description of the project (under its title) and a TODO Project section
 saying what a contributor runs -- and a `CLAUDE.md` that imports it, so a brand-new
 repository is not the one place an agent works with no conventions at
-all. `lanes` and `zizmor` report from the scaffold's own CI run; `codex`
-needs a pull request whose BASE branch already carries its workflow,
-since its status-writing sweep runs under `pull_request_target` (Codex
-review, mikelward/repo#14) -- so on the first pull request opened after
-the scaffold lands, not on the one adding it. Only the placeholder's replacement with real project
+all. `zizmor` reports from the scaffold's own CI run; `lanes` and `codex`
+need a pull request whose BASE branch already carries their workflow,
+since both run under `pull_request_target` (Codex review,
+mikelward/repo#14) -- so on the first pull request opened after the
+scaffold lands, not on the one adding it. `lanes` also needs the lanes App
+installed and its credential in the `lanes` environment, which `repo
+setup --credential` places. Only the placeholder's replacement with real project
 jobs is left undone (see `repo_lib/scaffold.py`'s own docstring for the
 full split between what's generated and what isn't).
 `repo setup` is quiet: the terminal gets what is changing and what is
@@ -290,7 +294,7 @@ bootstrap `repo create --scaffold` uses, written directly). A pull
 request rather than a direct push for two reasons that point the same
 way: it is the only write a branch an earlier run already protected
 accepts at all, and it is what makes the checks the scaffold installs
-actually run -- `lanes` and `zizmor` report on that pull request, and a
+actually run -- `zizmor` reports on that pull request, and a
 ruleset cannot require a check that has never passed. A scaffold pull
 request an earlier run left open -- its own, by branch prefix and by
 author -- is never reopened beside itself: a later run merges it once its
