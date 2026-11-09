@@ -71,8 +71,12 @@ project knowledge, and only ever does the former:
   push_initial_commit's bootstrap goes through the Contents API, which
   cannot write a symlink at all. A repository that already has the symlink
   keeps it -- see SYMLINK_IS_PRESENT_PATHS.
-- `ci.yml` is generated too, but only the classify+gate wiring
-  `mikelward/lanes`'s own README documents verbatim -- the actual project
+- `ci.yml` is generated too, but only the trusted-publishing wiring
+  `mikelward/lanes`'s own README documents (`init`, `classify`, and a
+  `gate` step publishing the `lanes` status as the App, under
+  `pull_request_target` so a pull request cannot rewrite the jobs behind
+  its own required check, and from the `lanes` environment `repo setup`
+  restricts to the default branch) -- the actual project
   jobs (tests, a build) are NOT something this can know, so a trivial
   always-passing placeholder job is wired into the gate instead of
   guessing at what "the project's real jobs" are. This is a deliberate
@@ -368,13 +372,18 @@ rules:
         # Everything else must pin to a hash.
         "*": hash-pin
   dangerous-triggers:
-    # Load-bearing pull_request_target usage in the codex-review pair,
+    # Load-bearing pull_request_target usage. The codex-review pair is
     # reasoned through in mikelward/codex-review's own docs/CONSUMER.md:
     # neither checks out or executes pull request code with the elevated
     # token.
     ignore:
       - codex-review.yml
       - codex-review-check.yml
+      # ci.yml: pull_request_target so a pull request cannot rewrite the
+      # jobs behind its own required `lanes` status. Its jobs check out the
+      # merge ref explicitly, and none that runs pull request code names a
+      # secret -- see the comment at the top of ci.yml.
+      - ci.yml
 """
 
 _LANES_CONF = """\
@@ -403,26 +412,62 @@ lint-title no
 _CI_YML = """\
 name: ci
 
+# Trusted publishing, per the lanes action's README ("Trusted publishing"):
+# the required `lanes` status is posted by the lanes App, not by this
+# workflow's own check-run, so a pull request cannot forge it.
+#
+# pull_request_target, not pull_request: the job definitions load from
+# '{default_branch_name}', so a pull request editing this file cannot rewrite
+# them into a pass, and the `lanes` environment (restricted to
+# '{default_branch_name}') admits the jobs that read the App credential. Two
+# rules keep that safe -- every job that reads the pull request checks out
+# its merge ref explicitly, and no job that runs its code names `secrets.*`.
 on:
   push:
     branches: [{default_branch}]
-  pull_request:
+  pull_request_target:
+    # `edited` re-runs on a retarget, which changes the diff without
+    # changing the head.
     types: [opened, synchronize, reopened, edited]
 
-permissions:
-  contents: read
-  pull-requests: read
+# A superseded pull request run is cancelled so its verdict cannot land
+# after the newer one's. An `edited` run never cancels: GitHub can start it
+# after the run for a push that followed the edit, and it would cancel the
+# only run on the new head. It queues instead.
+concurrency:
+  group: ci-${{{{ github.event.pull_request.number || github.sha }}}}
+  cancel-in-progress: ${{{{ github.event_name == 'pull_request_target' && github.event.action != 'edited' }}}}
+
+permissions: {{}}
 
 jobs:
+  # Posts a pending `lanes` status before anything else runs. No checkout:
+  # it reads nothing from the pull request.
+  init:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: lanes
+    permissions: {{}}
+    steps:
+      - uses: mikelward/lanes@main
+        with:
+          mode: init
+          app-id: ${{{{ secrets.LANES_APP_ID }}}}
+          app-private-key: ${{{{ secrets.LANES_APP_PRIVATE_KEY }}}}
+
   classify:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       docs_only: ${{{{ steps.lane.outputs.docs_only }}}}
       base_sha: ${{{{ steps.lane.outputs.base_sha }}}}
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{{{ github.event.pull_request.number && format('refs/pull/{{0}}/merge', github.event.pull_request.number) || '' }}}}
           persist-credentials: false
       - uses: mikelward/lanes@main
         id: lane
@@ -432,27 +477,36 @@ jobs:
 
   # TODO: replace this with the project's real jobs (test, build, lint,
   # ...), each carrying `needs: classify` and
-  # `if: needs.classify.outputs.docs_only != 'true'`. Add each job's name
-  # to the `lanes` job's own `needs:` and `results:` below, and delete this
-  # placeholder once a real job exists -- see mikelward/lanes's README for
-  # the documented shape.
+  # `if: needs.classify.outputs.docs_only != 'true'`, checking out
+  # `refs/pull/<number>/merge` as `classify` does, and naming no
+  # `secrets.*`. Add each job's name to the `lanes` job's `needs:` and
+  # `results:` below, and delete this placeholder once a real job exists.
   placeholder:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     needs: classify
     if: needs.classify.outputs.docs_only != 'true'
+    permissions: {{}}
     steps:
       - run: echo "no real jobs yet -- see the TODO in this file"
 
+  # Publishes the verdict as the App's `lanes` status. The ruleset requires
+  # that status, never this job's own check-run, which under
+  # pull_request_target reports on '{default_branch_name}', not the pull request.
   lanes:
-    name: lanes
+    name: Publish the lanes status
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [classify, placeholder]
-    if: always()
+    needs: [init, classify, placeholder]
+    if: ${{{{ !cancelled() }}}}
+    environment: lanes
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{{{ github.event.pull_request.number && format('refs/pull/{{0}}/merge', github.event.pull_request.number) || '' }}}}
           persist-credentials: false
       - uses: mikelward/lanes@main
         with:
@@ -461,6 +515,8 @@ jobs:
           classify-result: ${{{{ needs.classify.result }}}}
           base-sha: ${{{{ needs.classify.outputs.base_sha }}}}
           results: placeholder=${{{{ needs.placeholder.result }}}}
+          app-id: ${{{{ secrets.LANES_APP_ID }}}}
+          app-private-key: ${{{{ secrets.LANES_APP_PRIVATE_KEY }}}}
 """
 
 
@@ -472,9 +528,10 @@ mikelward/codex-review's own templates/), zizmor.yml (from
 mikelward/lanes, its self-identified pilot), and the exceptions/policy
 files each needs: .github/zizmor.yml and .github/lanes.conf.
 
-ci.yml wires the lanes classify+gate job pair per mikelward/lanes's own
-README, with a placeholder job standing in for this project's real jobs
-until they exist -- see the TODO in ci.yml.
+ci.yml wires lanes' trusted publishing per mikelward/lanes's own README:
+the lanes App posts the required `lanes` status, from the `lanes`
+environment, under pull_request_target. A placeholder job stands in for
+this project's real jobs until they exist -- see the TODO in ci.yml.
 """
 
 
@@ -602,7 +659,9 @@ def build_scaffold_files(default_branch, repo):
     # Quoted for the same reason _branches_line quotes its own
     # replacement: a default branch name can contain YAML flow-syntax
     # characters a bare scalar would misparse.
-    files[".github/workflows/ci.yml"] = _CI_YML.format(default_branch=json.dumps(default_branch))
+    files[".github/workflows/ci.yml"] = _CI_YML.format(
+        default_branch=json.dumps(default_branch), default_branch_name=default_branch
+    )
     return files
 
 
@@ -1647,8 +1706,9 @@ def _close_pull_request(repo, pr):
 # Which scaffold file publishes each check this fleet requires, and where
 # GitHub reads that workflow from when it runs for a pull request. `head`
 # is the pull request's own copy, `base` the default branch's -- so a pull
-# request adding `ci.yml` does run it, while `codex`'s publisher, running
-# under `pull_request_target`, is taken from the base branch either way.
+# request adding `zizmor.yml` does run it, while `lanes`'s and `codex`'s
+# publishers, running under `pull_request_target`, are taken from the base
+# branch either way.
 #
 # Both halves are acted on, by the two predicates below: the file decides
 # whether the BRANCH can publish a check, the head/base half whether a
@@ -1656,7 +1716,7 @@ def _close_pull_request(repo, pr):
 # that produces these very files, because this is the one place it can be
 # checked against reality.
 CHECK_PUBLISHERS = {
-    "lanes": (".github/workflows/ci.yml", "head"),
+    "lanes": (".github/workflows/ci.yml", "base"),
     "zizmor": (".github/workflows/zizmor.yml", "head"),
     "codex": (".github/workflows/codex-review-check.yml", "base"),
 }
@@ -1673,7 +1733,7 @@ def checks_a_gap_leaves_unpublished(paths, checks):
     mikelward/repo#56).
 
     Asked of the BRANCH, never of a pending pull request. A pull request
-    adding `ci.yml` does run `ci.yml`, so `lanes` could in principle
+    adding `zizmor.yml` does run it, so `zizmor` could in principle
     report on it -- but establishing that means reading a pull request
     anyone may change at any moment, and every answer read out of one has
     to be re-established at every later step to stay true. The cost of not
@@ -1699,7 +1759,7 @@ def checks_no_pull_request_can_report(missing, checks):
     requirement is answered yes-it-defers there because the branch really
     has no ci.yml. This one asks whether the repository is WEDGED, and a
     head-published check does not wedge it: the pull request carrying
-    ci.yml runs ci.yml, so `lanes` reports and the pull request merges on
+    zizmor.yml runs it, so `zizmor` reports and the pull request merges on
     its own (Codex review, mikelward/repo#42).
 
     Whether one particular pending pull request carries that workflow is

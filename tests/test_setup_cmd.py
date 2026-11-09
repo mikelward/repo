@@ -10713,12 +10713,50 @@ class BootstrapStepTest(unittest.TestCase):
         self.assertNotIn("merging it", err)
 
     def test_a_head_published_check_the_pull_request_carries_is_not_flagged(self):
-        # `lanes` is published by ci.yml, which GitHub reads from the pull
-        # request's OWN head -- so the pull request adding ci.yml runs it,
-        # `lanes` reports, and the pull request merges on its own. Only
-        # `codex`, read from the base branch, wedges the repository.
-        # Flagging a head-published check sent someone looking for a bypass
-        # actor they don't need (Codex review, mikelward/repo#42).
+        # `zizmor` is published by zizmor.yml, which GitHub reads from the
+        # pull request's OWN head -- so the pull request adding it runs it,
+        # `zizmor` reports, and the pull request merges on its own. Flagging
+        # a head-published check sent someone looking for a bypass actor
+        # they don't need (Codex review, mikelward/repo#42).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set(_SCAFFOLD_PATHS) - {".github/workflows/zizmor.yml"}
+        fake.effective_rules = [
+            {
+                "type": "required_status_checks",
+                "parameters": {"required_status_checks": [{"context": "zizmor"}]},
+            }
+        ]
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertIn(f"{REPO}: opened pull request #42", out)
+        self.assertNotIn("already requires", err)
+
+    def test_a_base_published_check_is_still_flagged_beside_a_head_published_one(self):
+        # Both are required and both publishers are missing, so the
+        # narrowing has to name `codex` and stay silent about `zizmor`
+        # rather than reporting all or nothing (Codex review,
+        # mikelward/repo#42).
+        fake = FakeGh()
+        fake.bootstrap_existing_paths = set(_SCAFFOLD_PATHS) - {
+            ".github/workflows/zizmor.yml",
+            ".github/workflows/codex-review-check.yml",
+        }
+        fake.effective_rules = [
+            {
+                "type": "required_status_checks",
+                "parameters": {
+                    "required_status_checks": [{"context": "zizmor"}, {"context": "codex"}]
+                },
+            }
+        ]
+        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
+        self.assertIn(f"{REPO}: opened pull request #42", out)
+        self.assertIn("this branch already requires 'codex'", err)
+        self.assertNotIn("zizmor", err)
+
+    def test_a_required_lanes_is_flagged_while_ci_is_missing(self):
+        # ci.yml runs under pull_request_target, so GitHub reads it from the
+        # base branch: a pull request adding it cannot report `lanes`, and a
+        # branch already requiring `lanes` without it is wedged.
         fake = FakeGh()
         fake.bootstrap_existing_paths = set(_SCAFFOLD_PATHS) - {".github/workflows/ci.yml"}
         fake.effective_rules = [
@@ -10729,30 +10767,7 @@ class BootstrapStepTest(unittest.TestCase):
         ]
         code, out, err = _run(fake, ["--force", "--no-rules", REPO])
         self.assertIn(f"{REPO}: opened pull request #42", out)
-        self.assertNotIn("already requires", err)
-
-    def test_a_base_published_check_is_still_flagged_beside_a_head_published_one(self):
-        # Both are required and both publishers are missing, so the
-        # narrowing has to name `codex` and stay silent about `lanes`
-        # rather than reporting all or nothing (Codex review,
-        # mikelward/repo#42).
-        fake = FakeGh()
-        fake.bootstrap_existing_paths = set(_SCAFFOLD_PATHS) - {
-            ".github/workflows/ci.yml",
-            ".github/workflows/codex-review-check.yml",
-        }
-        fake.effective_rules = [
-            {
-                "type": "required_status_checks",
-                "parameters": {
-                    "required_status_checks": [{"context": "lanes"}, {"context": "codex"}]
-                },
-            }
-        ]
-        code, out, err = _run(fake, ["--force", "--no-rules", REPO])
-        self.assertIn(f"{REPO}: opened pull request #42", out)
-        self.assertIn("this branch already requires 'codex'", err)
-        self.assertNotIn("lanes", err)
+        self.assertIn("this branch already requires 'lanes'", err)
 
     def test_a_check_bound_to_an_app_is_not_attributed_to_the_scaffold(self):
         # A requirement bound to a specific App names that App as the only
@@ -11701,7 +11716,7 @@ class BootstrapStepTest(unittest.TestCase):
         code, out, err = _run(fake, ["--no-rules", REPO])  # no --force, stdin is not a terminal
         self.assertEqual(code, 0, err)
         self.assertNotIn("stdin is not a terminal", err)
-        self.assertIn("pull request #18 waits: 'lanes', 'zizmor' has not succeeded as a run of its own workflow from it yet", err)
+        self.assertIn("pull request #18 waits: 'zizmor' has not succeeded as a run of its own workflow from it yet", err)
         self.assertEqual(fake.puts, [])
         self.assertEqual(fake.created_pulls, [])
 
@@ -11953,13 +11968,13 @@ class BootstrapStepTest(unittest.TestCase):
         code, out, err = _run(fake, ["--dry-run", "--no-rules", REPO])
         self.assertEqual(code, 0, err)
         self.assertIn("pull request #11 is carrying the scaffold", out)
-        self.assertIn("pull request #11 waits: 'lanes', 'zizmor' has not succeeded as a run of its own workflow from it yet", out)
+        self.assertIn("pull request #11 waits: 'zizmor' has not succeeded as a run of its own workflow from it yet", out)
         self.assertIn("still absent from the default branch: 9 file(s)", out)
         self.assertNotIn("open a pull request writing", out)
 
         code, out, err = _run(fake, ["--no-rules", REPO])  # no --force, no terminal
         self.assertEqual(code, 0, err)
-        self.assertIn("pull request #11 waits: 'lanes', 'zizmor' has not succeeded as a run of its own workflow from it yet", err)
+        self.assertIn("pull request #11 waits: 'zizmor' has not succeeded as a run of its own workflow from it yet", err)
         self.assertIn("a later run looks again", err)
         # Nothing to confirm and nothing to write: not a blob, not a
         # branch, not a second pull request.
@@ -12655,13 +12670,13 @@ class BootstrapStepTest(unittest.TestCase):
         code, out, err = _run(fake, ["--force", "--no-rules", REPO])
         self.assertEqual(code, 0, err)
         self.assertIn(
-            "pull request #11 waits: 'lanes', 'zizmor' has not succeeded as a run of its own "
+            "pull request #11 waits: 'zizmor' has not succeeded as a run of its own "
             "workflow from it yet",
             err,
         )
         self.assertEqual(fake.merged_pulls, [])
 
-        # Nor does a report merely NAMED `lanes`: a status anyone with
+        # Nor does a report merely NAMED `zizmor`: a status anyone with
         # write access can post, or another App's check run. What counts
         # is a successful Actions run of the workflow the pull request
         # adds, by path (Codex review, mikelward/repo#56).
@@ -12674,10 +12689,10 @@ class BootstrapStepTest(unittest.TestCase):
             fake.bootstrap_open_pulls = self._OPEN_11
             for attr, value in reports.items():
                 setattr(fake, attr, value)
-            fake.workflow_runs = {"prhead11": [(".github/workflows/zizmor.yml", "completed", "success")]}
+            fake.workflow_runs = {"prhead11": [(".github/workflows/ci.yml", "completed", "success")]}
             code, out, err = _run(fake, ["--force", "--no-rules", REPO])
             self.assertEqual(code, 0, err)
-            self.assertIn("'lanes' has not succeeded as a run of its own workflow from it yet", err)
+            self.assertIn("'zizmor' has not succeeded as a run of its own workflow from it yet", err)
             self.assertEqual(fake.merged_pulls, [])
 
         # A run still going is not a success either: a wait.
@@ -12687,13 +12702,12 @@ class BootstrapStepTest(unittest.TestCase):
         fake.check_runs = {"prhead11": ["lanes", "zizmor"]}
         fake.workflow_runs = {
             "prhead11": [
-                (".github/workflows/ci.yml", "in_progress", None),
-                (".github/workflows/zizmor.yml", "completed", "success"),
+                (".github/workflows/zizmor.yml", "in_progress", None),
             ]
         }
         code, out, err = _run(fake, ["--force", "--no-rules", REPO])
         self.assertEqual(code, 0, err)
-        self.assertIn("'lanes' has not succeeded as a run of its own workflow", err)
+        self.assertIn("'zizmor' has not succeeded as a run of its own workflow", err)
         self.assertEqual(fake.merged_pulls, [])
 
         # A run that completed without success -- a failure, a timeout, a

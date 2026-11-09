@@ -5,7 +5,9 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import patch
 
-from repo_lib import gh, scaffold
+import yaml
+
+from repo_lib import credentials, gh, scaffold
 from repo_lib.cli import main
 
 # Fake content for the four files the scaffold fetches live -- enough to
@@ -361,9 +363,40 @@ class ScaffoldFlagTest(unittest.TestCase):
         # The generated ci.yml pins the fleet's lowercase `name: ci`; the
         # other scaffold tests check only paths and counts, so without this a
         # regression back to `name: CI` would ship unnoticed.
-        rendered = scaffold._CI_YML.format(default_branch=json.dumps("main"))
+        rendered = scaffold._CI_YML.format(default_branch=json.dumps("main"), default_branch_name="main")
         self.assertIn("name: ci\n", rendered)
         self.assertNotIn("name: CI", rendered)
+
+    def test_scaffolded_ci_publishes_lanes_as_the_app(self):
+        # The scaffold's own ci.yml must be what `repo setup` reads as the
+        # App publishing `lanes` from the `lanes` environment: its `gate`
+        # step used to take no credential, so every scaffolded repository
+        # was reported as still on the ambient check-run and `lanes` was
+        # never bound to the App.
+        rendered = scaffold._CI_YML.format(default_branch=json.dumps("main"), default_branch_name="main")
+        ci = credentials.WorkflowName("ci.yml")
+        texts = {ci: rendered}
+        self.assertEqual(credentials.lanes_publishers(texts), {ci: True})
+        self.assertEqual(credentials.lanes_status_publishers(texts), [ci])
+        for finding in (
+            credentials.lanes_ambient_gate,
+            credentials.lanes_unread,
+            credentials.lanes_incomplete,
+            credentials.lanes_foreign,
+            credentials.lanes_indirect,
+        ):
+            self.assertEqual(finding(texts), [], finding.__name__)
+        # pull_request_target, so a pull request cannot rewrite its own
+        # required check, and the job publishing it is not itself named
+        # `lanes`: its check-run reports on the base branch, never the head.
+        workflow = yaml.safe_load(rendered)
+        self.assertEqual(set(workflow[True]), {"push", "pull_request_target"})
+        self.assertNotEqual(workflow["jobs"]["lanes"].get("name"), "lanes")
+        # An `edited` run must not cancel the run on a newer head.
+        self.assertIn("github.event.action != 'edited'", workflow["concurrency"]["cancel-in-progress"])
+        # zizmor's policy excuses exactly this file's trigger.
+        policy = yaml.safe_load(scaffold._ZIZMOR_POLICY)
+        self.assertIn("ci.yml", policy["rules"]["dangerous-triggers"]["ignore"])
 
     def test_scaffold_pushes_every_file_across_the_bootstrap_and_real_commit(self):
         fake = FakeGh(self_login="mikelward")
