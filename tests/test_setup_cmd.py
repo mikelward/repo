@@ -360,6 +360,10 @@ class FakeGh:
         # default's has the same blob sha and is not re-read.
         self.branch_workflows = {}
         self.workflow_texts_after_recheck = {}
+        # Workflow files (name -> text) the default branch gains when this
+        # run's own scaffold lands on it -- the bootstrap push to a branch
+        # with no commits. None: the scaffold adds nothing a reader sees.
+        self.workflows_after_bootstrap = None
         self.branch_workflows_after_recheck = {}  # branch -> its workflows from the second listing on
         self._branch_reads = {}
         self._workflow_reads = {}
@@ -1526,6 +1530,9 @@ class FakeGh:
                 self.bootstrap_ref_missing = False
                 self.bootstrap_ref_empty_409 = False
                 self._scaffold_ref_current_sha = "bootstrapcommitsha"
+                if self.workflows_after_bootstrap is not None:
+                    self.workflow_files = [*(self.workflow_files or []), *self.workflows_after_bootstrap]
+                    self.workflow_texts = {**self.workflow_texts, **self.workflows_after_bootstrap}
                 return json.dumps({"commit": {"sha": "bootstrapcommitsha"}}).encode()
         elif method == "POST":
             m = _ENV_POLICIES_RE.match(endpoint)
@@ -5897,6 +5904,76 @@ class LanesCredentialStepTest(unittest.TestCase):
         self.assertEqual(fake.env_puts, [])
         self.assertEqual(fake.restricted, [("lanes", "main")])
         self.assertEqual(fake.env_policies["lanes"], ["main"])
+
+    def test_a_pair_supplied_to_an_empty_repository_is_placed_after_the_bootstrap_push(self):
+        # The run's own bootstrap push adds ci.yml, whose `gate` step takes
+        # no App credential. The credential plan was read before that push,
+        # so its recheck saw "the workflows running lanes in `gate` mode
+        # changed" and held the move: a fresh repository could not be set
+        # up in one run. The run replans after its own push instead.
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = FakeGh()
+            fake.bootstrap_ref_missing = True
+            fake.workflow_files = []
+            fake.workflows_after_bootstrap = {
+                "ci.yml": (
+                    "jobs:\n  lanes:\n    steps:\n      - uses: mikelward/lanes@main\n"
+                    "        with:\n          mode: gate\n"
+                ),
+            }
+            code, out, err = _run(
+                fake,
+                [
+                    "--force", "--no-rules",
+                    "--credential", f"LANES_APP_ID={app_id}",
+                    "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                    REPO,
+                ],
+            )
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"{REPO}: added 9 fleet CI scaffold file(s)", out)
+        self.assertNotIn("changed since the plan was built", err)
+        self.assertEqual(
+            [w[:3] for w in fake.written_secrets],
+            [("LANES_APP_ID", REPO, "lanes"), ("LANES_APP_PRIVATE_KEY", REPO, "lanes")],
+        )
+        self.assertEqual(fake.restricted, [("lanes", "main")])
+
+    def test_a_move_the_replan_after_the_bootstrap_push_would_change_is_held(self):
+        # The replan only re-anchors a move it would make identically. Here
+        # the pushed workflow publishes as another App, so the fresh plan
+        # makes no move at all: the confirmed one is held by its own
+        # recheck rather than run, and the fresh finding is reported.
+        with tempfile.TemporaryDirectory() as tmp:
+            app_id = _secret_file(tmp, "id.txt", b"12345")
+            key = _secret_file(tmp, "key.pem", b"-----BEGIN RSA PRIVATE KEY-----")
+            fake = FakeGh()
+            fake.bootstrap_ref_missing = True
+            fake.workflow_files = []
+            fake.workflows_after_bootstrap = {
+                "ci.yml": (
+                    "jobs:\n  lanes:\n    environment: lanes\n    steps:\n"
+                    "      - uses: mikelward/lanes@main\n        with:\n          mode: gate\n"
+                    "          app-id: ${{ secrets.OTHER_ID }}\n"
+                    "          app-private-key: ${{ secrets.OTHER_KEY }}\n"
+                ),
+            }
+            code, out, err = _run(
+                fake,
+                [
+                    "--force", "--no-rules",
+                    "--credential", f"LANES_APP_ID={app_id}",
+                    "--credential", f"LANES_APP_PRIVATE_KEY={key}",
+                    REPO,
+                ],
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("LANES_APP_ID not set:", err)
+        self.assertIn("publishes as an App this tool does not manage", err)
+        self.assertEqual(fake.written_secrets, [])
+        self.assertEqual(fake.restricted, [])
 
     def test_a_publisher_that_went_away_while_the_plan_waited_is_not_restricted(self):
         # The environment already holds the pair and nothing is deleted, so
