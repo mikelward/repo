@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from repo_lib import apps, gh, rules, tag_rules
 from repo_lib.cli import main
+from tests.event_policy_fake import EventPolicyFake
 
 REPO = "owner/repo"
 
@@ -48,6 +49,8 @@ def _parse_api_args(rest):
         a = rest[i]
         if a == "--paginate":
             i += 1
+        elif a == "-H":
+            i += 2
         elif a == "--method":
             method = rest[i + 1]
             i += 2
@@ -100,6 +103,8 @@ class FakeGh:
 
     def __init__(self):
         self.calls = []
+        # The pull_request_target Actions policy (repo_lib.event_policy).
+        self.events = EventPolicyFake()
         self.default_branch = "main"
         self.default_branch_fails = False
         # Other branches: name -> {workflow name: text}; see the setup fake.
@@ -196,6 +201,9 @@ class FakeGh:
         self.calls.append(list(args))
         assert args[0] == "api", args
         endpoint, method, jq = _parse_api_args(args[1:])
+        answer = self.events.answer(args, endpoint, method, jq)
+        if answer is not None:
+            return answer
 
         m = _DEFAULT_BRANCH_RE.match(endpoint)
         if m and jq == ".default_branch":
@@ -2027,6 +2035,51 @@ class PullRequestCreationPolicyAuditTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn(f"could not read who may open a pull request on {REPO}:", err)
         self.assertNotIn("may open a pull request", out)
+
+
+class PullRequestTargetAuditTest(unittest.TestCase):
+    def test_an_allowing_policy_is_ok(self):
+        code, out, err = _run(FakeGh(), [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "[ok] codex-review.yml, codex-review-check.yml and ci.yml may run on "
+            "pull_request_target (Actions policy 'pull_request_target')",
+            out,
+        )
+
+    def test_a_private_repository_is_ok(self):
+        fake = FakeGh()
+        fake.events.private = "true"
+        fake.events.policies = {}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn("[ok] pull_request_target is not blocked in a private repository", out)
+
+    def test_no_policy_is_a_fix_naming_setup(self):
+        fake = FakeGh()
+        fake.events.policies = {}
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            f"[FIX] GitHub blocks pull_request_target on {REPO} from December 2, 2026, which "
+            f"stops the required `codex` status; `repo setup {REPO}` will create Actions policy "
+            "'pull_request_target'",
+            out,
+        )
+
+    def test_a_disabled_policy_fails_the_audit(self):
+        fake = FakeGh()
+        fake.events.policies["901"]["enforcement"] = "disabled"
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(f"[GAP] Actions policy 'pull_request_target' (id 901) on {REPO} is 'disabled'", out)
+
+    def test_a_failed_listing_fails_the_audit(self):
+        fake = FakeGh()
+        fake.events.list_fails = "gh: HTTP 500: boom\n"
+        code, out, err = _run(fake, [REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(f"[GAP] could not list {REPO}'s Actions policies", out)
 
 
 class ReleaseTagAuditTest(unittest.TestCase):

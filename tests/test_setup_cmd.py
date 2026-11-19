@@ -11,8 +11,9 @@ from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from unittest.mock import patch
 
-from repo_lib import apps, gh, rules, scaffold, setup_cmd, tag_rules
+from repo_lib import apps, event_policy, gh, rules, scaffold, setup_cmd, tag_rules
 from repo_lib.cli import main
+from tests.event_policy_fake import EventPolicyFake, standard_policy
 
 REPO = "owner/repo"
 
@@ -158,6 +159,8 @@ def _parse_api_args(rest):
         a = rest[i]
         if a == "--paginate":
             i += 1
+        elif a == "-H":
+            i += 2
         elif a == "--method":
             method = rest[i + 1]
             i += 2
@@ -195,6 +198,8 @@ class FakeGh:
 
     def __init__(self):
         self.calls = []
+        # The pull_request_target Actions policy (repo_lib.event_policy).
+        self.events = EventPolicyFake()
         # -- ruleset step state (unchanged) --
         self.default_branch = "main"
         self._default_branch_reads = 0
@@ -700,6 +705,9 @@ class FakeGh:
                 }
             )
         endpoint, method, jq = _parse_api_args(args[1:])
+        answer = self.events.answer(args, endpoint, method, jq)
+        if answer is not None:
+            return answer
         if "/compare/" in endpoint and jq == ".status":
             return self.merge_landed + "\n"
 
@@ -1434,6 +1442,10 @@ class FakeGh:
 
     def run_with_input(self, args, input_bytes):
         self.calls.append(list(args))
+        if args[:1] == ["api"]:
+            endpoint, method, _jq = _parse_api_args(args[1:])
+            if self.events.write(args, endpoint, method, input_bytes):
+                return ""
         if args[:2] == ["secret", "set"]:
             name = args[2]
             repo = args[args.index("--repo") + 1]
@@ -9917,6 +9929,143 @@ class PullRequestCreationPolicyStepTest(unittest.TestCase):
         )
         self.assertIn("failed on: pull-request-creation", err)
         self.assertEqual(fake.patches, [])
+
+
+class PullRequestTargetPolicyStepTest(unittest.TestCase):
+    """GitHub blocks pull_request_target in public repositories without an
+    Actions event policy allowing it, which would stop codex-review's
+    required `codex` status. One repository policy, aimed at the fleet's
+    three pull_request_target workflows, allows every event for them."""
+
+    PATHS = [
+        ".github/workflows/codex-review.yml",
+        ".github/workflows/codex-review-check.yml",
+        ".github/workflows/ci.yml",
+    ]
+
+    def _fake(self, **policy):
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        fake.events.policies = {"901": standard_policy(**policy)} if policy else {}
+        return fake
+
+    def test_an_allowed_repository_needs_nothing(self):
+        fake = FakeGh()
+        fake.workflow_files = ["ci.yml"]
+        code, out, err = _run(fake, ["--force", REPO])
+        self.assertEqual(fake.events.writes, [])
+        self.assertNotIn("pull_request_target", out + err)
+
+    def test_a_missing_policy_is_created_after_confirmation(self):
+        fake = self._fake()
+        code, out, err = _run(fake, ["--no-bootstrap", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn("  pull_request_target:\n    create Actions policy 'pull_request_target'", err)
+        self.assertEqual(fake.events.writes, [])
+        code, out, err = _run(fake, ["--force", "--no-bootstrap", REPO])
+        self.assertEqual(len(fake.events.writes), 1)
+        method, endpoint, body = fake.events.writes[0]
+        self.assertEqual((method, endpoint), ("POST", f"repos/{REPO}/actions/policies"))
+        self.assertEqual(body["enforcement"], "active")
+        self.assertEqual(body["conditions"], {"workflow_path": {"include": self.PATHS, "exclude": []}})
+        [rule] = body["rules"]
+        self.assertEqual(rule["type"], "restrict_action_events")
+        # Every trigger the three workflows declare, or the policy would
+        # block them instead.
+        for event in ("pull_request_target", "push", "schedule", "workflow_run", "workflow_dispatch"):
+            self.assertIn(event, rule["parameters"]["allowed_events"])
+        self.assertIn(
+            f"{REPO}: created Actions policy 'pull_request_target': codex-review.yml, "
+            "codex-review-check.yml and ci.yml may run on pull_request_target",
+            out,
+        )
+        self.assertNotIn("pull-request-target", err)
+        self.assertIn("X-GitHub-Api-Version: 2026-03-10", fake.events.headers)
+
+    def test_a_dry_run_reports_without_writing(self):
+        fake = self._fake()
+        code, out, err = _run(fake, ["--dry-run", REPO])
+        self.assertIn("  pull_request_target:\n    create Actions policy 'pull_request_target'", out)
+        self.assertEqual(fake.events.writes, [])
+
+    def test_a_private_repository_needs_nothing(self):
+        fake = self._fake()
+        fake.events.private = "true"
+        code, out, err = _run(fake, ["--force", "--no-bootstrap", REPO])
+        self.assertEqual(fake.events.writes, [])
+        self.assertNotIn("pull-request-target", err)
+
+    def test_an_existing_policy_gains_only_what_it_lacks(self):
+        fake = self._fake(
+            conditions={"workflow_path": {"include": [".github/workflows/codex-review.yml", "x.yml"], "exclude": []}},
+            rules=[
+                {"type": "restrict_action_events", "parameters": {"allowed_events": ["pull_request_target"]}},
+                {"type": "restrict_actions_actors", "parameters": {"allowed_actors": [{"id": 5, "type": "User"}]}},
+            ],
+        )
+        code, out, err = _run(fake, ["--force", "--no-bootstrap", REPO])
+        [(method, endpoint, body)] = fake.events.writes
+        self.assertEqual((method, endpoint), ("PUT", f"repos/{REPO}/actions/policies/901"))
+        self.assertEqual(
+            body["conditions"]["workflow_path"]["include"],
+            [".github/workflows/codex-review.yml", "x.yml", *self.PATHS[1:]],
+        )
+        events, actors = body["rules"]
+        self.assertEqual(events["parameters"]["allowed_events"][0], "pull_request_target")
+        self.assertEqual(sorted(events["parameters"]["allowed_events"]), sorted(event_policy.ALLOWED_EVENTS))
+        self.assertEqual(actors["type"], "restrict_actions_actors")
+        self.assertIn(f"{REPO}: updated Actions policy 'pull_request_target' (id 901): target ", out)
+
+    def test_a_policy_on_every_workflow_needs_no_paths(self):
+        fake = self._fake(conditions={})
+        code, out, err = _run(fake, ["--force", "--no-bootstrap", REPO])
+        self.assertEqual(fake.events.writes, [])
+
+    def _assert_held(self, fake, message):
+        fake.pull_request_creation_policy = "all"
+        code, out, err = _run(fake, ["--force", "--no-bootstrap", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(message, err)
+        self.assertIn("pull-request-target", err)
+        self.assertEqual(fake.events.writes, [])
+        # Every other step still makes its progress.
+        self.assertEqual(
+            [body for _args, body in fake.patches],
+            [{"pull_request_creation_policy": "collaborators_only"}],
+        )
+
+    def test_a_disabled_policy_is_left_for_a_person(self):
+        self._assert_held(
+            self._fake(enforcement="disabled"),
+            f"Actions policy 'pull_request_target' (id 901) on {REPO} is 'disabled', not 'active'",
+        )
+
+    def test_an_excluded_workflow_is_left_for_a_person(self):
+        self._assert_held(
+            self._fake(conditions={"workflow_path": {"include": ["~ALL"], "exclude": [self.PATHS[0]]}}),
+            f"excludes {self.PATHS[0]}, so GitHub blocks it on pull_request_target",
+        )
+
+    def test_a_failed_listing_is_held(self):
+        fake = self._fake()
+        fake.events.list_fails = "gh: Not Found (HTTP 404)\n"
+        self._assert_held(fake, f"could not list {REPO}'s Actions policies")
+
+    def test_a_policy_changed_since_the_plan_is_left_alone(self):
+        fake = self._fake()
+        fake.events.policies_later = {"905": standard_policy(id=905)}
+        code, out, err = _run(fake, ["--force", "--no-bootstrap", REPO])
+        self.assertEqual(fake.events.writes, [])
+        self.assertIn("nothing to write after all", out)
+
+    def test_a_failed_write_fails_the_run(self):
+        fake = self._fake()
+        fake.events.write_fails = "gh: HTTP 403: Must have admin rights\n"
+        code, out, err = _run(fake, ["--force", "--no-bootstrap", REPO])
+        self.assertEqual(code, 1)
+        self.assertIn(f"could not create Actions policy 'pull_request_target' on {REPO}:", err)
+        self.assertIn("failed on: ", err)
+        self.assertIn("pull-request-target", err)
 
 
 class ReleaseTagRulesetStepTest(unittest.TestCase):
