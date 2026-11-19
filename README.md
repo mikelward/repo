@@ -394,7 +394,12 @@ no `repo setup` run resolves a value nobody understands, so unlike the `[FIX]`
 findings it fails the audit. A repository whose `v*` tags can be moved or
 deleted is a `[FIX]`: a pin on a release would build different code. A ruleset
 named `release tags` that is turned off, aimed at branches, or excludes every
-`v*` tag is a `[GAP]`, since that is a person's decision.
+`v*` tag is a `[GAP]`, since that is a person's decision. A public
+repository whose Actions policies don't allow `pull_request_target` for
+`codex-review.yml`, `codex-review-check.yml` and `ci.yml` is a `[FIX]`:
+from December 2, 2026 GitHub blocks that trigger by default, which stops
+the required `codex` status. A policy under that name that is turned off
+or excludes one of them is a `[GAP]`.
 `[FIX]` findings do
 not fail the audit yet (see `TODO.md`): the layout is being rolled out through
 `repo setup`.
@@ -406,7 +411,10 @@ GitHub reports a policy it does not recognize. It also keeps a tag ruleset,
 `release tags`, that stops anyone moving or deleting a tag matching `v*`
 (creating one stays open, as every release job does); an existing one keeps
 what it has and gains only what it lacks, and `--no-rules` skips it with the
-branch ruleset. Its fleet-credentials step is always on: for
+branch ruleset. It keeps an Actions policy, `pull_request_target`, in
+every public repository, allowing every event for those three workflows
+(only they escape GitHub's block; an existing one keeps what it has and
+gains what it lacks). Its fleet-credentials step is always on: for
 each batch the repository runs (by whichever workflows call it from a job,
 whatever they are named, on the default branch) and for the
 commit-back workflow (by a job calling it), a value passed as

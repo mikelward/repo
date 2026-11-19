@@ -99,7 +99,7 @@ import json
 import re
 import urllib.parse
 
-from repo_lib import apps, credentials, gh, rules, tag_rules
+from repo_lib import apps, credentials, event_policy, gh, rules, tag_rules
 from repo_lib.common import error, error_lines
 
 # Same shape as setup_cmd.py's/secrets_cmd.py's own OWNER_REPO_RE -- kept
@@ -538,6 +538,29 @@ def audit_release_tags(repo, ok, fix, gap):
         fix(
             f"a v* tag on {repo} can be moved or deleted, so a pin on a release could build "
             f"different code later; `repo setup {repo}` will {plan.lines[0]}"
+        )
+    else:
+        gap(" ".join(line.strip() for line in plan.lines))
+
+
+def audit_pull_request_target(repo, ok, fix, gap):
+    """Whether the fleet's pull_request_target workflows still run once
+    GitHub blocks the trigger by default in public repositories. The
+    question is event_policy.plan's, asked rather than restated.
+
+    No policy, or one short of the standard, is a [FIX], since `repo setup`
+    closes it. One turned off or excluding a workflow this needs is a
+    person's decision, and a read that did not complete says nothing
+    either way: both are a [GAP]."""
+    plan = event_policy.plan(repo)
+    if plan.state == "allowed":
+        ok(event_policy.ALLOWED_LINE)
+    elif plan.state == "private":
+        ok("pull_request_target is not blocked in a private repository")
+    elif plan.state in ("create", "update"):
+        fix(
+            f"GitHub blocks pull_request_target on {repo} from December 2, 2026, which stops "
+            f"the required `codex` status; `repo setup {repo}` will {plan.lines[0]}"
         )
     else:
         gap(" ".join(line.strip() for line in plan.lines))
@@ -1601,6 +1624,7 @@ def run(args):
     audit_delete_branch_on_merge(repo, ok, fix)
     audit_pull_request_creation_policy(repo, ok, fix, gap)
     audit_release_tags(repo, ok, fix, gap)
+    audit_pull_request_target(repo, ok, fix, gap)
     audit_secrets(repo, ok, fix)
 
     if gap_found[0]:

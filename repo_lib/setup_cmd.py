@@ -96,7 +96,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field, replace
 from typing import Optional
 
-from repo_lib import apps, common, config, credentials, gh, rules, scaffold, secrets_cmd, tag_rules
+from repo_lib import apps, common, config, credentials, event_policy, gh, rules, scaffold, secrets_cmd, tag_rules
 from repo_lib.common import error, error_lines, info, warn
 
 # The lookaheads reject `.` and `..` components: made of allowed
@@ -2032,6 +2032,11 @@ def _run(args, log=None):
     if not args.no_rules:
         _progress(args, f"{repo}: checking the release tag ruleset")
         tag_plan = tag_rules.plan(repo)
+    # Always on, like auto-merge: it gates nothing and waits on nothing, and
+    # without it GitHub blocks codex-review's pull_request_target runs, so
+    # the required `codex` status stops reporting.
+    _progress(args, f"{repo}: checking the pull_request_target Actions policy")
+    event_plan = event_policy.plan(repo)
 
     # Always on, like credentials and auto-merge: there is nothing to
     # request here either, only one right state (the fleet's scaffold
@@ -2713,6 +2718,9 @@ def _run(args, log=None):
         if tag_plan is not None and (full or tag_plan.state != "protected"):
             lines.append("  release tags:")
             lines += [f"    {line}" for line in tag_plan.lines]
+        if full or event_plan.state not in ("allowed", "private"):
+            lines.append("  pull_request_target:")
+            lines += [f"    {line}" for line in event_plan.lines]
         wedged = wedged_branch_warning() if not args.no_bootstrap else None
         if not args.no_bootstrap and (full or not bootstrap_idle or wedged):
             lines.append("  bootstrap (fleet CI scaffold):")
@@ -2741,6 +2749,7 @@ def _run(args, log=None):
             or delete_branch_state == "error"
             or pr_policy_state == "error"
             or (tag_plan is not None and tag_plan.state == "error")
+            or event_plan.state == "error"
             or (bootstrap_plan is not None and bootstrap_plan.error)
             or (bootstrap_plan is not None and bootstrap_plan.missing_workflow_scope)
             or empty_branch_would_strand_ruleset
@@ -2827,6 +2836,7 @@ def _run(args, log=None):
         or delete_branch_state == "enable"
         or pr_policy_state == "restrict"
         or (tag_plan is not None and tag_plan.state in ("create", "update"))
+        or event_plan.state in ("create", "update")
         or (
             bootstrap_plan is not None
             and not bootstrap_plan.error
@@ -3841,6 +3851,21 @@ def _run(args, log=None):
             for line in tag_plan.lines:
                 error(line)
         failed.append("release-tags")
+
+    if event_plan.state in ("create", "update"):
+        event_done, event_lines = event_policy.apply(repo, event_plan)
+        for line in event_lines:
+            if event_done:
+                print(f"{repo}: {line}")
+            else:
+                error(line)
+        if not event_done:
+            failed.append("pull-request-target")
+    elif event_plan.state == "error":
+        if not show_plan:
+            for line in event_plan.lines:
+                error(line)
+        failed.append("pull-request-target")
 
     # Said last, from what the run actually left behind rather than from
     # what it planned. Six rounds went on deciding it earlier and each was

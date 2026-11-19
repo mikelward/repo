@@ -237,6 +237,21 @@ setup`, always on unless a flag opts the repository out:
   is a person's decision, held and reported, and every other step still
   runs. A ruleset that changed between the plan and the write is left as
   it is, for the next run. `--no-rules` opts out, with the branch ruleset.
+- **One Actions event policy named `pull_request_target`**, in every
+  public repository, allowing every event for
+  `.github/workflows/codex-review.yml`, `codex-review-check.yml` and
+  `ci.yml`. From December 2, 2026, GitHub blocks `pull_request_target` in a
+  public repository unless a policy allows it, and those three use it on
+  purpose: it loads the workflow from the default branch, so a pull
+  request cannot rewrite the job that judges it. Every event, not just
+  that one, because an event rule is an allowlist for the workflows it
+  targets and listing one would block their other triggers. `ci.yml` is
+  targeted everywhere, since allowing a trigger a workflow never declares
+  changes nothing. Every other workflow stays under GitHub's default. A
+  private repository needs none. It is a floor: an existing policy gains
+  the files and events it lacks and keeps the rest. One turned off, or
+  excluding one of the three files, is a person's decision, held and
+  reported. Always on: it gates nothing and lands on the first run.
 - **Fleet credentials in their environments**, each restricted to the
   default branch, with no repository-level copy left behind.
 - **Auto-merge** and **delete branch on merge** enabled.
@@ -436,6 +451,9 @@ do, and none of them is caused by a run:
 - A legacy-named ruleset whose merge methods conflict with rebase.
 - A `release tags` ruleset that is turned off, aimed at branches, or
   excludes every `v*` tag: turn it on, rename it, or remove the exclude.
+- A `pull_request_target` Actions policy that is turned off or excludes
+  one of the fleet's three `pull_request_target` workflows: turn it on or
+  remove the exclude.
 - A Vercel project unlinked, or its App's access removed, after the last
   push to the default branch and before a run -- the one entry here a run
   can cause: Vercel's status still on that head is what says the
